@@ -100,7 +100,19 @@ const unquoteToBytes = (run: string): readonly number[] => {
  * recommendation for how *many* replacement characters a truncated sequence
  * produces, so the two agree on everything reachable from a query string.
  */
-const REPLACING_DECODER = new TextDecoder('utf-8', { fatal: false });
+/**
+ * `ignoreBOM: true` is not a detail: the default is `false`, and `false` means
+ * the decoder **removes** a leading `U+FEFF` rather than ignoring the option's
+ * name.
+ *
+ * `bytes.decode('utf-8', 'replace')` keeps it, so `?after_turn=%EF%BB%BF5`
+ * reached `int()` as `'\ufeff5'` and was a `400` in CPython while this side
+ * decoded a bare `'5'` and served a `200` — measured by the query fuzz, and one
+ * of the two halves of the BOM/NEL asymmetry (the other is `String.trim()`, in
+ * `services/upstream.ts#parsePythonInt`).  A BOM is only ever a *character*
+ * here: `unquote` decodes a query value, not a file.
+ */
+const REPLACING_DECODER = new TextDecoder('utf-8', { fatal: false, ignoreBOM: true });
 
 /** `urllib.parse.unquote(value, encoding="utf-8", errors="replace")`. */
 export const pythonUnquote = (text: string): string =>
@@ -222,24 +234,6 @@ export const replayQuery = (query: string): Either.Either<ReplayQuery, BadReques
     normalizedQuery: `after_turn=${afterTurn.value}&limit=${limit.value}`,
   });
 };
-
-/**
- * A Python `int` as the loaders' `number`.
- *
- * `ReplayDerivationInput.afterTurn` and `BoardDerivationInput.turn` are
- * `number`, and Python's are not bounded — so a query that passed validation
- * can still name a turn no double can spell.  Saturating is the least-lying
- * option available at this seam: the loaders compare `turn > after_turn` over
- * turns that fit in six digits on disk, so a saturated value selects the same
- * (empty) set of savegames as the exact one.  The single observable difference
- * is the `next_after_turn` echoed by a replay derived with
- * `after_turn > 2**53`, which no viewer requests.
- *
- * Reported with this port rather than papered over: the fix is a `bigint` in
- * `services/derivation.ts`'s input types.
- */
-export const toLoaderInteger = (value: bigint): number =>
-  value > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(value);
 
 // ---------------------------------------------------------------------------
 // The two failure translations
@@ -486,8 +480,8 @@ export const replayRoute = (route: ReplayJsonRoute): ViewerRouteEffect =>
             derivation.replay({
               gameId: route.gameId,
               places: context.places,
-              afterTurn: toLoaderInteger(query.afterTurn),
-              limit: toLoaderInteger(query.limit),
+              afterTurn: query.afterTurn,
+              limit: query.limit,
               complete: context.complete,
             }),
           ),

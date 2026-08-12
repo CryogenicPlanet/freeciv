@@ -31,13 +31,24 @@ export type DerivationOperation = (typeof DERIVATION_OPERATIONS)[number];
  */
 export type ResolvedPlaces = ReadonlyArray<JsonObject>;
 
-/** `replay_from_autosaves(runs_root, game_id, places, *, after_turn, limit, cache_root, complete)`. */
+/**
+ * `replay_from_autosaves(runs_root, game_id, places, *, after_turn, limit, cache_root, complete)`.
+ *
+ * `bigint`, not `number`, and that is a parity requirement rather than a taste:
+ * these two integers come from a query string that CPython parses with `int()`,
+ * which is unbounded, and the loader **echoes `after_turn` back** in
+ * `next_after_turn`.  A `number` seam saturated `?after_turn=9007199254740993`
+ * to `9007199254740991` in the response body while CPython echoed the digits it
+ * was given — measured by the query fuzz, pinned as a finding, and closed by
+ * this type.  `String(bigint)` is also exact for the child's argv, where
+ * `String(1e21)` would hand the bridge `1e+21`.
+ */
 export interface ReplayDerivationInput {
   readonly gameId: string;
   /** Defaults to `[]`, which is the loader's own default (`()`). */
   readonly places?: ResolvedPlaces;
-  readonly afterTurn: number;
-  readonly limit: number;
+  readonly afterTurn: bigint;
+  readonly limit: bigint;
   /** `state in TERMINAL_STATES`, computed from the manifest — never from upstream (`:1700`). */
   readonly complete: boolean;
 }
@@ -46,7 +57,8 @@ export interface ReplayDerivationInput {
 export interface BoardDerivationInput {
   readonly gameId: string;
   readonly places?: ResolvedPlaces;
-  readonly turn: number;
+  /** `bigint`, for the reason {@link ReplayDerivationInput} carries. */
+  readonly turn: bigint;
 }
 
 /** `events_from_autosaves(runs_root, game_id, places, *, cache_root, complete)`. */

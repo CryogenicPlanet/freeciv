@@ -328,12 +328,41 @@ export const handleRequest = (
  * its upstream reader cancellation and its open file descriptor on, so a
  * client that disconnects mid-video releases both.  It is not the server's
  * scope and must not be confused with it.
+ *
+ * ## Why `Effect.interruptible`, and what breaks without it
+ *
+ * `HttpApp.toHandled` ends with `Effect.uninterruptible(scoped(app))`
+ * (`@effect/platform/HttpApp.js:74`), so **the whole handler runs in an
+ * uninterruptible region** — and a fiber forked inside one inherits that
+ * status.  `Effect.timeout` is `race` plus an interrupt of the loser, so in
+ * that region the timeout still *decides* on time and then waits for the loser
+ * to finish on its own.  A one-second `--upstream-timeout-s` against an
+ * unroutable upstream therefore became "no answer at all, connection closed at
+ * ~12s by Bun's idle timeout", which is exactly what the parity matrix
+ * measured (`test/parity/diff.test.ts`, the `upstream-timeout-ignored`
+ * finding: CPython answered the disk fallback at 1007ms, this side answered
+ * nothing).  Measured again with the framework and nothing else: a `Fiber.fork`
+ * of a ten-second `Effect.async` and an immediate `Fiber.interrupt` took
+ * 10005ms inside a served app and 203ms everywhere else, and the async
+ * canceller only ran at the ten-second mark.
+ *
+ * `@effect/platform`'s own routers restore it per route —
+ * `route.uninterruptible ? handler : Effect.interruptible(handler)`
+ * (`internal/httpRouter.js:166`, `HttpLayerRouter.js:113`), defaulting to
+ * interruptible — and this gateway serves a *bare* app rather than an
+ * `HttpRouter` (see the module doc: Bun's router would answer before us and
+ * take the method contract with it), so nothing else was ever going to do it.
+ * This is that same line, at the one place the app is defined.
+ *
+ * It is also what makes the framework's client-abort path real: the Bun server
+ * calls `fiber.interruptAsFork(clientAbortFiberId)` when the socket goes away,
+ * which an uninterruptible handler ignores.
  */
 export const gatewayApp: Effect.Effect<
   HttpServerResponse.HttpServerResponse,
   never,
   GatewayRouteServices | HttpServerRequest.HttpServerRequest | Observability
-> = Effect.flatMap(HttpServerRequest.HttpServerRequest, handleRequest);
+> = Effect.interruptible(Effect.flatMap(HttpServerRequest.HttpServerRequest, handleRequest));
 
 // ---------------------------------------------------------------------------
 // Startup

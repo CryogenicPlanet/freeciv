@@ -4,7 +4,14 @@
  */
 
 import { Array as Arr, Either, Option } from 'effect';
-import { decodeFrameIndexFromPngName, type FrameIndex, type GameId, isGameId } from '@arena/wire';
+import {
+  decodeFrameIndexFromPngName,
+  FRAME_INDEX_RE,
+  FrameIndex as FrameIndexBrand,
+  type FrameIndex,
+  type GameId,
+  isGameId,
+} from '@arena/wire';
 import {
   GATEWAY_GAMES_INDEX_PATH,
   GATEWAY_GAMES_PREFIX,
@@ -261,6 +268,56 @@ const viewerUpstreamPath = (gameId: GameId, segment: string): string =>
   `${GATEWAY_GAMES_INDEX_PATH}/${gameId}/${segment}`;
 
 /**
+ * An index `FRAME_INDEX_RE` accepts and no archive can hold.
+ *
+ * On disk a frame is `ARCHIVE_PNG_RE = ^([0-9]{6})\.png$` — six digits, so the
+ * largest index that can ever be *listed* is `999999`.  Anything at or above
+ * `2 ** 53 - 1` therefore misses every lookup by construction, which is exactly
+ * what a ~310-digit index does in Python.
+ */
+const UNREACHABLE_FRAME_INDEX: FrameIndex = FrameIndexBrand.make(Number.MAX_SAFE_INTEGER);
+
+/**
+ * `int(suffix[1][:-4])` (`:2034`) — total, for every name the regex admits.
+ *
+ * Python's `int` is arbitrary-precision and its lookup is an equality against
+ * the indices the archive listing produced, so `99999999999999999999999999.png`
+ * routes to the frame handler and comes back `404 map frame does not exist`.
+ * A JS `number` cannot hold that value, and the two obvious ports of this line
+ * are both wrong:
+ *
+ * - **Reject it at the router.**  That is a `404 not found` — the same status
+ *   with a different body, which byte parity reports as a divergence.
+ * - **Hand it to `decodeFrameIndexFromPngName` anyway.**  Measured: that
+ *   **throws**.  Wire's `FrameIndexFromPngName` is a `Schema.transform` whose
+ *   decode calls `FrameIndex.make(Number(digits))`, and `Schema.int()` is
+ *   `Number.isSafeInteger` — so `1e26` and `2 ** 53 + 1` fail the brand
+ *   *inside* the transformation, where a thrown `ParseError` escapes the
+ *   `Either` the "tolerant" decoder promises.  In the gateway that defect
+ *   surfaced as a bare `500` with an empty body and none of the gateway's own
+ *   headers, in every scenario (the parity matrix's `frame-index-overflow-500`
+ *   finding).  `arena/wire` is upstream of this package and is not edited from
+ *   here; the width test below keeps the throwing input away from it.
+ *
+ * So: names that fit a safe integer go through wire's decoder, which remains
+ * the single definition of the grammar; the ones that do not are routed with
+ * {@link UNREACHABLE_FRAME_INDEX}, which reaches `selectFramePng` and misses.
+ * Same route, same status, same bytes as CPython.
+ */
+const frameIndexFromPngName = (name: string): Option.Option<FrameIndex> => {
+  if (!FRAME_INDEX_RE.test(name)) return Option.none();
+  const digits = name.slice(0, -4);
+  return Option.some(
+    Number.isSafeInteger(Number(digits))
+      ? Option.getOrElse(
+          Either.getRight(decodeFrameIndexFromPngName(name)),
+          () => UNREACHABLE_FRAME_INDEX,
+        )
+      : UNREACHABLE_FRAME_INDEX,
+  );
+};
+
+/**
  * `:1996-2004` — matched **before** the query gate, which is the only reason
  * any route may carry a query string.
  */
@@ -337,17 +394,12 @@ const POST_QUERY_ROUTES: ReadonlyArray<SuffixRule> = [
     // `FrameIndexFromPngName` *is* `FRAME_INDEX_RE` followed by that `int`, so
     // a name the decoder refuses is a name Python's regex refuses — `00.png`
     // and `007.png` fall through to the `:2037` 404 without touching upstream,
-    // exactly as they do in Python.
-    //
-    // One bounded divergence: Python's `int` is arbitrary-precision, so a
-    // ~310-digit index routes there and 404s later at the archive lookup,
-    // while here it is not a finite JS number and 404s now.  Same status, a
-    // different message (`not found` vs `map frame does not exist`), only for
-    // inputs no archive can hold — six digits is the on-disk width.
+    // exactly as they do in Python. Arbitrary-width indices are normalized by
+    // `frameIndexFromPngName` so they still reach the archive-specific 404.
     decide: (context) =>
       context.suffix.length === 2 && context.suffix[0] === GATEWAY_ROUTE_SEGMENTS.frames
         ? Option.map(
-            Either.getRight(decodeFrameIndexFromPngName(context.suffix[1] ?? '')),
+            frameIndexFromPngName(context.suffix[1] ?? ''),
             (index): RouteDecision => ({
               _tag: 'FramePng',
               gameId: context.gameId,

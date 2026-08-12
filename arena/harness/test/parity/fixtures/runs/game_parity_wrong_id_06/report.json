@@ -1,0 +1,209 @@
+{
+  "episode": ".agent-eval/runs/game_parity_wrong_id_06",
+  "manifest": {
+    "benchmark_valid": false,
+    "bridge_status_file": "bridge-status.jsonl",
+    "checkpoints": 2,
+    "commands_file": "server.commands",
+    "config": {
+      "action_timeout_s": 180.0,
+      "control_protocol": "full-control-v2",
+      "lobby_timeout_s": 0.0,
+      "max_agents": 1,
+      "mode": "single",
+      "name": "session-game_parity_w",
+      "objective": "Maximize final Freeciv civilization score.",
+      "places": 2,
+      "ruleset": "classic",
+      "schema_version": 1,
+      "seats": [
+        {
+          "base_url": null,
+          "controller_fingerprint": "4ed7053ea5c490f60e619d96634ea39f136b0c7938eb4ba30df7327bce658efc",
+          "controller_label": "GPT-5.5",
+          "controller_metadata": {},
+          "id": "place-1",
+          "instructions": "Maximize final Freeciv civilization score.",
+          "model": null,
+          "name": "AgentPlace1",
+          "options": {},
+          "type": "external"
+        },
+        {
+          "base_url": null,
+          "controller_fingerprint": "a91991f2448230d006e992848530ac125c0b66c6d5e026ddecc783fe1d6e0c0a",
+          "controller_label": null,
+          "controller_metadata": {},
+          "id": "place-2",
+          "instructions": null,
+          "model": null,
+          "name": "NativePlace2",
+          "options": {},
+          "type": "native"
+        }
+      ],
+      "seeds": [
+        1906545511
+      ],
+      "server": {
+        "frame_interval": 1,
+        "frame_zoom": 1
+      },
+      "timing_mode": "default",
+      "turns": 5000
+    },
+    "control_protocol": "full-control-v2",
+    "created_at": 1785895825.843502,
+    "current_turn": 2,
+    "error": "full-control-v2 timed phase end could not be dispatched",
+    "finished_at": 1785896256.438215,
+    "frames": 2,
+    "game_id": "game_parity_wrong_id_06_other",
+    "invalid_reasons": [
+      "v2_phase_timeout_failed"
+    ],
+    "joined_agents": 1,
+    "resolved_places": [
+      {
+        "controller": "agent",
+        "controller_fingerprint": "4ed7053ea5c490f60e619d96634ea39f136b0c7938eb4ba30df7327bce658efc",
+        "controller_label": "GPT-5.5",
+        "controller_metadata": {},
+        "controller_type": "external",
+        "joined": true,
+        "model": null,
+        "place": 1,
+        "player_color": "#0067A5",
+        "player_name": "AgentPlace1",
+        "seat_id": "place-1"
+      },
+      {
+        "controller": "native_classic_ai",
+        "controller_label": "Freeciv Classic AI",
+        "controller_type": "native",
+        "joined": false,
+        "model": "classic",
+        "place": 2,
+        "player_color": "#F38400",
+        "player_name": "NativePlace2",
+        "seat_id": "place-2"
+      }
+    ],
+    "returncode": 0,
+    "schema_version": 1,
+    "scorelog_file": "score.log",
+    "start_count": 1,
+    "started_at": 1785895920.221737,
+    "state": "failed",
+    "status": "failed",
+    "trace_file": "decisions.jsonl",
+    "video_file": "game.mp4"
+  },
+  "score": {
+    "final_turn": 2,
+    "players": [
+      {
+        "added_turn": 1,
+        "alive": true,
+        "controller_fingerprint": "a91991f2448230d006e992848530ac125c0b66c6d5e026ddecc783fe1d6e0c0a",
+        "last_score_turn": 2,
+        "metrics": {
+          "bnp": 0,
+          "cities": 0,
+          "contentpop": 0,
+          "corruption": 0,
+          "culture": 0,
+          "gold": 50,
+          "gov": 1,
+          "happypop": 0,
+          "landarea": 0,
+          "literacy": 0,
+          "luxrate": 0,
+          "mfg": 0,
+          "munits": 0,
+          "pollution": 0,
+          "pop": 0,
+          "riots": 0,
+          "scirate": 60,
+          "score": 2,
+          "settledarea": 0,
+          "settlers": 2,
+          "spaceship": 0,
+          "specialists": 0,
+          "taxrate": 40,
+          "techout": 0,
+          "techs": 1,
+          "unhappypop": 0,
+          "unitsbuilt": 0,
+          "unitskilled": 0,
+          "unitslost": 0,
+          "unitsused": 0,
+          "wonders": 0
+        },
+        "name": "NativePlace2",
+        "player_id": 1,
+        "rank": 1,
+        "removed_turn": null,
+        "score": 2,
+        "seat_id": "place-2"
+      },
+      {
+        "added_turn": 1,
+        "alive": true,
+        "controller_fingerprint": "4ed7053ea5c490f60e619d96634ea39f136b0c7938eb4ba30df7327bce658efc",
+        "last_score_turn": 2,
+        "metrics": {
+          "bnp": 0,
+          "cities": 0,
+          "contentpop": 0,
+          "corruption": 0,
+          "culture": 0,
+          "gold": 50,
+          "gov": 1,
+          "happypop": 0,
+          "landarea": 0,
+          "literacy": 0,
+          "luxrate": 0,
+          "mfg": 0,
+          "munits": 0,
+          "pollution": 0,
+          "pop": 0,
+          "riots": 0,
+          "scirate": 60,
+          "score": 0,
+          "settledarea": 0,
+          "settlers": 2,
+          "spaceship": 0,
+          "specialists": 0,
+          "taxrate": 40,
+          "techout": 0,
+          "techs": 0,
+          "unhappypop": 0,
+          "unitsbuilt": 0,
+          "unitskilled": 0,
+          "unitslost": 0,
+          "unitsused": 0,
+          "wonders": 0
+        },
+        "name": "Ada",
+        "player_id": 0,
+        "rank": 2,
+        "removed_turn": null,
+        "score": 0,
+        "seat_id": "place-1"
+      }
+    ]
+  },
+  "seat_stats": {
+    "place-2": {
+      "controller_fingerprint": "a91991f2448230d006e992848530ac125c0b66c6d5e026ddecc783fe1d6e0c0a",
+      "decisions": 0,
+      "fallbacks": 0,
+      "input_tokens": 0,
+      "latency_ms": 0.0,
+      "mean_latency_ms": 0,
+      "output_tokens": 0,
+      "turns": 1
+    }
+  }
+}

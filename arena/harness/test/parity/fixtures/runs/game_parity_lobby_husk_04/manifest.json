@@ -1,0 +1,97 @@
+{
+  "benchmark_valid": null,
+  "bridge_status_file": "bridge-status.jsonl",
+  "checkpoints": 0,
+  "commands_file": "server.commands",
+  "config": {
+    "action_timeout_s": 180.0,
+    "control_protocol": "full-control-v2",
+    "lobby_timeout_s": 0.0,
+    "max_agents": 1,
+    "mode": "single",
+    "name": "session-game_parity_l",
+    "objective": "Maximize final Freeciv civilization score.",
+    "places": 2,
+    "ruleset": "classic",
+    "schema_version": 1,
+    "seats": [
+      {
+        "base_url": null,
+        "controller_fingerprint": "99de2a3c200076b92c63ec14f53aa294f41bde706efe3496b5025a62b5ed7fe4",
+        "controller_label": "kimi-k3",
+        "controller_metadata": {},
+        "id": "place-1",
+        "instructions": "Maximize final Freeciv civilization score.",
+        "model": null,
+        "name": "AgentPlace1",
+        "options": {},
+        "type": "external"
+      },
+      {
+        "base_url": null,
+        "controller_fingerprint": "a91991f2448230d006e992848530ac125c0b66c6d5e026ddecc783fe1d6e0c0a",
+        "controller_label": null,
+        "controller_metadata": {},
+        "id": "place-2",
+        "instructions": null,
+        "model": null,
+        "name": "NativePlace2",
+        "options": {},
+        "type": "native"
+      }
+    ],
+    "seeds": [
+      481885668
+    ],
+    "server": {
+      "frame_interval": 1,
+      "frame_zoom": 1
+    },
+    "timing_mode": "default",
+    "turns": 5000
+  },
+  "control_protocol": "full-control-v2",
+  "created_at": 1785895708.600097,
+  "current_turn": null,
+  "error": null,
+  "finished_at": null,
+  "frames": 0,
+  "game_id": "game_parity_lobby_husk_04",
+  "invalid_reasons": [],
+  "joined_agents": 0,
+  "resolved_places": [
+    {
+      "controller": "agent",
+      "controller_fingerprint": "99de2a3c200076b92c63ec14f53aa294f41bde706efe3496b5025a62b5ed7fe4",
+      "controller_label": "kimi-k3",
+      "controller_metadata": {},
+      "controller_type": "external",
+      "joined": true,
+      "model": null,
+      "place": 1,
+      "player_color": "#0067A5",
+      "player_name": "AgentPlace1",
+      "seat_id": "place-1"
+    },
+    {
+      "controller": "native_classic_ai",
+      "controller_label": "Freeciv Classic AI",
+      "controller_type": "native",
+      "joined": false,
+      "model": "classic",
+      "place": 2,
+      "player_color": "#F38400",
+      "player_name": "NativePlace2",
+      "seat_id": "place-2"
+    }
+  ],
+  "returncode": null,
+  "schema_version": 1,
+  "scorelog_file": "score.log",
+  "start_count": 0,
+  "started_at": null,
+  "state": "lobby",
+  "status": "lobby",
+  "trace_file": "decisions.jsonl",
+  "video_file": null
+}

@@ -458,6 +458,34 @@ def _resolve_agent_binary(repo_root: Path, override: str | None) -> Path:
     return candidate
 
 
+TS_GATEWAY_ENTRY = "arena/harness/src/gateway/main.ts"
+
+
+def _gateway_command(
+    python: str,
+    repo_root: Path,
+    flags: Sequence[str],
+    *,
+    ts_gateway: bool,
+    runner: CommandRunner = _run,
+) -> list[str]:
+    """argv for the replay gateway child: CPython by default, Bun on request.
+
+    Both implementations take the identical flag list and publish the same
+    private ready record (`pid`, `url`, `viewer_public_url`), so `--ts-gateway`
+    swaps only the runtime that is asked to serve: the readiness gate, the
+    health probe, the SIGTERM teardown and the Portless aliases are unchanged.
+    """
+    if not ts_gateway:
+        return [python, "-B", "-m", "agent_eval.replay_gateway", *flags]
+    entry = (repo_root / TS_GATEWAY_ENTRY).resolve()
+    if not entry.is_file():
+        raise StackError(f"--ts-gateway needs {TS_GATEWAY_ENTRY}; it is missing")
+    if runner(("bun", "--version")).returncode != 0:
+        raise StackError("Bun is required for --ts-gateway; install it first")
+    return ["bun", str(entry), *flags]
+
+
 def start_stack(args: argparse.Namespace) -> int:
     repo_root = Path(args.repo_root).expanduser().resolve()
     state_root = Path(args.state_dir).expanduser().resolve()
@@ -534,18 +562,20 @@ def start_stack(args: argparse.Namespace) -> int:
             raise StackError("supervisor published unsafe listener metadata")
         _wait_http(supervisor_raw + "/health", supervisor, b'"ok":true')
 
+        gateway_flags = [
+            "--host", "127.0.0.1", "--port", "0",
+            "--service-url", supervisor_raw,
+            "--viewer-public-url", viewer_public_url,
+            "--runs-root", str((state_root / "runs").resolve()),
+            "--cache-root", str((state_root / "replay-cache").resolve()),
+            "--repo-root", str(repo_root),
+            "--ready-file", str(ready_gateway),
+        ]
         gateway = spawn(
             "replay gateway",
-            [
-                python, "-B", "-m", "agent_eval.replay_gateway",
-                "--host", "127.0.0.1", "--port", "0",
-                "--service-url", supervisor_raw,
-                "--viewer-public-url", viewer_public_url,
-                "--runs-root", str((state_root / "runs").resolve()),
-                "--cache-root", str((state_root / "replay-cache").resolve()),
-                "--repo-root", str(repo_root),
-                "--ready-file", str(ready_gateway),
-            ],
+            _gateway_command(
+                python, repo_root, gateway_flags, ts_gateway=args.ts_gateway,
+            ),
             f"gateway-{invocation}.log",
         )
         gateway_ready = _wait_private_ready(ready_gateway, gateway)
@@ -680,6 +710,14 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "full-control-v2 client executable (default: same-checkout "
             "build-control-v2/freeciv-agent)"
+        ),
+    )
+    start.add_argument(
+        "--ts-gateway",
+        action="store_true",
+        help=(
+            "serve the replay gateway from arena/harness under Bun instead of "
+            "agent_eval.replay_gateway (same flags, same ready file)"
         ),
     )
     show = sub.add_parser("replay")
