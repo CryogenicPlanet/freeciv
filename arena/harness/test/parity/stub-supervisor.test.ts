@@ -21,6 +21,7 @@
 // oxlint-disable effecttsgo/global-fetch -- these tests assert what a stub puts on a socket, and an `HttpClient` layer between the assertion and the wire is exactly the thing that must not be in the way
 // oxlint-disable effecttsgo/global-console -- the measured numbers (bytes past the cap, milliseconds held) are the evidence a reader of the run needs
 import { describe, expect, test } from 'bun:test';
+import { parseJsonObjectFromText } from './json-boundary.ts';
 import {
   BINARY_ETAG,
   BINARY_LAST_MODIFIED,
@@ -74,9 +75,6 @@ const withStub = async <A>(
 
 /** The gateway's own upstream `Accept` for a JSON leg (`UPSTREAM_ACCEPT_JSON`). */
 const JSON_REQUEST: RequestInit = { headers: { accept: 'application/json' } };
-
-const isRecord = (value: unknown): value is Readonly<Record<string, unknown>> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
 
 /** `toEqual` on two `Uint8Array`s whose buffer types differ; the bytes are the claim. */
 const bytesOf = (value: Uint8Array): ReadonlyArray<number> => Array.from(value);
@@ -309,8 +307,8 @@ describe('oversize-9mib — past the 8 MiB cap, and chunked', () => {
     expect(seen.bytes.byteLength).toBe(OVERSIZE_TOTAL_BYTES);
     expect(seen.bytes.byteLength).toBeGreaterThan(MAX_PROXY_JSON_BYTES);
     expect(seen.pulled).toBe(OVERSIZE_CHUNKS);
-    const document: unknown = JSON.parse(new TextDecoder().decode(seen.bytes));
-    const items = isRecord(document) ? document['items'] : undefined;
+    const document = parseJsonObjectFromText(new TextDecoder().decode(seen.bytes));
+    const items = document?.['items'];
     expect(Array.isArray(items)).toBe(true);
     console.log(
       `  [oversize] ${seen.bytes.byteLength} bytes (cap ${MAX_PROXY_JSON_BYTES}) in ${seen.pulled} chunks`,

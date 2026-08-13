@@ -10,10 +10,20 @@
  * can kill setup failures and report orphans.
  */
 
+import { isJsonValue } from '@arena/wire';
 import { Either } from 'effect';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
+import {
+  type GatewayReadyRecord,
+  parseGatewayReadyRecord,
+  parseJsonObjectFromText,
+  pidFromStackRecord,
+  pipedStreamText,
+  portsFromServiceUrl,
+  portsFromStackRecord,
+} from './json-boundary.ts';
 
 // ---------------------------------------------------------------------------
 // Where things are
@@ -103,7 +113,7 @@ export const REFUSED_UPSTREAM_URL = 'http://127.0.0.1:1' as const;
 export type Impl = 'python' | 'typescript';
 
 /** The suffix each implementation's private files carry. */
-const SLOT: Readonly<Record<Impl, string>> = { python: 'py', typescript: 'ts' };
+const SLOT = { python: 'py', typescript: 'ts' } satisfies Readonly<Record<Impl, string>>;
 
 /**
  * The only flags whose values may differ between the two processes, and the
@@ -254,10 +264,12 @@ export const argvParity = (pair: GatewayPair): ArgvParity => {
  * A closure rather than a module-level binding, so the array can neither be
  * reassigned nor reached except through its three accessors.
  */
-const registry = ((): {
+interface BootRegistry {
   readonly add: (child: Bun.Subprocess) => Bun.Subprocess;
   readonly killAll: () => Promise<ReadonlyArray<number>>;
-} => {
+}
+
+const registry = ((): BootRegistry => {
   const children: Bun.Subprocess[] = [];
   return {
     add: (child) => {
@@ -326,13 +338,6 @@ const orNull = <A>(thunk: () => A): A | null => {
   return Either.isRight(outcome) ? outcome.right : null;
 };
 
-/** The `port` of a `http://127.0.0.1:NNNNN` service URL, when it has one. */
-const urlPort = (value: unknown): ReadonlyArray<number> => {
-  if (typeof value !== 'string' || !URL.canParse(value)) return [];
-  const port = Number(new URL(value).port);
-  return Number.isInteger(port) && port > 0 ? [port] : [];
-};
-
 /**
  * One `local_stack` ready record, reduced to what a safety guard needs.
  *
@@ -366,19 +371,10 @@ export const liveStackRecords = (): ReadonlyArray<LiveStackRecord> =>
     .flatMap((name): ReadonlyArray<LiveStackRecord> => {
       const file = join(LIVE_STACK_RECORDS_DIR, name);
       const text = orNull(() => readFileSync(file, 'utf8'));
-      const parsed: unknown = text === null ? null : orNull(() => JSON.parse(text) as unknown);
-      // A predicate rather than an assertion: the value came off a directory
-      // another process owns, so nothing about its shape is guaranteed.
-      if (!isRecord(parsed)) return [];
-      const port = parsed['port'];
-      const ports = [
-        ...(typeof port === 'number' ? [port] : []),
-        ...urlPort(parsed['url']),
-        ...urlPort(parsed['internal_service_url']),
-        ...urlPort(parsed['upstream_service_url']),
-      ];
-      const pid = parsed['pid'];
-      return [{ file, pid: typeof pid === 'number' ? pid : null, ports }];
+      if (text === null) return [];
+      const parsed = parseJsonObjectFromText(text);
+      if (parsed === null) return [];
+      return [{ file, pid: pidFromStackRecord(parsed), ports: portsFromStackRecord(parsed) }];
     });
 
 /**
@@ -410,7 +406,7 @@ export const liveStackPorts = (): ReadonlyArray<number> => {
  * real match through two test gateways.
  */
 const liveStackServiceUrl = (serviceUrl: string): ReadonlyArray<number> => {
-  const port = urlPort(serviceUrl)[0];
+  const port = portsFromServiceUrl(serviceUrl)[0];
   return port === undefined ? [] : liveStackPorts().filter((claimed) => claimed === port);
 };
 
@@ -433,7 +429,7 @@ export interface BootedGateway {
   readonly origin: string;
   readonly readyFile: string;
   readonly cacheRoot: string;
-  readonly readyRecord: Readonly<Record<string, unknown>>;
+  readonly readyRecord: GatewayReadyRecord;
   /** The child's stdout, once it has exited.  Consume once. */
   readonly stdout: () => Promise<string>;
   readonly stderr: () => Promise<string>;
@@ -454,28 +450,19 @@ export type BootResult = { readonly _tag: 'Booted'; readonly gateway: BootedGate
 /** The outcome of waiting on a ready file — tagged, so `reason` cannot collide
  * with a field of the record itself. */
 export type ReadyOutcome =
-  | { readonly _tag: 'Ready'; readonly record: Readonly<Record<string, unknown>> }
+  | { readonly _tag: 'Ready'; readonly record: GatewayReadyRecord }
   | { readonly _tag: 'NotReady'; readonly reason: string };
 
-/**
- * A predicate rather than an assertion: the value came off the disk, and
- * claiming a shape for it with `as` would make every downstream read of the
- * record unchecked.  The two fields that matter — `port` and `url` — are still
- * `typeof`-tested individually below.
- */
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
-
-const readReadyRecord = async (path: string): Promise<Readonly<Record<string, unknown>> | null> => {
+const readReadyRecord = async (path: string): Promise<GatewayReadyRecord | null> => {
   const file = Bun.file(path);
   if (!(await file.exists())) return null;
   // `.then(ok, fail)` rather than a `try` block: an absent or half-written
   // record is an expected poll result, not an exception.
-  const parsed: unknown = await file.json().then(
-    (value: unknown) => value,
+  const parsed = await file.json().then(
+    (value) => (isJsonValue(value) ? value : null),
     () => null,
   );
-  return isRecord(parsed) ? parsed : null;
+  return parsed === null ? null : parseGatewayReadyRecord(parsed);
 };
 
 /**
@@ -494,7 +481,7 @@ export const awaitReady = async (
   const deadline = Date.now() + deadlineMs;
   const poll = async (): Promise<ReadyOutcome> => {
     const record = await readReadyRecord(path);
-    if (record !== null && typeof record['url'] === 'string') {
+    if (record !== null) {
       return { _tag: 'Ready', record };
     }
     if (child.exitCode !== null) {
@@ -508,14 +495,6 @@ export const awaitReady = async (
   };
   return poll();
 };
-
-/**
- * `Bun.Subprocess`'s streams are typed as a union over every `stdio` option;
- * `'pipe'` — the one asked for below — is the `ReadableStream` arm, and
- * `instanceof` is how that is established rather than asserted.
- */
-const streamText = (stream: unknown): Promise<string> =>
-  stream instanceof ReadableStream ? new Response(stream).text() : Promise.resolve('');
 
 const bootGateway = async (spec: ResolvedBootSpec, impl: Impl): Promise<BootResult> => {
   const flags = gatewayFlags(spec, impl);
@@ -540,8 +519,8 @@ const bootGateway = async (spec: ResolvedBootSpec, impl: Impl): Promise<BootResu
       },
     }),
   );
-  const stdout = (): Promise<string> => streamText(child.stdout);
-  const stderr = (): Promise<string> => streamText(child.stderr);
+  const stdout = (): Promise<string> => pipedStreamText(child.stdout);
+  const stderr = (): Promise<string> => pipedStreamText(child.stderr);
   const abandon = async (reason: string): Promise<BootFailure> => {
     if (child.exitCode === null) child.kill('SIGKILL');
     await child.exited;
@@ -550,11 +529,8 @@ const bootGateway = async (spec: ResolvedBootSpec, impl: Impl): Promise<BootResu
 
   const outcome = await awaitReady(child, readyFile, spec.readyTimeoutMs);
   if (outcome._tag === 'NotReady') return abandon(outcome.reason);
-  const port = outcome.record['port'];
-  const url = outcome.record['url'];
-  if (typeof port !== 'number' || typeof url !== 'string') {
-    return abandon(`ready record lacks a numeric port and a string url: ${readyFile}`);
-  }
+  const port = outcome.record.port;
+  const url = outcome.record.url;
   return {
     _tag: 'Booted',
     gateway: {
@@ -581,7 +557,7 @@ const bootGateway = async (spec: ResolvedBootSpec, impl: Impl): Promise<BootResu
 /** A value keyed by implementation, which is most of what a rig reports. */
 export type ByImpl<A> = Readonly<Record<Impl, A>>;
 
-const byImpl = <A>(python: A, typescript: A): ByImpl<A> => ({ python, typescript });
+const byImpl = <A>(python: A, typescript: A) => ({ python, typescript }) satisfies ByImpl<A>;
 
 export interface GatewayPair {
   readonly scenario: string;
@@ -720,6 +696,10 @@ export const bootGatewayPair = async (spec: BootSpec): Promise<PairResult> => {
   return { _tag: 'Booted', pair: makePair(resolved, python.gateway, typescript.gateway, cleanup) };
 };
 
+interface PairStopState {
+  report: StopReport | null;
+}
+
 const makePair = (
   spec: ResolvedBootSpec,
   python: BootedGateway,
@@ -729,7 +709,7 @@ const makePair = (
   // One cell, consulted by `stop`, so a second call — an `afterAll` net after a
   // test already stopped the pair — reports the first call's findings rather
   // than waiting on already-consumed streams.
-  const state: { report: StopReport | null } = { report: null };
+  const state: PairStopState = { report: null };
   const both = [python, typescript] as const;
 
   const stop = async (): Promise<StopReport> => {
@@ -817,7 +797,7 @@ export const withGatewayPair = async <A>(
   const pair = unwrapPair(await bootGatewayPair(spec));
   const outcome = await use(pair).then(
     (value) => ({ ok: true, value }) as const,
-    (error: unknown) => ({ ok: false, error }) as const,
+    (error) => ({ ok: false, error }) as const,
   );
   await pair.stop();
   pair.cleanup();

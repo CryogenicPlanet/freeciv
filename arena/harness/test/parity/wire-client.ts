@@ -295,8 +295,10 @@ export const parseOrigin = (origin: string): WireEndpoint | null => {
     : null;
 };
 
-const bodyBuffer = (body: Uint8Array | string | undefined): Buffer | null =>
-  body === undefined ? null : Buffer.from(typeof body === 'string' ? Buffer.from(body, 'utf8') : body);
+const bodyBuffer = (body: Uint8Array | string | undefined): Buffer | null => {
+  if (body === undefined) return null;
+  return body instanceof Uint8Array ? Buffer.from(body) : Buffer.from(body, 'utf8');
+};
 
 /** The bytes before the body: request line, defaults, caller headers, blank line. */
 const renderHead = (
@@ -472,10 +474,15 @@ export const wireRequest = (origin: string, request: WireRequest): Promise<WireO
   const head = renderHead(request, endpoint, body);
   const timeoutMs = request.timeoutMs ?? DEFAULT_WIRE_TIMEOUT_MS;
 
+interface WireReadState {
+  settled: boolean;
+  chunks: ReadonlyArray<Buffer>;
+}
+
   return new Promise<WireOutcome>((resolve) => {
     // A single mutable cell, not a scatter of `let`s: `settled` is the
     // once-guard every listener consults, and `chunks` is the accumulator.
-    const state: { settled: boolean; chunks: ReadonlyArray<Buffer> } = {
+    const state: WireReadState = {
       settled: false,
       chunks: [],
     };

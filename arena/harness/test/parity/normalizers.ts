@@ -8,7 +8,7 @@
  * self-invalidating rather than a permanent comparison hole.
  */
 
-import { Either } from 'effect';
+import { isFlatJsonObject, parseJsonValueFromText } from './json-boundary.ts';
 import { bodyLatin1, type WireResponse } from './wire-client.ts';
 
 // ---------------------------------------------------------------------------
@@ -94,19 +94,10 @@ export const normalizeHealthBody = (text: string): NormalizedHealthBody =>
     { text, replaced: {} },
   );
 
-/** Parse as a value; non-JSON is an expected comparison input. */
-const jsonOrNull = (text: string): unknown =>
-  Either.getOrNull(Either.try(() => JSON.parse(text) as unknown));
-
 /** Validate the flat-object precondition required by textual substitution. */
 export const healthPayloadIsFlat = (text: string): boolean => {
-  const parsed: unknown = jsonOrNull(text);
-  return (
-    typeof parsed === 'object' &&
-    parsed !== null &&
-    !Array.isArray(parsed) &&
-    Object.values(parsed).every((value) => typeof value !== 'object' || value === null)
-  );
+  const parsed = parseJsonValueFromText(text);
+  return parsed !== null && isFlatJsonObject(parsed);
 };
 
 // ---------------------------------------------------------------------------

@@ -47,28 +47,9 @@ const PYTHON_INT_RE = /^[+-]?\p{Nd}(?:_?\p{Nd})*$/u;
 const DECIMAL_DIGIT_RE = /^\p{Nd}$/u;
 
 /**
- * What `int()` strips — which is **not** what `String.trim()` strips, and also
- * not what `str.isspace()` reports.
- *
- * Enumerated rather than assumed: every code point below `0x110000` was run
- * through `int(chr(cp) + '5')` in this checkout's CPython and through
- * `(chr(cp) + 'x').trim()` in Bun.  Two characters separate the results, and a
- * third separates `int()` from the obvious Python oracle:
- *
- * | Code point | `int()` strips | `trim()` strips | `str.isspace()` |
- * |---|---|---|---|
- * | `U+0085` (NEL) | **yes** | no | true |
- * | `U+FEFF` (BOM) | no | **yes** | false |
- * | `U+001C`–`U+001F` (the four separators) | no | no | **true** |
- *
- * Both of the first two were live divergences the query fuzz measured:
- * `?after_turn=%C2%855` was `200` on CPython (the NEL is stripped, so
- * `after_turn=5` goes upstream) and `400 after_turn and limit must be integers`
- * here, while `?after_turn=%EF%BB%BF5` was `400` there and `200` here.  The
- * third row is why this class is not `str.isspace()`: `int('\x1c5')` raises,
- * and the fuzz already pins `?after_turn=%1C5` as a leg *neither* side accepts
- * (`after-fs-prefix`).  Writing the wider set here would have turned an
- * agreement into a new divergence, which is exactly what that pin is for.
+ * Whitespace accepted around CPython `int()` input. This intentionally differs
+ * from both JavaScript `trim()` (which strips U+FEFF) and Python `isspace()`
+ * (which also accepts U+001C–U+001F); `int()` strips U+0085 but rejects those.
  */
 const PYTHON_SPACE_CLASS =
   '[\\t\\n\\v\\f\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]';
@@ -78,43 +59,10 @@ const PYTHON_STRIP_RE = new RegExp(`^${PYTHON_SPACE_CLASS}+|${PYTHON_SPACE_CLASS
 /** `int(text.strip())`'s strip, with Python's whitespace set. */
 const pythonStrip = (text: string): string => text.replace(PYTHON_STRIP_RE, '');
 
-/**
- * `sys.int_info.default_max_str_digits` (CPython 3.11+), which this checkout's
- * interpreter reports as **4300**.
- *
- * A denial-of-service guard on quadratic `str`→`int` conversion, and it is
- * observable through the gateway: `?after_turn=` followed by 4301 nines is a
- * `ValueError` in CPython — so `400 after_turn and limit must be integers` —
- * while a `bigint` has no cap and forwarded the whole 4377-byte query upstream.
- * Measured, including its two edges: the count is of **digit characters after
- * the sign and underscores are removed** (`int('0' * 5000 + '1')` raises, so
- * leading zeros count; `int('_'.join('9' * 4300))` does not, so separators do
- * not), and 4300 exactly is accepted.
- *
- * `sys.set_int_max_str_digits` can move it at runtime; nothing in `agent_eval`
- * does, and the gateway is started by `local_stack` with no such call, so the
- * default is the value in play.
- */
+/** CPython's default decimal-conversion limit; signs and underscores do not count. */
 const PYTHON_MAX_STR_DIGITS = 4300;
 
-/**
- * How far `code` sits above the first non-digit below it.
- *
- * Recursive rather than bounded at nine, because **digit blocks abut**: Unicode
- * 16 put Kirat Rai's zero at `U+116DA`, immediately after Takri's nine at
- * `U+116D9`, so a run of contiguous `\p{Nd}` code points can be twenty long and
- * a search that gives up after nine finds no boundary at all.  It used to give
- * up, and fall back to zero — measured against CPython over every code point
- * below `0x110000`: `int('\u{116DB}5')` is `15` there and was `5` here, in 90
- * probes across four blocks.
- *
- * That differential now agrees on all 2 228 224 probes but twenty, and the
- * twenty are not this function's: `U+11DE0`–`U+11DE9` are `\p{Nd}` to Bun's
- * Unicode database and *unassigned* to CPython 3.14.6's, so one runtime reads a
- * digit where the other reads a stray character.  Nothing here can close a
- * version skew in two shipped UCD tables; it closes itself when the
- * interpreter's catches up.
- */
+/** Distance to the preceding non-digit; Unicode decimal blocks can be adjacent. */
 const digitRunOffset = (code: number, distance: number): number =>
   code - distance - 1 >= 0 &&
   DECIMAL_DIGIT_RE.test(String.fromCodePoint(code - distance - 1))

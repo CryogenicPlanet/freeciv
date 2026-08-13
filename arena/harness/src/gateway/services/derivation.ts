@@ -34,14 +34,9 @@ export type ResolvedPlaces = ReadonlyArray<JsonObject>;
 /**
  * `replay_from_autosaves(runs_root, game_id, places, *, after_turn, limit, cache_root, complete)`.
  *
- * `bigint`, not `number`, and that is a parity requirement rather than a taste:
- * these two integers come from a query string that CPython parses with `int()`,
- * which is unbounded, and the loader **echoes `after_turn` back** in
- * `next_after_turn`.  A `number` seam saturated `?after_turn=9007199254740993`
- * to `9007199254740991` in the response body while CPython echoed the digits it
- * was given — measured by the query fuzz, pinned as a finding, and closed by
- * this type.  `String(bigint)` is also exact for the child's argv, where
- * `String(1e21)` would hand the bridge `1e+21`.
+ * These values are `bigint` because CPython's `int()` is unbounded and the
+ * loader echoes `after_turn` in `next_after_turn`. This also keeps the bridge
+ * argv in exact decimal notation beyond JavaScript's safe-integer range.
  */
 export interface ReplayDerivationInput {
   readonly gameId: string;

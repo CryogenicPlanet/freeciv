@@ -100,18 +100,7 @@ const unquoteToBytes = (run: string): readonly number[] => {
  * recommendation for how *many* replacement characters a truncated sequence
  * produces, so the two agree on everything reachable from a query string.
  */
-/**
- * `ignoreBOM: true` is not a detail: the default is `false`, and `false` means
- * the decoder **removes** a leading `U+FEFF` rather than ignoring the option's
- * name.
- *
- * `bytes.decode('utf-8', 'replace')` keeps it, so `?after_turn=%EF%BB%BF5`
- * reached `int()` as `'\ufeff5'` and was a `400` in CPython while this side
- * decoded a bare `'5'` and served a `200` — measured by the query fuzz, and one
- * of the two halves of the BOM/NEL asymmetry (the other is `String.trim()`, in
- * `services/upstream.ts#parsePythonInt`).  A BOM is only ever a *character*
- * here: `unquote` decodes a query value, not a file.
- */
+/** Keep a decoded U+FEFF as data, matching Python's UTF-8 decoder for query values. */
 const REPLACING_DECODER = new TextDecoder('utf-8', { fatal: false, ignoreBOM: true });
 
 /** `urllib.parse.unquote(value, encoding="utf-8", errors="replace")`. */

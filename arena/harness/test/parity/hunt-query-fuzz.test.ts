@@ -15,6 +15,9 @@ import {
   bootGatewayPair,
   type GatewayPair,
   killAllBooted,
+  PARITY_PLATFORM_SUPPORTED,
+  PARITY_REQUIRED,
+  paritySkipWarning,
   REFUSED_UPSTREAM_URL,
   type StopReport,
   unwrapPair,
@@ -24,6 +27,29 @@ import { PARITY_RUNS_ROOT } from './fixtures/scenarios.ts';
 import { makeStub, type StubHandle } from './stub-supervisor.ts';
 import { checkWaiver, waiverFor, waiversIn, waiverStillNeeded } from './waivers.ts';
 import { isWireResponse, wireGet, type WireOutcome } from './wire-client.ts';
+
+/** Linux and Darwin have the native locking support needed by the full rig. */
+const PLATFORM_SUPPORTED = PARITY_PLATFORM_SUPPORTED;
+
+/** Unsupported-platform skips must be visible, and required parity must fail. */
+test('the query fuzz is not silently skipped', () => {
+  if (!PLATFORM_SUPPORTED) {
+    // oxlint-disable-next-line effecttsgo/global-console -- skipped parity must reach the terminal
+    console.warn(
+      paritySkipWarning(
+        'the query fuzz',
+        'every query, parser-boundary, traversal and derivation probe',
+      ),
+    );
+  }
+  expect({
+    platform: process.platform,
+    ranTheFuzz: PLATFORM_SUPPORTED || !PARITY_REQUIRED,
+  }).toEqual({
+    platform: process.platform,
+    ranTheFuzz: true,
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Fixture ids
@@ -200,7 +226,7 @@ const BOARD_SEEDS: ReadonlyArray<QuerySeed> = [
 ];
 
 /** Where the query gate sits relative to every other gate in `do_GET`. */
-const SHAPE_LEGS: ReadonlyArray<Omit<FuzzLeg, 'phase'>> = [
+const QUERY_GATE_LEGS: ReadonlyArray<Omit<FuzzLeg, 'phase'>> = [
   {
     name: 'events-no-query',
     target: eventsTarget(ABSENT_GAME_ID, ''),
@@ -357,7 +383,7 @@ const fromSeeds = (
 const proxyPhaseLegs = (phase: 'stub' | 'disk'): ReadonlyArray<FuzzLeg> => [
   ...fromSeeds(phase, 'replay', REPLAY_SEEDS, (query) => replayTarget(ABSENT_GAME_ID, query)),
   ...fromSeeds(phase, 'board', BOARD_SEEDS, (query) => boardTarget(ABSENT_GAME_ID, query)),
-  ...SHAPE_LEGS.map((leg): FuzzLeg => ({ ...leg, phase, name: `${phase}-${leg.name}` })),
+  ...QUERY_GATE_LEGS.map((leg): FuzzLeg => ({ ...leg, phase, name: `${phase}-${leg.name}` })),
 ];
 
 // ---------------------------------------------------------------------------
@@ -537,15 +563,27 @@ const sideOf = (outcome: WireOutcome, forwarded: ReadonlyArray<string>): LegSide
         outcome,
       };
 
+interface ComparableLeg {
+  readonly tag: string | null;
+  readonly status: number | null;
+  readonly contentType: string | null;
+  readonly cacheControl: string | null;
+  readonly forwarded: ReadonlyArray<string>;
+  readonly body?: string;
+}
+
 /** The comparable projection: `compare: 'status'` drops the body from it. */
-const comparable = (leg: FuzzLeg, side: LegSide): Readonly<Record<string, unknown>> => ({
-  tag: side.tag,
-  status: side.status,
-  contentType: side.contentType,
-  cacheControl: side.cacheControl,
-  forwarded: side.forwarded,
-  ...(leg.compare === 'status' ? {} : { body: side.body }),
-});
+const comparable = (leg: FuzzLeg, side: LegSide): ComparableLeg => {
+  const base = {
+    tag: side.tag,
+    status: side.status,
+    contentType: side.contentType,
+    cacheControl: side.cacheControl,
+    forwarded: side.forwarded,
+  };
+  if (leg.compare === 'status') return base;
+  return { ...base, body: side.body };
+};
 
 /**
  * `refused` for the two statuses a traversal-shaped target may answer with.
@@ -623,7 +661,7 @@ const runPhase = async (
 // ---------------------------------------------------------------------------
 
 /** One cell, written once by `beforeAll`; `bun:test` registers tests first. */
-const state: { reports: ReadonlyMap<FuzzPhase, PhaseReport> } = { reports: new Map() };
+const state = { reports: new Map<FuzzPhase, PhaseReport>() };
 
 const PHASES: ReadonlyArray<FuzzPhase> = ['stub', 'disk', 'derive'];
 
@@ -634,6 +672,7 @@ const reportFor = (phase: FuzzPhase): PhaseReport => {
 };
 
 beforeAll(async () => {
+  if (!PLATFORM_SUPPORTED) return;
   const reports = await PHASES.reduce<Promise<ReadonlyMap<FuzzPhase, PhaseReport>>>(
     async (previous, phase) => {
       const collected = await previous;
@@ -642,7 +681,7 @@ beforeAll(async () => {
     },
     Promise.resolve(new Map()),
   );
-  state.reports = reports;
+  state.reports = new Map(reports);
 }, 300_000);
 
 afterAll(async () => {
@@ -651,7 +690,7 @@ afterAll(async () => {
   await killAllBooted();
 });
 
-describe('query-fuzz parity', () => {
+describe.if(PLATFORM_SUPPORTED)('query-fuzz parity', () => {
   PHASES.forEach((phase) => {
     describe(phase, () => {
       test('every leg ran on both sides', () => {

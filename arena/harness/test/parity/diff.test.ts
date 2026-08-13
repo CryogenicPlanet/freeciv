@@ -52,7 +52,7 @@ import {
   waiversIn,
   waiverStillNeeded,
 } from './waivers.ts';
-import { bodyLatin1, isWireResponse, type WireOutcome, wireRequest } from './wire-client.ts';
+import { bodyLatin1, isWireResponse, type WireOutcome, type WireRequest, wireRequest } from './wire-client.ts';
 
 /** Linux and Darwin have the native locking support needed by the full rig. */
 const PLATFORM_SUPPORTED = PARITY_PLATFORM_SUPPORTED;
@@ -441,15 +441,28 @@ const mapPool = async <A, B>(
     .map(([, value]) => value);
 };
 
+const matrixWireRequest = (leg: MatrixLeg): WireRequest => {
+  const base = { method: leg.method, target: leg.target, timeoutMs: LEG_TIMEOUT_MS };
+  if (leg.headers !== undefined && leg.body !== undefined && leg.rawRequestLine !== undefined) {
+    return { ...base, headers: leg.headers, body: leg.body, rawRequestLine: leg.rawRequestLine };
+  }
+  if (leg.headers !== undefined && leg.body !== undefined) {
+    return { ...base, headers: leg.headers, body: leg.body };
+  }
+  if (leg.headers !== undefined && leg.rawRequestLine !== undefined) {
+    return { ...base, headers: leg.headers, rawRequestLine: leg.rawRequestLine };
+  }
+  if (leg.body !== undefined && leg.rawRequestLine !== undefined) {
+    return { ...base, body: leg.body, rawRequestLine: leg.rawRequestLine };
+  }
+  if (leg.headers !== undefined) return { ...base, headers: leg.headers };
+  if (leg.body !== undefined) return { ...base, body: leg.body };
+  if (leg.rawRequestLine !== undefined) return { ...base, rawRequestLine: leg.rawRequestLine };
+  return base;
+};
+
 const runLeg = (origin: string, leg: MatrixLeg): Promise<WireOutcome> =>
-  wireRequest(origin, {
-    method: leg.method,
-    target: leg.target,
-    ...(leg.headers === undefined ? {} : { headers: leg.headers }),
-    ...(leg.body === undefined ? {} : { body: leg.body }),
-    ...(leg.rawRequestLine === undefined ? {} : { rawRequestLine: leg.rawRequestLine }),
-    timeoutMs: LEG_TIMEOUT_MS,
-  });
+  wireRequest(origin, matrixWireRequest(leg));
 
 /** Both sides of one leg, concurrently — they are two processes, not one queue. */
 const runBoth = async (

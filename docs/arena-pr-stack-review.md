@@ -7,7 +7,7 @@
 The release blockers found during review are resolved. The stack now provides:
 
 - strict, explicitly versioned gateway schemas and canonical JSON;
-- authoritative telemetry writes that distinguish OTLP mirror failure from event loss;
+- ordered NDJSON telemetry writes with explicit live, test, and no-op layers;
 - Linux and Darwin ready-file locking compatible with Python `fcntl.flock`;
 - listener-before-readiness teardown ordering;
 - typed startup and derivation transport failures;
@@ -31,7 +31,7 @@ The remaining medium concern is synchronous filesystem work in the TypeScript re
 | Ready file removed before listener close | Scoped LIFO teardown closes the listener first. |
 | Clean checkout skipped real derivation parity | Committed autosaves require replay, board, and events bridge parity. |
 | Competing technology catalogue schemas | One bounded `TechnologyCatalog` schema owns both shapes. |
-| OTLP failure reported as a dropped event | Persistence and mirror outcomes are distinct. |
+| Speculative OTLP mirror without a consumer | Removed; the retained backend records ordered NDJSON or captures events in memory for tests. |
 | Derivation transport failures swallowed | Stdin, reader, and child-exit failures map to typed failures with scoped cleanup. |
 | Startup order and bind reporting drift | Cache creation precedes binding and startup errors use the typed exit-2 contract. |
 | Python non-finite JSON rejected | Compatible parsing and rendering preserve CPython spellings. |
@@ -71,20 +71,18 @@ The standalone duplicate-`Content-Length` waiver oracle was removed after its wa
 | PR | Recommendation |
 |---|---|
 | #7 wire | Ready: gateway-focused, strict/versioned schemas. |
-| #8 telemetry/corpus | Ready: authoritative persistence and export semantics are distinct. |
+| #8 telemetry/corpus | Ready: ordered NDJSON delivery, explicit no-op/test layers, and create-only corpus v3. |
 | #9 gateway | Ready with the synchronous request-path filesystem caveat above. |
 | #10 parity rig | Ready: mandatory Linux/Darwin parity, raw-path safety, and retained high-value matrices/fixtures. |
 
-## Verification baseline
+## Verification
 
-Before this prose/test-helper slimming pass:
-
-- macOS workspace typecheck passed;
-- wire tests: **243 passed, 0 failed**;
-- PR #9 harness suite: **931 passed, 0 failed**;
-- `ARENA_REQUIRE_PARITY=1 bun test` at PR #10: **2082 passed, 0 failed**;
-- Python local-stack tests: **19 passed**;
-- Linux workspace typecheck passed;
-- Linux `ARENA_REQUIRE_PARITY=1 bun test`: **2081 passed, 0 failed**.
+- macOS harness typecheck passed;
+- macOS harness lint: **0 errors**;
+- macOS full harness: **2034 passed, 0 failed** before the final query-fuzz platform-gate-only change; exact-final query fuzz then passed **266 tests**;
+- macOS Python gateway/local-stack suites: **59 passed**;
+- Linux harness typecheck passed under CPython 3.14;
+- exact-final Linux `ARENA_REQUIRE_PARITY=1 bun test arena/harness/test`: **2034 passed, 0 failed**;
+- Linux Python gateway/local-stack suites: **59 passed**.
 
 The one-test platform difference is a Darwin-only non-parity spike; required parity runs on both supported platforms.

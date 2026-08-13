@@ -50,7 +50,7 @@ import {
 } from '@arena/wire/gateway';
 
 // ---------------------------------------------------------------------------
-// Shape
+// Expectations
 // ---------------------------------------------------------------------------
 
 /**
@@ -315,11 +315,11 @@ export const FRAME_INDEX_CASES: ReadonlyArray<ParityRequestCase> = [
 ] as const;
 
 // ---------------------------------------------------------------------------
-// Request-target shapes
+// Request-target forms
 // ---------------------------------------------------------------------------
 
-/** Targets whose *shape* — not whose ids — is the thing under test. */
-export const PATH_SHAPE_CASES: ReadonlyArray<ParityRequestCase> = [
+/** Targets whose path form — not whose ids — is the thing under test. */
+export const PATH_TARGET_CASES: ReadonlyArray<ParityRequestCase> = [
   {
     name: 'index',
     target: '/v1/games',
@@ -438,7 +438,7 @@ export const SCENARIO_ROUTE_CASES: ReadonlyArray<ParityRequestCase> = [
 
 /** Every case, in the order the rig should replay them. */
 export const REQUEST_CASES: ReadonlyArray<ParityRequestCase> = [
-  ...PATH_SHAPE_CASES,
+  ...PATH_TARGET_CASES,
   ...GAME_ID_CASES,
   ...FRAME_INDEX_CASES,
   ...SCENARIO_ROUTE_CASES,

@@ -5,9 +5,10 @@
 
 import { CANON_UTF8, canonicalBytes, type CanonValue, Gateway } from '@arena/wire';
 import type { HttpServerResponse } from '@effect/platform';
-import { Either, Option } from 'effect';
+import { Either, Option, Predicate } from 'effect';
 import { MAX_PROXY_JSON_BYTES } from '../constants.ts';
 import { ArchiveUnavailable, InternalError } from '../errors.ts';
+import { isCanonRecord } from '../python-json.ts';
 import { gatewayJsonResponse } from './respond.ts';
 
 // ---------------------------------------------------------------------------
@@ -43,9 +44,9 @@ export interface GatewayJsonPayload {
 const pythonNonFiniteBytes = (value: CanonValue): Option.Option<Uint8Array> => {
   const strings = new Set<string>();
   const rememberStrings = (item: CanonValue): void => {
-    if (typeof item === 'string') strings.add(item);
+    if (Predicate.isString(item)) strings.add(item);
     else if (Array.isArray(item)) item.forEach(rememberStrings);
-    else if (item !== null && typeof item === 'object') {
+    else if (isCanonRecord(item)) {
       Object.entries(item).forEach(([key, child]) => {
         strings.add(key);
         rememberStrings(child);
@@ -66,13 +67,13 @@ const pythonNonFiniteBytes = (value: CanonValue): Option.Option<Uint8Array> => {
     return marker;
   };
   const replace = (item: CanonValue): CanonValue => {
-    if (typeof item === 'number' && !Number.isFinite(item)) {
+    if (Predicate.isNumber(item) && !Number.isFinite(item)) {
       const marker = freshMarker();
       markers.set(marker, Number.isNaN(item) ? 'NaN' : item > 0 ? 'Infinity' : '-Infinity');
       return marker;
     }
     if (Array.isArray(item)) return item.map(replace);
-    if (item !== null && typeof item === 'object') {
+    if (isCanonRecord(item)) {
       return Object.fromEntries(Object.entries(item).map(([key, child]) => [key, replace(child)]));
     }
     return item;

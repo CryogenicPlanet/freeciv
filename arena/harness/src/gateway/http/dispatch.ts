@@ -267,42 +267,13 @@ const onSuffix = (
 const viewerUpstreamPath = (gameId: GameId, segment: string): string =>
   `${GATEWAY_GAMES_INDEX_PATH}/${gameId}/${segment}`;
 
-/**
- * An index `FRAME_INDEX_RE` accepts and no archive can hold.
- *
- * On disk a frame is `ARCHIVE_PNG_RE = ^([0-9]{6})\.png$` — six digits, so the
- * largest index that can ever be *listed* is `999999`.  Anything at or above
- * `2 ** 53 - 1` therefore misses every lookup by construction, which is exactly
- * what a ~310-digit index does in Python.
- */
+/** A valid but unrepresentable frame index that cannot match a six-digit disk name. */
 const UNREACHABLE_FRAME_INDEX: FrameIndex = FrameIndexBrand.make(Number.MAX_SAFE_INTEGER);
 
 /**
- * `int(suffix[1][:-4])` (`:2034`) — total, for every name the regex admits.
- *
- * Python's `int` is arbitrary-precision and its lookup is an equality against
- * the indices the archive listing produced, so `99999999999999999999999999.png`
- * routes to the frame handler and comes back `404 map frame does not exist`.
- * A JS `number` cannot hold that value, and the two obvious ports of this line
- * are both wrong:
- *
- * - **Reject it at the router.**  That is a `404 not found` — the same status
- *   with a different body, which byte parity reports as a divergence.
- * - **Hand it to `decodeFrameIndexFromPngName` anyway.**  Measured: that
- *   **throws**.  Wire's `FrameIndexFromPngName` is a `Schema.transform` whose
- *   decode calls `FrameIndex.make(Number(digits))`, and `Schema.int()` is
- *   `Number.isSafeInteger` — so `1e26` and `2 ** 53 + 1` fail the brand
- *   *inside* the transformation, where a thrown `ParseError` escapes the
- *   `Either` the "tolerant" decoder promises.  In the gateway that defect
- *   surfaced as a bare `500` with an empty body and none of the gateway's own
- *   headers, in every scenario (the parity matrix's `frame-index-overflow-500`
- *   finding).  `arena/wire` is upstream of this package and is not edited from
- *   here; the width test below keeps the throwing input away from it.
- *
- * So: names that fit a safe integer go through wire's decoder, which remains
- * the single definition of the grammar; the ones that do not are routed with
- * {@link UNREACHABLE_FRAME_INDEX}, which reaches `selectFramePng` and misses.
- * Same route, same status, same bytes as CPython.
+ * Preserve Python's archive-specific 404 for arbitrary-width indices.
+ * Safe values use wire's decoder; larger values route with an impossible
+ * sentinel rather than failing at the router or overflowing `FrameIndex`.
  */
 const frameIndexFromPngName = (name: string): Option.Option<FrameIndex> => {
   if (!FRAME_INDEX_RE.test(name)) return Option.none();

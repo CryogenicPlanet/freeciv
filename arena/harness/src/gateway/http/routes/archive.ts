@@ -516,25 +516,10 @@ const fileStream = (fd: number, size: number): Stream.Stream<Uint8Array> =>
  * The immutable `Cache-Control` (`:1510`) lives here and nowhere else; every
  * gateway-built JSON body is `no-store`.
  *
- * ## The `Content-Length` this response does not get
- *
- * Python sends `Content-Length: st_size` and then copies 64 KiB at a time.
- * `contentLength` below puts that number on the response *value* — where
- * `test/gateway/routes-archive.test.ts` asserts it — and it does **not** reach
- * the wire: Bun drops a `Content-Length` from any `Response` whose body is a
- * `ReadableStream` that does not resolve synchronously, which every Effect
- * `Stream` is, and answers `Transfer-Encoding: chunked` instead.  The bytes are
- * identical, `Range` is ignored exactly as CPython ignores it, and only the
- * framing differs.
- *
- * That is a **decision**, not an oversight, and it is not decided here: the
- * four candidate body types were each built and measured, the winner was worse
- * than the divergence (a `Blob` keeps the length but hands `Range` to Bun,
- * which answers `206` where CPython answers `200` — on `video.mp4`), and the
- * whole table lives with the entry that owns it, in
- * `test/parity/waivers.ts#binary-disk-fallback-chunked`.  It is policed there
- * by four matrix legs in five scenarios, and it dies the moment Bun can stream
- * a body of known length.
+ * Bun omits `Content-Length` from asynchronous streamed responses and uses
+ * chunked framing. The parity waiver owns this known framing difference; a
+ * `Blob` is not equivalent because Bun then applies `Range` and returns 206
+ * where Python deliberately returns the full 200 response.
  */
 const sendLocalFile = (
   path: string,

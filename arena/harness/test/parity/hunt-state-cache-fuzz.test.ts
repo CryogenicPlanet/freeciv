@@ -27,7 +27,13 @@ import { createHash } from 'node:crypto';
 import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Either } from 'effect';
+import { type JsonObject } from '@arena/wire';
+import {
+  parseJsonObjectFromText,
+  pidFromStackRecord,
+  pipedStreamText,
+  portFromListenAddress,
+} from './json-boundary.ts';
 import {
   bootGatewayPair,
   HARNESS_ROOT,
@@ -41,6 +47,7 @@ import {
   REPO_ROOT,
   TYPESCRIPT_LAUNCHER,
   unwrapPair,
+  type ByImpl,
   type GatewayPair,
   type Impl,
 } from './boot.ts';
@@ -106,8 +113,8 @@ const BINARY_ROUTE_ASPECTS: ReadonlyArray<string> = COMPARED_HEADERS;
 const digest = (text: string): string =>
   createHash('sha256').update(Buffer.from(text, 'latin1')).digest('hex').slice(0, 16);
 
-/** One side's comparable shape.  `null` fields mean "there was no response". */
-interface Shape {
+/** One side's comparable fingerprint.  `null` fields mean "there was no response". */
+interface LegFingerprint {
   readonly tag: string;
   readonly status: number | null;
   readonly reason: string | null;
@@ -117,7 +124,7 @@ interface Shape {
   readonly headers: Readonly<Record<string, string | null>>;
 }
 
-const shapeOf = (outcome: WireOutcome): Shape =>
+const legFingerprintOf = (outcome: WireOutcome): LegFingerprint =>
   isWireResponse(outcome)
     ? {
         tag: 'Response',
@@ -144,14 +151,14 @@ const shapeOf = (outcome: WireOutcome): Shape =>
 interface Leg {
   readonly name: string;
   readonly target: string;
-  readonly python: Shape;
-  readonly typescript: Shape;
+  readonly python: LegFingerprint;
+  readonly typescript: LegFingerprint;
   readonly diffs: ReadonlyArray<string>;
 }
 
 const diffsOf = (
-  python: Shape,
-  typescript: Shape,
+  python: LegFingerprint,
+  typescript: LegFingerprint,
   headers: ReadonlyArray<string>,
 ): ReadonlyArray<string> => [
   ...(python.tag === typescript.tag ? [] : [`outcome ${python.tag} vs ${typescript.tag}`]),
@@ -185,8 +192,8 @@ const runLeg = async (
     wireRequest(pair.python.origin, request),
     wireRequest(pair.typescript.origin, request),
   ]);
-  const left = shapeOf(python);
-  const right = shapeOf(typescript);
+  const left = legFingerprintOf(python);
+  const right = legFingerprintOf(typescript);
   return { name, target, python: left, typescript: right, diffs: diffsOf(left, right, headers) };
 };
 
@@ -204,8 +211,8 @@ const runBurst = async (
     Promise.all(indices.map(() => wireRequest(pair.typescript.origin, request))),
   ]);
   return indices.map((index) => {
-    const left = shapeOf(pythons[index] ?? { _tag: 'ClosedWithoutResponse', message: 'missing' });
-    const right = shapeOf(typescripts[index] ?? { _tag: 'ClosedWithoutResponse', message: 'missing' });
+    const left = legFingerprintOf(pythons[index] ?? { _tag: 'ClosedWithoutResponse', message: 'missing' });
+    const right = legFingerprintOf(typescripts[index] ?? { _tag: 'ClosedWithoutResponse', message: 'missing' });
     return {
       name: `${name}#${String(index)}`,
       target,
@@ -250,20 +257,13 @@ const cloneFixtures = (destination: string): string => {
 const manifestPath = (runsRoot: string, gameId: string): string =>
   join(runsRoot, gameId, 'manifest.json');
 
-/** Corrupt/unreadable manifests reduce to `{}` for mutation setup. */
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
+const readJson = (path: string): JsonObject =>
+  parseJsonObjectFromText(readFileSync(path, 'utf8')) ?? {};
 
-const readJson = (path: string): Record<string, unknown> => {
-  const parsed = safeJson(readFileSync(path, 'utf8'));
-  return isRecord(parsed) ? parsed : {};
-};
-
-const writeJson = (path: string, value: unknown): void =>
+const writeJson = (path: string, value: JsonObject): void =>
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
 
-/** Every file under a cache root as `relative path -> digest`. */
-const cacheTree = (root: string): Readonly<Record<string, string>> => {
+const cacheTree = (root: string) => {
   const walk = (directory: string, prefix: string): ReadonlyArray<readonly [string, string]> =>
     readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
       const full = join(directory, entry.name);
@@ -274,7 +274,7 @@ const cacheTree = (root: string): Readonly<Record<string, string>> => {
     });
   return Object.fromEntries(
     statSync(root, { throwIfNoEntry: false }) === undefined ? [] : walk(root, ''),
-  );
+  ) satisfies Readonly<Record<string, string>>;
 };
 
 // ---------------------------------------------------------------------------
@@ -296,10 +296,14 @@ const FLAP_404_BODY = '{ "error": "no such game",  "stub": "flap-404" }';
  * A stable-port upstream: `reset` reaches `UpstreamUnavailable` without the
  * self-proxy race caused by releasing and reusing an ephemeral port.
  */
+interface FlapServerState {
+  mode: FlapMode;
+}
+
 const makeFlapUpstream = (): Promise<FlapUpstream> => {
-  const state: { mode: FlapMode } = { mode: 'up' };
+  const flapState: FlapServerState = { mode: 'up' };
   const server = createServer((socket: Socket) => {
-    if (state.mode === 'reset') {
+    if (flapState.mode === 'reset') {
       socket.resetAndDestroy();
       return;
     }
@@ -315,11 +319,11 @@ const makeFlapUpstream = (): Promise<FlapUpstream> => {
   return new Promise<FlapUpstream>((resolve) => {
     server.listen(0, '127.0.0.1', () => {
       const address = server.address();
-      const port = typeof address === 'object' && address !== null ? address.port : 0;
+      const port = portFromListenAddress(address);
       resolve({
         origin: `http://127.0.0.1:${String(port)}`,
         setMode: (mode) => {
-          state.mode = mode;
+          flapState.mode = mode;
         },
         close: () => new Promise<void>((done) => server.close(() => done())),
       });
@@ -340,19 +344,11 @@ interface SpawnOutcome {
   readonly readyPid: number | null;
 }
 
-const streamText = (stream: unknown): Promise<string> =>
-  stream instanceof ReadableStream ? new Response(stream).text() : Promise.resolve('');
-
-/** Half-written ready records are expected probe values, not exceptions. */
-const safeJson = (text: string): unknown =>
-  Either.getOrNull(Either.try(() => JSON.parse(text) as unknown));
-
 const readyPidOf = (path: string): number | null => {
   const stats = statSync(path, { throwIfNoEntry: false });
   if (stats === undefined || !stats.isFile()) return null;
-  const parsed = safeJson(readFileSync(path, 'utf8'));
-  const pid = isRecord(parsed) ? parsed['pid'] : null;
-  return typeof pid === 'number' ? pid : null;
+  const parsed = parseJsonObjectFromText(readFileSync(path, 'utf8'));
+  return parsed === null ? null : pidFromStackRecord(parsed);
 };
 
 const spawnGateway = (
@@ -413,7 +409,7 @@ const spawnAndSettle = async (
   return {
     exitCode: child.exitCode,
     signal: child.signalCode,
-    stderrEmpty: (await streamText(child.stderr)).trim() === '',
+    stderrEmpty: (await pipedStreamText(child.stderr)).trim() === '',
     readyExists,
     readyPid,
   };
@@ -458,16 +454,18 @@ interface Report {
   readonly rebootWarm: ReadonlyArray<Leg>;
   readonly rebootBefore: ReadonlyArray<Leg>;
   readonly cacheSurvivedRestart: ReadonlyArray<string>;
-  readonly lockContention: Readonly<Record<Impl, SpawnOutcome>>;
-  readonly staleTakeover: Readonly<Record<Impl, SpawnOutcome>>;
-  readonly stalePids: Readonly<Record<Impl, number | null>>;
-  readonly teardown: ReadonlyArray<Readonly<Record<string, unknown>>>;
+  readonly lockContention: ByImpl<SpawnOutcome>;
+  readonly staleTakeover: ByImpl<SpawnOutcome>;
+  readonly stalePids: ByImpl<number | null>;
+  readonly teardown: ReadonlyArray<JsonObject>;
 }
 
-const state: { report: Report | null; scratches: ReadonlyArray<string> } = {
-  report: null,
-  scratches: [],
-};
+interface HuntState {
+  report: Report | null;
+  scratches: ReadonlyArray<string>;
+}
+
+const state: HuntState = { report: null, scratches: [] };
 
 const report = (): Report => {
   const built = state.report;
@@ -494,7 +492,7 @@ beforeAll(async () => {
   state.scratches = [scratch];
   const runsRoot = cloneFixtures(join(scratch, 'runs'));
   const stub: StubHandle = makeStub('not-found-404');
-  const teardown: Array<Readonly<Record<string, unknown>>> = [];
+  const teardown: Array<JsonObject> = [];
 
   const pair = unwrapPair(
     await bootGatewayPair({
@@ -563,7 +561,7 @@ beforeAll(async () => {
     ['poison-garbage-board', BOARD_1],
   ]);
   bothCaches((root) => turnCacheFiles(root).forEach((path) => writeFileSync(path, '{"turn": 99999}')));
-  const poisonWrongShape = await runSequence(pair, [
+  const poisonWrongSchema = await runSequence(pair, [
     ['poison-wrong-shape-replay', REPLAY_5],
     ['poison-wrong-shape-board', BOARD_1],
   ]);
@@ -815,7 +813,7 @@ beforeAll(async () => {
   const rebootWarm = await runSequence(secondBoot, mainRoutes());
 
   // The incumbent holds its ready file; a second gateway must refuse it.
-  const lockContention: Record<Impl, SpawnOutcome> = {
+  const lockContention = {
     python: await spawnAndSettle(
       'python',
       rebootStub.origin,
@@ -832,17 +830,17 @@ beforeAll(async () => {
       join(scratch, 'cache-clash-ts'),
       LIVE_PROBE_MS,
     ),
-  };
+  } satisfies ByImpl<SpawnOutcome>;
 
   // SIGKILL leaves the record behind with no lock holder; the next gateway
   // must take it over rather than refuse it.
   secondBoot.both.forEach((gateway) => gateway.process.kill('SIGKILL'));
   await Promise.all(secondBoot.both.map((gateway) => gateway.process.exited));
-  const stalePids: Record<Impl, number | null> = {
+  const stalePids = {
     python: readyPidOf(readyFileFor(rebootScratch, 'hunt-reboot', 'python')),
     typescript: readyPidOf(readyFileFor(rebootScratch, 'hunt-reboot', 'typescript')),
-  };
-  const staleTakeover: Record<Impl, SpawnOutcome> = {
+  } satisfies ByImpl<number | null>;
+  const staleTakeover = {
     python: await spawnAndSettle(
       'python',
       rebootStub.origin,
@@ -859,7 +857,7 @@ beforeAll(async () => {
       join(scratch, 'cache-stale-ts'),
       LIVE_PROBE_MS,
     ),
-  };
+  } satisfies ByImpl<SpawnOutcome>;
   await rebootStub.close();
 
   state.report = {
@@ -867,7 +865,7 @@ beforeAll(async () => {
     cacheTreesMatch,
     poison: [
       ...poisonGarbage,
-      ...poisonWrongShape,
+      ...poisonWrongSchema,
       ...poisonEmpty,
       ...poisonEvents,
       ...poisonRootGone,
@@ -1117,8 +1115,8 @@ describe.if(PLATFORM_SUPPORTED)('state and cache fuzz', () => {
         python: lockContention.python.readyExists,
         typescript: lockContention.typescript.readyExists,
       }).toEqual({ python: true, typescript: true });
-      expect(typeof stalePids.python).toBe('number');
-      expect(typeof stalePids.typescript).toBe('number');
+      expect(stalePids.python).not.toBeNull();
+      expect(stalePids.typescript).not.toBeNull();
     });
 
     test('a stale record left by a SIGKILLed gateway is taken over, not refused', () => {

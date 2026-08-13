@@ -102,7 +102,7 @@ const OK_JSON_INDEX_BODY = `{ "schema_version": 1,  "games": [ { "state": "runni
  * Bodies keyed by the route's last path segment — every one of them relayed
  * byte for byte, every one of them unsorted and over-spaced on purpose.
  */
-const OK_JSON_BY_SUFFIX: Readonly<Record<string, string>> = {
+const OK_JSON_BY_SUFFIX = {
   status: `{ "state": "running" ,  "game_id": ${JSON.stringify(
     STUB_LIVE_GAME_ID,
   )}, "outcome": { "status": "running" },  "current_turn": 7.0 }`,
@@ -112,10 +112,10 @@ const OK_JSON_BY_SUFFIX: Readonly<Record<string, string>> = {
   'replay.json': `{ "rows": [ { "turn": 1,  "kind": "turn_begin" } ] ,"schema_version": 1 }`,
   'board.json': `{ "board": { "width": 8,  "height": 8 } ,"turn": 7.0 }`,
   'events.json': `{ "events": [ { "turn": 1,  "kind": "city_built" } ] ,"schema_version": 1 }`,
-};
+} satisfies Readonly<Record<string, string>>;
 
 /** `GAME_ID_RE` (`arena/wire/src/ids.ts:35`), re-spelled so this file imports nothing from `src`. */
-const GAME_ID_SHAPE = /^[A-Za-z0-9_-]{20,80}$/;
+const GAME_ID_PATTERN = /^[A-Za-z0-9_-]{20,80}$/;
 
 /**
  * The exact bytes `ok-json` answers a target with — the rig's expectation
@@ -127,15 +127,36 @@ const GAME_ID_SHAPE = /^[A-Za-z0-9_-]{20,80}$/;
  * {@link StubHandle.requests} (where every byte is kept) instead of silently
  * changing the body under comparison.
  */
+const okJsonSuffixBody = (suffix: string): string | undefined => {
+  switch (suffix) {
+    case 'status':
+      return OK_JSON_BY_SUFFIX.status;
+    case 'result':
+      return OK_JSON_BY_SUFFIX.result;
+    case 'watch.json':
+      return OK_JSON_BY_SUFFIX['watch.json'];
+    case 'frames':
+      return OK_JSON_BY_SUFFIX.frames;
+    case 'replay.json':
+      return OK_JSON_BY_SUFFIX['replay.json'];
+    case 'board.json':
+      return OK_JSON_BY_SUFFIX['board.json'];
+    case 'events.json':
+      return OK_JSON_BY_SUFFIX['events.json'];
+    default:
+      return undefined;
+  }
+};
+
 export const okJsonBodyFor = (target: string): string => {
   const path = target.split('?')[0] ?? '';
   const trimmed = path.replace(/\/+$/, '');
   if (trimmed.endsWith('/v1/games')) return OK_JSON_INDEX_BODY;
   const last = trimmed.split('/').at(-1) ?? '';
-  const known = OK_JSON_BY_SUFFIX[last];
+  const known = okJsonSuffixBody(last);
   if (known !== undefined) return known;
   // The bare-id alias `/v1/games/{id}`, which upstream sees without `/status`.
-  if (GAME_ID_SHAPE.test(last)) return OK_JSON_BY_SUFFIX['status'] ?? '';
+  if (GAME_ID_PATTERN.test(last)) return OK_JSON_BY_SUFFIX['status'] ?? '';
   return `{ "stub": "ok-json",  "target": ${JSON.stringify(target)} }`;
 };
 
@@ -342,9 +363,7 @@ const binaryResponse = (url: URL, request: Request): Response => {
  * {@link STUB_MODES} without teaching the server how to serve it is then a
  * compile error rather than a fixture that answers 404 by accident.
  */
-const HANDLERS: Readonly<
-  Record<StubMode, (state: StubState, url: URL, request: Request) => Response | Promise<Response>>
-> = {
+const HANDLERS = {
   'ok-json': (_state, url) =>
     jsonResponse(okJsonBodyFor(`${url.pathname}${url.search}`), 200, {
       etag: OK_JSON_ETAG,
@@ -376,7 +395,9 @@ const HANDLERS: Readonly<
   hang: (state, _url, request) => hangForever(state, request),
 
   'binary-ok': (_state, url, request) => binaryResponse(url, request),
-};
+} satisfies Readonly<
+  Record<StubMode, (state: StubState, url: URL, request: Request) => Response | Promise<Response>>
+>;
 
 /**
  * Start one stub in one mode. The caller owns it; close it or use `await using`.
