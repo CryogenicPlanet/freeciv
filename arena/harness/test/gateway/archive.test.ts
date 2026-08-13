@@ -17,6 +17,7 @@ import {
   type ArchivePng,
   archiveFrames,
   archiveOutcome,
+  archivePpmPlayers,
   archiveReasons,
   archiveScoreOutcome,
   archiveStatus,
@@ -33,7 +34,12 @@ import {
   sortDiskGameRows,
   terminalArchiveView,
 } from '../../src/gateway/archive.ts';
-import { type Canonical, isUntrusted, type Untrusted } from '../../src/gateway/public.ts';
+import {
+  type Canonical,
+  isUntrusted,
+  publicPlaces,
+  type Untrusted,
+} from '../../src/gateway/public.ts';
 import { parsePythonJson } from '../../src/gateway/python-json.ts';
 
 // The route and repository suites own the CPython differentials.
@@ -65,6 +71,34 @@ const readFixture = (kind: 'manifest' | 'report', name: string): Untrusted =>
   record(JSON.parse(readFileSync(`${FIXTURES}/${kind}/${name}`, 'utf-8')));
 
 const BASE = 'http://127.0.0.1:48261';
+const REPO_ROOT = new URL('../../../../', import.meta.url).pathname;
+
+/** CPython's file-backed PPM header projection for one in-memory test case. */
+const ppmOracle = (text: string, manifest: Untrusted): string => {
+  const source = `
+import json, os, sys, tempfile
+from pathlib import Path
+sys.path.insert(0, ${JSON.stringify(REPO_ROOT)})
+from agent_eval.replay_gateway import _archive_ppm_players, _canonical, _public_places
+request = json.load(sys.stdin)
+with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="", delete=False) as stream:
+    stream.write(request["text"])
+    path = Path(stream.name)
+try:
+    places = _public_places(request["manifest"].get("resolved_places"), request["manifest"])
+    sys.stdout.buffer.write(_canonical(_archive_ppm_players(path, places)))
+finally:
+    os.unlink(path)
+`;
+  const result = Bun.spawnSync(['python3', '-c', source], {
+    stdin: Buffer.from(JSON.stringify({ text, manifest }), 'utf8'),
+    stderr: 'pipe',
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(`PPM oracle failed: ${result.stderr.toString()}`);
+  }
+  return result.stdout.toString();
+};
 
 // ---------------------------------------------------------------------------
 // Behaviour
@@ -226,6 +260,36 @@ describe('archiveVictory', () => {
 const png = (index: number): ArchivePng => ({
   index: frameIndex(index),
   name: `${String(index).padStart(6, '0')}.png`,
+});
+
+describe('archivePpmPlayers', () => {
+  it('matches Python on header boundaries, escaping, and dynamic factions', () => {
+    const manifest = readFixture('manifest', 'completed-strategic-v1-multiplayer.json');
+    const places = publicPlaces(manifest['resolved_places'], manifest);
+    const representative = [
+      [
+        'P3',
+        '# playerno:0:color:( 0, 103,165):name:"AgentPlace1"',
+        '# playerno:2:color:(  1,  2,  3):name:"Blackbeard"',
+        '# playerno:3:color:(300,  1,  1):name:"OutOfRange"',
+        '# playerno:4:color:(  1,  1,  1):name:""',
+        '4 4',
+        '# playerno:9:color:(1,1,1):name:"TooLate"',
+      ].join('\n'),
+      '# playerno:0:color:(1,2,3):name:"AgentPlace1"\nP3\n',
+      'P3\nnot a comment\n# playerno:0:color:(1,2,3):name:"AgentPlace1"\n',
+      '# playerno:0:color:(1,2,3):name:"He said \\"hi\\" \\\\ ok"\n',
+      'P3\r\n\r\n# playerno:2:color:(9,9,9):name:"Blackbeard"\r\n',
+      '',
+      'nothing here at all',
+    ] as const;
+
+    representative.forEach((text, index) => {
+      expect(canonical(archivePpmPlayers(text, places)), `PPM case ${String(index)}`).toBe(
+        ppmOracle(text, manifest),
+      );
+    });
+  });
 });
 
 describe('pairArchiveFrames', () => {
