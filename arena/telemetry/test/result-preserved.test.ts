@@ -134,6 +134,30 @@ const suite = (name: string, layer: Layer.Layer<Observability, TelemetryInitErro
 
 backends.forEach(([name, layer]) => suite(name, layer));
 
+describe('telemetry failures are reported without changing the program result', () => {
+  test('a corpus write loss is announced as a dropped event', async () => {
+    const lines: Array<string> = [];
+    const capture = Logger.make<unknown, void>(({ logLevel, message, annotations }) => {
+      lines.push(
+        `${logLevel.label} ${String(message)} ${JSON.stringify(Object.fromEntries(annotations))}`,
+      );
+    });
+
+    const exit = await Effect.runPromiseExit(
+      withWideEvent(Effect.succeed('fine'), 'unit.work').pipe(
+        Effect.provide(Layer.merge(ObservabilityBroken, Logger.replace(Logger.defaultLogger, capture))),
+      ),
+    );
+
+    expect(Exit.isSuccess(exit)).toBe(true);
+    expect(exit).toEqual(Exit.succeed('fine'));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('dropped a wide event');
+    expect(lines[0]).not.toContain('OTLP mirror failed');
+    expect(lines[0]).toContain('TelemetryWriteError');
+  });
+});
+
 describe('a dropped event is reported', () => {
   test('as exactly one warning, carrying the event it lost', async () => {
     // A corpus with a hole in it must not look identical to a complete one.

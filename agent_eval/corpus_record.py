@@ -33,8 +33,6 @@ nothing orders them against each other, and the corpus frames neither the
 action verbs nor the scope verbs the recorded CAPS frame advertises.
 ``gaps.json`` says all of that in ``frame_verbs`` and ``frame_traces``, because
 a gap nobody declared is the failure this recorder exists to prevent.
-Capturing real envelopes is what the ``live`` subcommand is for, and ``live``
-is deferred (see :func:`command_live`).
 
 Safety
 ------
@@ -60,8 +58,8 @@ Exit codes
 ----------
 ``0`` success, ``1`` a verification failure, ``2`` a usage or input error,
 ``3`` an existing corpus that differs (pass ``--force``), ``4`` a refusal to
-write to an unsafe target, ``5`` a deferred subcommand.  Every failure path
-returns one of these; none of them is a traceback.
+write to an unsafe target.  Every failure path returns one of these; none of
+them is a traceback.
 
 Determinism
 -----------
@@ -206,8 +204,6 @@ class CorpusError(Exception):
 #: destroy something.  Its own code because "I refused to delete your saves" is
 #: a different event from "this corpus differs, pass --force".
 UNSAFE_TARGET_EXIT_CODE = 4
-#: A subcommand that is deferred by design, not broken.
-DEFERRED_EXIT_CODE = 5
 
 
 def is_safe_relpath(relpath: str) -> bool:
@@ -1960,33 +1956,6 @@ def command_list(args: argparse.Namespace, stream: Any) -> int:
     return 0
 
 
-def command_live(args: argparse.Namespace, stream: Any) -> int:
-    """Deferred by design; see the message for why, not just that.
-
-    The design is a read-only HTTP client polling
-    ``GET /v2/games/{gid}/me/state`` and ``/me/legal-actions`` on a running
-    supervisor, following ``next_cursor`` and keyed on
-    ``state_revision.revision``.  It would capture response envelopes only -- it
-    can never see the native rows behind them nor the IPC frames, which never
-    leave the sidecar process -- so its records would be ``live-envelope`` with
-    ``determinism = "none"``.
-
-    Raised as a :class:`CorpusError` with its own exit code rather than as a
-    ``NotImplementedError``: every other failure in this CLI is a documented
-    exit code, and a deferral is a decision, not a crash.
-    """
-    raise CorpusError(
-        "corpus_record: the 'live' subcommand is deferred to phase 2 and is "
-        "not implemented. It would issue requests against a running game, and "
-        "even a read-only GET consumes cursor-registry slots on a live seat "
-        "(_make_cursor_room in v2_control) -- the supervisor's own phase.end "
-        "discovery draws on that reserve, so a recorder that pages a live seat "
-        "can evict the seat's own cursors. Recording live traffic safely needs "
-        "its own design pass; use 'record' against .agent-eval/runs/ instead.",
-        exit_code=DEFERRED_EXIT_CODE,
-    )
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python3 -m agent_eval.corpus_record",
@@ -2047,15 +2016,6 @@ def build_parser() -> argparse.ArgumentParser:
     listing.add_argument("--live-margin", type=float, default=120.0)
     listing.add_argument("--json", action="store_true")
 
-    live = subparsers.add_parser(
-        "live", help="DEFERRED: capture envelopes from a running supervisor",
-    )
-    live.add_argument("--base-url", required=True)
-    live.add_argument("--game", required=True)
-    live.add_argument("--token-file")
-    live.add_argument("--out", default=str(DEFAULT_OUT_ROOT))
-    live.add_argument("--poll-seconds", type=float, default=2.0)
-    live.add_argument("--max-revisions", type=int, default=64)
     return parser
 
 
@@ -2066,7 +2026,6 @@ def main(argv: Sequence[str] | None = None, stream: Any = None) -> int:
         "record": command_record,
         "verify": command_verify,
         "list": command_list,
-        "live": command_live,
     }
     try:
         return handlers[args.command](args, out)

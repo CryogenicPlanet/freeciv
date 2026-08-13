@@ -1585,46 +1585,6 @@ class DestructiveWriteGuardTests(unittest.TestCase):
 
 class CommandLineTests(unittest.TestCase):
 
-    def test_live_refuses_and_names_the_deferral_and_its_reason(self):
-        """Deferred loudly, with the reason, not silently missing.
-
-        Even a read-only GET consumes cursor-registry slots on a live seat, and
-        the supervisor's own ``phase.end`` discovery draws on that reserve -- so
-        a recorder that pages a live seat can evict the seat's own cursors.
-        """
-        args = argparse.Namespace(
-            base_url="http://localhost:1", game="game_x", token_file=None,
-            out="/dev/null", poll_seconds=1.0, max_revisions=1,
-        )
-        with self.assertRaises(recorder.CorpusError) as caught:
-            recorder.command_live(args, io.StringIO())
-        message = str(caught.exception)
-        self.assertIn("'live' subcommand is deferred", message)
-        self.assertIn("cursor-registry slots", message)
-        self.assertIn("record", message)
-        self.assertEqual(caught.exception.exit_code, recorder.DEFERRED_EXIT_CODE)
-
-    def test_live_exits_through_a_documented_code_not_a_traceback(self):
-        """A deferral is a decision, not a crash.
-
-        ``NotImplementedError`` escaped ``main``'s except clauses and reached
-        the shell as a stack trace, which is the one failure delivery this CLI
-        does not otherwise have.
-        """
-        stream = io.StringIO()
-        errors = io.StringIO()
-        saved = sys.stderr
-        sys.stderr = errors
-        try:
-            code = recorder.main(
-                ["live", "--base-url", "http://localhost:1", "--game", "g"],
-                stream,
-            )
-        finally:
-            sys.stderr = saved
-        self.assertEqual(code, recorder.DEFERRED_EXIT_CODE)
-        self.assertIn("deferred to phase 2", errors.getvalue())
-
     def test_the_dead_save_ref_dataclass_is_gone(self):
         """It was defined and never constructed anywhere in the module."""
         self.assertFalse(hasattr(recorder, "SaveRef"))
@@ -1635,7 +1595,6 @@ class CommandLineTests(unittest.TestCase):
             ["record", "--run-dir", "x"],
             ["verify", "--corpus", "x"],
             ["list"],
-            ["live", "--base-url", "u", "--game", "g"],
         ):
             with self.subTest(argv=argv):
                 self.assertEqual(parser.parse_args(argv).command, argv[0])

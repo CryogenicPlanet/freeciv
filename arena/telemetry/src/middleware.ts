@@ -49,7 +49,7 @@
  */
 
 import { Cause, Effect, Exit, Function, Option } from 'effect';
-import { describeFailure, sealWideEvent } from './evlog-adapter.ts';
+import { describeFailure, sealWideEvent, TelemetryExportError } from './evlog-adapter.ts';
 import { Observability } from './observability.ts';
 import {
   annotateError,
@@ -115,29 +115,39 @@ const prefixed = (
     ]),
   );
 
+const isTelemetryExportError = (cause: unknown): cause is TelemetryExportError =>
+  cause instanceof TelemetryExportError;
+
 /**
  * The last resort: telemetry failed, so say so on the logger and let the
  * program continue exactly as it would have.
  *
- * This is the one place a dropped event is reported, which makes it the one
- * place that has to be *worth reading*. A `Data.TaggedError` has an empty
- * `message`, so a warning built from its tag and its message says the same word
- * twice and nothing else — a full disk and a `BigInt` in an `annotate()` call
- * would produce the identical line. So the failure's payload goes on the line
- * as well (`failure.dir`, `failure.cause`, `failure.endpoint`, …), along with
- * the remedy registered for its tag, because a warning that names what to do is
- * this package's whole thesis and the dropped-event path was the one place not
- * holding to it.
+ * Two failure classes, two messages. A `TelemetryExportError` means the NDJSON
+ * corpus was written and only the OTLP mirror failed — calling that a dropped
+ * event would send the reader to check disk space when the record of truth is
+ * already on disk. Every other failure on this path is a genuine corpus loss.
+ *
+ * A `Data.TaggedError` has an empty `message`, so a warning built from its tag
+ * and its message says the same word twice and nothing else — a full disk and
+ * a `BigInt` in an `annotate()` call would produce the identical line. So the
+ * failure's payload goes on the line as well (`failure.dir`, `failure.cause`,
+ * `failure.endpoint`, …), along with the remedy registered for its tag,
+ * because a warning that names what to do is this package's whole thesis and
+ * the dropped-event path was the one place not holding to it.
  *
  * `describeFailure` is fenced: the value being described arrives from
  * `catchAllDefect` and nobody has vetted it.
  */
-const reportDropped =
+const reportTelemetryFailure =
   (event: WideEvent) =>
   (cause: unknown): Effect.Effect<void> =>
     describeFailure(cause).pipe(
       Effect.flatMap((failure) =>
-        Effect.logWarning('@arena/telemetry dropped a wide event').pipe(
+        Effect.logWarning(
+          isTelemetryExportError(cause)
+            ? '@arena/telemetry OTLP mirror failed for a wide event'
+            : '@arena/telemetry dropped a wide event',
+        ).pipe(
           Effect.annotateLogs({
             eventId: event.id,
             event: event.name,
@@ -168,8 +178,8 @@ const finish = <A, E>(
       Effect.flatMap(Observability, (observability) => observability.record(sealed)),
     ),
     Effect.asVoid,
-    Effect.catchAll(reportDropped(event)),
-    Effect.catchAllDefect(reportDropped(event)),
+    Effect.catchAll(reportTelemetryFailure(event)),
+    Effect.catchAllDefect(reportTelemetryFailure(event)),
   );
 
 /**

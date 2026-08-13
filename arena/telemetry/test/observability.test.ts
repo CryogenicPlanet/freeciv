@@ -262,6 +262,8 @@ describe('the OTLP mirror', () => {
     expect(result).toBe('ok');
     expect(await readCorpus(dir)).toMatchObject([{ event: 'turn.play', turn: 3 }]);
     expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('OTLP mirror failed for a wide event');
+    expect(lines[0]).not.toContain('dropped a wide event');
     expect(lines[0]).toContain('TelemetryExportError');
     expect(lines[0]).toContain(DEAD_COLLECTOR);
   });
