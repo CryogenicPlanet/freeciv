@@ -21,9 +21,8 @@
  * regression the viewer sees (`viewer/src/api.ts:21-34` renders
  * `payload.error` verbatim, falling back to `"{status} {statusText}"`).  Every
  * literal below is therefore transcribed character-for-character from a
- * `raise GatewayProblem(...)` site, and `test/gateway/problem.test.ts`
- * re-extracts them from the Python source in both directions: a message the
- * gateway gained, lost, or reworded fails the suite.
+ * `raise GatewayProblem(...)` site. Gateway parity tests compare the resulting
+ * response bodies byte-for-byte with Python.
  *
  * Line citations are the `raise` statement in
  * `agent_eval/replay_gateway.py` at the commit this file was written against.

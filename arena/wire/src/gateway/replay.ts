@@ -36,9 +36,9 @@
  * and **not** `Schema.optionalWith(X, { nullable: true })`, which the gateway
  * dossier's checklist suggests.  `optionalWith({ nullable: true })` decodes an
  * explicit `null` to a *missing key* and re-encodes it as a missing key, so
- * `{"turn":null}` comes back out as `{}`.  That is fatal for a package whose
- * job is to hand back what the server said, byte for byte; it is pinned by a
- * test in `test/gateway/replay.test.ts`.
+ * `{"turn":null}` comes back out as `{}`. That is fatal for a package whose
+ * job is to hand back what the server said, byte for byte; captured round-trip
+ * tests pin the distinction.
  *
  * ## What is *not* enforced
  *

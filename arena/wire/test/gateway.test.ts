@@ -5,23 +5,45 @@ import { Either, ParseResult, Schema } from 'effect';
 import { decodeWire, encodeWire } from 'src/codec';
 import { decodeWatchResponse } from 'src/gateway/archive';
 import {
+  decodeArchiveResult,
+  decodeGameResult,
   decodeGamesIndexResponse,
+  decodeGameRow,
   decodeGameStatus,
+  decodeUpstreamResult,
+  encodeArchiveResult,
+  encodeGameResult,
+  encodeGamesIndexResponse,
+  encodeGameStatus,
+  encodeUpstreamResult,
 } from 'src/gateway/games';
-import { decodeGatewayIdentity } from 'src/gateway/identity';
-import { decodeManifest, decodeReport } from 'src/gateway/manifest';
+import { decodeGatewayIdentity, encodeGatewayIdentity } from 'src/gateway/identity';
+import {
+  decodeManifest,
+  decodeReport,
+  encodeManifest,
+  encodeReport,
+} from 'src/gateway/manifest';
 import { decodeGatewayProblem } from 'src/gateway/problem';
 import {
   decodeBoardResponse,
   decodeGameEventsResponse,
   decodeReplayResponse,
   decodeTechnologyCatalog,
+  encodeBoardResponse,
+  encodeGameEventsResponse,
+  encodeReplayResponse,
+  encodeTechnologyCatalog,
 } from 'src/gateway/replay';
 
 const fixtures = join(import.meta.dir, 'fixtures');
 const read = (path: string): unknown =>
   JSON.parse(readFileSync(join(fixtures, path), 'utf8'));
 const accepts = (result: Either.Either<unknown, unknown>): boolean => Either.isRight(result);
+const right = <A>(result: Either.Either<A, unknown>): A => {
+  if (Either.isLeft(result)) throw new Error('expected Right');
+  return result.right;
+};
 
 const cases = [
   ['identity', decodeGatewayIdentity, 'live/gateway-health.json'],
@@ -32,6 +54,10 @@ const cases = [
   ['replay', decodeReplayResponse, 'live/gateway-replay-terminal-limit5.json'],
   ['board', decodeBoardResponse, 'live/gateway-board-turn1.json'],
   ['events', decodeGameEventsResponse, 'live/gateway-events.json'],
+  ['archive result', decodeArchiveResult, 'live/gateway-result-terminal.json'],
+  ['upstream result', decodeUpstreamResult, 'live/supervisor-result-terminal.json'],
+  ['result union (archive)', decodeGameResult, 'live/gateway-result-terminal.json'],
+  ['result union (upstream)', decodeGameResult, 'live/supervisor-result-terminal.json'],
 ] as const;
 
 const validCorpus = [
@@ -65,6 +91,22 @@ const validCorpus = [
   [decodeGameStatus, 'live/supervisor-status-running.json'],
   [decodeGameStatus, 'live/supervisor-status-terminal.json'],
   [decodeWatchResponse, 'live/supervisor-watch.json'],
+] as const;
+
+const roundTripCases = [
+  ['identity', decodeGatewayIdentity, encodeGatewayIdentity, 'live/gateway-health.json'],
+  ['games index', decodeGamesIndexResponse, encodeGamesIndexResponse, 'live/gateway-games-index.json'],
+  ['status', decodeGameStatus, encodeGameStatus, 'live/supervisor-status-terminal.json'],
+  ['manifest', decodeManifest, encodeManifest, 'runs/manifest/running-v2-multiplayer.json'],
+  ['report', decodeReport, encodeReport, 'runs/report/completed-two-seats-full-score.json'],
+  ['replay', decodeReplayResponse, encodeReplayResponse, 'live/gateway-replay-terminal-limit5.json'],
+  ['board', decodeBoardResponse, encodeBoardResponse, 'live/gateway-board-turn1.json'],
+  ['events', decodeGameEventsResponse, encodeGameEventsResponse, 'live/gateway-events.json'],
+  ['technology catalog', decodeTechnologyCatalog, encodeTechnologyCatalog, 'runs/replay-catalog/tech-tree-with-depth-and-requires.json'],
+  ['archive result', decodeArchiveResult, encodeArchiveResult, 'live/gateway-result-terminal.json'],
+  ['upstream result', decodeUpstreamResult, encodeUpstreamResult, 'live/supervisor-result-terminal.json'],
+  ['archive result union', decodeGameResult, encodeGameResult, 'live/gateway-result-terminal.json'],
+  ['upstream result union', decodeGameResult, encodeGameResult, 'live/supervisor-result-terminal.json'],
 ] as const;
 
 const versionedCases = [
@@ -110,6 +152,13 @@ describe('current gateway schemas', () => {
     });
   }
 
+  test.each(roundTripCases)('%s decodes and re-encodes its captured current shape', (_name, decoder, encoder, path) => {
+    const decode = decoder as (input: unknown) => Either.Either<unknown, unknown>;
+    const encode = encoder as (input: never) => Either.Either<unknown, unknown>;
+    const input = read(path);
+    expect(right(encode(right(decode(input)) as never))).toEqual(input);
+  });
+
   test.each(validCorpus)('accepts captured fixture %s', (decoder, path) => {
     const decode = decoder as (input: unknown) => Either.Either<unknown, unknown>;
     expect(accepts(decode(read(path)))).toBe(true);
@@ -132,6 +181,26 @@ describe('current gateway schemas', () => {
     ]) {
       expect(accepts(decode(candidate))).toBe(false);
     }
+  });
+
+  test('timing fields must be both present or both absent', () => {
+    const status = read('live/supervisor-status-terminal.json') as Record<string, unknown>;
+    const { action_timeout_s: _timeout, ...withoutTimeout } = status;
+    const { timing_mode: _mode, ...withoutMode } = status;
+    expect(accepts(decodeGameStatus(withoutTimeout))).toBe(false);
+    expect(accepts(decodeGameStatus(withoutMode))).toBe(false);
+
+    const row = (read('live/gateway-games-index.json') as { games: readonly Record<string, unknown>[] }).games[0];
+    expect(row).toBeDefined();
+    const { timing_mode: _rowMode, action_timeout_s: _rowTimeout, ...withoutTiming } = row ?? {};
+    expect(accepts(decodeGameRow({ ...withoutTiming, timing_mode: 'default' }))).toBe(false);
+  });
+
+  test('disk rows preserve sanitized states outside the known vocabulary', () => {
+    const row = (read('live/gateway-games-index.json') as { games: readonly Record<string, unknown>[] }).games[0];
+    expect(row).toBeDefined();
+    const decoded = decodeGameRow({ ...row, state: 'paused' });
+    expect(Either.isRight(decoded) && decoded.right.state).toBe('paused');
   });
 
   test('nested unknown fields are rejected with their path', () => {

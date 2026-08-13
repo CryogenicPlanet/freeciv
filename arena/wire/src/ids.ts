@@ -2,17 +2,10 @@
  * Identifiers and the run-state vocabulary, branded so a raw `string` can
  * never be mistaken for a validated one.
  *
- * Every rule here is transcribed from the Python gateway, which is the
- * authority for as long as both implementations run side by side.  Two tests
- * hold the transcription to it, and they check different things:
- *
- * - `test/ids.test.ts` re-reads `agent_eval/replay_gateway.py` and compares the
- *   *patterns and vocabularies* — so a regex that drifts fails, wherever it
- *   moved to.  It asserts nothing about line numbers.
- * - `test/citations.test.ts` checks the *line numbers*: every citation below
- *   that names a Python identifier must point at a region that still mentions
- *   it.  Its reach is limited to citations written in that anchored form; a
- *   bare `` `:1234` `` continuation is not checked by anything.
+ * Every rule here is transcribed from the Python gateway, which remains the
+ * authority while both implementations run side by side. `test/ids.test.ts`
+ * re-reads `agent_eval/replay_gateway.py` and compares the patterns and
+ * vocabularies directly.
  *
  * @module
  */

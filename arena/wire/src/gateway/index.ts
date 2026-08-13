@@ -112,6 +112,8 @@ export {
   UNCLAIMED_CONTROLLER_LABEL,
   UPSTREAM_OUTCOME_STATUSES,
   UpstreamResult,
+  UpstreamResultPlayer,
+  UpstreamResultScore,
 } from './games.ts';
 
 export {

@@ -6,8 +6,7 @@
  * Line numbers cite `agent_eval/replay_gateway.py` (the producer being
  * ported) and `agent_eval/supervisor.py` (the upstream service whose bodies
  * the gateway relays verbatim) at the commit this file was written against.
- * `test/gateway/games.test.ts` re-reads both Python files and fails if a
- * literal drifts, so a stale citation cannot go unnoticed.
+ * Captured current payloads and differential gateway tests pin the contract.
  *
  * ## Every payload here has two producers
  *
@@ -32,8 +31,7 @@
  * like the natural fit for the third row. It *maps `null` to `undefined`* on
  * decode, so `{"model": null}` re-encodes as an absent key — silently turning
  * an upstream row into a gateway row. It also moves the field to the end of
- * the key order, breaking `propertyOrder: "original"`. Both are proven in
- * `test/gateway/games.test.ts`.
+ * the key order, breaking `propertyOrder: "original"`.
  *
  * ## Integers are `bigint`
  *
@@ -99,11 +97,9 @@ const omittedOrNull = <A, I>(
  * `timing_mode` and no `action_timeout_s` decoded happily, and a port that
  * *builds* one of these rows had nothing to check itself against.
  *
- * This is deliberately **not** a `Schema.filter`.  House policy is decode
- * tolerance — a half-present pair from some future gateway should still decode,
- * so a consumer can read the other thirty fields — and the corpus test pins
- * that no captured row has ever been half-present.  This is the check a
- * *producer* runs, and the one a consumer runs when it wants the strict answer.
+ * The current schemas enforce this with a `Schema.filter`; this helper remains
+ * public for projection code that wants to diagnose the invariant before
+ * encoding.
  *
  * Presence, not nullness, is what matters: `action_timeout_s` is legitimately
  * `null` when `timing_mode` is `"infinite"`, and the key is still there.
@@ -127,6 +123,15 @@ export const hasJointTiming = (row: {
   readonly timing_mode?: string | null | undefined;
   readonly action_timeout_s?: number | null | undefined;
 }): boolean => timingPairIssue(row) === undefined;
+
+const jointTiming = <S extends Schema.Schema.Any>(schema: S): Schema.filter<S> =>
+  schema.pipe(
+    Schema.filter((value) =>
+      typeof value === 'object' && value !== null && timingPairIssue(value) === undefined
+        ? undefined
+        : 'timing_mode and action_timeout_s must be both present or both absent',
+    ),
+  );
 
 // ---------------------------------------------------------------------------
 // Closed vocabularies (`replay_gateway.py:43-70`)
@@ -544,13 +549,13 @@ export const decodeLeaderboardEntry: WireDecoder<LeaderboardEntry> = decodeWire(
  * - `benchmark_valid`: `bool | null` here — the manifest value only if it is a
  *   real bool (`:1133`). Contrast {@link GameStatus}, where the archive path
  *   narrows it to a strict `bool` (dossier T5).
- * - `state`: an open string. `_public_text(..., "unknown", 32)` passes through
- *   whatever a manifest says, so this decodes through
- *   {@link RunState} and an unfamiliar state is branded, not rejected.
+ * - `state`: an open, non-empty string. `_public_text(..., "unknown", 32)`
+ *   sanitizes and passes through whatever a manifest says. Consumers that
+ *   require the known vocabulary can call `decodeRunState` separately.
  */
-export const GameRow = Schema.Struct({
+const GameRowFields = {
   game_id: GameId,
-  state: RunState,
+  state: Schema.NonEmptyString,
   created_at: Schema.NullOr(Schema.Number),
   finished_at: Schema.NullOr(Schema.Number),
   current_turn: Schema.NullOr(WireInt),
@@ -571,7 +576,11 @@ export const GameRow = Schema.Struct({
   outcome: MatchOutcome,
   /** Root-relative `/watch/{id}` from the gateway; may carry the service path prefix upstream. */
   watch_path: Schema.String,
-}).annotations({ identifier: 'GameRow' });
+} as const;
+
+export const GameRow = jointTiming(Schema.Struct(GameRowFields)).annotations({
+  identifier: 'GameRow',
+});
 /** One row of the games index. */
 export type GameRow = typeof GameRow.Type;
 
@@ -653,7 +662,7 @@ export const interruptedOutcome = (currentTurn: bigint): MatchOutcome => ({
  * still says "never finished".
  */
 export const InterruptedGameRow = Schema.Struct({
-  ...GameRow.fields,
+  ...GameRowFields,
   state: Schema.Literal(INTERRUPTED_STATUS),
   current_turn: WireInt,
   outcome: Schema.Struct({
@@ -778,7 +787,7 @@ export type ArchiveUrls = typeof ArchiveUrls.Type;
  *   emitted only for full-control-v2 games (`:9563`) and is left as an opaque
  *   object here — the v2 phase block has its own module.
  */
-export const GameStatus = Schema.Struct({
+const GameStatusFields = {
   schema_version: SchemaVersion1,
   game_id: GameId,
   state: RunState,
@@ -808,7 +817,11 @@ export const GameStatus = Schema.Struct({
   phase: Schema.optional(Schema.NullOr(JsonObject)),
   /** Upstream, full-control-v2 only. */
   phase_events_url: Schema.optional(Schema.String),
-}).annotations({ identifier: 'GameStatus' });
+} as const;
+
+export const GameStatus = jointTiming(Schema.Struct(GameStatusFields)).annotations({
+  identifier: 'GameStatus',
+});
 /** The `/status` body. */
 export type GameStatus = typeof GameStatus.Type;
 
@@ -832,8 +845,8 @@ export const encodeGameStatus: WireEncoder<GameStatus, typeof GameStatus.Encoded
  * Every key is always present, and the set is a deliberate subset: the
  * scorer's `alive`, `added_turn`, `removed_turn`, `last_score_turn` and
  * `controller_fingerprint` are dropped, and `metrics` is filtered to
- * {@link PUBLIC_SCORE_METRICS}. The upstream document keeps all of them, which
- * this schema tolerates as the current schema.
+ * {@link PUBLIC_SCORE_METRICS}. The upstream document uses the separate full
+ * report score schema from `manifest.ts`.
  */
 export const ResultPlayer = Schema.Struct({
   seat_id: Schema.String,
@@ -860,6 +873,31 @@ export const ResultScore = Schema.Struct({
 /** The `score` block of a `/result` body. */
 export type ResultScore = typeof ResultScore.Type;
 
+/** One unfiltered scorer row relayed verbatim by the supervisor `/result`. */
+export const UpstreamResultPlayer = Schema.Struct({
+  player_id: WireInt,
+  name: Schema.String,
+  score: WireInt,
+  metrics: Schema.Record({ key: Schema.String, value: WireInt }),
+  alive: Schema.optional(Schema.NullOr(Schema.Boolean)),
+  added_turn: Schema.optional(WireInt),
+  removed_turn: Schema.optional(Schema.NullOr(WireInt)),
+  last_score_turn: Schema.optional(Schema.NullOr(WireInt)),
+  rank: WireInt,
+  seat_id: Schema.String,
+  controller_fingerprint: Schema.String,
+}).annotations({ identifier: 'UpstreamResultPlayer' });
+/** One player in the supervisor's full report score. */
+export type UpstreamResultPlayer = typeof UpstreamResultPlayer.Type;
+
+/** The unfiltered report score relayed by the supervisor `/result`. */
+export const UpstreamResultScore = Schema.Struct({
+  final_turn: Schema.NullOr(WireInt),
+  players: Schema.Array(UpstreamResultPlayer),
+}).annotations({ identifier: 'UpstreamResultScore' });
+/** The full report score in an upstream `/result`. */
+export type UpstreamResultScore = typeof UpstreamResultScore.Type;
+
 /** The five-key, suffix-less URL map unique to `/result` (`:1113`). */
 export const ArtifactUrls = Schema.Struct({
   status: Schema.String,
@@ -880,7 +918,7 @@ export type ArtifactUrls = typeof ArtifactUrls.Type;
  * URLs it keeps. The viewer never fetches this route, so nothing in
  * `viewer/src/types.ts` describes it.
  */
-export const ArchiveResult = Schema.Struct({
+const ArchiveResultFields = {
   schema_version: SchemaVersion1,
   artifact_id: GameId,
   state: RunState,
@@ -893,7 +931,11 @@ export const ArchiveResult = Schema.Struct({
   outcome: MatchOutcome,
   score: ResultScore,
   artifact_urls: ArtifactUrls,
-}).annotations({ identifier: 'ArchiveResult' });
+} as const;
+
+export const ArchiveResult = jointTiming(Schema.Struct(ArchiveResultFields)).annotations({
+  identifier: 'ArchiveResult',
+});
 /** The archive `/result` body. */
 export type ArchiveResult = typeof ArchiveResult.Type;
 
@@ -938,7 +980,7 @@ export const UpstreamResult = Schema.Struct({
   artifact_urls: ArtifactUrls,
   /** The discriminator: present here, absent from every archive result. */
   manifest: JsonObject,
-  score: Schema.optional(ResultScore),
+  score: Schema.optional(UpstreamResultScore),
   seat_stats: Schema.optional(JsonObject),
   recovery: Schema.optional(JsonObject),
 }).annotations({ identifier: 'UpstreamResult' });
@@ -961,8 +1003,8 @@ export const encodeUpstreamResult: WireEncoder<UpstreamResult, typeof UpstreamRe
  * {@link UpstreamResult} is tried first because it *requires* `manifest`,
  * which no archive document has; {@link ArchiveResult} requires
  * `schema_version: 1`, which no upstream document has. Order matters: with
- * `onExcessProperty: "preserve"` an over-wide document would otherwise satisfy
- * the narrower schema and lose nothing but its identity.
+ * strict excess-property checking an over-wide document cannot satisfy the
+ * narrower branch accidentally.
  */
 export const GameResult = Schema.Union(UpstreamResult, ArchiveResult).annotations({
   identifier: 'GameResult',

@@ -33,9 +33,8 @@
  * for one it guarantees is a `float`, {@link WireNumber} for the handful that
  * are genuinely either.  The corpus proves the classification — the raw bytes
  * of every fixture say `"action_timeout_s": 600.0` and `"places": 2`, and
- * `test/gateway/manifest.test.ts` walks each file's number literals in
- * document order and asserts float-spelled ⟺ decoded `number`,
- * int-spelled ⟺ decoded `bigint`.
+ * captured manifest/report fixtures and round-trip tests pin the resulting
+ * float-spelled ⟺ decoded `number`, int-spelled ⟺ decoded `bigint` contract.
  *
  * The residual int/float gaps are unrecoverable from parsed JSON and use
  * {@link WireNumber}: `mean_latency_ms` (see {@link SeatStats}) and catalog

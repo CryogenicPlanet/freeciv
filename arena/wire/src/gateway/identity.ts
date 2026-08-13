@@ -347,8 +347,7 @@ export const isGatewayIdentity: (input: unknown) => input is GatewayIdentity =
  * string, so the trailing `\0` is always there.  Feeding this through sha256
  * and taking the first 20 hex characters must reproduce `identity` — that is
  * the strongest available proof that a port read the four fields with the
- * right meanings, and `test/gateway/identity.test.ts` runs it against the
- * captured payload.
+ * right meanings; the current captured health payload pins that material.
  *
  * Kept hash-free on purpose: `@arena/wire` depends on `effect` and nothing
  * else, so the digest belongs to the caller that already has one.
