@@ -64,7 +64,6 @@ import {
   type GameId,
   Gateway,
   isGameId,
-  isKnownRunState,
   isTerminalRunState,
   type RunState,
 } from '@arena/wire';
@@ -116,11 +115,9 @@ export interface ArchiveView {
  */
 const SCHEMA_VERSION = 1n;
 
-/** Current-version state; malformed or legacy values project to `unknown`. */
-export const manifestState = (manifest: unknown): RunState => {
-  const state = publicText(untrustedFieldOr(manifest, 'state', 'status'), 'unknown', 32);
-  return isKnownRunState(state) ? state : 'unknown';
-};
+/** Sanitized manifest state, preserving unfamiliar non-empty strings like Python. */
+export const manifestState = (manifest: unknown): string =>
+  publicText(untrustedFieldOr(manifest, 'state', 'status'), 'unknown', 32);
 
 // ---------------------------------------------------------------------------
 // _archive_reasons

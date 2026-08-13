@@ -58,6 +58,7 @@ import {
   gamesIndex,
   interruptedCandidates,
   liveGameIds,
+  manifestState,
   pairArchiveFrames,
   selectFramePng,
   sortDiskGameRows,
@@ -360,6 +361,14 @@ const runProjections = (spec: RunSpec): CanonValue => {
 // ---------------------------------------------------------------------------
 // Behaviour
 // ---------------------------------------------------------------------------
+
+describe('manifest state projection', () => {
+  it('preserves an unfamiliar sanitized state like Python _public_text', () => {
+    expect(manifestState({ state: ' paused\u0000 ' })).toBe('paused');
+    expect(manifestState({ status: 'future-state' })).toBe('future-state');
+    expect(manifestState({ state: 7 })).toBe('unknown');
+  });
+});
 
 describe('archiveReasons', () => {
   it('redacts a reason that names a path or a secret, wholesale', () => {
