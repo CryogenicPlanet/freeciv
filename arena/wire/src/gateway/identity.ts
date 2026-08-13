@@ -41,7 +41,7 @@
 import { Schema } from 'effect';
 import { WireInt, WireNonNegativeInt } from '../numeric.ts';
 import { decodeWire, encodeWire, isWire } from '../codec.ts';
-import type { WireDecoder, WireEncoder } from '../codec.ts';
+import type { WireDecoder, WireEncoder, WireGuard } from '../codec.ts';
 
 /**
  * `GATEWAY_KIND` — `agent_eval/replay_gateway.py:52`.  The self-identifying
@@ -330,8 +330,7 @@ export const encodeGatewayIdentity: WireEncoder<
  * would decode, use {@link decodeGatewayIdentity} and test the `Either`; see
  * `isWire` in `../codec.ts` for why the two differ here.
  */
-export const isGatewayIdentity: (input: unknown) => input is GatewayIdentity =
-  isWire(GatewayIdentity);
+export const isGatewayIdentity: WireGuard<GatewayIdentity> = isWire(GatewayIdentity);
 
 /**
  * The exact preimage `_identity` hashes (`:175-183`):

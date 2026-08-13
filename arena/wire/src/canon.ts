@@ -31,7 +31,7 @@
  * Nothing in this module throws: every refusal is an `Either.left` carrying the
  * path of the offending node.
  */
-import { Data, Either, Option } from 'effect';
+import { Data, Either, Option, Predicate } from 'effect';
 
 // ---------------------------------------------------------------------------
 // The value model
@@ -95,7 +95,7 @@ export type CanonPath = readonly CanonPathSegment[];
 export const formatCanonPath = (path: CanonPath): string =>
   path.reduce<string>(
     (rendered, segment) =>
-      typeof segment === 'number'
+      Predicate.isNumber(segment)
         ? `${rendered}[${segment}]`
         : `${rendered}[${JSON.stringify(segment)}]`,
     '$',
@@ -443,9 +443,6 @@ const RIGHT_FALSE: Either.Either<string, CanonError> = Either.right('false');
 const isCanonRecord = (value: readonly CanonValue[] | CanonRecord): value is CanonRecord =>
   !Array.isArray(value);
 
-/** `typeof` of something the types say cannot exist. */
-const kindOf = (value: unknown): string => typeof value;
-
 const write = (
   value: CanonValue,
   ensureAscii: boolean,
@@ -453,23 +450,26 @@ const write = (
   depth: number,
 ): Either.Either<string, CanonError> => {
   if (value === null) return RIGHT_NULL;
-  switch (typeof value) {
-    case 'boolean':
-      return value ? RIGHT_TRUE : RIGHT_FALSE;
-    case 'bigint':
-      return Either.right(value.toString(10));
-    case 'number':
-      return Option.match(formatFloat(value), {
-        onNone: () => Either.left(nonFiniteFloat(link, value)),
-        onSome: (text) => Either.right(text),
-      });
-    case 'string':
-      return encodeStringAt(value, ensureAscii, link);
-    case 'object':
-      return writeContainer(value, ensureAscii, link, depth);
-    default:
-      return Either.left(unsupportedValue(link, kindOf(value)));
+  if (Predicate.isBoolean(value)) return value ? RIGHT_TRUE : RIGHT_FALSE;
+  if (Predicate.isBigInt(value)) return Either.right(value.toString(10));
+  if (Predicate.isNumber(value)) {
+    return Option.match(formatFloat(value), {
+      onNone: () => Either.left(nonFiniteFloat(link, value)),
+      onSome: (text) => Either.right(text),
+    });
   }
+  if (Predicate.isString(value)) return encodeStringAt(value, ensureAscii, link);
+  if (Array.isArray(value) || Predicate.isRecord(value)) {
+    return writeContainer(value, ensureAscii, link, depth);
+  }
+  const invalidKind = Predicate.isUndefined(value)
+    ? 'undefined'
+    : Predicate.isSymbol(value)
+      ? 'symbol'
+      : Predicate.isFunction(value)
+        ? 'function'
+        : 'unsupported';
+  return Either.left(unsupportedValue(link, invalidKind));
 };
 
 const writeContainer = (

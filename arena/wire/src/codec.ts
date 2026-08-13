@@ -31,11 +31,15 @@ export class WireEncodeError extends Data.TaggedError('WireEncodeError')<{
   readonly issues: ReadonlyArray<WireIssue>;
 }> {}
 
-export type WireDecoder<A> = (input: unknown) => Either.Either<A, WireDecodeError>;
+/** A guard that can inspect any already-owned value without widening it. */
+export type WireGuard<A> = <Input>(input: Input) => input is Input & A;
+
+/** A decoder that accepts a value of any provenance and owns its validation. */
+export type WireDecoder<A> = <Input>(input: Input) => Either.Either<A, WireDecodeError>;
 export type WireEncoder<A, I> = (value: A) => Either.Either<I, WireEncodeError>;
 
 /** Decode one supported packet shape. Unknown fields are version errors. */
-export const decodeWire = <A, I>(schema: Schema.Schema<A, I, never>, name = 'wire value'): WireDecoder<A> => {
+export const decodeWire = <A, I>(schema: Schema.Schema<A, I>, name = 'wire value'): WireDecoder<A> => {
   const decode = Schema.decodeUnknownEither(schema, options);
   return (input) =>
     Either.mapLeft(decode(input), (error) =>
@@ -47,7 +51,7 @@ export const decodeWire = <A, I>(schema: Schema.Schema<A, I, never>, name = 'wir
 };
 
 /** Encode the current packet shape. */
-export const encodeWire = <A, I>(schema: Schema.Schema<A, I, never>, name = 'wire value'): WireEncoder<A, I> => {
+export const encodeWire = <A, I>(schema: Schema.Schema<A, I>, name = 'wire value'): WireEncoder<A, I> => {
   const encode = Schema.encodeEither(schema, options);
   return (value) =>
     Either.mapLeft(encode(value), (error) =>
@@ -58,5 +62,7 @@ export const encodeWire = <A, I>(schema: Schema.Schema<A, I, never>, name = 'wir
       }));
 };
 
-export const isWire = <A, I>(schema: Schema.Schema<A, I>): ((input: unknown) => input is A) =>
-  Schema.is(schema, options);
+export const isWire = <A, I>(schema: Schema.Schema<A, I>): WireGuard<A> => {
+  const isSchema = Schema.is(schema, options);
+  return <Input>(input: Input): input is Input & A => isSchema(input);
+};

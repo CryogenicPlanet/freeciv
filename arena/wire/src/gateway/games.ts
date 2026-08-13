@@ -57,6 +57,7 @@ import {
   isWire,
   type WireDecoder,
   type WireEncoder,
+  type WireGuard,
 } from '../codec.ts';
 
 // ---------------------------------------------------------------------------
@@ -106,10 +107,12 @@ const omittedOrNull = <A, I>(
  *
  * @returns `undefined` when the pair is whole (both keys, or neither).
  */
-export const timingPairIssue = (row: {
+interface TimingFields {
   readonly timing_mode?: string | null | undefined;
   readonly action_timeout_s?: number | null | undefined;
-}): string | undefined => {
+}
+
+export const timingPairIssue = (row: TimingFields): string | undefined => {
   const hasMode = Object.hasOwn(row, 'timing_mode');
   const hasTimeout = Object.hasOwn(row, 'action_timeout_s');
   if (hasMode === hasTimeout) return undefined;
@@ -119,15 +122,12 @@ export const timingPairIssue = (row: {
 };
 
 /** True when `timing_mode` and `action_timeout_s` are both present or both absent. */
-export const hasJointTiming = (row: {
-  readonly timing_mode?: string | null | undefined;
-  readonly action_timeout_s?: number | null | undefined;
-}): boolean => timingPairIssue(row) === undefined;
+export const hasJointTiming = (row: TimingFields): boolean => timingPairIssue(row) === undefined;
 
-const jointTiming = <S extends Schema.Schema.Any>(schema: S): Schema.filter<S> =>
+const jointTiming = <A extends TimingFields, I>(schema: Schema.Schema<A, I>) =>
   schema.pipe(
     Schema.filter((value) =>
-      typeof value === 'object' && value !== null && timingPairIssue(value) === undefined
+      timingPairIssue(value) === undefined
         ? undefined
         : 'timing_mode and action_timeout_s must be both present or both absent',
     ),
@@ -697,8 +697,7 @@ export const encodeInterruptedGameRow: WireEncoder<
  * interrupted shape.  {@link decodeInterruptedGameRow} reads the wire form;
  * this reads the form {@link asInterruptedRow} produces.
  */
-export const isInterruptedGameRow: (input: unknown) => input is InterruptedGameRow =
-  isWire(InterruptedGameRow);
+export const isInterruptedGameRow: WireGuard<InterruptedGameRow> = isWire(InterruptedGameRow);
 
 const maxBigInt = (left: bigint, right: bigint): bigint => (left > right ? left : right);
 

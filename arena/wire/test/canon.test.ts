@@ -435,8 +435,8 @@ describe('canon / refusals are values, never throws', () => {
     // Untyped input really can carry `undefined`; this is the one place the
     // suite fabricates a value the types say cannot exist, because refusing it
     // is precisely what the writer is being tested for.
-    // oxlint-disable-next-line no-unsafe-type-assertion
-    const rogue = { a: undefined } as unknown as CanonValue;
+    const rogue: CanonValue = { a: null };
+    Object.defineProperty(rogue, 'a', { value: undefined });
     const error = errorOf(canonicalText(rogue, CANON_ASCII));
     expect(error?._tag).toBe('UnsupportedValue');
     expect(error?.path).toEqual(['a']);

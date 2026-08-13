@@ -76,7 +76,7 @@
  * @module
  */
 
-import { Option, Schema } from 'effect';
+import { Option, Predicate, Schema } from 'effect';
 import { FrameIndex, GameId } from '../ids.ts';
 import { WireInt, WireNonNegativeInt } from '../numeric.ts';
 import {
@@ -375,9 +375,9 @@ export const legacyFrameTurn = (frame: {
   readonly turn?: bigint | number | null | undefined;
   readonly source_name: string;
 }): Option.Option<number> =>
-  typeof frame.turn === 'bigint' && frame.turn >= 0n
+  Predicate.isBigInt(frame.turn) && frame.turn >= 0n
     ? Option.some(Number(frame.turn))
-    : typeof frame.turn === 'number' && Number.isFinite(frame.turn) && frame.turn >= 0
+    : Predicate.isNumber(frame.turn) && Number.isFinite(frame.turn) && frame.turn >= 0
       ? Option.some(Math.trunc(frame.turn))
       : Option.map(Option.fromNullable(LEGACY_FRAME_TURN_RE.exec(frame.source_name)?.[1]), Number);
 
@@ -504,11 +504,6 @@ export const encodeWatchResponse: WireEncoder<
 /** Who built a `watch.json`: the gateway's archive reader, or the supervisor. */
 export type WatchProducer = 'archive' | 'live' | 'unknown';
 
-const WATCH_PRODUCER_BY_VIDEO_KIND: Readonly<Record<string, WatchProducer>> = {
-  [ARCHIVED_VIDEO_KIND]: 'archive',
-  [LIVE_VIDEO_KIND]: 'live',
-};
-
 /**
  * `video.kind` is the only self-describing field in the payload, and the two
  * producers disagree on every subtlety above, so this is the branch to take
@@ -516,4 +511,8 @@ const WATCH_PRODUCER_BY_VIDEO_KIND: Readonly<Record<string, WatchProducer>> = {
  * frame's `turn`.
  */
 export const watchProducer = (watch: WatchResponse): WatchProducer =>
-  WATCH_PRODUCER_BY_VIDEO_KIND[watch.video.kind] ?? 'unknown';
+  watch.video.kind === ARCHIVED_VIDEO_KIND
+    ? 'archive'
+    : watch.video.kind === LIVE_VIDEO_KIND
+      ? 'live'
+      : 'unknown';

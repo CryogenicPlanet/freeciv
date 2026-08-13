@@ -30,6 +30,7 @@ export {
   isWire,
   type WireDecoder,
   type WireEncoder,
+  type WireGuard,
   WireDecodeError,
   WireEncodeError,
   type WireIssue,

@@ -43,7 +43,7 @@
  * @module
  */
 
-import { Either, Option, Schema } from 'effect';
+import { Option, Schema, type Either } from 'effect';
 import { CANON_UTF8, type CanonError, canonicalBytes, canonicalText } from '../canon.ts';
 import {
   decodeWire,
@@ -51,6 +51,7 @@ import {
   isWire,
   type WireDecoder,
   type WireEncoder,
+  type WireGuard,
 } from '../codec.ts';
 
 // ---------------------------------------------------------------------------
@@ -195,7 +196,7 @@ export type GatewayProblemMessage = (typeof GATEWAY_PROBLEM_MESSAGES)[GatewayPro
  * {status}` is the one message whose status is not fixed (see
  * {@link upstreamReturnedHttp}).
  */
-export const GATEWAY_PROBLEM_STATUS: { readonly [M in GatewayProblemMessage]: number } = {
+export const GATEWAY_PROBLEM_STATUS = {
   'invalid Content-Length': 400,
   'GET request bodies are not accepted': 400,
   'health does not accept query parameters': 400,
@@ -233,7 +234,7 @@ export const GATEWAY_PROBLEM_STATUS: { readonly [M in GatewayProblemMessage]: nu
   'replay telemetry is temporarily unavailable': 503,
   'game events are temporarily unavailable': 503,
   'board snapshot is temporarily unavailable': 503,
-};
+} as const satisfies { readonly [M in GatewayProblemMessage]: number };
 
 const KNOWN_MESSAGES: ReadonlySet<string> = new Set<string>(
   Object.values(GATEWAY_PROBLEM_MESSAGES),
@@ -340,8 +341,7 @@ export const encodeGatewayProblem: WireEncoder<
 > = encodeWire(GatewayProblem, 'GatewayProblem');
 
 /** True when `input` has a string `error`. Not proof it is an *error* body — see {@link isBareGatewayProblem}. */
-export const isGatewayProblem: (input: unknown) => input is GatewayProblem =
-  isWire(GatewayProblem);
+export const isGatewayProblem: WireGuard<GatewayProblem> = isWire(GatewayProblem);
 
 /** The problem body parsed straight from response text. */
 export const GatewayProblemFromString: Schema.Schema<GatewayProblem, string> =
@@ -364,7 +364,9 @@ export const decodeGatewayProblemFromString: WireDecoder<GatewayProblem> = decod
  * gateway rather than a promise: prefer the HTTP status when you have it, and
  * expect this predicate to go false the day the gateway adds a second key.
  */
-export const isBareGatewayProblem = (input: unknown): input is GatewayProblem =>
+export const isBareGatewayProblem: WireGuard<GatewayProblem> = <Input>(
+  input: Input,
+): input is Input & GatewayProblem =>
   isGatewayProblem(input) && Object.keys(input).length === 1;
 
 // ---------------------------------------------------------------------------

@@ -14,10 +14,12 @@ import * as GatewayProblem from 'src/gateway/problem';
 import * as GatewayReplay from 'src/gateway/replay';
 import * as GatewayTechnology from 'src/gateway/technology';
 
-const exportsOf = (module: object): readonly string[] =>
+type RuntimeModule = Parameters<typeof Object.keys>[0];
+
+const exportsOf = (module: RuntimeModule): readonly string[] =>
   Object.keys(module).filter((name) => name !== 'default');
 
-type Family = readonly (readonly [string, object])[];
+type Family = readonly (readonly [string, RuntimeModule])[];
 const CORE: Family = [
   ['canon', Canon],
   ['codec', Codec],
@@ -36,7 +38,7 @@ const GATEWAY: Family = [
   ['problem', GatewayProblem],
 ];
 
-const missingFrom = (barrel: object, family: Family): readonly string[] =>
+const missingFrom = (barrel: RuntimeModule, family: Family): readonly string[] =>
   family.flatMap(([label, module]) =>
     exportsOf(module)
       .filter((name) => !Object.hasOwn(barrel, name))

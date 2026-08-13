@@ -211,7 +211,7 @@ describe('documented looseness', () => {
       }
     }
     const instance = new Marker();
-    expect(typeof instance.dropped).toBe('function');
+    expect(instance.dropped()).toBe(1);
     const decoded = decodeJsonObject(instance);
     expect(Either.isRight(decoded) && decoded.right).toEqual({ own: { kept: true } });
   });

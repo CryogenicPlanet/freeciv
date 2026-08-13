@@ -1,8 +1,20 @@
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
-import { Either, ParseResult, Schema } from 'effect';
-import { decodeWire, encodeWire } from 'src/codec';
+import { Data, Effect, Either, ParseResult, Schema } from 'effect';
+import {
+  decodeWire,
+  encodeWire,
+  type WireDecoder,
+  type WireEncoder,
+} from 'src/codec';
+import {
+  decodeJsonValue,
+  decodeJsonValueFromString,
+  isJsonArray,
+  isJsonObject,
+  jsonField,
+  type JsonObject,
+  type JsonValue,
+} from 'src/json';
 import { decodeWatchResponse } from 'src/gateway/archive';
 import {
   decodeArchiveResult,
@@ -36,28 +48,73 @@ import {
   encodeTechnologyCatalog,
 } from 'src/gateway/replay';
 
-const fixtures = join(import.meta.dir, 'fixtures');
-const read = (path: string): unknown =>
-  JSON.parse(readFileSync(join(fixtures, path), 'utf8'));
-const accepts = (result: Either.Either<unknown, unknown>): boolean => Either.isRight(result);
-const right = <A>(result: Either.Either<A, unknown>): A => {
+const fixtures = `${import.meta.dir}/fixtures`;
+
+class FixtureError extends Data.TaggedError('FixtureError')<{
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
+const accepts = <A, E>(result: Either.Either<A, E>): boolean => Either.isRight(result);
+const right = <A, E>(result: Either.Either<A, E>): A => {
   if (Either.isLeft(result)) throw new Error('expected Right');
   return result.right;
 };
+const read = (path: string): Effect.Effect<JsonValue, FixtureError> =>
+  Effect.tryPromise({
+    try: () => Bun.file(`${fixtures}/${path}`).text(),
+    catch: (cause) => new FixtureError({ message: `failed to read fixture: ${path}`, cause }),
+  }).pipe(
+    Effect.flatMap((text) =>
+      Either.match(decodeJsonValueFromString(text), {
+        onLeft: (error) => Effect.fail(new FixtureError({ message: `invalid JSON fixture: ${path}: ${error.message}` })),
+        onRight: (value) => Effect.succeed(value),
+      })),
+  );
+const readObject = (path: string): Effect.Effect<JsonObject, FixtureError> =>
+  Effect.flatMap(read(path), (value) =>
+    isJsonObject(value)
+      ? Effect.succeed(value)
+      : Effect.fail(new FixtureError({ message: `expected object fixture: ${path}` })));
+type WireAcceptance = (input: JsonValue) => boolean;
+
+const acceptsWith = <A>(decoder: WireDecoder<A>): WireAcceptance =>
+  (input): boolean => accepts(decoder(input));
+const decoderCase = <A>(
+  name: string,
+  decoder: WireDecoder<A>,
+  path: string,
+): readonly [string, WireAcceptance, string] => [name, acceptsWith(decoder), path];
+const fixtureCase = <A>(
+  decoder: WireDecoder<A>,
+  path: string,
+): readonly [WireAcceptance, string] => [acceptsWith(decoder), path];
+const roundTripCase = <A, I>(
+  name: string,
+  decoder: WireDecoder<A>,
+  encoder: WireEncoder<A, I>,
+  path: string,
+): readonly [string, (input: JsonValue) => void, string] => [
+  name,
+  (input) => {
+    const encoded = right(encoder(right(decoder(input))));
+    expect(right(decodeJsonValue(encoded))).toEqual(input);
+  },
+  path,
+];
 
 const cases = [
-  ['identity', decodeGatewayIdentity, 'live/gateway-health.json'],
-  ['games index', decodeGamesIndexResponse, 'live/gateway-games-index.json'],
-  ['manifest', decodeManifest, 'runs/manifest/running-v2-multiplayer.json'],
-  ['report', decodeReport, 'runs/report/completed-two-seats-full-score.json'],
-  ['watch', decodeWatchResponse, 'live/gateway-watch-terminal.json'],
-  ['replay', decodeReplayResponse, 'live/gateway-replay-terminal-limit5.json'],
-  ['board', decodeBoardResponse, 'live/gateway-board-turn1.json'],
-  ['events', decodeGameEventsResponse, 'live/gateway-events.json'],
-  ['archive result', decodeArchiveResult, 'live/gateway-result-terminal.json'],
-  ['upstream result', decodeUpstreamResult, 'live/supervisor-result-terminal.json'],
-  ['result union (archive)', decodeGameResult, 'live/gateway-result-terminal.json'],
-  ['result union (upstream)', decodeGameResult, 'live/supervisor-result-terminal.json'],
+  decoderCase('identity', decodeGatewayIdentity, 'live/gateway-health.json'),
+  decoderCase('games index', decodeGamesIndexResponse, 'live/gateway-games-index.json'),
+  decoderCase('manifest', decodeManifest, 'runs/manifest/running-v2-multiplayer.json'),
+  decoderCase('report', decodeReport, 'runs/report/completed-two-seats-full-score.json'),
+  decoderCase('watch', decodeWatchResponse, 'live/gateway-watch-terminal.json'),
+  decoderCase('replay', decodeReplayResponse, 'live/gateway-replay-terminal-limit5.json'),
+  decoderCase('board', decodeBoardResponse, 'live/gateway-board-turn1.json'),
+  decoderCase('events', decodeGameEventsResponse, 'live/gateway-events.json'),
+  decoderCase('archive result', decodeArchiveResult, 'live/gateway-result-terminal.json'),
+  decoderCase('upstream result', decodeUpstreamResult, 'live/supervisor-result-terminal.json'),
+  decoderCase('result union (archive)', decodeGameResult, 'live/gateway-result-terminal.json'),
+  decoderCase('result union (upstream)', decodeGameResult, 'live/supervisor-result-terminal.json'),
 ] as const;
 
 const validCorpus = [
@@ -74,7 +131,7 @@ const validCorpus = [
     'invalid-strategic-v1-freetext-reasons.json',
     'invalid-v2-score-snapshot-incomplete.json',
     'running-v2-multiplayer.json',
-  ].map((name) => [decodeManifest, `runs/manifest/${name}`] as const),
+  ].map((name) => fixtureCase(decodeManifest, `runs/manifest/${name}`)),
   ...[
     'alive-null-legacy-players.json',
     'completed-two-seats-full-score.json',
@@ -84,41 +141,41 @@ const validCorpus = [
     'partial-seat-stats-with-recovery.json',
     'three-players-ranked.json',
     'tied-ranks-empty-seat-stats.json',
-  ].map((name) => [decodeReport, `runs/report/${name}`] as const),
-  [decodeTechnologyCatalog, 'runs/replay-catalog/tech-tree-with-depth-and-requires.json'],
-  [decodeTechnologyCatalog, 'runs/replay-catalog/tech-tree-without-depth.json'],
-  [decodeGamesIndexResponse, 'live/supervisor-games-index.json'],
-  [decodeGameStatus, 'live/supervisor-status-running.json'],
-  [decodeGameStatus, 'live/supervisor-status-terminal.json'],
-  [decodeWatchResponse, 'live/supervisor-watch.json'],
+  ].map((name) => fixtureCase(decodeReport, `runs/report/${name}`)),
+  fixtureCase(decodeTechnologyCatalog, 'runs/replay-catalog/tech-tree-with-depth-and-requires.json'),
+  fixtureCase(decodeTechnologyCatalog, 'runs/replay-catalog/tech-tree-without-depth.json'),
+  fixtureCase(decodeGamesIndexResponse, 'live/supervisor-games-index.json'),
+  fixtureCase(decodeGameStatus, 'live/supervisor-status-running.json'),
+  fixtureCase(decodeGameStatus, 'live/supervisor-status-terminal.json'),
+  fixtureCase(decodeWatchResponse, 'live/supervisor-watch.json'),
 ] as const;
 
 const roundTripCases = [
-  ['identity', decodeGatewayIdentity, encodeGatewayIdentity, 'live/gateway-health.json'],
-  ['games index', decodeGamesIndexResponse, encodeGamesIndexResponse, 'live/gateway-games-index.json'],
-  ['status', decodeGameStatus, encodeGameStatus, 'live/supervisor-status-terminal.json'],
-  ['manifest', decodeManifest, encodeManifest, 'runs/manifest/running-v2-multiplayer.json'],
-  ['report', decodeReport, encodeReport, 'runs/report/completed-two-seats-full-score.json'],
-  ['replay', decodeReplayResponse, encodeReplayResponse, 'live/gateway-replay-terminal-limit5.json'],
-  ['board', decodeBoardResponse, encodeBoardResponse, 'live/gateway-board-turn1.json'],
-  ['events', decodeGameEventsResponse, encodeGameEventsResponse, 'live/gateway-events.json'],
-  ['technology catalog', decodeTechnologyCatalog, encodeTechnologyCatalog, 'runs/replay-catalog/tech-tree-with-depth-and-requires.json'],
-  ['archive result', decodeArchiveResult, encodeArchiveResult, 'live/gateway-result-terminal.json'],
-  ['upstream result', decodeUpstreamResult, encodeUpstreamResult, 'live/supervisor-result-terminal.json'],
-  ['archive result union', decodeGameResult, encodeGameResult, 'live/gateway-result-terminal.json'],
-  ['upstream result union', decodeGameResult, encodeGameResult, 'live/supervisor-result-terminal.json'],
+  roundTripCase('identity', decodeGatewayIdentity, encodeGatewayIdentity, 'live/gateway-health.json'),
+  roundTripCase('games index', decodeGamesIndexResponse, encodeGamesIndexResponse, 'live/gateway-games-index.json'),
+  roundTripCase('status', decodeGameStatus, encodeGameStatus, 'live/supervisor-status-terminal.json'),
+  roundTripCase('manifest', decodeManifest, encodeManifest, 'runs/manifest/running-v2-multiplayer.json'),
+  roundTripCase('report', decodeReport, encodeReport, 'runs/report/completed-two-seats-full-score.json'),
+  roundTripCase('replay', decodeReplayResponse, encodeReplayResponse, 'live/gateway-replay-terminal-limit5.json'),
+  roundTripCase('board', decodeBoardResponse, encodeBoardResponse, 'live/gateway-board-turn1.json'),
+  roundTripCase('events', decodeGameEventsResponse, encodeGameEventsResponse, 'live/gateway-events.json'),
+  roundTripCase('technology catalog', decodeTechnologyCatalog, encodeTechnologyCatalog, 'runs/replay-catalog/tech-tree-with-depth-and-requires.json'),
+  roundTripCase('archive result', decodeArchiveResult, encodeArchiveResult, 'live/gateway-result-terminal.json'),
+  roundTripCase('upstream result', decodeUpstreamResult, encodeUpstreamResult, 'live/supervisor-result-terminal.json'),
+  roundTripCase('archive result union', decodeGameResult, encodeGameResult, 'live/gateway-result-terminal.json'),
+  roundTripCase('upstream result union', decodeGameResult, encodeGameResult, 'live/supervisor-result-terminal.json'),
 ] as const;
 
 const versionedCases = [
-  ['identity', decodeGatewayIdentity, 'live/gateway-health.json'],
-  ['games index', decodeGamesIndexResponse, 'live/gateway-games-index.json'],
-  ['game status', decodeGameStatus, 'live/supervisor-status-running.json'],
-  ['manifest', decodeManifest, 'runs/manifest/running-v2-multiplayer.json'],
-  ['watch', decodeWatchResponse, 'live/gateway-watch-terminal.json'],
-  ['replay', decodeReplayResponse, 'live/gateway-replay-terminal-limit5.json'],
-  ['board', decodeBoardResponse, 'live/gateway-board-turn1.json'],
-  ['events', decodeGameEventsResponse, 'live/gateway-events.json'],
-  ['technology catalog', decodeTechnologyCatalog, 'runs/replay-catalog/tech-tree-with-depth-and-requires.json'],
+  decoderCase('identity', decodeGatewayIdentity, 'live/gateway-health.json'),
+  decoderCase('games index', decodeGamesIndexResponse, 'live/gateway-games-index.json'),
+  decoderCase('game status', decodeGameStatus, 'live/supervisor-status-running.json'),
+  decoderCase('manifest', decodeManifest, 'runs/manifest/running-v2-multiplayer.json'),
+  decoderCase('watch', decodeWatchResponse, 'live/gateway-watch-terminal.json'),
+  decoderCase('replay', decodeReplayResponse, 'live/gateway-replay-terminal-limit5.json'),
+  decoderCase('board', decodeBoardResponse, 'live/gateway-board-turn1.json'),
+  decoderCase('events', decodeGameEventsResponse, 'live/gateway-events.json'),
+  decoderCase('technology catalog', decodeTechnologyCatalog, 'runs/replay-catalog/tech-tree-with-depth-and-requires.json'),
 ] as const;
 
 const invalidCorpus = [
@@ -129,89 +186,92 @@ const invalidCorpus = [
     'manifest-schema-version-string.json',
     'manifest-seats-object-not-array.json',
     'manifest-status-unknown.json',
-  ].map((name) => [decodeManifest, `invalid/${name}`] as const),
-  [decodeTechnologyCatalog, 'invalid/replay-catalog-requires-names-not-ids.json'],
-  [decodeTechnologyCatalog, 'invalid/replay-catalog-tech-missing-id.json'],
-  [decodeReport, 'invalid/report-final-turn-string.json'],
-  [decodeReport, 'invalid/report-missing-seat-stats.json'],
-  [decodeReport, 'invalid/report-players-object-not-array.json'],
-  [decodeGameStatus, 'invalid/status-outcome-status-unknown.json'],
-  [decodeGameStatus, 'invalid/status-resolved-places-null.json'],
+  ].map((name) => fixtureCase(decodeManifest, `invalid/${name}`)),
+  fixtureCase(decodeTechnologyCatalog, 'invalid/replay-catalog-requires-names-not-ids.json'),
+  fixtureCase(decodeTechnologyCatalog, 'invalid/replay-catalog-tech-missing-id.json'),
+  fixtureCase(decodeReport, 'invalid/report-final-turn-string.json'),
+  fixtureCase(decodeReport, 'invalid/report-missing-seat-stats.json'),
+  fixtureCase(decodeReport, 'invalid/report-players-object-not-array.json'),
+  fixtureCase(decodeGameStatus, 'invalid/status-outcome-status-unknown.json'),
+  fixtureCase(decodeGameStatus, 'invalid/status-resolved-places-null.json'),
 ] as const;
 
 describe('current gateway schemas', () => {
-  for (const [name, decoder, path] of cases) {
-    const decode = decoder as (input: unknown) => Either.Either<unknown, unknown>;
-    test(`${name} accepts its captured v1 payload`, () => {
-      expect(accepts(decode(read(path)))).toBe(true);
-    });
+  for (const [name, acceptsInput, path] of cases) {
+    test(`${name} accepts its captured v1 payload`, () =>
+      Effect.runPromise(Effect.map(read(path), (input) => {
+        expect(acceptsInput(input)).toBe(true);
+      })));
 
-    test(`${name} rejects fields outside its version`, () => {
-      const value = read(path);
-      expect(accepts(decode({ ...(value as object), future_field: true }))).toBe(false);
-    });
+    test(`${name} rejects fields outside its version`, () =>
+      Effect.runPromise(Effect.map(readObject(path), (input) => {
+        expect(acceptsInput({ ...input, future_field: true })).toBe(false);
+      })));
   }
 
-  test.each(roundTripCases)('%s decodes and re-encodes its captured current shape', (_name, decoder, encoder, path) => {
-    const decode = decoder as (input: unknown) => Either.Either<unknown, unknown>;
-    const encode = encoder as (input: never) => Either.Either<unknown, unknown>;
-    const input = read(path);
-    expect(right(encode(right(decode(input)) as never))).toEqual(input);
-  });
+  test.each(roundTripCases)('%s decodes and re-encodes its captured current shape', (_name, assertRoundTrip, path) =>
+    Effect.runPromise(Effect.map(read(path), assertRoundTrip)));
 
-  test.each(validCorpus)('accepts captured fixture %s', (decoder, path) => {
-    const decode = decoder as (input: unknown) => Either.Either<unknown, unknown>;
-    expect(accepts(decode(read(path)))).toBe(true);
-  });
+  test.each(validCorpus)('accepts captured fixture %s', (acceptsInput, path) =>
+    Effect.runPromise(Effect.map(read(path), (input) => {
+      expect(acceptsInput(input)).toBe(true);
+    })));
 
-  test.each(invalidCorpus)('rejects invalid fixture %s', (decoder, path) => {
-    const decode = decoder as (input: unknown) => Either.Either<unknown, unknown>;
-    expect(accepts(decode(read(path)))).toBe(false);
-  });
+  test.each(invalidCorpus)('rejects invalid fixture %s', (acceptsInput, path) =>
+    Effect.runPromise(Effect.map(read(path), (input) => {
+      expect(acceptsInput(input)).toBe(false);
+    })));
 
-  test.each(versionedCases)('%s requires the current integer schema version', (_name, decoder, path) => {
-    const decode = decoder as (input: unknown) => Either.Either<unknown, unknown>;
-    const value = read(path) as Record<string, unknown>;
-    const { schema_version: _schemaVersion, ...missing } = value;
-    for (const candidate of [
-      missing,
-      { ...value, schema_version: '1' },
-      { ...value, schema_version: 0 },
-      { ...value, schema_version: 2 },
-    ]) {
-      expect(accepts(decode(candidate))).toBe(false);
-    }
-  });
+  test.each(versionedCases)('%s requires the current integer schema version', (_name, acceptsInput, path) =>
+    Effect.runPromise(Effect.map(readObject(path), (value) => {
+      const { schema_version: _schemaVersion, ...missing } = value;
+      for (const candidate of [
+        missing,
+        { ...value, schema_version: '1' },
+        { ...value, schema_version: 0 },
+        { ...value, schema_version: 2 },
+      ]) {
+        expect(acceptsInput(candidate)).toBe(false);
+      }
+    })));
 
-  test('timing fields must be both present or both absent', () => {
-    const status = read('live/supervisor-status-terminal.json') as Record<string, unknown>;
-    const { action_timeout_s: _timeout, ...withoutTimeout } = status;
-    const { timing_mode: _mode, ...withoutMode } = status;
-    expect(accepts(decodeGameStatus(withoutTimeout))).toBe(false);
-    expect(accepts(decodeGameStatus(withoutMode))).toBe(false);
+  test('timing fields must be both present or both absent', () =>
+    Effect.runPromise(Effect.gen(function* () {
+      const status = yield* readObject('live/supervisor-status-terminal.json');
+      const { action_timeout_s: _timeout, ...withoutTimeout } = status;
+      const { timing_mode: _mode, ...withoutMode } = status;
+      expect(accepts(decodeGameStatus(withoutTimeout))).toBe(false);
+      expect(accepts(decodeGameStatus(withoutMode))).toBe(false);
 
-    const row = (read('live/gateway-games-index.json') as { games: readonly Record<string, unknown>[] }).games[0];
-    expect(row).toBeDefined();
-    const { timing_mode: _rowMode, action_timeout_s: _rowTimeout, ...withoutTiming } = row ?? {};
-    expect(accepts(decodeGameRow({ ...withoutTiming, timing_mode: 'default' }))).toBe(false);
-  });
+      const index = yield* readObject('live/gateway-games-index.json');
+      const games = jsonField(index, 'games');
+      if (!isJsonArray(games)) throw new FixtureError({ message: 'expected games fixture array' });
+      const row = games[0];
+      if (!isJsonObject(row)) throw new FixtureError({ message: 'expected game row fixture' });
+      const { timing_mode: _rowMode, action_timeout_s: _rowTimeout, ...withoutTiming } = row;
+      expect(accepts(decodeGameRow({ ...withoutTiming, timing_mode: 'default' }))).toBe(false);
+    })));
 
-  test('disk rows preserve sanitized states outside the known vocabulary', () => {
-    const row = (read('live/gateway-games-index.json') as { games: readonly Record<string, unknown>[] }).games[0];
-    expect(row).toBeDefined();
-    const decoded = decodeGameRow({ ...row, state: 'paused' });
-    expect(Either.isRight(decoded) && decoded.right.state).toBe('paused');
-  });
+  test('disk rows preserve sanitized states outside the known vocabulary', () =>
+    Effect.runPromise(Effect.map(readObject('live/gateway-games-index.json'), (index) => {
+      const games = jsonField(index, 'games');
+      if (!isJsonArray(games)) throw new FixtureError({ message: 'expected games fixture array' });
+      const row = games[0];
+      if (!isJsonObject(row)) throw new FixtureError({ message: 'expected game row fixture' });
+      const decoded = decodeGameRow({ ...row, state: 'paused' });
+      expect(Either.isRight(decoded) && decoded.right.state).toBe('paused');
+    })));
 
-  test('nested unknown fields are rejected with their path', () => {
-    const manifest = read('runs/manifest/running-v2-multiplayer.json') as Record<string, unknown>;
-    const config = manifest['config'] as Record<string, unknown>;
-    const nested = decodeManifest({ ...manifest, config: { ...config, future_field: true } });
-    expect(Either.isLeft(nested)).toBe(true);
-    if (Either.isLeft(nested)) {
-      expect(nested.left.issues.some((issue) => issue.path.join('.') === 'config.future_field')).toBe(true);
-    }
-  });
+  test('nested unknown fields are rejected with their path', () =>
+    Effect.runPromise(Effect.map(readObject('runs/manifest/running-v2-multiplayer.json'), (manifest) => {
+      const config = jsonField(manifest, 'config');
+      if (!isJsonObject(config)) throw new FixtureError({ message: 'expected manifest config fixture' });
+      const nested = decodeManifest({ ...manifest, config: { ...config, future_field: true } });
+      expect(Either.isLeft(nested)).toBe(true);
+      if (Either.isLeft(nested)) {
+        expect(nested.left.issues.some((issue) => issue.path.join('.') === 'config.future_field')).toBe(true);
+      }
+    })));
 
   test('problem bodies are exact', () => {
     expect(accepts(decodeGatewayProblem({ error: 'not found' }))).toBe(true);

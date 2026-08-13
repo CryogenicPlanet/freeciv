@@ -660,7 +660,7 @@ export const encodeGameEventsResponse: WireEncoder<
  */
 export const REPLAY_ROUTE_PROBLEMS = {
   /** 400 — a repeated or unexpected query parameter. */
-  queryShape: GATEWAY_PROBLEM_MESSAGES.replayQueryDuplicates,
+  'queryShape': GATEWAY_PROBLEM_MESSAGES.replayQueryDuplicates,
   /** 400 — `int()` refused a value. */
   queryNotIntegers: GATEWAY_PROBLEM_MESSAGES.replayQueryNotIntegers,
   /** 400 — a value was in range for `int` but not for the route. */
@@ -674,7 +674,7 @@ export const REPLAY_ROUTE_PROBLEMS = {
 /** The problems `_board` can emit (`replay_gateway.py:1799-1878`). */
 export const BOARD_ROUTE_PROBLEMS = {
   /** 400 — zero, two, or foreign query parameters. */
-  queryShape: GATEWAY_PROBLEM_MESSAGES.boardQueryTurn,
+  'queryShape': GATEWAY_PROBLEM_MESSAGES.boardQueryTurn,
   /** 400 — `int()` refused the value. */
   queryNotInteger: GATEWAY_PROBLEM_MESSAGES.boardTurnNotInteger,
   /** 400 — `turn <= 0`. */
