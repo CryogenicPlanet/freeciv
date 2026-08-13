@@ -1,50 +1,22 @@
 /**
- * Drizzle schema for the arena database — the Postgres twin of a `runs_root`.
+ * Arena schema v2 — a model of Freeciv games, not a mirror of a runs_root.
  *
- * The contract this file exists to keep is **byte fidelity**: the pg-backed
- * gateway must emit responses byte-identical to the filesystem-backed one, and
- * the database is not allowed to launder a single byte on the way through.
- * Three column classes follow from that:
+ * A game run on disk is described by three JSON files, all written by the
+ * supervisor: `manifest.json` (the run's lifecycle record — state, timestamps,
+ * config, who joined) and `report.json` (end-of-run agent statistics).
+ * `replay.jsonl` holds one line per turn with
+ * every player's metrics. This schema decodes those into typed tables and
+ * stores no artifacts and no filesystem paths: frames/video/saves are
+ * ephemeral — resolved from the gateway's own --runs-root while they exist on
+ * disk, regenerable from game state after that. bytea appears only in the
+ * content-hash column.
  *
- * - **Class A — verbatim `bytea`.** Every document that reaches a response body
- *   (`manifest.json`, `report.json`, `victory.json`, the `replay.jsonl` tail
- *   window, PNG frames, `game.mp4`, saves, derivation-cache entries) is stored
- *   as `bytea` and re-parsed on read by the *same* reader the fs backend uses.
- *   Never `json`, never `jsonb`, never `text`: `jsonb` sorts keys, drops
- *   duplicate keys, renormalises numeric literals (`1e3` → `1000`, which is
- *   exactly the int-vs-float spelling `victory.json`'s `turn`/`year` depends
- *   on) and rejects `\u0000`; `text` rejects `\u0000` too and re-encodes on a
- *   `client_encoding` mismatch, which would make the invalid-UTF-8 503 path
- *   unreproducible.
- * - **Class B — typed columns, for query and index only, never served.**
- *   `state`, `created_at`, `finished_at`, `benchmark_valid`, `frame_index`,
- *   `save_turn`, `sha256`. A read that reaches a response body through one of
- *   these is a defect. The one exception is `byte_size`, which is not metadata
- *   but a *gate*: `readArchiveJson` refuses `size <= 0` and `size > 8 MiB` on
- *   the **fstat** size, and a short `readFully` can leave `octet_length(bytes)`
- *   below it — so the fstat size is stored verbatim and the gate applies to it.
- * - **Class C — status enums**, because "the file was there but unusable" is a
- *   distinct answer from "the file was not there": row absent → 404, row with
- *   `status = 'unusable'` → 503, row with `status = 'ok'` → parse it.
+ * victory.json is deliberately not stored (most games do not end cleanly
+ * yet); the /result route reads it from disk in both backends. Outcome
+ * columns return with one migration when that changes.
  *
- * Every table is scoped by `runs_root` so one database can hold several logical
- * roots and `RunsRepositoryApi.runsRoot` keeps its meaning.
- *
- * `bigint` columns are all declared `{ mode: "number" }` on purpose: PGlite
- * hands `int8` back as a JS `bigint` and `pg` hands it back as a `string`, and
- * drizzle's 53-bit mode normalises both to `number`. Without that pin the
- * hermetic PGlite tests would not predict live behaviour — and a `bigint` also
- * throws inside `JSON.stringify`.
- *
- * **Every `byte_size` column in this schema is `bigint`, without exception.**
- * It holds an `fstat` size, `st_size` is an `off_t`, and nothing upstream caps
- * it: `readArchiveJson` caps the *read* at 8 MiB but stores the size that
- * failed the gate, so a 3 GiB `report.json` — one `truncate(2)` away on any
- * filesystem — is a number this column must be able to hold in order to answer
- * the 503 the fs backend answers. An `integer` here does not truncate, it
- * aborts the statement, which is how one hostile file kept an entire archive
- * out of the database. The rule is uniform rather than per-table so that no
- * future column has to re-derive which sizes happen to be bounded today.
+ * Parity note: timestamps stay double-precision epoch seconds — the
+ * manifest's own spelling, served verbatim.
  */
 
 import {
@@ -54,6 +26,7 @@ import {
   doublePrecision,
   foreignKey,
   integer,
+  jsonb,
   pgEnum,
   pgTable,
   primaryKey,
@@ -61,286 +34,194 @@ import {
   timestamp
 } from "drizzle-orm/pg-core"
 
-/**
- * `bytea`. Drizzle 0.45 ships no built-in bytea column, so it is defined here as
- * a custom type. The pg wire protocol hands bytea back as a `Uint8Array` under
- * PGlite and as a `Buffer` under `pg` — and `Buffer` *is* a `Uint8Array`
- * subclass — and both accept a `Uint8Array` parameter on the way in, so the
- * codec is the identity in both directions. Compare bytes, not objects, when
- * asserting across the two backends.
- */
-export const bytea = customType<{ data: Uint8Array; driverData: Uint8Array }>({
+/** bytea, used exclusively for the sha256 ingest content hash. */
+export const hashBytes = customType<{ data: Uint8Array; driverData: Uint8Array }>({
   dataType: () => "bytea",
   toDriver: (value) => value,
   fromDriver: (value) => value
 })
 
-/** A timestamptz column. Bookkeeping only — never on a byte-parity path. */
-const ingestedAt = (name: string) => timestamp(name, { withTimezone: true, mode: "date" })
-
-/** Which of the three archive JSON documents a `run_documents` row holds. */
-export const documentKind = pgEnum("document_kind", ["manifest", "report", "victory"])
+/**
+ * Run lifecycle, exactly the states the supervisor writes. (`interrupted` and
+ * `unknown` are derived at serving time from live/terminal context and are
+ * deliberately not storable.)
+ */
+export const runState = pgEnum("run_state", [
+  "lobby",
+  "starting",
+  "running",
+  "completed",
+  "invalid",
+  "failed",
+  "cancelled"
+])
 
 /**
- * Class C. `ok` — the fs backend would have parsed it. `unusable` — the fs
- * backend would have answered 503 (non-regular, size 0, over 8 MiB, invalid
- * UTF-8, or not a JSON object). The bytes are stored either way, so the 503 is
- * reproducible rather than merely asserted.
+ * Whether a source document was readable at ingest.
+ * absent → 404, unusable → 503, ok → its data is in the typed columns.
  */
-export const documentStatus = pgEnum("document_status", ["ok", "unusable"])
+export const documentStatus = pgEnum("document_status", ["ok", "unusable", "absent"])
 
-/** How a `run_saves` entry is named, mirroring `SAVE_NAME_RE` / `PPM_NAME_RE`. */
-export const saveKind = pgEnum("save_kind", ["autosave", "ppm", "other"])
+/** Who controls a seat: an LLM agent, or the game's built-in AI. */
+export const seatKind = pgEnum("seat_kind", ["agent", "cpu"])
 
-/**
- * One ingest walk over one `runs_root` — an **operator's ledger**, and nothing
- * else reads it.
- *
- * It is worth being exact about that, because the obvious design is the wrong
- * one. Making deletion conditional on `status = 'complete'` would put a safety
- * property in a row that a `kill -9` leaves saying `running` for ever, with
- * nothing able to tell a crashed sweep from a live one. So deletion is licensed
- * by evidence that cannot go stale: the delete transaction re-reads the disk for
- * every id it is about to remove (`ingest.ts#staleRuns`). A walk that could not
- * list the root deletes nothing because it never reaches the delete phase at
- * all, and a run another process ingested during the window survives because it
- * is on the disk when the recheck looks.
- *
- * What the ledger *is* good for is answering "when did a sweep last run here,
- * how many entries did it see, and did it finish" — which is why
- * {@link ingest} also closes out sweeps that have been `running` implausibly
- * long (`ingest.ts#reconcileAbandonedSweeps`), so `running` means "probably
- * now" rather than "at some point since install".
- */
-export const ingestSweeps = pgTable("ingest_sweeps", {
-  sweepId: bigint("sweep_id", { mode: "number" }).generatedAlwaysAsIdentity().primaryKey(),
-  runsRoot: text("runs_root").notNull(),
-  startedAt: ingestedAt("started_at").notNull().defaultNow(),
-  finishedAt: ingestedAt("finished_at"),
-  /** `'running' | 'complete' | 'aborted'`. */
-  status: text("status").notNull(),
-  seenCount: integer("seen_count").notNull().default(0)
+/** One row per game: identity, lifecycle, setup, and ingest bookkeeping. */
+export const games = pgTable("games", {
+  gameId: text("game_id").primaryKey(),
+
+  // ---- lifecycle ----
+  state: runState("state").notNull(),
+  schemaVersion: integer("schema_version"),
+  /** Epoch seconds as doubles — the manifest's own spelling, served verbatim. */
+  createdAt: doublePrecision("created_at"),
+  startedAt: doublePrecision("started_at"),
+  finishedAt: doublePrecision("finished_at"),
+  currentTurn: integer("current_turn"),
+  /**
+   * Highest turn recorded in replay.jsonl. Kept as a column (not inferred from
+   * player_turns) because the API's interrupted-game relabeling needs it even
+   * for games whose replay lines failed to parse into rows, and it must match
+   * the fs backend's tail-window read exactly.
+   */
+  lastReplayTurn: integer("last_replay_turn"),
+  /** Served in the games index; false when the run broke benchmark rules. */
+  benchmarkValid: boolean("benchmark_valid"),
+
+  // ---- game setup, lifted from config for querying ----
+  name: text("name"),
+  ruleset: text("ruleset"),
+  mode: text("mode"),
+  timingMode: text("timing_mode"),
+  maxTurns: integer("max_turns"),
+  objective: text("objective"),
+  /** The full config document; the columns above are its queryable projection. */
+  config: jsonb("config"),
+
+  // ---- source-document readability gates ----
+  // 404/503 semantics per document: absent → 404, unusable (unreadable /
+  // oversize / not JSON) → 503. Sizes are the fstat sizes the gates check.
+  manifestStatus: documentStatus("manifest_status").notNull(),
+  manifestByteSize: bigint("manifest_byte_size", { mode: "number" }),
+  reportStatus: documentStatus("report_status").notNull(),
+  reportByteSize: bigint("report_byte_size", { mode: "number" }),
+
+  // ---- ingest metadata: "was this game already ingested" ----
+  contentHash: hashBytes("content_hash").notNull(),
+  ingestedAt: timestamp("ingested_at", { withTimezone: true, mode: "date" })
+    .notNull()
+    .defaultNow(),
+
+  /**
+   * Everything from the manifest that has no typed column (error/returncode/
+   * start_count/invalid_reasons/…). Operational detail, kept for completeness,
+   * never queried by the API.
+   */
+  extras: jsonb("extras")
 })
 
-/**
- * One run directory under one `runs_root`.
- *
- * `content_hash` is sha256 over the canonical listing of the run's artifacts
- * (`name`, `byte_size`, `sha256(bytes)`, `status`) plus the two directory
- * booleans, and it is the idempotency key: a re-ingest that finds an equal hash
- * commits without writing anything at all. Every field in that listing is
- * length-prefixed (`ingest.ts#encodeFields`), because one of the names in it is
- * a save filename off a hostile disk and an idempotency key that a filename can
- * forge is a way to keep a real archive out of the database.
- *
- * The four class-B columns below the fold are advisory copies for operators.
- * Nothing in a response body may be derived from them — the projections run in
- * TypeScript over the re-parsed manifest bytes, exactly as the fs backend does.
- */
-export const runs = pgTable("runs", {
-  runsRoot: text("runs_root").notNull(),
-  gameId: text("game_id").notNull(),
-  contentHash: bytea("content_hash").notNull(),
-  ingestedAt: ingestedAt("ingested_at").notNull().defaultNow(),
+/** One row per seat: who controlled it. */
+export const seats = pgTable("seats", {
+  gameId: text("game_id").notNull()
+    .references(() => games.gameId, { onDelete: "cascade" }),
   /**
-   * The sweep that last *changed* this run — never the sweep that last saw it,
-   * because stamping an unchanged run is a write and one write per unchanged
-   * run is what the idempotence contract forbids.
-   *
-   * Nullable, with `ON DELETE SET NULL`, so the ledger is prunable: a plain FK
-   * would have pinned every `ingest_sweeps` row for as long as any run pointed
-   * at it, and the ledger grows one row per sweep for ever. Nothing reads this
-   * column to decide anything — deletion is licensed by a fresh look at the
-   * disk inside the delete transaction (`ingest.ts`), not by the ledger — so
-   * losing the provenance of an old change costs an operator a note and no
-   * safety property.
+   * Position in the game's configured seat list (which chair — seat ids are
+   * literally "place-1", "place-2"). Identity, not a result: standings live in
+   * player_turns.
    */
-  sweepId: bigint("sweep_id", { mode: "number" })
-    .references(() => ingestSweeps.sweepId, { onDelete: "set null" }),
-  /** `safeArchiveDirectory(watch_frames)` succeeded at ingest time. */
-  framesDirOk: boolean("frames_dir_ok").notNull(),
-  /** `safeArchiveDirectory(saves)` succeeded at ingest time. */
-  savesDirOk: boolean("saves_dir_ok").notNull(),
-  // ---- class B, advisory only, never reaches a response body ----
-  state: text("state"),
-  /** Seconds since the epoch as a double, *not* a timestamptz: the wire spells
-   * this as the manifest spelled it, and a timestamptz round trip would not. */
-  createdAt: doublePrecision("created_at"),
-  finishedAt: doublePrecision("finished_at"),
-  benchmarkValid: boolean("benchmark_valid")
-}, (table) => [primaryKey({ columns: [table.runsRoot, table.gameId] })])
-
-/**
- * `manifest.json`, `report.json` and `victory.json`, verbatim.
- *
- * `victory.json` in particular may never be pre-decoded: `archive.ts#relayedJson`
- * is the only place in the port that guesses int-vs-float, it is reached only
- * through this document's `turn`/`year`, and those are copied out with no
- * validation at all. Store the bytes, re-run `decodeUtf8 → parseJson`, hand the
- * result to the same `archiveVictory`.
- */
-export const runDocuments = pgTable("run_documents", {
-  runsRoot: text("runs_root").notNull(),
-  gameId: text("game_id").notNull(),
-  kind: documentKind("kind").notNull(),
-  status: documentStatus("status").notNull(),
-  /** Class A: exactly what `read(2)` returned. */
-  bytes: bytea("bytes").notNull(),
+  seatIndex: integer("seat_index").notNull(),
+  seatId: text("seat_id"),
+  kind: seatKind("kind"),
+  /** Display/model name, e.g. "claude-code-claude-opus-5". */
+  label: text("label"),
   /**
-   * The fstat size — the `<= 0` / `> 8 MiB` gate, not `octet_length(bytes)`,
-   * and `bigint` because a document that *fails* the gate is still stored with
-   * the size that failed it.
+   * sha256 over the seat's identity config (id, type, model, instructions,
+   * base_url, options) — "the same agent setup" across games, the join key
+   * for cross-game win rates.
    */
-  byteSize: bigint("byte_size", { mode: "number" }).notNull(),
-  sha256: bytea("sha256").notNull()
+  fingerprint: text("fingerprint"),
+  metadata: jsonb("metadata")
+}, (table) => [primaryKey({ columns: [table.gameId, table.seatIndex] })])
+
+/** One row per recorded turn (replay.jsonl line). */
+export const turns = pgTable("turns", {
+  gameId: text("game_id").notNull()
+    .references(() => games.gameId, { onDelete: "cascade" }),
+  turn: integer("turn").notNull(),
+  year: integer("year")
+}, (table) => [primaryKey({ columns: [table.gameId, table.turn] })])
+
+/**
+ * The board at a given turn, joined 1:1 onto `turns`.
+ *
+ * The projection `board_from_autosave` derives (tile grid, units, cities) —
+ * structured data, filled at ingest from that turn's autosave while it exists
+ * on disk. With this table the database is self-sufficient for board
+ * scrubbing, frame regeneration, and replay; the raw savegames remain the
+ * lossless archive (disk today, object storage when hosted).
+ */
+export const boardState = pgTable("board_state", {
+  gameId: text("game_id").notNull(),
+  turn: integer("turn").notNull(),
+  board: jsonb("board").notNull()
 }, (table) => [
-  primaryKey({ columns: [table.runsRoot, table.gameId, table.kind] }),
+  primaryKey({ columns: [table.gameId, table.turn] }),
   foreignKey({
-    columns: [table.runsRoot, table.gameId],
-    foreignColumns: [runs.runsRoot, runs.gameId]
+    columns: [table.gameId, table.turn],
+    foreignColumns: [turns.gameId, turns.turn]
   }).onDelete("cascade")
 ])
 
 /**
- * The last 64 KiB of `replay.jsonl`, as a byte window.
- *
- * `makeLastReplayTurn` reads `[max(0, size - 65536), size)` and then splits on
- * newlines — so the window's first line is very often partial, and that partial
- * line is part of the contract. `byte_size` is the **whole** file's size, which
- * is what decides `size <= 0 → Option.none`.
+ * Per-agent, per-turn snapshot — the game's time series. Final standings are
+ * a query, not a table: player_turns at `games.last_replay_turn`.
  */
-export const runReplayTail = pgTable("run_replay_tail", {
-  runsRoot: text("runs_root").notNull(),
+export const playerTurns = pgTable("player_turns", {
   gameId: text("game_id").notNull(),
-  byteSize: bigint("byte_size", { mode: "number" }).notNull(),
-  tailBytes: bytea("tail_bytes").notNull(),
-  sha256: bytea("sha256").notNull()
+  turn: integer("turn").notNull(),
+  seatId: text("seat_id").notNull(),
+  playerId: integer("player_id"),
+  playerName: text("player_name"),
+  nation: text("nation"),
+  government: text("government"),
+  alive: boolean("alive"),
+  score: doublePrecision("score"),
+  cities: integer("cities"),
+  citizens: integer("citizens"),
+  population: bigint("population", { mode: "number" }),
+  units: integer("units"),
+  gold: doublePrecision("gold"),
+  culture: doublePrecision("culture"),
+  futureTechs: integer("future_techs"),
+  knownTechIds: jsonb("known_tech_ids"),
+  research: jsonb("research")
 }, (table) => [
-  primaryKey({ columns: [table.runsRoot, table.gameId] }),
+  primaryKey({ columns: [table.gameId, table.turn, table.seatId] }),
   foreignKey({
-    columns: [table.runsRoot, table.gameId],
-    foreignColumns: [runs.runsRoot, runs.gameId]
+    columns: [table.gameId, table.turn],
+    foreignColumns: [turns.gameId, turns.turn]
   }).onDelete("cascade")
 ])
 
-/**
- * `watch_frames/*.png`, one row per file.
- *
- * `name` is the listing key and preserves `archiveRegularFiles`' output;
- * `frame_index` is `decodeArchivePngName`'s result and is NULL when the name is
- * listable but not indexable, which keeps `selectFramePng` unchanged.
- */
-export const runFrames = pgTable("run_frames", {
-  runsRoot: text("runs_root").notNull(),
-  gameId: text("game_id").notNull(),
-  name: text("name").notNull(),
-  frameIndex: integer("frame_index"),
-  bytes: bytea("bytes").notNull(),
-  byteSize: bigint("byte_size", { mode: "number" }).notNull(),
-  sha256: bytea("sha256").notNull()
-}, (table) => [
-  primaryKey({ columns: [table.runsRoot, table.gameId, table.name] }),
-  foreignKey({
-    columns: [table.runsRoot, table.gameId],
-    foreignColumns: [runs.runsRoot, runs.gameId]
-  }).onDelete("cascade")
-])
+/** Per-seat agent performance for the whole run (from report.json). */
+export const agentStats = pgTable("agent_stats", {
+  gameId: text("game_id").notNull()
+    .references(() => games.gameId, { onDelete: "cascade" }),
+  seatId: text("seat_id").notNull(),
+  controllerFingerprint: text("controller_fingerprint"),
+  turns: integer("turns"),
+  decisions: integer("decisions"),
+  fallbacks: integer("fallbacks"),
+  inputTokens: bigint("input_tokens", { mode: "number" }),
+  outputTokens: bigint("output_tokens", { mode: "number" }),
+  meanLatencyMs: doublePrecision("mean_latency_ms")
+}, (table) => [primaryKey({ columns: [table.gameId, table.seatId] })])
 
-/** `game.mp4`, verbatim. */
-export const runVideos = pgTable("run_videos", {
-  runsRoot: text("runs_root").notNull(),
-  gameId: text("game_id").notNull(),
-  bytes: bytea("bytes").notNull(),
-  byteSize: bigint("byte_size", { mode: "number" }).notNull(),
-  sha256: bytea("sha256").notNull()
-}, (table) => [
-  primaryKey({ columns: [table.runsRoot, table.gameId] }),
-  foreignKey({
-    columns: [table.runsRoot, table.gameId],
-    foreignColumns: [runs.runsRoot, runs.gameId]
-  }).onDelete("cascade")
-])
-
-/**
- * `saves/*`, one row per file, materialised back to disk for the python bridge.
- *
- * An autosave is stored whole. A PPM is stored as its first `PPM_HEAD_BYTES`
- * (128 KiB by default), because no reader ever looks past its header — the
- * gateway stops at the first non-`#` line after index 0 within 513 lines, and
- * `save_replay._ppm_players` breaks at 64 KiB consumed. `byte_size` is always
- * the **true** on-disk size and `is_whole` says whether `head_bytes` is the
- * whole file, so a materialised PPM's deliberate shortness is never mistaken
- * for the real length.
- */
-export const runSaves = pgTable("run_saves", {
-  runsRoot: text("runs_root").notNull(),
-  gameId: text("game_id").notNull(),
-  name: text("name").notNull(),
-  kind: saveKind("kind").notNull(),
-  saveTurn: bigint("save_turn", { mode: "number" }),
-  byteSize: bigint("byte_size", { mode: "number" }).notNull(),
-  headBytes: bytea("head_bytes").notNull(),
-  isWhole: boolean("is_whole").notNull(),
-  sha256: bytea("sha256").notNull()
-}, (table) => [
-  primaryKey({ columns: [table.runsRoot, table.gameId, table.name] }),
-  foreignKey({
-    columns: [table.runsRoot, table.gameId],
-    foreignColumns: [runs.runsRoot, runs.gameId]
-  }).onDelete("cascade")
-])
-
-/**
- * The durable copy of `<cache_root>/<game_id>/<entry>`.
- *
- * `cache_key` is the resolved `--cache-root` string, so the pg cache namespace
- * and the fs cache namespace are the same namespace under two spellings. This
- * is a *cache*: a stale or missing row is only ever a performance loss, because
- * `save_replay._load_cache` revalidates every entry against the source's stat
- * signature. It is deliberately not scoped by `runs_root` and carries no
- * foreign key, matching how the on-disk cache is keyed.
- */
-export const derivationCache = pgTable("derivation_cache", {
-  cacheKey: text("cache_key").notNull(),
-  gameId: text("game_id").notNull(),
-  /** `turn-{turn:010d}-{sha256(name)[:12]}.json` or `events.json`. */
-  entryName: text("entry_name").notNull(),
-  bytes: bytea("bytes").notNull(),
-  byteSize: bigint("byte_size", { mode: "number" }).notNull(),
-  writtenAt: ingestedAt("written_at").notNull().defaultNow()
-}, (table) => [primaryKey({ columns: [table.cacheKey, table.gameId, table.entryName] })])
-
-/**
- * Where a run's saves were materialised for the python bridge, and what they
- * hashed to.
- *
- * The path is *stable* across requests on purpose: `save_replay._load_cache`
- * validates its entries against `st_dev`/`st_ino`/`st_size`/`mtime_ns`/`ctime_ns`
- * of the source save, so a fresh `mkdtemp` per request — or an unconditional
- * rewrite of an unchanged file — permanently disables the python-side cache.
- * `saves_hash` short-circuits reconciliation entirely when the save set has not
- * changed: one SELECT, zero `lstat`s.
- */
-export const derivationWorkdirs = pgTable("derivation_workdirs", {
-  runsRoot: text("runs_root").notNull(),
-  gameId: text("game_id").notNull(),
-  path: text("path").notNull(),
-  savesHash: bytea("saves_hash").notNull(),
-  materializedAt: ingestedAt("materialized_at").notNull().defaultNow()
-}, (table) => [primaryKey({ columns: [table.runsRoot, table.gameId] })])
-
-/**
- * Every table in the arena schema, in dependency order. Used by tests that walk
- * the schema rather than naming tables one at a time.
- */
+/** Every table, in dependency order, for schema-walking tests. */
 export const arenaTables = [
-  ingestSweeps,
-  runs,
-  runDocuments,
-  runReplayTail,
-  runFrames,
-  runVideos,
-  runSaves,
-  derivationCache,
-  derivationWorkdirs
+  games,
+  seats,
+  turns,
+  boardState,
+  playerTurns,
+  agentStats
 ] as const
