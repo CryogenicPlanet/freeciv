@@ -1,84 +1,80 @@
-/**
- * `withWideEvent` — exactly one event, on every way an effect can end.
- *
- * The four exits are not four variations on a theme. Success and typed failure
- * are the paths anyone writes a test for; **defect** and **interruption** are
- * the paths that decide whether a telemetry package is useful during an
- * incident, and they are the two that a `tap`-based implementation silently
- * misses. Each has its own test below, and each asserts the same two things:
- * one event, and the right `outcome` on it.
- */
-
-// `bun:test` bodies are promises, and every test is its own entry point: both
-// diagnostics below describe correct-but-unidiomatic shapes that a test file
-// cannot avoid. `strict-effect-provide` says so itself ("If this is an entry
-// point, you can safely disable this diagnostic").
 // oxlint-disable effecttsgo/async-function
 // oxlint-disable effecttsgo/strict-effect-provide
 import { describe, expect, test } from 'bun:test';
-import { Data, Deferred, Effect, Exit, Fiber, Layer, Option, TestClock, TestContext } from 'effect';
 import {
-  annotate,
-  annotateError,
-  type EvlogWideEvent,
-  TelemetryCapture,
-  withWideEvent,
-} from 'src/index';
-import { captureLayer, takeEvents } from 'test/support';
+  Data,
+  Deferred,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Logger,
+  TestClock,
+  TestContext,
+} from 'effect';
+import type { EvlogWideEvent } from 'src/evlog-adapter.ts';
+import { TelemetryWriteError } from 'src/evlog-adapter.ts';
+import { withWideEvent } from 'src/middleware.ts';
+import { Observability } from 'src/observability.ts';
+import { annotate } from 'src/wide-event.ts';
+import { captureLayer, summarize, takeEvents } from 'test/support';
 
 class TurnRefused extends Data.TaggedError('TurnRefused')<{
   readonly reason: string;
 }> {}
 
-/** Run `self` under a fresh capture layer and return the events it produced. */
-const eventsOf = <A, E>(self: Effect.Effect<A, E>): Promise<ReadonlyArray<EvlogWideEvent>> =>
-  Effect.exit(withWideEvent(self, 'unit.work'))
-    .pipe(
-      Effect.zipRight(takeEvents),
-      Effect.provide(captureLayer),
-      Effect.map((events) => events.map((event) => ({ ...event }))),
-      Effect.runPromise,
-    );
+const capturedExit = <A, E>(
+  self: Effect.Effect<A, E>,
+): Promise<{ readonly exit: Exit.Exit<A, E>; readonly events: ReadonlyArray<EvlogWideEvent> }> =>
+  Effect.gen(function* () {
+    const exit = yield* Effect.exit(withWideEvent(self, 'unit.work'));
+    const events = yield* takeEvents;
+    return { exit, events };
+  }).pipe(Effect.provide(captureLayer), Effect.runPromise);
 
 const only = (events: ReadonlyArray<EvlogWideEvent>): EvlogWideEvent => {
   expect(events).toHaveLength(1);
   return events[0]!;
 };
 
-describe('withWideEvent seals exactly once', () => {
-  test('success', async () => {
-    const event = only(await eventsOf(Effect.succeed(7)));
-    expect(event['event']).toBe('unit.work');
-    expect(event['outcome']).toBe('success');
-    expect(event['level']).toBe('info');
-    expect(event['error']).toBeUndefined();
-  });
-
-  test('typed failure', async () => {
-    const event = only(await eventsOf(Effect.fail(new TurnRefused({ reason: 'no legal move' }))));
-    expect(event['outcome']).toBe('failure');
-    expect(event['level']).toBe('error');
-    // `tapError` ran inside the FiberRef scope, so the ambient `annotateError`
-    // found the event — and the tag was mapped to a remedy on the way in.
-    // A `Data.TaggedError` has an empty `message`; its payload is its fields,
-    // and those are what land in the corpus.
-    expect(event['error']).toMatchObject({
-      code: 'TurnRefused',
-      message: 'TurnRefused',
-      internal: { tag: 'TurnRefused', registeredRemedy: false, fields: { reason: 'no legal move' } },
+describe('four exits', () => {
+  test('success emits once and preserves the value', async () => {
+    const self = Effect.succeed({ moves: 3 });
+    const result = await capturedExit(self);
+    expect(summarize(result.exit)).toEqual(summarize(await Effect.runPromiseExit(self)));
+    expect(only(result.events)).toMatchObject({
+      event: 'unit.work',
+      outcome: 'success',
+      level: 'info',
     });
   });
 
-  test('defect', async () => {
-    const event = only(await eventsOf(Effect.die(new RangeError('kaboom'))));
-    // No tap fires on a defect. This event exists only because the finalizer
-    // reads the Exit rather than trusting the taps.
-    expect(event['outcome']).toBe('defect');
-    expect(event['level']).toBe('error');
-    expect(event['error']).toMatchObject({ code: 'RangeError', message: 'kaboom' });
+  test('typed failure emits once and preserves the same error', async () => {
+    const refusal = new TurnRefused({ reason: 'no legal move' });
+    const self = Effect.fail(refusal);
+    const result = await capturedExit(self);
+    expect(summarize(result.exit)).toEqual(summarize(await Effect.runPromiseExit(self)));
+    expect(summarize(result.exit).failure).toEqual(summarize(await Effect.runPromiseExit(self)).failure);
+    expect(only(result.events)).toMatchObject({
+      outcome: 'failure',
+      level: 'error',
+      error: { code: 'TurnRefused', message: 'TurnRefused' },
+    });
   });
 
-  test('interruption', async () => {
+  test('defect emits once and stays a defect', async () => {
+    const defect = new RangeError('kaboom');
+    const self = Effect.die(defect);
+    const result = await capturedExit(self);
+    expect(summarize(result.exit)).toEqual(summarize(await Effect.runPromiseExit(self)));
+    expect(only(result.events)).toMatchObject({
+      outcome: 'defect',
+      level: 'error',
+      error: { code: 'RangeError', message: 'kaboom' },
+    });
+  });
+
+  test('interruption emits once and stays interruption', async () => {
     const program = Effect.gen(function* () {
       const started = yield* Deferred.make<void>();
       const fiber = yield* Effect.fork(
@@ -87,144 +83,136 @@ describe('withWideEvent seals exactly once', () => {
           'unit.work',
         ),
       );
-      // Wait for the body to actually be running: interrupting a fiber that has
-      // not started yet would prove nothing about the finalizer.
       yield* Deferred.await(started);
-      yield* Fiber.interrupt(fiber);
-      return yield* takeEvents;
+      const exit = yield* Fiber.interrupt(fiber);
+      const events = yield* takeEvents;
+      return { exit, events };
     });
-
-    const events = await Effect.runPromise(program.pipe(Effect.provide(captureLayer)));
-
-    expect(events).toHaveLength(1);
-    // Interruption is the case `Effect.ensuring`-style cleanup loses, because
-    // the cleanup is itself interrupted. `Effect.onExit` runs uninterruptibly.
-    expect(events[0]?.['outcome']).toBe('interrupt');
-    expect(events[0]?.['level']).toBe('info');
-  });
-
-  test('a second exit is impossible: the wrapped effect is entered once', async () => {
-    // Belt and braces on top of the seal — an effect that succeeds and is then
-    // interrupted while its finalizer runs still yields exactly one event.
-    const program = Effect.gen(function* () {
-      const fiber = yield* Effect.fork(withWideEvent(Effect.succeed('done'), 'unit.work'));
-      yield* Fiber.join(fiber);
-      yield* Fiber.interrupt(fiber);
-      return yield* takeEvents;
-    });
-    const events = await Effect.runPromise(program.pipe(Effect.provide(captureLayer)));
-    expect(events).toHaveLength(1);
+    const result = await Effect.runPromise(program.pipe(Effect.provide(captureLayer)));
+    expect(summarize(result.exit).interrupted).toBe(true);
+    expect(only(result.events)).toMatchObject({ outcome: 'interrupt', level: 'info' });
   });
 });
 
-describe('annotation', () => {
-  test('annotate reaches the event from inside the effect', async () => {
-    const event = only(
-      await eventsOf(annotate({ turn: 42, nation: 'Romans' }).pipe(Effect.as('ok'))),
+describe('annotation scope', () => {
+  test('ambient fields reach the event and reserved fields cannot be shadowed', async () => {
+    const result = await capturedExit(
+      annotate({
+        turn: 42,
+        event: 'imposter',
+        eventId: 'imposter',
+        durationMs: -1,
+        outcome: 'imposter',
+        service: 'imposter',
+        environment: 'imposter',
+      }),
     );
+    const event = only(result.events);
     expect(event['turn']).toBe(42);
-    expect(event['nation']).toBe('Romans');
-  });
-
-  test('annotate outside any event is a no-op, not a failure', () => {
-    // Instrumented code has to stay callable from uninstrumented callers.
-    expect(Exit.isSuccess(Effect.runSyncExit(annotate({ turn: 1 })))).toBe(true);
-    expect(Exit.isSuccess(Effect.runSyncExit(annotateError(new Error('nobody listening'))))).toBe(
-      true,
-    );
-  });
-
-  test('the wrapper\u2019s own keys cannot be shadowed by instrumentation', async () => {
-    // `event`, `eventId` and `durationMs` are written after the caller's fields;
-    // `outcome` is written by the finalizer, which runs after everything.
-    const event = only(
-      await eventsOf(
-        annotate({
-          event: 'imposter',
-          eventId: 'imposter',
-          durationMs: -1,
-          outcome: 'imposter',
-        }).pipe(Effect.as('ok')),
-      ),
-    );
     expect(event['event']).toBe('unit.work');
     expect(event['eventId']).not.toBe('imposter');
     expect(event['durationMs']).not.toBe(-1);
     expect(event['outcome']).toBe('success');
+    expect(event['service']).toBe('arena-telemetry-test');
+    expect(event['environment']).toBe('test');
   });
-});
 
-describe('fiber isolation', () => {
-  test('concurrent units of work get their own events', async () => {
-    // Each fiber annotates with only its own name; a shared event would show
-    // all three keys on one row.
+  test('outside a wide event annotate is a no-op', () => {
+    expect(Effect.runSyncExit(annotate({ turn: 1 }))).toEqual(Exit.succeed(undefined));
+  });
+
+  test('concurrent roots are isolated', async () => {
     const program = Effect.all(
-      [
-        withWideEvent(annotate({ who: 'alpha' }), 'alpha'),
-        withWideEvent(annotate({ who: 'beta' }), 'beta'),
-        withWideEvent(annotate({ who: 'gamma' }), 'gamma'),
-      ],
+      ['alpha', 'beta', 'gamma'].map((name) =>
+        withWideEvent(annotate({ who: name }), name),
+      ),
       { concurrency: 3 },
     ).pipe(Effect.zipRight(takeEvents));
-
     const events = await Effect.runPromise(program.pipe(Effect.provide(captureLayer)));
-
     expect(events).toHaveLength(3);
-    // `name/who` per event: a shared event would show up as one row with three
-    // `who` values fighting over the same key.
-    const pairs = events.map((event) => `${String(event['event'])}/${String(event['who'])}`).toSorted();
-    expect(pairs).toEqual(['alpha/alpha', 'beta/beta', 'gamma/gamma']);
+    expect(
+      events
+        .map((event) => `${String(event['event'])}/${String(event['who'])}`)
+        .toSorted(),
+    ).toEqual(['alpha/alpha', 'beta/beta', 'gamma/gamma']);
   });
 
-  test('a forked child annotates its parent unit of work', async () => {
-    // The FiberRef's default fork behaviour copies the value to children, which
-    // is what makes `Effect.forEach(..., { concurrency })` inside a unit of work
-    // still describe that unit.
-    const event = only(
-      await eventsOf(
-        Effect.forEach([1, 2, 3], (n) => annotate({ [`child${n}`]: n }), { concurrency: 3 }),
+  test('forked children inherit their parent event', async () => {
+    const result = await capturedExit(
+      Effect.forEach(
+        [1, 2, 3],
+        (number) => annotate({ [`child${String(number)}`]: number }),
+        { concurrency: 3 },
       ),
     );
-    expect(event['child1']).toBe(1);
-    expect(event['child2']).toBe(2);
-    expect(event['child3']).toBe(3);
+    expect(only(result.events)).toMatchObject({ child1: 1, child2: 2, child3: 3 });
   });
-});
 
-describe('duration', () => {
-  test('durationMs is measured on the Clock, so TestClock controls it', async () => {
+  test('duration uses the Effect Clock', async () => {
     const program = Effect.gen(function* () {
       const fiber = yield* Effect.fork(withWideEvent(Effect.sleep('5 seconds'), 'slow.work'));
       yield* TestClock.adjust('5 seconds');
       yield* Fiber.join(fiber);
       return yield* takeEvents;
     });
-
     const events = await Effect.runPromise(
       program.pipe(Effect.provide(Layer.merge(captureLayer, TestContext.TestContext))),
     );
-
-    expect(events).toHaveLength(1);
-    // Exactly 5000, not "about 5000": nothing here reads a wall clock.
-    expect(events[0]?.['durationMs']).toBe(5000);
+    expect(only(events)['durationMs']).toBe(5000);
   });
-});
 
-describe('capture accessor', () => {
-  test('takeEvents drains, so one test cannot see another test’s events', async () => {
+  test('capture drains between assertions', async () => {
     const program = Effect.gen(function* () {
       yield* withWideEvent(Effect.void, 'first');
       const first = yield* takeEvents;
-      const second = yield* takeEvents;
-      yield* withWideEvent(Effect.void, 'third');
-      const third = yield* Effect.flatMap(TelemetryCapture, (capture) => capture.peekEvents);
-      return { first, second, third };
+      const empty = yield* takeEvents;
+      return { first, empty };
     });
-
     const result = await Effect.runPromise(program.pipe(Effect.provide(captureLayer)));
     expect(result.first).toHaveLength(1);
-    expect(result.second).toHaveLength(0);
-    expect(result.third).toHaveLength(1);
-    expect(Option.fromNullable(result.third[0]?.['event'])).toEqual(Option.some('third'));
+    expect(result.empty).toHaveLength(0);
+  });
+});
+
+const ObservabilityBroken = Layer.succeed(Observability, {
+  record: () =>
+    Effect.fail(new TelemetryWriteError({ dir: '/full', events: 1, cause: 'ENOSPC' })),
+});
+
+const ObservabilityRabid = Layer.succeed(Observability, {
+  record: () => Effect.die(new Error('backend defect')),
+});
+
+const runWithWarnings = async (
+  backend: Layer.Layer<Observability>,
+): Promise<{ readonly exit: Exit.Exit<string>; readonly lines: ReadonlyArray<string> }> => {
+  const lines: Array<string> = [];
+  const logger = Logger.make<unknown, void>(({ message, annotations }) => {
+    lines.push(`${String(message)} ${JSON.stringify(Object.fromEntries(annotations))}`);
+  });
+  const exit = await Effect.runPromiseExit(
+    withWideEvent(Effect.succeed('unchanged'), 'unit.work').pipe(
+      Effect.provide(
+        Layer.merge(backend, Logger.replace(Logger.defaultLogger, logger)),
+      ),
+    ),
+  );
+  return { exit, lines };
+};
+
+describe('backend failures', () => {
+  test('typed failure is swallowed and reported once', async () => {
+    const result = await runWithWarnings(ObservabilityBroken);
+    expect(result.exit).toEqual(Exit.succeed('unchanged'));
+    expect(result.lines).toHaveLength(1);
+    expect(result.lines[0]).toContain('dropped a wide event');
+    expect(result.lines[0]).toContain('TelemetryWriteError');
+    expect(result.lines[0]).toContain('unit.work');
+  });
+
+  test('backend defect is swallowed and reported once', async () => {
+    const result = await runWithWarnings(ObservabilityRabid);
+    expect(result.exit).toEqual(Exit.succeed('unchanged'));
+    expect(result.lines).toHaveLength(1);
   });
 });
