@@ -48,13 +48,13 @@ const importsSymbol = (module: Module, symbol: string): boolean =>
  * The point of the list is that it is short and that each entry names a
  * *success* shape or the socket edge.  Nothing on it builds an error body.
  */
-const RESPONSE_BUILDERS: Readonly<Record<string, string>> = {
+const RESPONSE_BUILDERS = {
   'http/respond.ts': 'THE renderer: the only module that turns a failure into bytes',
   'http/json.ts': 'the two success serializers, `_json` and `_bounded_json`',
   'server.ts': "the pre-router stdlib 501, which is the socket edge and not a route",
   'http/routes/archive.ts': 'the proxied stream and the local file — success shapes',
   'http/routes/replay.ts': 'the relayed upstream 2xx — a success shape',
-};
+} satisfies Readonly<Record<string, string>>;
 
 /**
  * Statuses a *route* may never write.  `respond.ts` owns every one of them.

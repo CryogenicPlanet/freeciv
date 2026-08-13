@@ -1,6 +1,7 @@
 /** Live CPython-vs-TypeScript process parity over raw HTTP and shared fixtures. */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { Gateway } from '@arena/wire';
+import { Gateway, isJsonObject, type JsonObject } from '@arena/wire';
+import { Predicate } from 'effect';
 import {
   existsSync,
   mkdirSync,
@@ -60,15 +61,15 @@ const FRAME_ZERO = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0
 const VIDEO = encoder.encode('archive-video');
 const SECRET = '{"owner_token":"must-not-leak"}';
 
-const readFixture = (kind: string, name: string): Record<string, unknown> => {
+const readFixture = (kind: string, name: string): JsonObject => {
   const parsed: unknown = JSON.parse(readFileSync(join(FIXTURES, kind, `${name}.json`), 'utf8'));
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+  if (!isJsonObject(parsed)) {
     throw new Error(`fixture ${kind}/${name}.json is not a JSON object`);
   }
   return { ...parsed };
 };
 
-const writeJson = (path: string, value: unknown): void =>
+const writeJson = <Value>(path: string, value: Value): void =>
   writeFileSync(path, `${JSON.stringify(value)}\n`, 'utf8');
 
 interface RunSpec {
@@ -90,14 +91,12 @@ const writeRun = (root: string, spec: RunSpec): void => {
   });
   const report = readFixture('report', 'completed-two-seats-full-score');
   const manifest = report['manifest'];
+  const reportManifest = isJsonObject(manifest)
+    ? { ...manifest, game_id: spec.id }
+    : { game_id: spec.id };
   writeJson(join(directory, 'report.json'), {
     ...report,
-    manifest: {
-      ...(typeof manifest === 'object' && manifest !== null && !Array.isArray(manifest)
-        ? manifest
-        : {}),
-      game_id: spec.id,
-    },
+    manifest: reportManifest,
   });
   // A secret in the run directory: nothing this file requests may echo it.
   writeFileSync(join(directory, 'auth.json'), SECRET, 'utf8');
@@ -251,6 +250,12 @@ const request = (origin: string, spec: RawRequest): Promise<RawResponse> => {
 // The recording stub upstream
 // ---------------------------------------------------------------------------
 
+interface StubSeen {
+  readonly targets: string[];
+  readonly accepts: string[];
+  headers: string[];
+}
+
 interface Stub {
   readonly origin: string;
   /** Every forwarded `pathname + search`, in arrival order. */
@@ -263,7 +268,7 @@ interface Stub {
 }
 
 const startStub = (): Stub => {
-  const seen = { targets: [] as string[], accepts: [] as string[], headers: [] as string[] };
+  const seen: StubSeen = { targets: [], accepts: [], headers: [] };
   const json = (body: string, status = 200, extra: Record<string, string> = {}): Response =>
     new Response(body, { status, headers: { 'content-type': 'application/json', ...extra } });
 
@@ -335,7 +340,7 @@ interface Gw {
   readonly pid: number;
   readonly url: string;
   readonly readyFile: string;
-  readonly readyRecord: Readonly<Record<string, unknown>>;
+  readonly readyRecord: JsonObject;
   /** Everything the process printed on stdout, read after it exits. */
   readonly stdout: () => Promise<string>;
   readonly stderr: () => Promise<string>;
@@ -343,24 +348,22 @@ interface Gw {
 
 const READY_TIMEOUT_MS = 40_000;
 
-const readReady = (path: string): Readonly<Record<string, unknown>> | null => {
+const readReady = (path: string): JsonObject | null => {
   if (!existsSync(path)) return null;
   const text = readFileSync(path, 'utf8');
   if (text.trim() === '') return null;
   const parsed: unknown = JSON.parse(text);
-  return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
-    ? (parsed as Record<string, unknown>)
-    : null;
+  return isJsonObject(parsed) ? parsed : null;
 };
 
 const awaitReady = async (
   child: Bun.Subprocess,
   path: string,
-): Promise<Readonly<Record<string, unknown>>> => {
+): Promise<JsonObject> => {
   const deadline = Date.now() + READY_TIMEOUT_MS;
-  const poll = async (): Promise<Readonly<Record<string, unknown>>> => {
+  const poll = async (): Promise<JsonObject> => {
     const record = readReady(path);
-    if (record !== null && typeof record['url'] === 'string') return record;
+    if (record !== null && Predicate.isString(record['url'])) return record;
     if (child.exitCode !== null) {
       throw new Error(`gateway exited ${String(child.exitCode)} before publishing ${path}`);
     }
@@ -428,7 +431,7 @@ const spawnGateway = async (
   spawned.push(child);
   const record = await awaitReady(child, readyFile);
   const url = record['url'];
-  if (typeof url !== 'string') throw new Error(`ready record has no url: ${readyFile}`);
+  if (!Predicate.isString(url)) throw new Error(`ready record has no url: ${readyFile}`);
   return {
     kind,
     process: child,
@@ -436,9 +439,9 @@ const spawnGateway = async (
     url,
     readyFile,
     readyRecord: record,
-    // `Bun.Subprocess`'s streams are typed as a union over every `stdio`
-    // option; `'pipe'` is the one asked for above, and it is a stream.
+    // SAFETY: this spawn fixes stdout to `'pipe'`, so Bun returns a stream.
     stdout: () => new Response(child.stdout as ReadableStream<Uint8Array>).text(),
+    // SAFETY: this spawn fixes stderr to `'pipe'`, so Bun returns a stream.
     stderr: () => new Response(child.stderr as ReadableStream<Uint8Array>).text(),
   };
 };
@@ -573,8 +576,11 @@ const PROCESS_SCOPED_HEALTH_FIELDS = ['cache_root', 'identity', 'pid', 'port', '
 const ORIGIN_PLACEHOLDER = 'http://gateway.invalid';
 
 /** A `/health` body as a field map — the one place a body is read structurally. */
-const healthFields = (body: Buffer): Record<string, unknown> =>
-  JSON.parse(body.toString('utf8')) as Record<string, unknown>;
+const healthFields = (body: Buffer): JsonObject => {
+  const parsed: unknown = JSON.parse(body.toString('utf8'));
+  if (!isJsonObject(parsed)) throw new Error('health response is not a JSON object');
+  return parsed;
+};
 
 /** Rewrite a gateway's own origin out of a body so the two are comparable. */
 const normalize = (body: Buffer, origin: string): string =>
@@ -675,7 +681,13 @@ interface Rig {
   readonly stubHeadersSeen: ReadonlyArray<string>;
 }
 
-const state: { rig: Rig | null; roots: string[]; stub: Stub | null } = {
+interface SmokeState {
+  rig: Rig | null;
+  roots: string[];
+  stub: Stub | null;
+}
+
+const state: SmokeState = {
   rig: null,
   roots: [],
   stub: null,
@@ -764,7 +776,12 @@ afterAll(async () => {
 
 // ---------------------------------------------------------------------------
 
-const problem = (name: Gateway.GatewayProblemName): { status: number; body: string } => {
+interface ExpectedProblem {
+  readonly status: number;
+  readonly body: string;
+}
+
+const problem = (name: Gateway.GatewayProblemName): ExpectedProblem => {
   const message = Gateway.GATEWAY_PROBLEM_MESSAGES[name];
   return {
     status: Gateway.GATEWAY_PROBLEM_STATUS[message],
@@ -811,7 +828,8 @@ describe.skipIf(!DARWIN)('live smoke parity', () => {
           expect(gateway.readyRecord['kind']).toBe('freeciv-replay-gateway');
           expect(gateway.readyRecord['schema_version']).toBe(1);
           expect(gateway.readyRecord['pid']).toBe(gateway.pid);
-          expect(String(gateway.readyRecord['identity'])).toMatch(/^[0-9a-f]{20}$/);
+          const identity = gateway.readyRecord['identity'];
+          expect(Predicate.isString(identity) ? identity : '').toMatch(/^[0-9a-f]{20}$/);
         });
       });
     });
@@ -963,8 +981,9 @@ describe.skipIf(!DARWIN)('live smoke parity', () => {
   describe('the disk-fallback matrix, offline', () => {
     test('the games index relabels the orphaned run as interrupted, identically', () => {
       const result = row('offline', 'games-index');
+      // SAFETY: the compared successful games-index response owns this documented body shape.
       const parsed = JSON.parse(result.py.body.toString('utf8')) as {
-        games: ReadonlyArray<Record<string, unknown>>;
+        games: ReadonlyArray<JsonObject>;
       };
       const live = parsed.games.find((game) => game['game_id'] === LIVE);
       expect(live?.['state']).toBe('interrupted');

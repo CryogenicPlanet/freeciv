@@ -12,7 +12,7 @@ import {
   type JsonObject,
   type JsonValue,
 } from '@arena/wire';
-import { Effect, Either, Layer, Option } from 'effect';
+import { Predicate, Effect, Either, Layer, Option } from 'effect';
 import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -71,7 +71,7 @@ const readFixture = (kind: string, name: string): JsonObject => {
   return document.right;
 };
 
-const writeJson = (path: string, value: unknown): void => {
+const writeJson = <Value>(path: string, value: Value): void => {
   writeFileSync(path, `${JSON.stringify(value)}\n`, 'utf8');
 };
 
@@ -92,9 +92,12 @@ const writeRun = (root: string, spec: RunSpec): void => {
   if (spec.report !== undefined) {
     const report = readFixture('report', spec.report);
     const manifest = report['manifest'];
+    const reportManifest = isJsonObject(manifest)
+      ? { ...manifest, game_id: spec.id }
+      : { game_id: spec.id };
     writeJson(join(directory, 'report.json'), {
       ...report,
-      manifest: { ...(isJsonObject(manifest) ? manifest : {}), game_id: spec.id },
+      manifest: reportManifest,
     });
   }
   if (spec.replay !== undefined) {
@@ -197,7 +200,11 @@ const portlessUpstream = (): Upstream =>
 const refusedUpstream = (): Upstream =>
   scriptedUpstream(() => Promise.reject(new Error('connect ECONNREFUSED')));
 
-const runsRootRef: { current: string } = { current: '' };
+interface RunsRootRef {
+  current: string;
+}
+
+const runsRootRef: RunsRootRef = { current: '' };
 
 const layersFor = (
   upstream: Upstream,
@@ -430,7 +437,7 @@ describe('/v1/games', () => {
     expect(field(running, 'current_turn')).toBe(44);
     expect(field(field(running, 'outcome'), 'status')).toBe('interrupted');
     const summary = field(field(running, 'outcome'), 'summary');
-    expect(typeof summary === 'string' && summary.includes('turn 44')).toBe(true);
+    expect(Predicate.isString(summary) && summary.includes('turn 44')).toBe(true);
 
     // A husk with no recorded turn stays hidden.
     expect(rowFor(payload, HUSK)).toBeUndefined();
@@ -709,7 +716,7 @@ const askOracle = (): OracleBodies => {
   }
   const read = (key: string): string => {
     const value = document[key];
-    if (typeof value !== 'string') throw new Error(`oracle is missing ${key}`);
+    if (!Predicate.isString(value)) throw new Error(`oracle is missing ${key}`);
     return value;
   };
   return {

@@ -45,10 +45,12 @@ const REPO_ROOT = resolve(import.meta.dir, '../../../..');
  * in a closure rather than a module-level array so nothing else can reach the
  * list and so the only writes this suite makes are provably inside it.
  */
-const scratch = ((): {
+interface ScratchDirectories {
   readonly directory: (label: string) => string;
   readonly cleanup: () => void;
-} => {
+}
+
+const scratch = ((): ScratchDirectories => {
   const paths: Array<string> = [];
   return {
     directory: (label) => {
@@ -355,13 +357,15 @@ const transportRequest = (places: DerivationRequest['places'] = []): DerivationR
   turn: 1,
 });
 
-const transportOptions = (python: string, timeout?: Duration.DurationInput) => ({
-  repoRoot: REPO_ROOT,
-  runsRoot: '/runs',
-  cacheRoot: '/cache',
-  python,
-  ...(timeout === undefined ? {} : { timeout }),
-});
+const transportOptions = (python: string, timeout?: Duration.DurationInput) => {
+  const base = {
+    repoRoot: REPO_ROOT,
+    runsRoot: '/runs',
+    cacheRoot: '/cache',
+    python,
+  };
+  return timeout === undefined ? base : { ...base, timeout };
+};
 
 const executableFixture = (source: string): string => {
   const directory = scratchDirectory('transport');
@@ -443,7 +447,12 @@ interface RunFixture {
  * must run in a clean checkout rather than depending on a developer's ignored
  * `.agent-eval/runs` directory.
  */
-const makeCommittedRun = (): { readonly fixture: RunFixture; readonly runsRoot: string } => {
+interface CommittedRun {
+  readonly fixture: RunFixture;
+  readonly runsRoot: string;
+}
+
+const makeCommittedRun = (): CommittedRun => {
   const runsRoot = scratchDirectory('committed-run');
   const saves = join(runsRoot, FIXTURE_GAME_ID, 'saves');
   mkdirSync(saves, { recursive: true });

@@ -1,6 +1,6 @@
 /** Bounded upstream transport, relay, timeout, Portless, header, and scope coverage. */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { Chunk, Duration, Effect, Fiber, Option, Stream, TestClock, TestContext } from 'effect';
+import { Chunk, Duration, Effect, Fiber, Option, Predicate, Stream, TestClock, TestContext } from 'effect';
 import {
   MAX_PROXY_ERROR_BYTES,
   MAX_PROXY_JSON_BYTES,
@@ -43,6 +43,19 @@ interface Stub {
   readonly stop: () => void;
 }
 
+interface StubCounters {
+  readonly pulled: Record<string, number>;
+  readonly cancels: Record<string, number>;
+}
+
+interface StubState {
+  current: Stub | null;
+}
+
+interface ResponseHandlers {
+  readonly [path: string]: () => Response;
+}
+
 /**
  * A body produced chunk by chunk, counting how many chunks the client actually
  * pulled and whether it walked away.  That count is the evidence for "drained
@@ -53,7 +66,7 @@ const countedBody = (
   chunk: Uint8Array,
   chunkCount: number,
   delayMs: number,
-  counters: { pulled: Record<string, number>; cancels: Record<string, number> },
+  counters: StubCounters,
 ): ReadableStream<Uint8Array> => {
   const cursor = { sent: 0 };
   return new ReadableStream<Uint8Array>({
@@ -79,7 +92,7 @@ const countedBody = (
 
 const startStub = (): Stub => {
   const requests: Array<RecordedRequest> = [];
-  const counters: { pulled: Record<string, number>; cancels: Record<string, number> } = {
+  const counters: StubCounters = {
     pulled: {},
     cancels: {},
   };
@@ -90,7 +103,7 @@ const startStub = (): Stub => {
   // Deliberately not canonical JSON: byte parity means these exact bytes.
   const watchBody = encoder.encode('{"zeta":1,  "alpha":[2,3] ,"png_url":"http://up/x.png"}');
 
-  const handlers: Record<string, () => Response> = {
+  const handlers: ResponseHandlers = {
     '/watch.json': () =>
       new Response(watchBody, { headers: { 'content-type': 'application/json' } }),
 
@@ -221,7 +234,7 @@ const startStub = (): Stub => {
   };
 };
 
-const stub: { current: Stub | null } = { current: null };
+const stub: StubState = { current: null };
 const upstream = (): Stub => {
   const current = stub.current;
   if (current === null) throw new Error('stub upstream not started');
@@ -582,7 +595,7 @@ describe('the injected-transport layer', () => {
 
   test('layerLive provides the tag without an injected transport', () => {
     const layer = layerLive({ serviceUrl: 'http://upstream.test' });
-    expect(typeof layer).toBe('object');
+    expect(Predicate.isObject(layer)).toBe(true);
     expect(UpstreamClient.key).toBe('@arena/harness/gateway/UpstreamClient');
   });
 

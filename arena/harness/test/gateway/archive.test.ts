@@ -45,7 +45,7 @@ const canonical = (value: CanonValue): string =>
 const gameId = (value: string): GameId =>
   Either.getOrThrowWith(decodeGameId(value), (error) => new Error(String(error)));
 
-const record = (value: unknown): Untrusted => {
+const record = <Value>(value: Value): Untrusted => {
   if (!isUntrusted(value)) throw new Error('fixture is not an object');
   return value;
 };

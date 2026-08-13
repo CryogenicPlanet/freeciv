@@ -195,12 +195,12 @@ export type RouteDecision =
 export type ArchiveJsonView = 'status' | 'result' | 'watch' | 'frames';
 
 /** Archive-JSON route tag → the projection `_archive_json_route` selects. */
-export const ARCHIVE_JSON_VIEWS: { readonly [T in ArchiveJsonRoute['_tag']]: ArchiveJsonView } = {
+export const ARCHIVE_JSON_VIEWS = {
   ArchiveStatus: 'status',
   ArchiveResult: 'result',
   ArchiveWatch: 'watch',
   ArchiveFrames: 'frames',
-};
+} satisfies { readonly [T in ArchiveJsonRoute['_tag']]: ArchiveJsonView };
 
 // ---------------------------------------------------------------------------
 // Path normalization

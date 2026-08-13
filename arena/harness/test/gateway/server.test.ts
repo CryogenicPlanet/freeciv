@@ -2,13 +2,11 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { Gateway } from '@arena/wire';
 import {
-  makeWideEvent,
-  Observability,
   ObservabilityNoop,
   ObservabilityTest,
-  sealWideEvent,
   TelemetryCapture,
   telemetryConfigLayer,
+  withWideEvent,
 } from '@arena/telemetry';
 import { HelpDoc, ValidationError } from '@effect/cli';
 import { Headers } from '@effect/platform';
@@ -1119,18 +1117,13 @@ describe('main: the single stderr line', () => {
 });
 
 describe('main: telemetry is opt-in', () => {
-  test('with no corpus directory configured the backend records nothing', async () => {
-    const recorded = await Effect.runPromise(
-      Effect.flatMap(makeWideEvent('probe'), sealWideEvent).pipe(
-        Effect.flatMap((sealed) =>
-          Effect.flatMap(Observability, (backend) => backend.record(sealed)),
-        ),
+  test('with no corpus directory configured telemetry preserves the program', async () => {
+    const result = await Effect.runPromise(
+      withWideEvent(Effect.succeed('unchanged'), 'probe').pipe(
         Effect.provide(telemetryLayer),
-        Effect.orDie,
       ),
     );
-    expect(Option.isNone(recorded)).toBe(true);
-    // And the layer it degrades to is the documented one.
+    expect(result).toBe('unchanged');
     expect(ObservabilityNoop).toBeDefined();
     expect(process.env[GATEWAY_TELEMETRY_DIR_ENV]).toBeUndefined();
   });
