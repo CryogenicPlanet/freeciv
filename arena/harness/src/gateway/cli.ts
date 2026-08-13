@@ -77,12 +77,6 @@ export const DATABASE_URL_OPTION = 'database-url' as const;
 /** `--database-url`, as a user types it. */
 export const DATABASE_URL_FLAG = `--${DATABASE_URL_OPTION}` as const;
 
-/** `--materialize-root`'s flag name, without its dashes. */
-export const MATERIALIZE_ROOT_OPTION = 'materialize-root' as const;
-
-/** `--materialize-root`, as a user types it. */
-export const MATERIALIZE_ROOT_FLAG = `--${MATERIALIZE_ROOT_OPTION}` as const;
-
 /** The values `--backend` accepts; anything else is `@effect/cli`'s own error. */
 export const GATEWAY_BACKENDS = ['fs', 'postgres'] as const;
 
@@ -117,26 +111,19 @@ export const withoutPostgresMessage = (flag: string): string =>
 /** What a `--database-url` that no backend asked for is told. */
 export const DATABASE_URL_WITHOUT_POSTGRES: string = withoutPostgresMessage(DATABASE_URL_FLAG);
 
-/** What a `--materialize-root` that no backend asked for is told. */
-export const MATERIALIZE_ROOT_WITHOUT_POSTGRES: string =
-  withoutPostgresMessage(MATERIALIZE_ROOT_FLAG);
-
 /**
- * The three TypeScript-only flags, resolved into the one value
+ * The two TypeScript-only flags, resolved into the one value
  * {@link GatewayConfigInput.backend} carries.
  *
- * They are parsed as a group because they are one decision, and the rejections
- * are the point: a `--database-url` or a `--materialize-root` typed without
- * `--backend postgres` is a *silent* fallback to the filesystem otherwise — an
- * operator who believed they were serving from Postgres would get
- * correct-looking answers from the wrong storage.  `--materialize-root` is kept
- * unresolved here; `makeGatewayConfig` resolves it and refuses one that nests
- * with `--cache-root`, because that check needs the resolved cache root.
+ * They are parsed as a group because they are one decision, and the rejection
+ * is the point: a `--database-url` typed without `--backend postgres` is a
+ * *silent* fallback to the filesystem otherwise — an operator who believed they
+ * were serving from Postgres would get correct-looking answers from the wrong
+ * storage.
  */
 const selectBackend = (parsed: {
   readonly backend: GatewayBackendName;
   readonly databaseUrl: Option.Option<string>;
-  readonly materializeRoot: Option.Option<string>;
 }): Effect.Effect<PostgresBackendInput | undefined, ValidationError.ValidationError> =>
   parsed.backend === 'postgres'
     ? Option.match(parsed.databaseUrl, {
@@ -148,14 +135,11 @@ const selectBackend = (parsed: {
           Effect.succeed<PostgresBackendInput>({
             _tag: 'Postgres',
             databaseUrl: Redacted.make(url),
-            materializeRoot: Option.getOrUndefined(parsed.materializeRoot),
           }),
       })
     : Option.isSome(parsed.databaseUrl)
       ? Effect.fail(ValidationError.invalidValue(HelpDoc.p(DATABASE_URL_WITHOUT_POSTGRES)))
-      : Option.isSome(parsed.materializeRoot)
-        ? Effect.fail(ValidationError.invalidValue(HelpDoc.p(MATERIALIZE_ROOT_WITHOUT_POSTGRES)))
-        : Effect.succeed(undefined);
+      : Effect.succeed(undefined);
 
 /**
  * The nine flags of `_parser()`, in declaration order, plus the two
@@ -191,23 +175,24 @@ export const gatewayCliOptions = {
   /** `--viewer-public-url`, optional with no default — `None` (`:2184`). */
   viewerPublicUrl: Options.optional(Options.text('viewer-public-url')),
   /**
-   * `--backend fs|postgres`, `--database-url` and `--materialize-root`, as one
-   * field.
+   * `--backend fs|postgres` and `--database-url`, as one field.
    *
-   * They are parsed together because none is meaningful alone: they are one
-   * decision — which storage the repository reads, and where it stages the
-   * files the python bridge needs — and resolving it here means `main.ts`
-   * matches on a value that cannot be inconsistent, instead of re-deriving the
-   * rule from three loose fields.  `fs` (and the absent flags) resolve to
-   * `undefined`, so the record is unchanged for every caller that does not ask
-   * for Postgres.
+   * They are parsed together because neither is meaningful alone: they are one
+   * decision — which storage the repository reads — and resolving it here means
+   * `main.ts` matches on a value that cannot be inconsistent, instead of
+   * re-deriving the rule from two loose fields.  `fs` (and the absent flags)
+   * resolve to `undefined`, so the record is unchanged for every caller that
+   * does not ask for Postgres.
+   *
+   * *Where* the python bridge reads its files used to be part of this decision,
+   * as `--materialize-root`.  It is not a decision any more: both backends
+   * point the bridge at `--runs-root`.
    */
   backend: Options.all({
     backend: Options.choice(GATEWAY_BACKEND_OPTION, GATEWAY_BACKENDS).pipe(
       Options.withDefault(DEFAULT_GATEWAY_BACKEND),
     ),
     databaseUrl: Options.optional(Options.text(DATABASE_URL_OPTION)),
-    materializeRoot: Options.optional(Options.text(MATERIALIZE_ROOT_OPTION)),
   }).pipe(Options.mapEffect(selectBackend)),
 } as const;
 

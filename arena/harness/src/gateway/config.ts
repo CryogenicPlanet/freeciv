@@ -42,14 +42,6 @@ export const GATEWAY_CONFIG_MESSAGES = {
   portOutOfRange: 'gateway port must be in [0, 65535]',
   /** `Path.expanduser()` with no resolvable home (`pathlib`, not the gateway). */
   noHomeDirectory: 'Could not determine home directory.',
-  /**
-   * `--materialize-root` equals, contains or sits inside `--cache-root`.
-   *
-   * TypeScript-only, like the flag pair that can produce it: it is the
-   * construction-time form of `save_replay`'s own refusal, moved to the one
-   * exit-2 site so it cannot become a 503 on the first replay request.
-   */
-  materializeRootNestsCacheRoot: 'materialize root must be separate from the replay cache root',
 } as const;
 
 /** One of the construction-time failure texts. */
@@ -870,51 +862,24 @@ export const gatewayIdentity = (material: GatewayIdentityMaterial): string =>
 export interface PostgresBackend {
   readonly _tag: 'Postgres';
   readonly databaseUrl: Redacted.Redacted<string>;
-  /**
-   * `--materialize-root`, resolved, with `<cacheRoot>-saves` filled in.
-   *
-   * Always present once the configuration is validated: the python bridge
-   * needs real files, so a Postgres-backed gateway always has somewhere to put
-   * them, whether or not an operator named it.
-   */
-  readonly materializeRoot: string;
 }
 
 /**
- * {@link PostgresBackend} as the parser produces it, before resolution.
+ * {@link PostgresBackend} as the parser produces it.
  *
- * `materializeRoot` is the flag's text or `undefined`; {@link makeGatewayConfig}
- * is what turns it into a resolved path and what refuses one that nests with
- * the cache root.
- */
-export interface PostgresBackendInput {
-  readonly _tag: 'Postgres';
-  readonly databaseUrl: Redacted.Redacted<string>;
-  readonly materializeRoot: string | undefined;
-}
-
-/**
- * Does one path contain, equal or sit inside the other?
+ * The same shape, and deliberately so: **the backend carries no path**.  It
+ * used to carry `--materialize-root`, which {@link makeGatewayConfig} resolved
+ * and refused when it nested with `--cache-root`, so "as parsed" and "as
+ * validated" were genuinely two types.  A pg gateway now reads its savegames
+ * out of `<--runs-root>/<game-id>` like every other gateway, so there is
+ * nothing left to resolve and nothing left to refuse.
  *
- * `save_replay._cache_directory` raises `SaveReplayError("Replay cache must be
- * separate from game saves.")` for exactly this relation between the resolved
- * cache root and the saves directory — checked twice, before and after
- * `_safe_directory` — so a `--materialize-root` that nests with `--cache-root`
- * would surface as a 503 on the first replay request instead of as a refusal to
- * start.  `@arena/db`'s `Materialize.nestsWith` is the same predicate for
- * callers on the other side of the package boundary; `test/gateway/cli.test.ts`
- * asserts the two agree rather than trusting that they do.  It is duplicated
- * here, three lines of it, because importing `@arena/db` from this module would
- * put a database driver in the *filesystem* gateway's module graph.
+ * The alias is kept rather than collapsed because the two *roles* have not
+ * merged — `cli.ts` produces one and `GatewayConfigValues` consumes the other —
+ * and a future field that does need resolving should widen this type, not
+ * re-split it.
  */
-export const pathsNest = (left: string, right: string): boolean => {
-  const a = left.replace(/\/+$/, '');
-  const b = right.replace(/\/+$/, '');
-  return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
-};
-
-/** `<cacheRoot>-saves` — the sibling `--materialize-root` defaults to. */
-export const defaultMaterializeRoot = (cacheRoot: string): string => `${cacheRoot}-saves`;
+export type PostgresBackendInput = PostgresBackend;
 
 /**
  * Everything the gateway needs before it binds, resolved and validated.
@@ -983,35 +948,6 @@ const checkPort = (port: bigint): Either.Either<number, GatewayConfigError> =>
     ? Either.right(Number(port))
     : fail(GATEWAY_CONFIG_MESSAGES.portOutOfRange);
 
-/**
- * Resolve the backend's paths, or refuse the pair.
- *
- * Runs **last** in {@link makeGatewayConfig}, after every Python check, so that
- * a gateway invoked exactly as `local_stack.py` invokes one cannot reach a new
- * failure — and so that an argv that is wrong in two ways still reports the
- * error the Python would have reported first.
- */
-const resolveBackend = (
-  backend: PostgresBackendInput | undefined,
-  cacheRoot: string,
-  environment: PathEnvironment,
-): Effect.Effect<PostgresBackend | undefined, GatewayConfigError, FileSystem.FileSystem> =>
-  backend === undefined
-    ? Effect.succeed(undefined)
-    : Effect.gen(function* () {
-        const materializeRoot = yield* resolvePath(
-          backend.materializeRoot ?? defaultMaterializeRoot(cacheRoot),
-          environment,
-        );
-        return yield* pathsNest(materializeRoot, cacheRoot)
-          ? fail(GATEWAY_CONFIG_MESSAGES.materializeRootNestsCacheRoot)
-          : Either.right({
-              _tag: 'Postgres' as const,
-              databaseUrl: backend.databaseUrl,
-              materializeRoot,
-            });
-      });
-
 const checkTimeout = (seconds: number): Either.Either<number, GatewayConfigError> =>
   Number.isFinite(seconds) && seconds > 0
     ? Either.right(seconds)
@@ -1028,7 +964,9 @@ const checkTimeout = (seconds: number): Either.Either<number, GatewayConfigError
  * `--backend postgres`) is a parse-time `ValidationError` in `cli.ts`, and the
  * URL's shape is `@arena/db`'s to judge, at the one place that opens a
  * connection.  Adding a check here would put a *new* failure into the order
- * above, which is the one thing this function's contract forbids.
+ * above, which is the one thing this function's contract forbids — and the one
+ * check that used to live here, `--materialize-root` against `--cache-root`,
+ * is gone with the flag rather than relaxed.
  */
 export const makeGatewayConfig = (
   input: GatewayConfigInput,
@@ -1047,7 +985,7 @@ export const makeGatewayConfig = (
       onNone: () => Effect.succeedNone,
       onSome: (value) => Effect.asSome(normalizeServiceUrl(value)),
     });
-    const backend = yield* resolveBackend(input.backend, cacheRoot, environment);
+    const backend = input.backend;
     return {
       repoRoot,
       upstreamServiceUrl,

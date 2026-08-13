@@ -33,12 +33,22 @@
  * - `Client` — the live `@effect/sql-pg` layer, configured through a tag.
  * - `Pglite` — the hermetic in-process backend the tests run against.
  * - `Ingest` — the runs_root → Postgres sweep (idempotent, content-hash keyed).
+ *
+ * ## Two modules that used to be here, and why they are not
+ *
+ * `Materialize` and `DerivationCachePg` existed for one reason: a pg-backed
+ * gateway had no run directory, so saves and frames were rebuilt into a
+ * `--materialize-root` and the replay cache was mirrored into the database.
+ * Schema v2 stores no artifacts and no paths, and every backend resolves a run
+ * as `<--runs-root>/<game_id>` — so `TerminalArchive.runRoot` is a real
+ * directory again, `http/routes/archive.ts`'s three reach-arounds work
+ * unmodified, and the derivation cache goes back to the disk `cache_root` the
+ * filesystem gateway already uses. Both modules are deleted rather than
+ * emptied: a materializer that materializes nothing is a lock nobody takes.
  */
 
 export * as Client from "./client.ts"
-export * as DerivationCachePg from "./derivation-cache-pg.ts"
 export * as Ingest from "./ingest.ts"
-export * as Materialize from "./materialize.ts"
 export * as Migrate from "./migrate.ts"
 export * as Pglite from "./pglite.ts"
 export * as RunsRepositoryPg from "./runs-repository-pg.ts"

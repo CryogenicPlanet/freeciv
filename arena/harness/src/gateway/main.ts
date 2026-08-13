@@ -24,7 +24,6 @@ import {
   type GatewayConfigError,
   type GatewayConfigValues,
   type PostgresBackend,
-  defaultMaterializeRoot,
   gatewayConfigLayer,
 } from './config.ts';
 import { type GatewayServeError, runGatewayForever } from './server.ts';
@@ -190,25 +189,6 @@ export class DatabaseUnavailable extends Data.TaggedError('DatabaseUnavailable')
 }> {}
 
 /**
- * Where saves and archives are materialized for a Postgres-backed gateway.
- *
- * A **sibling** of the cache root, never a parent or a child:
- * `save_replay._cache_directory` raises `SaveReplayError("Replay cache must be
- * separate from game saves.")` when the resolved cache root equals, contains or
- * is contained by the saves directory, which would turn into a 503 on the first
- * replay request instead of a startup error.  `<cacheRoot>-saves` cannot nest
- * with `<cacheRoot>` for any string — the suffix is not a path separator — so
- * the default needs no check; `--materialize-root` overrides it, and *that* is
- * checked in `config.ts` at construction.
- *
- * Re-exported from `config.ts` rather than spelled twice: the value a caller
- * gets when they pass no `--materialize-root` and the value this module would
- * derive have to be the same string, and an alias is the only way to say so
- * that a compiler checks.
- */
-export const materializeRootFor: typeof defaultMaterializeRoot = defaultMaterializeRoot;
-
-/**
  * How many pooled connections one gateway may hold.
  *
  * `@arena/db`'s `databaseConfig` leaves this unset, which means the `pg`
@@ -261,10 +241,10 @@ export const describeRepositoryFailure = (operation: string, gameId: string, err
  * The failure's `cause`, when it has one.
  *
  * This is the discriminator the log line turns on, and it is the repository's
- * own: a 503 the *content* produced — a manifest that is not UTF-8, one that is
- * over 8 MiB, one that is not an object — is built with no `cause`, because
- * there is nothing behind it to name.  A 503 the *infrastructure* produced
- * carries the `SqlError` or the `MaterializeFailed` that caused it.  Only the
+ * own: a 503 the *content* produced — a manifest ingest recorded as `unusable`,
+ * because it was not UTF-8, was over 8 MiB, or was not an object — is built
+ * with no `cause`, because there is nothing behind it to name.  A 503 the
+ * *infrastructure* produced carries the `SqlError` that caused it.  Only the
  * second kind is a defect report; the first is an answer, and the parity
  * corpus contains a fixture that produces it on every run.
  */
@@ -276,11 +256,10 @@ const failureCause = (error: unknown): unknown =>
  *
  * One level deep on purpose, and it is the level that matters: the public text
  * of every one of these is `game manifest is unavailable`, and the `cause` is
- * what distinguishes a `SqlError` from a `MaterializeFailed` — which is the
- * difference between "the database is gone" and "two requests raced to build
- * the same working directory".  Rendering it with the same
- * {@link describeStartupError} the exit-2 site uses keeps the scalar-only,
- * no-stack, no-URL discipline in one function.
+ * what distinguishes a `SqlError` — "the database is gone", "the pool is
+ * cold", "a column was mistyped" — from a stored verdict the read path merely
+ * relayed.  Rendering it with the same {@link describeStartupError} the exit-2
+ * site uses keeps the scalar-only, no-stack, no-URL discipline in one function.
  */
 const failureLine = (operation: string, gameId: string, error: unknown, cause: unknown): string =>
   `${describeRepositoryFailure(operation, gameId, error)} (${describeStartupError(cause)})`;
@@ -310,28 +289,19 @@ const logged = <A, E, R>(
 /**
  * The Postgres repository, with every failing read reported on stderr.
  *
- * ## Logging only — the serialization lives in `@arena/db`
+ * ## Logging only — nothing here serializes, and nothing here should
  *
- * `terminalArchive` does not just query: it reconciles
- * `<materialize-root>/<game-id>` against the stored rows before answering,
- * because the python bridge needs real files.  That reconciliation is
- * *idempotent* but it is not *concurrent*, and two requests for one cold game
- * arriving together used to race — measured: a 24-way burst answered `200` **2**
- * times and `503` **22** times in round 0, then `200` 24/24 forever after.
+ * This decorator once held a per-game semaphore, because `terminalArchive`
+ * used to *reconcile a directory* — staging the archive's saves and frames out
+ * of `bytea` so the python bridge could read real files — and two requests for
+ * one cold game raced (measured: a 24-way burst answered `200` **2** times and
+ * `503` **22** times in round 0, then `200` 24/24 forever after).
  *
- * This decorator briefly held a per-game semaphore of its own to close that.
- * It no longer does, and not because the race went away: the lock moved down
- * into `@arena/db`'s materializer, which is the only object every caller shares.
- * The gateway-side lock could not cover the derivation bridge — that path
- * materializes the same directory through `ReplayDerivationPg`, never through
- * this interface — so a replay derivation and an archive read of one game still
- * raced past it.  Two locks in two places was also one lock too many to reason
- * about; `materialize.ts`'s docstring now carries the whole argument, including
- * why `replay_lock` nesting outside the per-game semaphore cannot cycle.
- *
- * Nothing here serializes, and nothing here should: `frameFile` and `videoFile`
- * answer out of `bytea` and touch no directory at all, so the lock this
- * decorator used to take around them was only ever a queue on a `SELECT`.
+ * There is no directory to reconcile any more.  A `TerminalArchive.runRoot` is
+ * `<--runs-root>/<game-id>` in *both* backends, so the binaries were never
+ * moved and never have to be put back: `frameFile` and `videoFile` are pure
+ * disk reads, and the database contributes the two documents and the replay
+ * tail.  A lock over that would only be a queue on a `SELECT`.
  *
  * ## The logging
  *
@@ -352,52 +322,72 @@ export const withFailureLog = (repository: RunsRepositoryApi): RunsRepositoryApi
 });
 
 /**
+ * The derivation bridge, built the same way for every backend.
+ *
+ * Spelled once and called twice so that "the pg arm uses the *same* bridge as
+ * the fs arm" is a property the compiler keeps rather than a claim two call
+ * sites happen to satisfy.  It is replaced, not rewired, when the savegame
+ * parsers are ported.
+ */
+const derivationServices = (config: GatewayConfigValues): Layer.Layer<ReplayDerivation> =>
+  ReplayDerivationPython({
+    repoRoot: config.repoRoot,
+    runsRoot: config.runsRoot,
+    cacheRoot: config.cacheRoot,
+  });
+
+/**
  * The archive services, out of Postgres.
  *
- * Both layers come from `@arena/db` and both are given the same database: one
- * {@link Client.DatabaseLive} under a `DatabaseConfig` built from the redacted
- * URL.  The two errors that stack can produce — an unusable URL and a refused
- * connection — become one {@link DatabaseUnavailable}, which is exit 2, because
- * a gateway that cannot reach its storage has nothing to serve.  Read failures
- * *after* startup are a different question and stay where the repository puts
- * them: a read of one named artifact answers 503, and the two index reads
- * answer empty, because that is what an unreadable `runs_root` does to the
- * filesystem backend.
+ * ## Only *one* of the two services changes
  *
- * ## One materializer, provided once
+ * `ReplayDerivation` is the **same layer, with the same arguments, as the
+ * filesystem arm builds** — one `python3 -m agent_eval.replay_derive_cli` per
+ * derivation, pointed at the real `--runs-root` and the real `--cache-root`.
+ * It used to be `ReplayDerivationPg`, which staged savegames out of `bytea`
+ * into a materialization root and mirrored the loaders' cache into a table,
+ * because a pg gateway had no run directory to give the bridge.  It has one
+ * now: `<--runs-root>/<game-id>`, resolved by the same `realpath`-with-fallback
+ * both backends use, because the savegames were never in the database — the
+ * frozen schema stores no artifacts and no paths, and the binaries are
+ * ephemeral and regenerable.
  *
- * `Materialize.layer` is handed to the *merge* rather than to either half, and
- * that placement is the fix for the cold-burst 503s: `Layer.provide` memoizes by
- * layer reference, so the repository and the derivation bridge receive the same
- * materializer — and therefore the same per-game lock — exactly as they already
- * receive the same connection pool from `DatabaseLive` below it.  Two
- * materializers over one root would be two lock tables, which is no lock at all,
- * and neither layer can build one for itself any more: both take it from the
- * tag, so the sharing is checked by the compiler.  It is also the only place
- * `runsRoot` and `materializeRoot` are spelled — the repository scopes its rows
- * by the first and the bridge reads the second, both off the materializer.
+ * That is the whole of why `--materialize-root`, the materializer and the cache
+ * mirror are gone, and it makes the parity claim *stronger* rather than weaker:
+ * `TerminalArchive.runRoot` is now the same string on both TypeScript legs, so
+ * it stops being the one field the differential oracle has to exclude.
+ *
+ * ## What the database is still asked for
+ *
+ * {@link RunsRepository}, and only it: the two documents, the replay tail and
+ * the games index.  One {@link ArenaDb.Client.DatabaseLive} under a
+ * `DatabaseConfig` built from the redacted URL.  The two errors that stack can
+ * produce — an unusable URL and a refused connection — become one
+ * {@link DatabaseUnavailable}, which is exit 2, because a gateway that cannot
+ * reach its storage has nothing to serve.  Read failures *after* startup are a
+ * different question and stay where the repository puts them: a read of one
+ * named artifact answers 503, and the two index reads answer empty, because
+ * that is what an unreadable `runs_root` does to the filesystem backend.
+ *
+ * The `mapError` is scoped to the repository's own stack for the same reason
+ * the derivation layer is built outside it: the python bridge cannot fail to
+ * *construct*, and folding it into a `DatabaseUnavailable` conversion would
+ * claim otherwise.
  */
 const postgresArchiveServices = (
   config: GatewayConfigValues,
   backend: PostgresBackend,
   db: ArenaDb,
 ): Layer.Layer<GatewayArchiveServices, DatabaseUnavailable, FileSystem.FileSystem | Path.Path> => {
-  const materializeRoot = backend.materializeRoot;
   const target = Either.match(db.Client.describeTarget(backend.databaseUrl), {
     onLeft: () => UNUSABLE_DATABASE_URL,
     onRight: (reached) => `${reached.host}:${String(reached.port)}/${reached.database}`,
   });
-  return Layer.merge(
-    Layer.effect(
-      RunsRepository,
-      Effect.map(RunsRepository, withFailureLog),
-    ).pipe(Layer.provide(db.RunsRepositoryPg.layer)),
-    db.DerivationCachePg.ReplayDerivationPg({
-      repoRoot: config.repoRoot,
-      cacheRoot: config.cacheRoot,
-    }),
+  const repository = Layer.effect(
+    RunsRepository,
+    Effect.map(RunsRepository, withFailureLog),
   ).pipe(
-    Layer.provide(db.Materialize.layer({ runsRoot: config.runsRoot, materializeRoot })),
+    Layer.provide(db.RunsRepositoryPg.layer(config.runsRoot)),
     Layer.provide(db.Client.DatabaseLive),
     Layer.provide(
       db.Client.databaseConfigLayer({
@@ -417,6 +407,7 @@ const postgresArchiveServices = (
         }),
     ),
   );
+  return Layer.merge(repository, derivationServices(config));
 };
 
 /**
@@ -428,13 +419,13 @@ const postgresArchiveServices = (
  * layers it always built, and neither `@arena/db` nor a database driver is
  * loaded, resolved or reachable on the way there.
  *
- * `ReplayDerivationPython` is the interim bridge: one `python3 -m
+ * {@link derivationServices} is the interim bridge: one `python3 -m
  * agent_eval.replay_derive_cli` per derivation, which is what makes the two
  * gateways byte-comparable on `replay.json`/`board.json`/`events.json` — they
- * call the *same* loaders with the *same* cache discipline.  It is replaced,
- * not rewired, when the savegame parsers are ported.  The Postgres arm keeps
- * that bridge and moves only what it reads: `ReplayDerivationPg` materializes
- * the saves the loaders need and mirrors the cache they write.
+ * call the *same* loaders, over the *same* `--runs-root`, with the *same*
+ * cache discipline.  **Both arms build it identically**, which is why it is
+ * hoisted out of the branch: after `--materialize-root` died, the storage
+ * choice reaches exactly one of the two services.
  */
 export const archiveServices = (
   config: GatewayConfigValues,
@@ -445,14 +436,7 @@ export const archiveServices = (
 > => {
   const backend = config.backend;
   return backend === undefined
-    ? Layer.merge(
-        runsRepositoryLayer(config.runsRoot),
-        ReplayDerivationPython({
-          repoRoot: config.repoRoot,
-          runsRoot: config.runsRoot,
-          cacheRoot: config.cacheRoot,
-        }),
-      )
+    ? Layer.merge(runsRepositoryLayer(config.runsRoot), derivationServices(config))
     : Layer.unwrapEffect(
         Effect.map(loadArenaDb, (db) => postgresArchiveServices(config, backend, db)),
       );

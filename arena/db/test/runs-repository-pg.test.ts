@@ -2,35 +2,39 @@
  * The pg `RunsRepository`, differentially against the filesystem one.
  *
  * **The filesystem repository is the oracle.** Every assertion below runs
- * `makeRunsRepository(runs_root)` and `makeRunsRepositoryPg(db, …)` over the
- * *same* eight parity fixtures and compares the two answers. Nothing here
- * asserts that a `SELECT` returned the right rows — that is not the bar. The bar
- * is that a caller cannot tell the two repositories apart, because the gateway
- * above them is byte-compared against CPython and any difference here becomes a
- * difference there.
+ * `makeRunsRepository(runs_root)` and `makeRunsRepositoryPg(db, runs_root)` over
+ * the *same* eight parity fixtures and compares the two answers, method for
+ * method. Nothing here asserts that a `SELECT` returned the right rows — that is
+ * not the bar. The bar is that a caller cannot tell the two repositories apart,
+ * because the gateway above them is byte-compared against CPython and any
+ * difference here becomes a difference there.
  *
- * The corpus is `arena/harness/test/parity/fixtures/runs`, copied into a scratch
- * directory with `cp -R` so the symlinked run (`game_parity_symlink_07 →
- * game_parity_terminal_valid_01`) stays a symlink — it is the fixture that
- * proves the pg backend reproduces a containment refusal it cannot perform,
- * because the ingester never wrote a row for it. A `game.mp4` is added to the
- * one terminal fixture, because the corpus ships none and `videoFile`'s success
- * path would otherwise be untested on both sides.
+ * Two things changed from the v1 version of this file, and both make the
+ * comparison *stronger*:
  *
- * Four comparisons need a word:
+ * - **`TerminalArchive.runRoot` is no longer excluded.** v1 pointed a pg archive
+ *   at a materialized mirror, so one field had to be waived. v2 resolves
+ *   `<runs-root>/<game_id>` in both backends, so the archives are compared
+ *   whole.
+ * - **The lifted config columns are poisoned on purpose.** `name`, `ruleset`,
+ *   `mode`, `timing_mode`, `max_turns` and `objective` are written with values
+ *   that are *not* what `config` says (see {@link POISON}). They are write-only
+ *   query projections that have never been through `publicText`, and a pg-side
+ *   answer built from one would be silently, differently truncated. If any of
+ *   them ever reaches a response body, every payload comparison below fails
+ *   loudly instead of by two characters.
  *
- * - **Payloads are compared as canonical text.** `canonicalText(value, CANON_UTF8)`
- *   is the writer the gateway serves with, so comparing its output compares the
- *   response body rather than a structural equality that might tolerate a `1`
- *   where CPython wrote `1.0`.
- * - **Failures are compared as `tag:problem`.** Both repositories fail with the
- *   same `../errors.ts` classes, and that pair decides a status and a message —
- *   the whole observable content of a failure.
- * - **`TerminalArchive.runRoot` is excluded, and only it.** The pg archive points
- *   at the materialized directory (see `src/runs-repository-pg.ts`'s docstring);
- *   every other field, the `manifest` and `report` documents included, is equal.
- * - **Binaries are compared as bytes**, never as paths: the fs backend answers
- *   with a path into `runs_root` and the pg backend with bytes out of `bytea`.
+ * ## The ingest stand-in, and why it is here
+ *
+ * `src/ingest.ts`'s v2 rewrite is a separate work item; this file needs rows, so
+ * {@link storeRun} is a **minimal, deliberately dumb** implementation of the
+ * plan's §1.2 storage rules: the two document gates, the demotion table, the
+ * `extras` envelope and `_last_replay_turn`'s window. It writes no `seats`, no
+ * `turns`, no `player_turns` and no `board_state` — the repository reads none of
+ * them. When the real ingest lands, this function is deleted and the fixture
+ * calls it instead; what must **not** happen is that the real ingest quietly
+ * disagrees with it, so `describe("the storage rules the repository depends on")`
+ * pins the three rules a rewrite could get wrong and still look green.
  *
  * Nothing here touches a live Postgres. PGlite runs the same committed
  * migrations and the same drizzle statements, so what is asserted here is
@@ -38,64 +42,77 @@
  */
 
 import { BunContext } from "@effect/platform-bun"
-import { FileSystem } from "@effect/platform/FileSystem"
-import { Path } from "@effect/platform/Path"
 import * as PgDrizzle from "@effect/sql-drizzle/Pg"
-import { and, eq } from "drizzle-orm"
+import { eq } from "drizzle-orm"
 import * as Effect from "effect/Effect"
 import * as Either from "effect/Either"
 import * as Layer from "effect/Layer"
 import * as ManagedRuntime from "effect/ManagedRuntime"
 import * as Option from "effect/Option"
-import * as Ref from "effect/Ref"
 import { afterAll, describe, expect, it } from "bun:test"
-import { readFileSync, rmSync, statSync } from "node:fs"
+import { createHash } from "node:crypto"
+import {
+  closeSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readSync,
+  rmSync,
+  statSync
+} from "node:fs"
+import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 
-import { CANON_UTF8, type CanonValue, canonicalText, type FrameIndex, Gateway } from "@arena/wire"
+import {
+  CANON_UTF8,
+  type CanonValue,
+  canonicalText,
+  decodeJsonValueFromString,
+  type FrameIndex,
+  Gateway,
+  isGameId,
+  type JsonArray,
+  type JsonObject,
+  type JsonValue
+} from "@arena/wire"
 
-import { interruptedCandidates } from "../../harness/src/gateway/archive.ts"
+import { MAX_PROXY_JSON_BYTES } from "../../harness/src/gateway/constants.ts"
+import { untrustedField } from "../../harness/src/gateway/public.ts"
+import { parsePythonJson } from "../../harness/src/gateway/python-json.ts"
 import {
   type BinaryArtifact,
   isArchiveBytes,
   makeRunsRepository,
-  RunsRepository,
+  MANIFEST_FILE,
+  O_CLOEXEC,
+  O_NOFOLLOW,
+  O_RDONLY,
+  REPLAY_JSONL_FILE,
+  REPLAY_TAIL_BYTES,
+  REPORT_FILE,
   type RunsError,
   type RunsRepositoryApi,
   type TerminalArchive
 } from "../../harness/src/gateway/services/runs.ts"
 
-import {
-  type DerivationRequest,
-  pythonDerivationRunner,
-  ReplayDerivation
-} from "../../harness/src/gateway/services/derivation.ts"
-
-import { makeDerivationCacheMirror, ReplayDerivationPg } from "../src/derivation-cache-pg.ts"
-import * as Ingest from "../src/ingest.ts"
-import {
-  makeMaterializer,
-  Materializer,
-  nestsWith,
-  type RunArchiveMaterializer
-} from "../src/materialize.ts"
 import * as Migrate from "../src/migrate.ts"
 import * as Pglite from "../src/pglite.ts"
 import {
-  layer as runsRepositoryPgLayer,
+  type Database,
+  type GameDocumentRow,
   makeRunsRepositoryPg,
-  type RunsRepositoryPgApi
+  reconstructManifest,
+  reconstructReport
 } from "../src/runs-repository-pg.ts"
-import { derivationCache, derivationWorkdirs, runFrames, runs } from "../src/schema.ts"
+import { games, runState } from "../src/schema.ts"
 
 // ------------------------------------------------------------------ scratch --
 
 const fixturesRoot = fileURLToPath(
   new URL("../../harness/test/parity/fixtures/runs", import.meta.url)
 )
-
-/** The checkout the python bridge is spawned in — it needs `agent_eval/`. */
-const repoRoot = fileURLToPath(new URL("../../../", import.meta.url))
 
 /** Every id the corpus contains, including the one that is a symlink. */
 const FIXTURE_IDS = [
@@ -121,6 +138,9 @@ const EVERY_ID = [...FIXTURE_IDS, ...ABSENT_IDS]
 
 const TERMINAL_ID = "game_parity_terminal_valid_01"
 const NOWIN_ID = "game_parity_terminal_nowin_02"
+const INTERRUPTED_ID = "game_parity_interrupted_03"
+const HUSK_ID = "game_parity_lobby_husk_04"
+const WRONG_ID = "game_parity_wrong_id_06"
 
 /** A short but structurally real MP4 head, so `videoFile`'s success path exists. */
 const VIDEO_BYTES = new Uint8Array([
@@ -132,8 +152,6 @@ interface Scratch {
   /** The `mktemp -d` directory everything below lives in, removed in `afterAll`. */
   readonly base: string
   readonly runsRoot: string
-  readonly materializeRoot: string
-  readonly cacheRoot: string
 }
 
 /**
@@ -141,9 +159,7 @@ interface Scratch {
  *
  * `cp -R` rather than a recursive walk: it preserves the symlinked run, and a
  * hand-rolled copier that quietly dereferenced it would delete the one fixture
- * whose entire purpose is to be a symlink. Nothing outside this directory is
- * written, and `runs_root` itself is never modified — the corpus is copied, not
- * used in place.
+ * whose entire purpose is to be a symlink.
  */
 const makeScratch = async (): Promise<Scratch> => {
   const base = Bun.spawnSync(["mktemp", "-d", "/tmp/arena-pg-repo-XXXXXX"]).stdout.toString().trim()
@@ -151,20 +167,382 @@ const makeScratch = async (): Promise<Scratch> => {
   const copy = Bun.spawnSync(["cp", "-R", fixturesRoot, runsRoot])
   // The one throw in this file, and deliberate: a corpus that did not copy makes
   // every assertion below meaningless, and no value a fixture builder returns
-  // would be read by a later expectation as "the environment broke". The house
-  // rule's carve-out for a programmer/environment error, not a failure mode of
-  // the code under test.
+  // would be read by a later expectation as "the environment broke".
   if (copy.exitCode !== 0) {
     throw new Error(`cp -R failed: ${copy.stderr.toString()}`)
   }
   await Bun.write(`${runsRoot}/${TERMINAL_ID}/game.mp4`, VIDEO_BYTES)
-  return { base, runsRoot, materializeRoot: `${base}/cache-saves`, cacheRoot: `${base}/cache` }
+  return { base, runsRoot }
 }
+
+// ------------------------------------------------------- the ingest stand-in --
+
+const attempt = <A>(thunk: () => A): Option.Option<A> => Option.getRight(Either.try(thunk))
+
+const UTF8 = new TextDecoder("utf-8", { fatal: true })
+
+const decodeUtf8 = (bytes: Uint8Array): Option.Option<string> =>
+  Option.getRight(Either.try(() => UTF8.decode(bytes)))
+
+const parseJson = (text: string): Option.Option<JsonValue> =>
+  Option.getRight(decodeJsonValueFromString(text))
+
+// `Array.isArray` does not narrow a `ReadonlyArray` member out of a union in its
+// false branch; a declared guard does.
+const isJsonArray = (value: JsonValue): value is JsonArray => Array.isArray(value)
+
+const asJsonObject = (value: JsonValue): Option.Option<JsonObject> =>
+  value !== null && typeof value === "object" && !isJsonArray(value)
+    ? Option.some(value)
+    : Option.none()
+
+/** `read(2)` from `position` until `length` bytes are in hand or the file ends. */
+const readAt = (fd: number, position: number, length: number): Uint8Array => {
+  const buffer = new Uint8Array(length)
+  const step = (offset: number): number => {
+    if (offset >= length) {
+      return offset
+    }
+    const read = readSync(fd, buffer, offset, length - offset, position + offset)
+    return read <= 0 ? offset : step(offset + read)
+  }
+  return buffer.subarray(0, step(0))
+}
+
+/** `_read_archive_json`'s verdict (`:573`), plus the document when there is one. */
+interface StoredDocument {
+  readonly status: "ok" | "unusable" | "absent"
+  /** The **fstat** size that the gate saw; `0` when the open failed. */
+  readonly byteSize: number
+  readonly document: Option.Option<JsonObject>
+}
+
+const ABSENT: StoredDocument = { status: "absent", byteSize: 0, document: Option.none() }
+
+/**
+ * The two document gates, exactly as `services/runs.ts#readArchiveJson` applies
+ * them: `O_NOFOLLOW` (a symlinked `manifest.json` is *absent*, not followed),
+ * then regular / non-empty / at most 8 MiB / strict UTF-8 / a JSON **object**.
+ *
+ * A document Postgres cannot hold faithfully — a lone surrogate or a `U+0000`
+ * anywhere in it — is `unusable` by policy (see {@link storable}), which is a
+ * *declared* divergence from the fs backend and is pinned in
+ * `hunt-pg-divergence.test.ts`, not hidden here.
+ */
+const readDocument = (path: string): StoredDocument =>
+  Option.match(attempt(() => openSync(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)), {
+    onNone: () => ABSENT,
+    onSome: (fd) => {
+      const info = attempt(() => fstatSync(fd))
+      const document = Option.flatMap(info, (stat) =>
+        !stat.isFile() || stat.size <= 0 || stat.size > MAX_PROXY_JSON_BYTES
+          ? Option.none<JsonObject>()
+          : Option.flatMap(
+            Option.flatMap(attempt(() => readAt(fd, 0, stat.size)), decodeUtf8),
+            (text) =>
+              Option.filter(Option.flatMap(parseJson(text), asJsonObject), (value) =>
+                storable(value))
+          ))
+      Option.getOrElse(attempt(() => closeSync(fd)), () => undefined)
+      return {
+        status: Option.isSome(document) ? "ok" : "unusable",
+        byteSize: Option.match(info, { onNone: () => 0, onSome: (stat) => stat.size }),
+        document
+      }
+    }
+  })
+
+/** A lone surrogate: half a pair, which is valid JSON text and invalid jsonb. */
+const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
+
+const storableText = (value: string): boolean =>
+  !value.includes("\u0000") && !LONE_SURROGATE_RE.test(value)
+
+/**
+ * Whether Postgres can hold this document faithfully (measured, §7 of the plan).
+ *
+ * `jsonb` **errors** on a `U+0000` and on a lone surrogate, in a key or in a
+ * value, and `text` errors on the NUL byte. There is no bytes-shaped carrier in
+ * the frozen schema, and stripping the offending characters would silently
+ * change `resolved_places` and the derivation places digest — so the honest
+ * answer is to refuse the document at ingest and answer 503.
+ */
+const storable = (value: JsonValue): boolean => {
+  if (typeof value === "string") {
+    return storableText(value)
+  }
+  if (Array.isArray(value)) {
+    return value.every(storable)
+  }
+  if (value !== null && typeof value === "object") {
+    return Object.entries(value).every(([key, member]) => storableText(key) && storable(member))
+  }
+  return true
+}
+
+const INT32_MIN = -2147483648
+const INT32_MAX = 2147483647
+
+const int32Column = (value: unknown): number | null =>
+  typeof value === "number" && Number.isInteger(value) && value >= INT32_MIN && value <= INT32_MAX
+    ? value
+    : null
+
+/** `float8` holds every double except `-0`, which the parameter binding flattens. */
+const floatColumn = (value: unknown): number | null =>
+  typeof value === "number" && !Object.is(value, -0) ? value : null
+
+const boolColumn = (value: unknown): boolean | null =>
+  typeof value === "boolean" ? value : null
+
+/** The seven spellings `games.state` accepts, `'invalid'` among them. */
+type RunStateValue = (typeof runState.enumValues)[number]
+
+const RUN_STATES: ReadonlySet<string> = new Set<string>(runState.enumValues)
+
+const isRunState = (value: string): value is RunStateValue => RUN_STATES.has(value)
+
+/** Every manifest key with a typed column; everything else is `extras.manifest`. */
+const COLUMN_KEYS: ReadonlySet<string> = new Set([
+  "state",
+  "schema_version",
+  "created_at",
+  "started_at",
+  "finished_at",
+  "current_turn",
+  "benchmark_valid",
+  "config"
+])
+
+/**
+ * What the lifted config columns are written with.
+ *
+ * Not the config's values: they are a *query* projection that has never been
+ * through `publicText`, and the only way to prove no response body reads one is
+ * to make reading one visible. A pg answer that ever contains this string is a
+ * defect the diff spells out.
+ */
+const POISON = "!! lifted column, never served !!"
+
+/** The `games` row one run becomes, minus the bookkeeping columns. */
+interface StoredGame {
+  readonly state: RunStateValue
+  readonly schemaVersion: number | null
+  readonly createdAt: number | null
+  readonly startedAt: number | null
+  readonly finishedAt: number | null
+  readonly currentTurn: number | null
+  readonly benchmarkValid: boolean | null
+  readonly config: JsonValue | null
+  readonly extrasManifest: JsonObject
+}
+
+/**
+ * §1.2's partition: every key exactly once, in its column or in
+ * `extras.manifest`, and a key whose column cannot hold it losslessly is demoted
+ * whole and verbatim.
+ *
+ * `state` is the one key stored twice, and deliberately: the column is `NOT
+ * NULL` over an enum with an `'invalid'` sentinel, so it cannot distinguish *no
+ * `state` key* from a manifest that literally said `"invalid"` — and
+ * `manifestState`'s `untrustedFieldOr(manifest, 'state', 'status')` reads those
+ * two differently. The verbatim copy is what
+ * {@link reconstructManifest} prefers; the column stays for domain queries.
+ */
+const partitionManifest = (document: JsonObject): StoredGame => {
+  const has = (key: string): boolean => Object.hasOwn(document, key)
+  // A decoded JSON object holds no `undefined`, so the index signature's
+  // `undefined` is exactly "the key is absent" — and `has` is what distinguishes
+  // it from a present `null` everywhere it matters.
+  const at = (key: string): JsonValue => document[key] ?? null
+  const rawState = at("state")
+  const columns: ReadonlyArray<readonly [string, JsonValue | null]> = [
+    ["schema_version", int32Column(at("schema_version"))],
+    ["created_at", floatColumn(at("created_at"))],
+    ["started_at", floatColumn(at("started_at"))],
+    ["finished_at", floatColumn(at("finished_at"))],
+    ["current_turn", int32Column(at("current_turn"))],
+    ["benchmark_valid", boolColumn(at("benchmark_valid"))],
+    // jsonb holds any JSON value — object, array, string, number, bool — so the
+    // only demotion left for `config` is an explicit `null`, which a column
+    // cannot tell from an absent key. (A document jsonb could not hold at all
+    // never reaches here: it was `unusable`.)
+    ["config", has("config") && at("config") !== null ? at("config") : null]
+  ]
+  const column = (key: string): JsonValue | null =>
+    columns.find(([name]) => name === key)?.[1] ?? null
+  const numberColumn = (key: string): number | null => {
+    const value = column(key)
+    return typeof value === "number" ? value : null
+  }
+  return {
+    state: typeof rawState === "string" && isRunState(rawState) ? rawState : "invalid",
+    schemaVersion: numberColumn("schema_version"),
+    createdAt: numberColumn("created_at"),
+    startedAt: numberColumn("started_at"),
+    finishedAt: numberColumn("finished_at"),
+    currentTurn: numberColumn("current_turn"),
+    benchmarkValid: column("benchmark_valid") === null
+      ? null
+      : column("benchmark_valid") === true,
+    config: column("config"),
+    extrasManifest: Object.fromEntries<JsonValue>([
+      ...Object.entries(document).filter(([key]) => !COLUMN_KEYS.has(key)),
+      ...(has("state") ? [["state", rawState] as const] : []),
+      ...columns
+        .filter(([key, value]) => has(key) && value === null)
+        .map(([key]) => [key, at(key)] as const)
+    ])
+  }
+}
+
+/** `bytes.splitlines()` — `\n`, `\r` and `\r\n`, over the lossless Latin-1 map. */
+const splitLines = (bytes: Uint8Array): ReadonlyArray<string> =>
+  Array.from(bytes, (byte) => String.fromCharCode(byte)).join("").split(/\r\n|\n|\r/)
+
+const BLANK_LINE_RE = /^[ \t\v\f]*$/
+
+const latin1Bytes = (line: string): Uint8Array =>
+  Uint8Array.from(line, (character) => character.charCodeAt(0))
+
+/**
+ * `_last_replay_turn` (`:1178`) — the 64 KiB tail, backwards, stopping at the
+ * **first line that parses**. `parsePythonJson`, so `{"turn": 2.0}` is refused
+ * for being a float exactly as CPython's `isinstance(turn, int)` refuses it.
+ *
+ * Transcribed rather than delegated to the fs repository on purpose: reading the
+ * column's value *through the oracle* would make `lastReplayTurn`'s differential
+ * a tautology.
+ */
+const tailTurn = (path: string): Option.Option<bigint> =>
+  Option.match(attempt(() => openSync(path, O_RDONLY | O_CLOEXEC)), {
+    onNone: () => Option.none<bigint>(),
+    onSome: (fd) => {
+      const size = Option.match(attempt(() => fstatSync(fd).size), {
+        onNone: () => 0,
+        onSome: (value) => value
+      })
+      const start = Math.max(0, size - REPLAY_TAIL_BYTES)
+      const tail = size <= 0
+        ? new Uint8Array(0)
+        : Option.getOrElse(attempt(() => readAt(fd, start, size - start)), () => new Uint8Array(0))
+      Option.getOrElse(attempt(() => closeSync(fd)), () => undefined)
+      const parsed = splitLines(tail)
+        .filter((line) => !BLANK_LINE_RE.test(line))
+        .toReversed()
+        .map((line) =>
+          Option.flatMap(
+            decodeUtf8(latin1Bytes(line)),
+            (text) => Option.getRight(parsePythonJson(text))
+          )
+        )
+        .find(Option.isSome)
+      if (parsed === undefined) {
+        return Option.none<bigint>()
+      }
+      const turn = untrustedField(parsed.value, "turn")
+      return typeof turn === "bigint" && turn > 0n ? Option.some(turn) : Option.none<bigint>()
+    }
+  })
+
+/** `Path.is_symlink()` / `Path.is_dir()` — `False` on any `OSError`. */
+const isSymlink = (path: string): boolean =>
+  Option.match(attempt(() => lstatSync(path)), {
+    onNone: () => false,
+    onSome: (info) => info.isSymbolicLink()
+  })
+
+const isDirectory = (path: string): boolean =>
+  Option.match(attempt(() => statSync(path)), {
+    onNone: () => false,
+    onSome: (info) => info.isDirectory()
+  })
+
+/**
+ * The run directories ingest writes a row for.
+ *
+ * `GAME_ID_RE`, not a symlink, and a directory — the same three refusals
+ * `_read_manifest` performs per request. A run that fails one gets **no row**,
+ * which is how the pg backend answers the 404 the fs backend answers by
+ * re-running the check. `game_parity_symlink_07` is the fixture that proves it.
+ */
+const runDirectories = (runsRoot: string): ReadonlyArray<string> =>
+  Option.getOrElse(attempt(() => readdirSync(runsRoot)), (): ReadonlyArray<string> => [])
+    .filter((name) =>
+      isGameId(name) && !isSymlink(join(runsRoot, name)) && isDirectory(join(runsRoot, name))
+    )
+
+/**
+ * One run, stored the way §1.2/§1.5 say to store it.
+ *
+ * `content_hash` is bookkeeping the repository never reads, so it is the id's
+ * digest and nothing more; the real ingest's length-prefixed listing belongs to
+ * the sweep's idempotence proof, not to this file's subject.
+ */
+const storeRun = (
+  db: Database,
+  runsRoot: string,
+  gameId: string
+): Effect.Effect<unknown, never> => {
+  const runRoot = join(runsRoot, gameId)
+  const manifest = readDocument(join(runRoot, MANIFEST_FILE))
+  const report = readDocument(join(runRoot, REPORT_FILE))
+  const turn = tailTurn(join(runRoot, REPLAY_JSONL_FILE))
+  const stored = Option.map(manifest.document, partitionManifest)
+  const fits = Option.exists(turn, (value) =>
+    value >= BigInt(INT32_MIN) && value <= BigInt(INT32_MAX))
+  const derived: JsonObject = Option.match(turn, {
+    onNone: (): JsonObject => ({}),
+    onSome: (value): JsonObject => fits ? {} : { last_replay_turn: value.toString() }
+  })
+  return Effect.orDie(db.insert(games).values({
+    gameId,
+    state: Option.match(stored, { onNone: () => "invalid" as const, onSome: (row) => row.state }),
+    schemaVersion: Option.getOrNull(Option.map(stored, (row) => row.schemaVersion)),
+    createdAt: Option.getOrNull(Option.map(stored, (row) => row.createdAt)),
+    startedAt: Option.getOrNull(Option.map(stored, (row) => row.startedAt)),
+    finishedAt: Option.getOrNull(Option.map(stored, (row) => row.finishedAt)),
+    currentTurn: Option.getOrNull(Option.map(stored, (row) => row.currentTurn)),
+    lastReplayTurn: fits ? Number(Option.getOrElse(turn, () => 0n)) : null,
+    benchmarkValid: Option.getOrNull(Option.map(stored, (row) => row.benchmarkValid)),
+    // The six write-only projections, deliberately wrong. See POISON.
+    name: POISON,
+    ruleset: POISON,
+    mode: POISON,
+    timingMode: POISON,
+    maxTurns: 424242,
+    objective: POISON,
+    config: Option.getOrNull(Option.map(stored, (row) => row.config)),
+    manifestStatus: manifest.status,
+    manifestByteSize: manifest.byteSize,
+    reportStatus: report.status,
+    reportByteSize: report.byteSize,
+    contentHash: new Uint8Array(createHash("sha256").update(gameId).digest()),
+    extras: {
+      ...Option.match(stored, {
+        onNone: (): JsonObject => ({}),
+        onSome: (row): JsonObject => ({ manifest: row.extrasManifest })
+      }),
+      ...Option.match(report.document, {
+        onNone: (): JsonObject => ({}),
+        onSome: (document): JsonObject => ({ report: document })
+      }),
+      derived
+    }
+  }))
+}
+
+const ingestCorpus = (db: Database, runsRoot: string): Effect.Effect<number, never> =>
+  Effect.map(
+    Effect.forEach(runDirectories(runsRoot), (gameId) => storeRun(db, runsRoot, gameId)),
+    (rows) => rows.length
+  )
 
 // -------------------------------------------------------------------- layers --
 
 const testLayer = Layer.mergeAll(
   Layer.provideMerge(PgDrizzle.layer, Pglite.layer(Pglite.memory)),
+  // `Migrate.run` reads `drizzle/` through `@effect/platform`'s `FileSystem`.
   BunContext.layer
 )
 
@@ -174,81 +552,58 @@ type TestContext = Layer.Layer.Success<typeof testLayer>
  * One PGlite instance for the whole file.
  *
  * A `ManagedRuntime` rather than a per-test `Effect.provide`: the layer is
- * memoized, so every test sees the *same* database, and `dispose` in `afterAll`
- * is what closes it. Building the layer per test would give each one a fresh,
- * empty PGlite — which is right for `schema.test.ts`, whose subject is the
- * migrations, and wrong here, whose subject is a corpus.
+ * memoized, so every test sees the *same* database and the corpus is ingested
+ * once.
  */
 const runtime = ManagedRuntime.make(testLayer)
 
 const run = <A, E>(effect: Effect.Effect<A, E, TestContext>): Promise<A> =>
   runtime.runPromise(effect)
 
-afterAll(async () => {
-  await runtime.dispose()
-  // The corpus copy is ~13 MB and the staged archive is another few; a suite
-  // that leaves one of each per run fills a developer's /tmp quietly.
-  //
-  // `Option` rather than a swallowed `catch`: a fixture that never built has
-  // nothing to remove, and teardown is not where that failure is reported —
-  // every test that needed it has already failed.
-  const built = await fixture.then(Option.some, () => Option.none<Fixture>())
-  if (Option.isSome(built) && built.value.scratch.base.startsWith("/tmp/arena-pg-repo-")) {
-    rmSync(built.value.scratch.base, { recursive: true, force: true })
-  }
-})
-
-/** Both repositories over one scratch corpus, plus the handles the tests poke. */
+/** Both repositories over one scratch corpus. */
 interface Fixture {
   readonly fs: RunsRepositoryApi
-  readonly pg: RunsRepositoryPgApi
+  readonly pg: RunsRepositoryApi
   readonly scratch: Scratch
-  readonly db: PgDrizzle.PgDrizzle["Type"]
-  readonly report: Ingest.IngestReport
-  /**
-   * The *one* materializer the pg repository was built over.
-   *
-   * Kept on the fixture rather than rebuilt per test because it owns the
-   * per-game lock: a second materializer over the same root would be a second
-   * lock table, and every test below that says two callers are serialized would
-   * be asserting nothing.
-   */
-  readonly materializer: RunArchiveMaterializer
+  readonly db: Database
+  readonly stored: number
 }
 
-/**
- * `Effect.orDie`: a fixture that cannot be built is a defect, not a failure the
- * suite should classify. It fails every test with the real cause, which is what
- * a broken migration or an unreadable corpus should do.
- */
 const buildFixture = (scratch: Scratch): Effect.Effect<Fixture, never, TestContext> =>
   Effect.orDie(Effect.gen(function*() {
     yield* Migrate.run
-    const report = yield* Ingest.ingest(Ingest.ingestOptions(scratch.runsRoot))
     const db = yield* PgDrizzle.PgDrizzle
-    const fileSystem = yield* FileSystem
-    const path = yield* Path
-    const fs = makeRunsRepository(scratch.runsRoot)
-    const materializer = yield* makeMaterializer(db, fileSystem, path, {
-      runsRoot: fs.runsRoot,
-      materializeRoot: scratch.materializeRoot
-    })
-    const pg = makeRunsRepositoryPg(db, materializer)
-    return { fs, pg, scratch, db, report, materializer }
+    const stored = yield* ingestCorpus(db, scratch.runsRoot)
+    return {
+      fs: makeRunsRepository(scratch.runsRoot),
+      pg: makeRunsRepositoryPg(db, scratch.runsRoot),
+      scratch,
+      db,
+      stored
+    }
   }))
 
 /**
- * The corpus, ingested once.
+ * The corpus, ingested once, and then **held still**.
  *
- * A module-level promise rather than a `beforeAll` writing into a mutable
- * binding: it starts at import, every test awaits the same value, and there is
- * no moment at which the fixture is half-built.
+ * §4.4: the manifest comes from the database while the binaries and
+ * `victory.json` come from disk, so a run whose directory changes after ingest
+ * can legitimately answer `200 /status` and `404 /frames`. Every test below
+ * reads; none writes into `runs_root` after this point.
  */
 const fixture: Promise<Fixture> = makeScratch().then((scratch) => run(buildFixture(scratch)))
 
 const withFixture = <A, E>(
   body: (fixture: Fixture) => Effect.Effect<A, E, TestContext>
 ): Promise<A> => fixture.then((value) => run(body(value)))
+
+afterAll(async () => {
+  await runtime.dispose()
+  const built = await fixture.then(Option.some, () => Option.none<Fixture>())
+  if (Option.isSome(built) && built.value.scratch.base.startsWith("/tmp/arena-pg-repo-")) {
+    rmSync(built.value.scratch.base, { recursive: true, force: true })
+  }
+})
 
 // --------------------------------------------------------------- comparators --
 
@@ -268,11 +623,11 @@ const canonical = (value: CanonValue): string =>
  * A payload as the canonical writer sees it.
  *
  * `Canonical<A>` intersects every field with `CanonValue` but the *aliases* the
- * repositories return (`Gateway.Manifest`, an array of rows) are not themselves
- * declared as `CanonValue`, so the writer's parameter needs the assertion. It is
- * checked at run time by `canonicalText`, which refuses anything it cannot spell
- * — an `undefined`, a function, a `NaN` — with an error this file renders into
- * the comparison rather than swallowing.
+ * repositories return are not themselves declared as `CanonValue`, so the
+ * writer's parameter needs the assertion. It is checked at run time by
+ * `canonicalText`, which refuses anything it cannot spell — an `undefined`, a
+ * function, a `NaN` — with an error this file renders into the comparison rather
+ * than swallowing.
  */
 const asCanon = (value: unknown): CanonValue => value as CanonValue
 
@@ -281,22 +636,55 @@ const bytesOf = (value: Uint8Array): ReadonlyArray<number> => Array.from(value)
 const readBytes = (artifact: BinaryArtifact): ReadonlyArray<number> =>
   isArchiveBytes(artifact) ? bytesOf(artifact.bytes) : bytesOf(readFileSync(artifact))
 
-/** `TerminalArchive` minus the one field the two backends spell differently. */
-const withoutRunRoot = (archive: TerminalArchive): Omit<TerminalArchive, "runRoot"> => {
-  const { runRoot: _runRoot, ...rest } = archive
-  return rest
-}
-
 const frameIndex = (name: string): Option.Option<FrameIndex> =>
   Option.getRight(Gateway.decodeArchivePngName(name))
 
-// -------------------------------------------------------------------- ingest --
+/** A `bigint` anywhere in a reconstructed document is R4, the int/float trap. */
+const hasBigInt = (value: unknown): boolean =>
+  typeof value === "bigint" ||
+  (Array.isArray(value)
+    ? value.some(hasBigInt)
+    : typeof value === "object" && value !== null
+    ? Object.values(value).some(hasBigInt)
+    : false)
 
-describe("ingest of the parity corpus", () => {
+/**
+ * The document on disk, as the *filesystem backend* sees it — the §0 oracle's
+ * right side.
+ *
+ * `decodeJsonValueFromString` rather than a bare `JSON.parse`: it is literally
+ * what `readManifest` runs (`Schema.JsonNumber`, so every number is a JS
+ * `number`), and a reconstruction that matched `JSON.parse` but not the reader
+ * would be matching the wrong oracle.
+ */
+const documentOnDisk = (runsRoot: string, gameId: string, file: string): JsonObject | null =>
+  Option.getOrNull(
+    Option.flatMap(parseJson(readFileSync(join(runsRoot, gameId, file), "utf8")), asJsonObject)
+  )
+
+/**
+ * One stored row, as {@link GameDocumentRow}.
+ *
+ * `Effect.orDie` on the absence: a test that names a run the corpus does not
+ * hold is a defect in the test, not a failure of the code under test.
+ */
+const rowOf = (db: Database, gameId: string): Effect.Effect<GameDocumentRow, never> =>
+  Effect.orDie(Effect.flatMap(
+    db.select().from(games).where(eq(games.gameId, gameId)),
+    (rows) =>
+      Option.match(Option.fromNullable(rows[0]), {
+        onNone: () => Effect.die(`no games row for ${gameId}`),
+        onSome: (row): Effect.Effect<GameDocumentRow> => Effect.succeed(row)
+      })
+  ))
+
+// ------------------------------------------------------------------- ingest --
+
+describe("the corpus, as rows", () => {
   it("stores every run the fs backend can see, and skips the symlinked one", () =>
     withFixture((f) =>
-      Effect.sync(() => {
-        expect(f.report.runs.map((result) => result.gameId).toSorted()).toEqual([
+      Effect.map(f.db.select({ gameId: games.gameId }).from(games), (rows) => {
+        expect(rows.map((row) => row.gameId).toSorted()).toEqual([
           "game_parity_interrupted_03",
           "game_parity_lobby_husk_04",
           "game_parity_malformed_05",
@@ -305,75 +693,104 @@ describe("ingest of the parity corpus", () => {
           "game_parity_torn_tail_08",
           "game_parity_wrong_id_06"
         ])
-        expect(f.report.skipped.map((skip) => skip.entry)).toEqual(["game_parity_symlink_07"])
-        // The logical scope key must be the *same string* the fs repository
-        // resolved, or every `WHERE runs_root = $1` silently matches nothing.
-        expect(f.report.runsRoot).toBe(f.fs.runsRoot)
+        expect(f.stored).toBe(7)
       })
     ))
 
-  it("is idempotent: a second sweep reports no change", () =>
+  it("records the malformed manifest as unusable, with the fstat size that failed", () =>
     withFixture((f) =>
       Effect.map(
-        Ingest.ingest(Ingest.ingestOptions(f.scratch.runsRoot)),
-        (again) => {
-          expect(again.runs.map((result) => result.outcome)).toEqual(
-            again.runs.map(() => "unchanged")
+        f.db.select().from(games),
+        (rows) => {
+          const malformed = rows.find((row) => row.gameId === "game_parity_malformed_05")
+          expect(malformed?.manifestStatus).toBe("unusable")
+          expect(malformed?.manifestByteSize).toBe(
+            statSync(join(f.scratch.runsRoot, "game_parity_malformed_05", MANIFEST_FILE)).size
           )
+          // `unusable` carries no reconstructable document at all.
+          expect(malformed?.extras).toEqual({ derived: {} })
         }
       )
     ))
 })
 
-// -------------------------------------------------------------- readManifest --
+// ------------------------------------------------- the §0 reconstruction oracle --
+
+describe("reconstruction is deep-equal to the document on disk", () => {
+  it.each(["game_parity_terminal_valid_01", "game_parity_terminal_nowin_02", INTERRUPTED_ID, HUSK_ID, WRONG_ID, "game_parity_torn_tail_08"])(
+    "%s: manifest.json survives the round trip",
+    (gameId) =>
+      withFixture((f) =>
+        Effect.map(rowOf(f.db, gameId), (row) => {
+          const rebuilt = reconstructManifest(row)
+          expect(Option.isSome(rebuilt)).toBe(true)
+          expect(Option.getOrNull(rebuilt)).toEqual(
+            documentOnDisk(f.scratch.runsRoot, gameId, MANIFEST_FILE)
+          )
+          expect(hasBigInt(Option.getOrNull(rebuilt))).toBe(false)
+        })
+      )
+  )
+
+  it.each([TERMINAL_ID, NOWIN_ID, WRONG_ID])(
+    "%s: report.json survives the round trip",
+    (gameId) =>
+      withFixture((f) =>
+        Effect.map(rowOf(f.db, gameId), (row) => {
+          expect(Option.getOrNull(reconstructReport(row))).toEqual(
+            documentOnDisk(f.scratch.runsRoot, gameId, REPORT_FILE)
+          )
+        })
+      )
+  )
+})
+
+// ------------------------------------------------------------- readManifest --
 
 describe("readManifest", () => {
-  it.each(EVERY_ID)("agrees with the fs backend for %s", (gameId) =>
+  it.each(EVERY_ID)("answers identically for %s", (gameId) =>
     withFixture((f) =>
       Effect.gen(function*() {
-        const expected = yield* settle(f.fs.readManifest(gameId))
-        const actual = yield* settle(f.pg.readManifest(gameId))
-        expect(Either.map(actual, (value) => JSON.stringify(value))).toEqual(
-          Either.map(expected, (value) => JSON.stringify(value))
-        )
+        const fs = yield* settle(f.fs.readManifest(gameId))
+        const pg = yield* settle(f.pg.readManifest(gameId))
+        expect(pg).toEqual(fs)
       })
     ))
 
   it("keeps the three answers distinct: 404 game, 503 unusable, 404 wrong id", () =>
     withFixture((f) =>
       Effect.gen(function*() {
-        // The symlinked run has no row at all, so it is `gameNotFound` — the
-        // same answer the fs backend reaches through `Path.is_symlink`.
         expect(yield* settle(f.pg.readManifest("game_parity_symlink_07"))).toEqual(
           Either.left("NotFound:gameNotFound")
         )
-        // A manifest that is not JSON is stored with `status = 'unusable'` and
-        // its bytes intact, so the 503 is reproduced rather than asserted.
         expect(yield* settle(f.pg.readManifest("game_parity_malformed_05"))).toEqual(
           Either.left("ArchiveUnavailable:manifestUnavailable")
         )
-        // A manifest whose `game_id` disagrees with its directory is a 404 on
-        // the *game*, decided on the read side over the stored bytes.
-        expect(yield* settle(f.pg.readManifest("game_parity_wrong_id_06"))).toEqual(
+        expect(yield* settle(f.pg.readManifest(WRONG_ID))).toEqual(
           Either.left("NotFound:gameNotFound")
         )
       })
     ))
+
+  it("never publishes a lifted column", () =>
+    withFixture((f) =>
+      Effect.map(f.pg.readManifest(TERMINAL_ID), (manifest) => {
+        expect(canonical(asCanon(manifest))).not.toContain(POISON)
+      })
+    ))
 })
 
-// ------------------------------------------------------------ decodeManifest --
-
 describe("decodeManifest", () => {
-  it.each(FIXTURE_IDS)("agrees with the fs backend for %s", (gameId) =>
+  it.each(EVERY_ID)("answers identically for %s", (gameId) =>
     withFixture((f) =>
       Effect.gen(function*() {
-        const expected = yield* Effect.either(f.fs.decodeManifest(gameId))
-        const actual = yield* Effect.either(f.pg.decodeManifest(gameId))
-        expect(Either.map(actual, (value) => canonical(asCanon(value)))).toEqual(
-          Either.map(expected, (value) => canonical(asCanon(value)))
+        const fs = yield* Effect.either(f.fs.decodeManifest(gameId))
+        const pg = yield* Effect.either(f.pg.decodeManifest(gameId))
+        expect(Either.map(pg, (value) => canonical(asCanon(value)))).toEqual(
+          Either.map(fs, (value) => canonical(asCanon(value)))
         )
-        expect(Either.mapLeft(actual, (error) => error._tag)).toEqual(
-          Either.mapLeft(expected, (error) => error._tag)
+        expect(Either.mapLeft(pg, (error) => error._tag)).toEqual(
+          Either.mapLeft(fs, (error) => error._tag)
         )
       })
     ))
@@ -382,107 +799,109 @@ describe("decodeManifest", () => {
 // ----------------------------------------------------------- terminalArchive --
 
 describe("terminalArchive", () => {
-  it.each(EVERY_ID)("agrees with the fs backend for %s", (gameId) =>
+  it.each(EVERY_ID)("answers identically for %s, runRoot included", (gameId) =>
     withFixture((f) =>
       Effect.gen(function*() {
-        const expected = yield* settle(f.fs.terminalArchive(gameId))
-        const actual = yield* settle(f.pg.terminalArchive(gameId))
-        expect(Either.map(actual, withoutRunRoot)).toEqual(Either.map(expected, withoutRunRoot))
+        const fs = yield* settle(f.fs.terminalArchive(gameId))
+        const pg = yield* settle(f.pg.terminalArchive(gameId))
+        expect(pg).toEqual(fs)
+        expect(Either.map(pg, (archive: TerminalArchive) => canonical(asCanon(archive.outcome))))
+          .toEqual(
+            Either.map(fs, (archive: TerminalArchive) => canonical(asCanon(archive.outcome)))
+          )
       })
     ))
 
-  it("serves victory.json from the stored bytes, spelling included", () =>
+  it("reads victory.json from the run directory, spelling included", () =>
     withFixture((f) =>
-      Effect.map(f.pg.terminalArchive(TERMINAL_ID), (archive) => {
-        const outcome = canonical(asCanon(archive.outcome))
-        // `turn` and `year` are relayed with no validation at all, and the only
-        // reason they come out as Python ints is that the *bytes* were re-parsed
-        // here rather than a decoded record being stored.
-        expect(outcome).toContain(`"turn":753`)
-        expect(outcome).toContain(`"year":1995`)
+      Effect.gen(function*() {
+        const archive = yield* f.pg.terminalArchive(TERMINAL_ID)
+        // The *resolved* root — `/tmp` is a symlink to `/private/tmp` on darwin,
+        // and both backends resolve it once at construction.
+        expect(archive.runRoot).toBe(join(f.fs.runsRoot, TERMINAL_ID))
+        expect(canonical(asCanon(archive.outcome.victory))).toBe(
+          canonical(asCanon((yield* f.fs.terminalArchive(TERMINAL_ID)).outcome.victory))
+        )
+        // The nowin fixture has no victory.json at all.
+        const nowin = yield* f.pg.terminalArchive(NOWIN_ID)
+        expect(nowin.outcome.victory).toBeNull()
       })
     ))
 
   it("answers terminalArchiveNotFound for a live run, before it looks for a report", () =>
     withFixture((f) =>
-      Effect.map(settle(f.pg.terminalArchive("game_parity_interrupted_03")), (outcome) => {
-        expect(outcome).toEqual(Either.left("NotFound:terminalArchiveNotFound"))
+      Effect.gen(function*() {
+        expect(yield* settle(f.pg.terminalArchive(INTERRUPTED_ID))).toEqual(
+          Either.left("NotFound:terminalArchiveNotFound")
+        )
+        expect(yield* settle(f.fs.terminalArchive(INTERRUPTED_ID))).toEqual(
+          Either.left("NotFound:terminalArchiveNotFound")
+        )
       })
     ))
 })
 
 // ------------------------------------------------------------ lastReplayTurn --
 
-/**
- * The ids `lastReplayTurn` can be *reached* with.
- *
- * `_last_replay_turn` is the one read in the fs backend that validates nothing:
- * no `GAME_ID_RE`, no symlink refusal, no containment check — it opens
- * `join(runs_root, game_id, "replay.jsonl")` and follows whatever is there. Two
- * ids in this corpus therefore answer out of a run the archive does not contain,
- * and the pg backend cannot follow them because no row exists: the symlinked run
- * (`game_parity_symlink_07 → game_parity_terminal_valid_01`) and, on a
- * case-insensitive filesystem, a case variant of a real id. Both divergences are
- * unreachable through the service, which is asserted below rather than argued.
- */
-const UNCONTAINED_IDS = ["game_parity_symlink_07", "GAME_PARITY_TERMINAL_VALID_01"]
-
-const REPLAY_TURN_IDS = EVERY_ID.filter((gameId) => !UNCONTAINED_IDS.includes(gameId))
-
 describe("lastReplayTurn", () => {
-  it.each(REPLAY_TURN_IDS)("agrees with the fs backend for %s", (gameId) =>
+  /** Every id but the two the fs reader answers from outside the archive. */
+  const UNGUARDED = new Set(["game_parity_symlink_07", "GAME_PARITY_TERMINAL_VALID_01"])
+  const TAIL_IDS = EVERY_ID.filter((gameId) => !UNGUARDED.has(gameId))
+
+  it.each(TAIL_IDS)("answers identically for %s", (gameId) =>
     withFixture((f) =>
       Effect.gen(function*() {
-        const expected = yield* f.fs.lastReplayTurn(gameId)
-        const actual = yield* f.pg.lastReplayTurn(gameId)
-        expect(Option.getOrNull(actual)).toEqual(Option.getOrNull(expected))
+        const fs = yield* f.fs.lastReplayTurn(gameId)
+        const pg = yield* f.pg.lastReplayTurn(gameId)
+        expect(Option.getOrNull(pg)).toEqual(Option.getOrNull(fs))
       })
     ))
 
-  it("reads a turn out of a window whose first line is torn", () =>
-    withFixture((f) =>
-      Effect.gen(function*() {
-        const expected = yield* f.fs.lastReplayTurn("game_parity_torn_tail_08")
-        const actual = yield* f.pg.lastReplayTurn("game_parity_torn_tail_08")
-        expect(Option.isSome(expected)).toBe(true)
-        expect(Option.getOrNull(actual)).toEqual(Option.getOrNull(expected))
-      })
-    ))
+  /**
+   * The two divergences, and both are the fs reader's own inconsistency.
+   *
+   * `_last_replay_turn` opens `<runs_root>/<id>/replay.jsonl` with **no**
+   * `O_NOFOLLOW`, no `GAME_ID_RE` check and no run-directory check
+   * (`services/runs.ts` says so in as many words). So it reads *through* the
+   * symlinked run the rest of the gateway refuses, and — on a case-insensitive
+   * filesystem — through an id no `GAME_ID_RE` accepts. The pg backend has no
+   * row for either and answers nothing.
+   *
+   * Both are unreachable: the only caller is `diskRowsWithInterrupted`, whose
+   * candidates come from `interruptedCandidates(rows, …)` — rows of the index,
+   * which contains neither id in either backend. Pinned rather than waived, so
+   * that a future caller of `lastReplayTurn` has to come past this comment.
+   */
+  it.each([...UNGUARDED])(
+    "diverges for %s only where the fs reader leaves the archive, and unreachably",
+    (gameId) =>
+      withFixture((f) =>
+        Effect.gen(function*() {
+          expect(Option.getOrNull(yield* f.fs.lastReplayTurn(gameId))).toBe(3n)
+          expect(Option.isNone(yield* f.pg.lastReplayTurn(gameId))).toBe(true)
+          // …and it cannot reach a payload: the id is in neither index.
+          const pgRows = yield* f.pg.diskRowsWithInterrupted(new Set())
+          const fsRows = yield* f.fs.diskRowsWithInterrupted(new Set())
+          expect(pgRows.map((row) => row.game_id)).not.toContain(gameId)
+          expect(fsRows.map((row) => row.game_id)).not.toContain(gameId)
+        })
+      )
+  )
 
-  it("diverges only where the fs reader leaves the archive, and only unreachably", () =>
+  it("reads the column, not the file: the tail window was read once, at ingest", () =>
     withFixture((f) =>
-      Effect.gen(function*() {
-        // The fs reader follows the symlink and the case-insensitive name into a
-        // run the archive does contain, and answers from *its* replay.jsonl.
-        // The pg reader has no row to follow, so it answers `none`.
-        yield* Effect.forEach(UNCONTAINED_IDS, (gameId) =>
-          Effect.gen(function*() {
-            expect(Option.isSome(yield* f.fs.lastReplayTurn(gameId))).toBe(true)
-            expect(Option.isNone(yield* f.pg.lastReplayTurn(gameId))).toBe(true)
-          }), { discard: true })
-
-        // ...and neither id can ever be asked about, because the only caller is
-        // `diskRowsWithInterrupted`, whose candidates come from the index, whose
-        // ids are the run directories the walk accepted.
-        const rows = yield* f.pg.diskGamesIndex()
-        const candidates = interruptedCandidates(rows.games, new Set<string>())
-        expect(candidates.some((gameId) => UNCONTAINED_IDS.includes(gameId))).toBe(false)
-        const fsRows = yield* f.fs.diskGamesIndex()
-        expect(
-          interruptedCandidates(fsRows.games, new Set<string>()).some((gameId) =>
-            UNCONTAINED_IDS.includes(gameId)
-          )
-        ).toBe(false)
+      Effect.map(f.pg.lastReplayTurn(INTERRUPTED_ID), (turn) => {
+        // §4.4's skew window is the design, and this is the half of it the
+        // database owns: the answer is a column, not a 64 KiB read.
+        expect(Option.getOrNull(turn)).toBe(4n)
       })
     ))
 
   it("hides a lobby husk exactly as the fs backend does", () =>
     withFixture((f) =>
       Effect.gen(function*() {
-        const expected = yield* f.fs.lastReplayTurn("game_parity_lobby_husk_04")
-        const actual = yield* f.pg.lastReplayTurn("game_parity_lobby_husk_04")
-        expect(Option.isNone(expected)).toBe(true)
-        expect(Option.isNone(actual)).toBe(true)
+        expect(Option.isNone(yield* f.pg.lastReplayTurn(HUSK_ID))).toBe(true)
+        expect(Option.isNone(yield* f.fs.lastReplayTurn(HUSK_ID))).toBe(true)
       })
     ))
 })
@@ -493,716 +912,131 @@ describe("diskGamesIndex", () => {
   it("is byte-identical to the fs index", () =>
     withFixture((f) =>
       Effect.gen(function*() {
-        const expected = yield* f.fs.diskGamesIndex()
-        const actual = yield* f.pg.diskGamesIndex()
-        expect(canonical(actual)).toBe(canonical(expected))
-        // Not vacuous: the corpus really does produce rows.
-        expect(actual.games.length).toBeGreaterThan(0)
+        const fs = yield* f.fs.diskGamesIndex()
+        const pg = yield* f.pg.diskGamesIndex()
+        expect(canonical(asCanon(pg))).toBe(canonical(asCanon(fs)))
+        expect(canonical(asCanon(pg))).not.toContain(POISON)
       })
     ))
 
   it("is byte-identical with terminalOnly", () =>
     withFixture((f) =>
       Effect.gen(function*() {
-        const expected = yield* f.fs.diskGamesIndex({ terminalOnly: true })
-        const actual = yield* f.pg.diskGamesIndex({ terminalOnly: true })
-        expect(canonical(actual)).toBe(canonical(expected))
-        expect(actual.games.length).toBeLessThan(
-          (yield* f.pg.diskGamesIndex()).games.length
-        )
+        const fs = yield* f.fs.diskGamesIndex({ terminalOnly: true })
+        const pg = yield* f.pg.diskGamesIndex({ terminalOnly: true })
+        expect(canonical(asCanon(pg))).toBe(canonical(asCanon(fs)))
       })
     ))
 })
-
-// -------------------------------------------------- diskRowsWithInterrupted --
-
-const LIVE_SETS: Array<[string, Array<string>]> = [
-  ["(none)", []],
-  ["interrupted", ["game_parity_interrupted_03"]],
-  ["terminal", [TERMINAL_ID]],
-  ["two running", ["game_parity_interrupted_03", "game_parity_torn_tail_08"]],
-  ["husk and absentee", ["game_parity_lobby_husk_04", "game_parity_absent_99"]]
-]
 
 describe("diskRowsWithInterrupted", () => {
-  it.each(LIVE_SETS)("agrees with the fs backend when live = %s", (_label, ids) =>
-    withFixture((f) =>
-      Effect.gen(function*() {
-        const live = new Set<string>(ids)
-        const expected = yield* f.fs.diskRowsWithInterrupted(live)
-        const actual = yield* f.pg.diskRowsWithInterrupted(live)
-        expect(canonical(asCanon(actual))).toBe(canonical(asCanon(expected)))
-      })
-    ))
+  const LIVE_SETS: ReadonlyArray<ReadonlyArray<string>> = [
+    [],
+    [INTERRUPTED_ID],
+    [TERMINAL_ID, HUSK_ID],
+    [...FIXTURE_IDS]
+  ]
 
-  it("relabels an orphaned run through archive.ts, not through SQL", () =>
-    withFixture((f) =>
-      Effect.map(f.pg.diskRowsWithInterrupted(new Set<string>()), (rows) => {
-        const interrupted = rows.filter((row) => row.state === Gateway.INTERRUPTED_STATUS)
-        expect(interrupted.length).toBeGreaterThan(0)
-        // The summary quotes the *post-`max`* turn, which is what `asInterrupted`
-        // computes and what no `SELECT` could have produced.
-        expect(
-          interrupted.map((row) => row.outcome.summary)
-        ).toEqual(
-          interrupted.map((row) =>
-            Gateway.interruptedSummary(
-              typeof row.current_turn === "bigint" ? row.current_turn : 0n
-            )
-          )
-        )
-      })
-    ))
+  it.each(LIVE_SETS.map((ids) => [ids.join(",") || "(none)", ids] as const))(
+    "relabels identically with live ids %s",
+    (_label, ids) =>
+      withFixture((f) =>
+        Effect.gen(function*() {
+          const live = new Set(ids)
+          const fs = yield* f.fs.diskRowsWithInterrupted(live)
+          const pg = yield* f.pg.diskRowsWithInterrupted(live)
+          expect(canonical(asCanon(pg))).toBe(canonical(asCanon(fs)))
+        })
+      )
+  )
 })
 
-// ----------------------------------------------------------------- binaries --
+// -------------------------------------------------------- frames and video --
 
 describe("frameFile and videoFile", () => {
-  const archives = (f: Fixture) =>
-    Effect.all({ fs: f.fs.terminalArchive(TERMINAL_ID), pg: f.pg.terminalArchive(TERMINAL_ID) })
+  const FRAME_NAMES = ["000000.png", "000752.png"]
 
-  it("serves the same PNG bytes for latest and for every stored index", () =>
+  it.each(FRAME_NAMES)("answers the same artifact for %s", (name) =>
     withFixture((f) =>
       Effect.gen(function*() {
-        const both = yield* archives(f)
-        const wanted: ReadonlyArray<Option.Option<FrameIndex>> = [
-          Option.none(),
-          frameIndex("000000.png"),
-          frameIndex("000752.png")
-        ]
-        yield* Effect.forEach(wanted, (index) =>
-          Effect.gen(function*() {
-            const expected = yield* settle(f.fs.frameFile(both.fs, index))
-            const actual = yield* settle(f.pg.frameBytes(both.pg, index))
-            expect(Either.isRight(expected)).toBe(true)
-            expect(Either.map(actual, bytesOf)).toEqual(Either.map(expected, readBytes))
-          }), { discard: true })
+        const fsArchive = yield* f.fs.terminalArchive(TERMINAL_ID)
+        const pgArchive = yield* f.pg.terminalArchive(TERMINAL_ID)
+        const fsFrame = yield* settle(f.fs.frameFile(fsArchive, frameIndex(name)))
+        const pgFrame = yield* settle(f.pg.frameFile(pgArchive, frameIndex(name)))
+        expect(pgFrame).toEqual(fsFrame)
+        expect(Either.map(pgFrame, readBytes)).toEqual(Either.map(fsFrame, readBytes))
       })
     ))
 
-  it("refuses an index that is not there, and a run whose frames directory failed", () =>
+  it("answers the same latest frame, and the same 404 for one that is not there", () =>
     withFixture((f) =>
       Effect.gen(function*() {
-        const both = yield* archives(f)
-        const missing = frameIndex("000123.png")
-        expect(Option.isSome(missing)).toBe(true)
-        expect(yield* settle(f.pg.frameBytes(both.pg, missing))).toEqual(
-          Either.left("NotFound:mapFrameDoesNotExist")
+        const fsArchive = yield* f.fs.terminalArchive(TERMINAL_ID)
+        const pgArchive = yield* f.pg.terminalArchive(TERMINAL_ID)
+        expect(yield* settle(f.pg.frameFile(pgArchive, Option.none()))).toEqual(
+          yield* settle(f.fs.frameFile(fsArchive, Option.none()))
         )
-        expect(
-          Either.getLeft(yield* settle(f.fs.frameFile(both.fs, missing)))
-        ).toEqual(Either.getLeft(yield* settle(f.pg.frameBytes(both.pg, missing))))
-
-        // `game_parity_terminal_nowin_02` has frames but no `saves/`; its PNGs
-        // are still listable, so the two backends must agree on that too.
-        const nowin = yield* Effect.all({
-          fs: f.fs.terminalArchive(NOWIN_ID),
-          pg: f.pg.terminalArchive(NOWIN_ID)
-        })
-        const expected = yield* settle(f.fs.frameFile(nowin.fs, Option.none()))
-        const actual = yield* settle(f.pg.frameBytes(nowin.pg, Option.none()))
-        expect(Either.map(actual, bytesOf)).toEqual(Either.map(expected, readBytes))
-      })
-    ))
-
-  it("serves the same video bytes, and the same 404 when there is none", () =>
-    withFixture((f) =>
-      Effect.gen(function*() {
-        const both = yield* archives(f)
-        const expected = yield* settle(f.fs.videoFile(both.fs))
-        const actual = yield* settle(f.pg.videoBytes(both.pg))
-        expect(Either.map(actual, bytesOf)).toEqual(Either.map(expected, readBytes))
-        expect(Either.map(actual, bytesOf)).toEqual(Either.right(bytesOf(VIDEO_BYTES)))
-
-        const nowin = yield* Effect.all({
-          fs: f.fs.terminalArchive(NOWIN_ID),
-          pg: f.pg.terminalArchive(NOWIN_ID)
-        })
-        expect(yield* settle(f.pg.videoBytes(nowin.pg))).toEqual(
-          Either.left("NotFound:replayVideoNotFound")
-        )
-        expect(yield* settle(f.fs.videoFile(nowin.fs))).toEqual(
-          Either.left("NotFound:replayVideoNotFound")
+        expect(yield* settle(f.pg.frameFile(pgArchive, frameIndex("000999.png")))).toEqual(
+          yield* settle(f.fs.frameFile(fsArchive, frameIndex("000999.png")))
         )
       })
     ))
 
-  it("answers bytes artifacts straight from bytea, no staged file", () =>
+  it("answers the same video, and the same 404 when there is none", () =>
     withFixture((f) =>
       Effect.gen(function*() {
-        const archive = yield* f.pg.terminalArchive(TERMINAL_ID)
-        const frameArtifact = yield* f.pg.frameFile(archive, Option.none())
-        const videoArtifact = yield* f.pg.videoFile(archive)
-        const frameBytes = yield* f.pg.frameBytes(archive, Option.none())
-        const videoBytes = yield* f.pg.videoBytes(archive)
+        const fsArchive = yield* f.fs.terminalArchive(TERMINAL_ID)
+        const pgArchive = yield* f.pg.terminalArchive(TERMINAL_ID)
+        const fsVideo = yield* settle(f.fs.videoFile(fsArchive))
+        const pgVideo = yield* settle(f.pg.videoFile(pgArchive))
+        expect(pgVideo).toEqual(fsVideo)
+        expect(Either.map(pgVideo, readBytes)).toEqual(Either.right(bytesOf(VIDEO_BYTES)))
 
-        // `http/routes/archive.ts#sendArtifact` streams a bytes artifact with
-        // contentLength = bytes.length, so identity with the stored bytes is
-        // the whole contract; no file is staged for frames or video.
-        expect(isArchiveBytes(frameArtifact)).toBe(true)
-        expect(isArchiveBytes(videoArtifact)).toBe(true)
-        expect(readBytes(frameArtifact)).toEqual(bytesOf(frameBytes))
-        expect(readBytes(videoArtifact)).toEqual(bytesOf(videoBytes))
-      })
-    ))
-})
-
-// -------------------------------------------------------------- materialized --
-
-describe("materialization", () => {
-  it("reproduces the run's saves and frames byte for byte", () =>
-    withFixture((f) =>
-      Effect.map(f.pg.terminalArchive(TERMINAL_ID), (archive) => {
-        const source = `${f.fs.runsRoot}/${TERMINAL_ID}`
-        // An autosave is stored whole, so it must match the original exactly —
-        // this is the file the python bridge actually parses.
-        const save = "saves/turn-0001-auto.sav.gz"
-        expect(readBytes(`${archive.runRoot}/${save}`)).toEqual(readBytes(`${source}/${save}`))
-        const frame = "watch_frames/000000.png"
-        expect(readBytes(`${archive.runRoot}/${frame}`)).toEqual(readBytes(`${source}/${frame}`))
-        // A PPM is deliberately a *head*: no reader looks past the header, and
-        // storing 2.4 MB of pixels per frame is what the head exists to avoid.
-        const ppm = "saves/turn-0001-M-bc--tuZ1Pall.map.ppm"
-        const staged = readFileSync(`${archive.runRoot}/${ppm}`)
-        const original = readFileSync(`${source}/${ppm}`)
-        expect(staged.length).toBeLessThanOrEqual(original.length)
-        expect(bytesOf(staged)).toEqual(bytesOf(original.subarray(0, staged.length)))
-      })
-    ))
-
-  it("changes no inode and no ctime when nothing changed", () =>
-    withFixture((f) =>
-      Effect.gen(function*() {
-        const first = yield* f.pg.terminalArchive(TERMINAL_ID)
-        const target = `${first.runRoot}/saves/turn-0001-auto.sav.gz`
-        const before = statSync(target)
-        yield* f.pg.terminalArchive(TERMINAL_ID)
-        const after = statSync(target)
-        // `save_replay._load_cache` validates its entries against exactly these
-        // fields; an unconditional rewrite would silently and permanently
-        // disable the python-side cache.
-        expect(after.ino).toBe(before.ino)
-        expect(after.ctimeMs).toBe(before.ctimeMs)
-        expect(after.mtimeMs).toBe(before.mtimeMs)
-      })
-    ))
-
-  it("rewrites a file whose content changed but whose length did not", () =>
-    withFixture((f) =>
-      Effect.gen(function*() {
-        const before = yield* f.pg.terminalArchive(TERMINAL_ID)
-        const staged = `${before.runRoot}/watch_frames/000000.png`
-        const original = readFileSync(staged)
-        const frameKey = and(
-          eq(runFrames.runsRoot, f.fs.runsRoot),
-          eq(runFrames.gameId, TERMINAL_ID),
-          eq(runFrames.name, "000000.png")
-        )
-        const stored = yield* f.db
-          .select({ bytes: runFrames.bytes, sha256: runFrames.sha256 })
-          .from(runFrames)
-          .where(frameKey)
-        const restore = stored[0]
-        expect(restore).toBeDefined()
-
-        // A same-length re-ingest is the case a size-only freshness check gets
-        // wrong: nothing about the file's `stat` changes, and serving the old
-        // bytes forever would be silent.
-        const replacement = new Uint8Array(original.length).fill(0x5a)
-        yield* f.db
-          .update(runFrames)
-          .set({ bytes: replacement, sha256: new Uint8Array(32).fill(0x11) })
-          .where(frameKey)
-
-        const after = yield* f.pg.terminalArchive(TERMINAL_ID)
-        expect(readBytes(`${after.runRoot}/watch_frames/000000.png`)).toEqual(
-          bytesOf(replacement)
-        )
-
-        // Put the row back and materialize again, so the tests after this one
-        // see the corpus. A re-ingest would *not* do it: `runs.content_hash`
-        // still matches the untouched disk, which is exactly the zero-write
-        // property the ingester is built for.
-        yield* f.db
-          .update(runFrames)
-          .set({
-            bytes: restore?.bytes ?? new Uint8Array(),
-            sha256: restore?.sha256 ?? new Uint8Array()
-          })
-          .where(frameKey)
-        yield* f.pg.terminalArchive(TERMINAL_ID)
-        expect(readBytes(staged)).toEqual(bytesOf(original))
-      })
-    ))
-
-  it("removes a file no row names", () =>
-    withFixture((f) =>
-      Effect.gen(function*() {
-        const archive = yield* f.pg.terminalArchive(TERMINAL_ID)
-        const fileSystem = yield* FileSystem
-        const intruder = `${archive.runRoot}/saves/intruder.sav.gz`
-        yield* fileSystem.writeFileString(intruder, "not from the archive")
-        expect(yield* fileSystem.exists(intruder)).toBe(true)
-
-        // Drop the recorded set digest so the next call reconciles instead of
-        // short-circuiting — which is exactly what a re-ingest would do.
-        yield* f.db
-          .delete(derivationWorkdirs)
-          .where(
-            and(
-              eq(derivationWorkdirs.runsRoot, f.fs.runsRoot),
-              eq(derivationWorkdirs.gameId, TERMINAL_ID)
-            )
-          )
-
-        yield* f.pg.terminalArchive(TERMINAL_ID)
-        expect(yield* fileSystem.exists(intruder)).toBe(false)
-        // And the real files are still there, untouched.
-        expect(yield* fileSystem.exists(`${archive.runRoot}/saves/turn-0001-auto.sav.gz`)).toBe(
-          true
+        const fsNowin = yield* f.fs.terminalArchive(NOWIN_ID)
+        const pgNowin = yield* f.pg.terminalArchive(NOWIN_ID)
+        expect(yield* settle(f.pg.videoFile(pgNowin))).toEqual(
+          yield* settle(f.fs.videoFile(fsNowin))
         )
       })
     ))
 })
 
-// -------------------------------------------------------------- cache mirror --
-
-describe("the derivation cache mirror", () => {
-  it("captures what the bridge wrote and hydrates it back, byte for byte", () =>
-    withFixture((f) =>
-      Effect.gen(function*() {
-        const fileSystem = yield* FileSystem
-        const path = yield* Path
-        const mirror = makeDerivationCacheMirror(f.db, fileSystem, path, {
-          cacheRoot: f.scratch.cacheRoot
-        })
-        const directory = `${f.scratch.cacheRoot}/${TERMINAL_ID}`
-        // `2.0` must not become `2`, and the escaped NUL must survive: neither
-        // would through a `json` or `jsonb` column.
-        const document = new TextEncoder().encode(`{"turns":[1,2.0],"nul":"a\\u0000b"}`)
-
-        yield* fileSystem.makeDirectory(directory, { recursive: true })
-        yield* fileSystem.writeFile(`${directory}/events.json`, document)
-
-        expect(yield* mirror.capture(TERMINAL_ID)).toEqual(["events.json"])
-        // A second capture writes nothing: the bytes are unchanged.
-        expect(yield* mirror.capture(TERMINAL_ID)).toEqual([])
-
-        const stored = yield* f.db
-          .select()
-          .from(derivationCache)
-          .where(eq(derivationCache.gameId, TERMINAL_ID))
-        expect(stored.length).toBe(1)
-        // The namespace key is the resolved `--cache-root`, exactly as the
-        // on-disk cache is namespaced.
-        expect(stored[0]?.cacheKey).toBe(f.scratch.cacheRoot)
-        expect(bytesOf(stored[0]?.bytes ?? new Uint8Array())).toEqual(bytesOf(document))
-
-        yield* fileSystem.remove(directory, { recursive: true })
-        expect(yield* mirror.hydrate(TERMINAL_ID)).toEqual(["events.json"])
-        expect(bytesOf(yield* fileSystem.readFile(`${directory}/events.json`))).toEqual(
-          bytesOf(document)
-        )
-        // Hydrating again is a no-op.
-        expect(yield* mirror.hydrate(TERMINAL_ID)).toEqual([])
-      })
-    ))
+describe("runsRoot", () => {
+  it("is the same resolved string in both backends", () =>
+    withFixture((f) => Effect.sync(() => expect(f.pg.runsRoot).toBe(f.fs.runsRoot))))
 })
 
-// ------------------------------------------------- physical-order independence --
+// ------------------------------------- the storage rules the repository needs --
 
-/**
- * The index cannot depend on the heap order of the rows.
- *
- * This is the test that would fail the first time someone "optimizes"
- * `diskGamesIndex` with an `ORDER BY`: Postgres orders `text` by collation and
- * `sortDiskGameRows` orders by code point, and the two disagree above U+FFFF —
- * but only for some inputs, which is why the property is asserted over several
- * physical orders rather than argued about.
- *
- * It runs last because it rebuilds the corpus in the database; the final sweep
- * restores it.
- */
-describe("physical order independence", () => {
-  it("answers the same index whatever order the rows were written in", () =>
+describe("the storage rules the repository depends on", () => {
+  it("stores an explicit null in extras, never as a NULL column", () =>
     withFixture((f) =>
-      Effect.gen(function*() {
-        const baseline = canonical(yield* f.pg.diskGamesIndex())
-        const ids = f.report.runs.map((result) => result.gameId).toSorted()
-
-        yield* Effect.forEach([0, 2, 3, 5], (offset) =>
-          Effect.gen(function*() {
-            // Cascades to every child table, so the whole corpus goes.
-            yield* f.db.delete(runs).where(eq(runs.runsRoot, f.fs.runsRoot))
-            const rotated = [...ids.slice(offset % ids.length), ...ids.slice(0, offset % ids.length)]
-            yield* Effect.forEach(rotated, (gameId) =>
-              Ingest.ingest({
-                ...Ingest.ingestOptions(f.scratch.runsRoot),
-                gameIds: new Set([gameId])
-              }), { discard: true, concurrency: 1 })
-            expect(canonical(yield* f.pg.diskGamesIndex())).toBe(baseline)
-          }), { discard: true, concurrency: 1 })
-
-        yield* Ingest.ingest(Ingest.ingestOptions(f.scratch.runsRoot))
-        expect(canonical(yield* f.pg.diskGamesIndex())).toBe(baseline)
-      })
-    ))
-})
-
-// ------------------------------------------------------- the python bridge --
-
-/**
- * The claim `./materialize.ts` exists to make, tested end to end.
- *
- * `python3 -m agent_eval.replay_derive_cli` is run **twice** with the same
- * request: once against the real `runs_root`, and once through
- * {@link ReplayDerivationPg} against the materialized one. The two documents must
- * be byte-identical, which is what "`ReplayDerivationPython` works unchanged in
- * pg mode" means — and it is also the differential that licenses storing a PPM
- * as a *head*, since `board.json` is built from the PPM header the loader reads.
- *
- * The two runs get **different** cache roots, for the same reason the parity rig
- * gives its two gateways different ones: sharing would let the first run answer
- * for the second, and the comparison would then be of one document with itself.
- */
-describe("the python derivation bridge over a materialized archive", () => {
-  const REQUEST: DerivationRequest = {
-    operation: "board",
-    gameId: TERMINAL_ID,
-    places: [],
-    turn: 1n
-  }
-
-  it("produces a byte-identical board.json from the materialized saves", () =>
-    withFixture((f) =>
-      Effect.gen(function*() {
-        // The oracle: the bridge against the archive as it really is on disk.
-        const expected = yield* pythonDerivationRunner({
-          repoRoot,
-          runsRoot: f.fs.runsRoot,
-          cacheRoot: `${f.scratch.cacheRoot}-oracle`
-        })(REQUEST)
-
-        // The layer under test *is* the entry point here: this test exists to
-        // build it and run one derivation through it. It is given the fixture's
-        // materializer — the same instance the repository holds — because that
-        // sharing is what the bridge's roots and its per-game lock both come
-        // from.
-        // oxlint-disable-next-line effecttsgo/strict-effect-provide
-        const actual = yield* Effect.provide(
-          Effect.flatMap(ReplayDerivation, (derivation) =>
-            derivation.board({ gameId: TERMINAL_ID, turn: 1n })),
-          ReplayDerivationPg({
-            repoRoot,
-            cacheRoot: `${f.scratch.cacheRoot}-bridge`
-          }).pipe(Layer.provide(Layer.succeed(Materializer, f.materializer)))
-        )
-
-        expect(canonical(asCanon(actual))).toBe(canonical(asCanon(expected)))
-        // Not vacuous: a board really was derived.
-        expect(Object.keys(actual).length).toBeGreaterThan(0)
-      })
-    ), 120_000)
-
-  it("captures the bridge's cache entries into the mirror", () =>
-    withFixture((f) =>
-      Effect.gen(function*() {
-        const rows = yield* f.db
-          .select({ cacheKey: derivationCache.cacheKey, entryName: derivationCache.entryName })
-          .from(derivationCache)
-          .where(eq(derivationCache.cacheKey, `${f.scratch.cacheRoot}-bridge`))
-        // The bridge wrote `turn-…json` under its own cache root, and `capture`
-        // carried it into the durable copy under exactly that namespace key.
-        expect(rows.length).toBeGreaterThan(0)
-        expect(rows.every((row) => row.entryName.endsWith(".json"))).toBe(true)
+      Effect.map(rowOf(f.db, HUSK_ID), (row) => {
+        // `current_turn: null` in the fixture: a NULL column *and* a demoted key,
+        // which is what makes absent-vs-present-null decidable (R5).
+        expect(row.currentTurn).toBeNull()
+        const extras = row.extras
+        expect(extras).toBeTruthy()
+        const demoted = Option.getOrNull(reconstructManifest(row))
+        expect(demoted !== null && Object.hasOwn(demoted, "current_turn")).toBe(true)
+        expect(demoted?.["current_turn"]).toBeNull()
       })
     ))
 
-  it("refuses a materialize root that nests with the cache root", () => {
-    // `save_replay._cache_directory` raises `SaveReplayError` for these, and it
-    // has to be caught at construction rather than as a 503 on first replay.
-    expect(nestsWith("/srv/cache", "/srv/cache")).toBe(true)
-    expect(nestsWith("/srv/cache/saves", "/srv/cache")).toBe(true)
-    expect(nestsWith("/srv/cache", "/srv/cache/saves")).toBe(true)
-    expect(nestsWith("/srv/cache/", "/srv/cache")).toBe(true)
-    // The default the gateway should pass: a sibling, not a relative.
-    expect(nestsWith("/srv/cache-saves", "/srv/cache")).toBe(false)
-  })
-})
-
-// ------------------------------------------------ one lock, every caller --
-
-/**
- * A `FileSystem` that records how many fibers are inside one game's directory.
- *
- * The materializer's reconciliation is idempotent but not concurrent — it
- * lists the directory, writes through `<name>.tmp-<digest>` and `rename(2)`,
- * then deletes every entry no row names — so two fibers inside
- * `<materialize-root>/<game-id>` at once is precisely the defect: one deletes
- * the other's temporary file, one lists a tree the other is half-way through
- * rewriting, and the loser fails with `MaterializeFailed`, which the gateway
- * serves as a 503. Measured before the lock, on a 24-way burst against one cold
- * game: `200` twice and `503` twenty-two times in round 0, then `200` 24/24 in
- * every round after — a defect only a cold burst can see.
- *
- * Every call is attributed to the game whose directory it touches and delayed a
- * millisecond, which widens the window enough that an unlocked materializer
- * fails these tests every time rather than occasionally.
- */
-interface DirectoryProbe {
-  /** The instrumented filesystem, to build a materializer over. */
-  readonly fs: FileSystem
-  /** The most fibers ever inside one game's directory at once. */
-  readonly peak: (gameId: string) => number
-  /** The most fibers ever inside the materialize root at once, any game. */
-  readonly peakOverall: () => number
-}
-
-const directoryProbe = (fileSystem: FileSystem, materializeRoot: string): DirectoryProbe => {
-  const inside = new Map<string, number>()
-  const peaks = new Map<string, number>()
-  const overall = { inside: 0, peak: 0 }
-
-  /** The game a path belongs to: the first segment under the materialize root. */
-  const gameOf = (target: string): Option.Option<string> => {
-    const [first] = target.startsWith(`${materializeRoot}/`)
-      ? target.slice(materializeRoot.length + 1).split("/")
-      : []
-    return first === undefined || first === "" ? Option.none() : Option.some(first)
-  }
-
-  const enter = (gameId: string): void => {
-    const depth = (inside.get(gameId) ?? 0) + 1
-    inside.set(gameId, depth)
-    peaks.set(gameId, Math.max(peaks.get(gameId) ?? 0, depth))
-    overall.inside += 1
-    overall.peak = Math.max(overall.peak, overall.inside)
-  }
-
-  const leave = (gameId: string): void => {
-    inside.set(gameId, (inside.get(gameId) ?? 1) - 1)
-    overall.inside -= 1
-  }
-
-  const guard = <A, E>(target: string, effect: Effect.Effect<A, E>): Effect.Effect<A, E> =>
-    Option.match(gameOf(target), {
-      onNone: () => effect,
-      onSome: (gameId) =>
-        Effect.acquireUseRelease(
-          Effect.sync(() => enter(gameId)),
-          () => Effect.flatMap(Effect.sleep("1 millis"), () => effect),
-          () => Effect.sync(() => leave(gameId))
-        )
-    })
-
-  return {
-    // Every call the materializer makes, so an overlap cannot hide in the one
-    // method the probe forgot.
-    fs: {
-      ...fileSystem,
-      makeDirectory: (target, options) => guard(target, fileSystem.makeDirectory(target, options)),
-      readDirectory: (target, options) => guard(target, fileSystem.readDirectory(target, options)),
-      readFileString: (target, encoding) =>
-        guard(target, fileSystem.readFileString(target, encoding)),
-      remove: (target, options) => guard(target, fileSystem.remove(target, options)),
-      // By destination: a rename into the tree is a write to the tree.
-      rename: (from, to) => guard(to, fileSystem.rename(from, to)),
-      stat: (target) => guard(target, fileSystem.stat(target)),
-      writeFile: (target, data, options) =>
-        guard(target, fileSystem.writeFile(target, data, options)),
-      writeFileString: (target, data, options) =>
-        guard(target, fileSystem.writeFileString(target, data, options))
-    },
-    peak: (gameId) => peaks.get(gameId) ?? 0,
-    peakOverall: () => overall.peak
-  }
-}
-
-/** A materializer over a private, cold materialize root and a probe. */
-const probedMaterializer = (
-  f: Fixture,
-  name: string
-): Effect.Effect<
-  { readonly materializer: RunArchiveMaterializer; readonly probe: DirectoryProbe },
-  never,
-  TestContext
-> =>
-  Effect.gen(function*() {
-    const fileSystem = yield* FileSystem
-    const path = yield* Path
-    // A root of its own per test, so every one of them starts *cold*: a warm
-    // tree short-circuits on the recorded digest and reconciles nothing, which
-    // would make these tests pass against a materializer with no lock at all.
-    const materializeRoot = `${f.scratch.base}/${name}`
-    const probe = directoryProbe(fileSystem, materializeRoot)
-    const materializer = yield* makeMaterializer(f.db, probe.fs, path, {
-      runsRoot: f.fs.runsRoot,
-      materializeRoot
-    })
-    return { materializer, probe }
-  })
-
-/**
- * The lock the cold-burst 503s needed, where every caller can reach it.
- *
- * It used to be a per-game semaphore in the gateway's repository decorator
- * (`main.ts`'s `withFailureLog`), which covered the archive reads and nothing
- * else — the derivation bridge materializes the same directory through
- * `ReplayDerivationPg`, holding only `replay_lock`, so a replay and an archive
- * read of one game still raced. The lock is `makeMaterializer`'s now, and the
- * materializer is a service both of them take from the same tag.
- *
- * These tests share the fixture's database and corpus but never its materialize
- * root: each builds its own, so `derivation_workdirs.path` is re-stamped as they
- * run. That is a legal state — the row records where the archive was last built
- * — and the reads above re-materialize under their own root if they follow.
- */
-describe("materialization is single-flight per game", () => {
-  it("a 24-way burst on one cold game never has two fibers in its directory", () =>
+  it("keeps the manifest's game_id claim, and never reads the primary key", () =>
     withFixture((f) =>
-      Effect.gen(function*() {
-        const { materializer, probe } = yield* probedMaterializer(f, "lock-burst")
-        const roots = yield* Effect.all(
-          Array.from({ length: 24 }, () => materializer.ensureRunArchive(TERMINAL_ID)),
-          { concurrency: "unbounded" }
+      Effect.map(rowOf(f.db, WRONG_ID), (row) => {
+        expect(Option.getOrNull(reconstructManifest(row))?.["game_id"]).toBe(
+          "game_parity_wrong_id_06_other"
         )
-
-        expect(probe.peak(TERMINAL_ID)).toBe(1)
-        // Not vacuous: the archive really was built, and every caller was told
-        // the same directory rather than 22 of them getting a 503.
-        expect(new Set(roots).size).toBe(1)
-        const fileSystem = yield* FileSystem
-        expect(yield* fileSystem.exists(`${roots[0] ?? ""}/saves/turn-0001-auto.sav.gz`)).toBe(true)
-      })
-    ), 60_000)
-
-  it("different games are still materialized in parallel", () =>
-    withFixture((f) =>
-      Effect.gen(function*() {
-        const games = [TERMINAL_ID, NOWIN_ID, "game_parity_interrupted_03", "game_parity_torn_tail_08"]
-        const { materializer, probe } = yield* probedMaterializer(f, "lock-parallel")
-        yield* Effect.all(
-          games.flatMap((gameId) =>
-            Array.from({ length: 4 }, () => materializer.ensureRunArchive(gameId))
-          ),
-          { concurrency: "unbounded" }
-        )
-
-        // Serialized within a game…
-        expect(games.map((gameId) => probe.peak(gameId))).toEqual(games.map(() => 1))
-        // …and not across games: the lock is per id, not one global mutex.
-        expect(probe.peakOverall()).toBeGreaterThan(1)
-      })
-    ), 60_000)
-
-  it("a derivation and an archive read of one game take the same lock", () =>
-    withFixture((f) =>
-      Effect.gen(function*() {
-        const { materializer, probe } = yield* probedMaterializer(f, "lock-bridge")
-        const repository = makeRunsRepositoryPg(f.db, materializer)
-
-        // The bridge is pointed at a python that does not exist, so it fails
-        // the instant materialization hands off to it: what is under test is
-        // the reconciliation *before* the spawn, and a real derivation here
-        // would spend a minute proving nothing extra.
-        const bridge = ReplayDerivationPg({
-          repoRoot,
-          cacheRoot: `${f.scratch.cacheRoot}-lock`,
-          python: "/nonexistent/arena-lock-probe-python3"
-        }).pipe(Layer.provide(Layer.succeed(Materializer, materializer)))
-
-        const [archive, derived] = yield* Effect.all(
-          [
-            Effect.either(repository.terminalArchive(TERMINAL_ID)),
-            // oxlint-disable-next-line effecttsgo/strict-effect-provide
-            Effect.provide(
-              Effect.either(
-                Effect.flatMap(ReplayDerivation, (derivation) =>
-                  derivation.board({ gameId: TERMINAL_ID, turn: 1n }))
-              ),
-              bridge
-            )
-          ],
-          { concurrency: "unbounded" }
-        )
-
-        // The claim: two callers that hold *different* mutexes reconciled the
-        // same directory one at a time, because the mutex they share is the
-        // materializer's.
-        expect(probe.peak(TERMINAL_ID)).toBe(1)
-        // The archive read answered rather than 503-ing on a half-built tree…
-        expect(Either.isRight(archive)).toBe(true)
-        // …and the derivation got all the way past materialization to the
-        // spawn, which is the only reason it failed.
-        expect(
-          Either.match(derived, {
-            onLeft: (error) => `${error._tag}:${error.detail.slice(0, 12)}`,
-            onRight: () => "derived"
-          })
-        ).toBe("DerivationUnavailable:spawn failed")
-      })
-    ), 60_000)
-
-  it("the repository and the bridge are built from one materializer", () =>
-    withFixture((f) =>
-      Effect.gen(function*() {
-        // The wiring `main.ts` relies on, as an assertion: one materializer
-        // layer handed to a `Layer.merge` of both consumers is *built once*,
-        // because `Layer.provide` memoizes by layer reference. If that ever
-        // stopped holding, both halves would still typecheck and each would
-        // quietly get a lock table of its own — the exact defect the tag exists
-        // to make impossible.
-        const fileSystem = yield* FileSystem
-        const path = yield* Path
-        const built = yield* Ref.make(0)
-        const materializerLayer = Layer.effect(
-          Materializer,
-          Effect.flatMap(Ref.update(built, (count) => count + 1), () =>
-            makeMaterializer(f.db, fileSystem, path, {
-              runsRoot: f.fs.runsRoot,
-              materializeRoot: `${f.scratch.base}/lock-shared`
-            }))
-        )
-
-        // oxlint-disable-next-line effecttsgo/strict-effect-provide
-        yield* Effect.provide(
-          Effect.all([RunsRepository, ReplayDerivation], { concurrency: 1 }),
-          Layer.merge(
-            runsRepositoryPgLayer,
-            ReplayDerivationPg({ repoRoot, cacheRoot: `${f.scratch.cacheRoot}-shared` })
-          ).pipe(Layer.provide(materializerLayer))
-        )
-
-        expect(yield* Ref.get(built)).toBe(1)
       })
     ))
 
-  it("two materializers over one root are two lock tables — the shape this removed", () =>
+  it("records state verbatim as well as in the column", () =>
     withFixture((f) =>
-      Effect.gen(function*() {
-        // The falsifier for the three tests above: the probe reports an overlap
-        // the moment the callers stop sharing a materializer, which is exactly
-        // what the gateway had when the archive read locked in `main.ts` and the
-        // derivation bridge built a materializer of its own. Nothing asserts
-        // success here — a losing fiber failing with `MaterializeFailed` *is*
-        // the defect, and it is why the lock has one home.
-        const fileSystem = yield* FileSystem
-        const path = yield* Path
-        const materializeRoot = `${f.scratch.base}/lock-unshared`
-        const probe = directoryProbe(fileSystem, materializeRoot)
-        const options = { runsRoot: f.fs.runsRoot, materializeRoot }
-        const first = yield* makeMaterializer(f.db, probe.fs, path, options)
-        const second = yield* makeMaterializer(f.db, probe.fs, path, options)
-
-        yield* Effect.all(
-          [first, second].flatMap((materializer) =>
-            Array.from({ length: 6 }, () =>
-              Effect.either(materializer.ensureRunArchive(TERMINAL_ID)))
-          ),
-          { concurrency: "unbounded" }
-        )
-
-        expect(probe.peak(TERMINAL_ID)).toBeGreaterThan(1)
+      Effect.map(rowOf(f.db, TERMINAL_ID), (row) => {
+        expect(row.state).toBe("completed")
+        expect(Option.getOrNull(reconstructManifest(row))?.["state"]).toBe("completed")
       })
-    ), 60_000)
+    ))
 })

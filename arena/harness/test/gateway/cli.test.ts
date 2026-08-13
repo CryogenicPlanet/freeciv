@@ -28,8 +28,6 @@ import type { GatewayConfigInput } from '../../src/gateway/config.ts';
 import {
   DATABASE_URL_FLAG,
   DATABASE_URL_WITHOUT_POSTGRES,
-  MATERIALIZE_ROOT_FLAG,
-  MATERIALIZE_ROOT_WITHOUT_POSTGRES,
   DEFAULT_GATEWAY_BACKEND,
   DEFAULT_GATEWAY_HOST,
   DEFAULT_GATEWAY_PORT,
@@ -46,7 +44,6 @@ import {
 } from '../../src/gateway/cli.ts';
 import type { GatewayCliArgs } from '../../src/gateway/cli.ts';
 import type { PostgresBackendInput } from '../../src/gateway/config.ts';
-import { pathsNest } from '../../src/gateway/config.ts';
 import {
   GATEWAY_DB_APPLICATION_NAME,
   GATEWAY_MAX_DB_CONNECTIONS,
@@ -55,10 +52,8 @@ import {
   archiveServices,
   describeRepositoryFailure,
   describeStartupError,
-  materializeRootFor,
   withFailureLog,
 } from '../../src/gateway/main.ts';
-import { Materialize } from '@arena/db';
 import { ReplayDerivation } from '../../src/gateway/services/derivation.ts';
 import { RunsRepository } from '../../src/gateway/services/runs.ts';
 import type { RunsRepositoryApi, TerminalArchive } from '../../src/gateway/services/runs.ts';
@@ -1164,12 +1159,12 @@ describe('--backend / --database-url — additive, TypeScript-only, default off'
     expect(parsed.backend?._tag).toBe('Postgres');
     expect(parsed).toEqual({
       ...NINE_FLAG_SNAPSHOT,
-      backend: {
-        _tag: 'Postgres',
-        databaseUrl: Redacted.make(DATABASE_URL),
-        materializeRoot: undefined,
-      },
+      backend: { _tag: 'Postgres', databaseUrl: Redacted.make(DATABASE_URL) },
     });
+    // The backend carries a URL and **nothing else**.  It used to carry
+    // `--materialize-root`; a pg gateway reads `<--runs-root>/<game-id>` now,
+    // so a path here would be a path the gateway does not use.
+    expect(Object.keys(parsed.backend ?? {}).toSorted()).toEqual(['_tag', 'databaseUrl']);
     const backend = parsed.backend;
     expect(backend === undefined ? '' : Redacted.value(backend.databaseUrl)).toBe(DATABASE_URL);
   });
@@ -1235,21 +1230,37 @@ describe('--backend / --database-url — additive, TypeScript-only, default off'
     expect(usage.includes('--service-url') && usage.includes('--viewer-public-url')).toBe(true);
   });
 
-
-  test('--materialize-root is discoverable too, and refused without postgres', async () => {
+  test('--materialize-root is gone, loudly: an unknown argument, not an ignored one', () => {
+    // The flag named where a pg gateway staged the savegames the python bridge
+    // reads.  There is no such place any more — both backends point the bridge
+    // at `--runs-root` — so the flag was **removed** rather than accepted and
+    // ignored, which is the failure mode this test exists to forbid: an
+    // operator who passes it must be told, not silently obeyed in a way that
+    // does nothing.
     const usage = HelpDoc.toAnsiText(
       CommandDescriptor.getHelp(gatewayCommand.descriptor, CliConfig.defaultConfig),
     );
-    expect(usage).toContain(MATERIALIZE_ROOT_FLAG);
-    const message = messageOf(await parseArgs([...REQUIRED, MATERIALIZE_ROOT_FLAG, '/elsewhere']));
-    expect(message).toContain(MATERIALIZE_ROOT_WITHOUT_POSTGRES);
+    expect(usage).not.toContain('--materialize-root');
+    // Through the **real** entry point, not through `parseArgs`.  Measured, and
+    // it is why: `CommandDescriptor.parse` is the option matcher and answers
+    // `UserDefined` with the stray token merely *unconsumed*, so a
+    // `parseArgs`-based assertion here would have read "parsed" and passed for
+    // the wrong reason.  `Command.run` is the layer that refuses leftovers, and
+    // it is the layer `main` actually uses.
+    const child = Bun.spawnSync(
+      ['bun', join(REPO_ROOT, 'arena/harness/src/gateway/main.ts'), ...REQUIRED, '--materialize-root', '/elsewhere'],
+      { cwd: join(REPO_ROOT, 'arena/harness') },
+    );
+    const output = `${child.stdout.toString()}${child.stderr.toString()}`;
+    expect(output).toContain('--materialize-root');
+    expect(output.toLowerCase()).toContain('unknown');
+    expect(child.exitCode).toBe(GATEWAY_CLI_ERROR_EXIT_CODE);
   });
 
-  test('the config resolves the backend, and the identity digest still ignores it', async () => {
+  test('the config carries the backend through, and the identity digest still ignores it', async () => {
     const backend: PostgresBackendInput = {
       _tag: 'Postgres',
       databaseUrl: Redacted.make(DATABASE_URL),
-      materializeRoot: undefined,
     };
     const [plain, postgres] = await Promise.all([
       runFs(Effect.orDie(makeGatewayConfig(BASE))),
@@ -1264,79 +1275,57 @@ describe('--backend / --database-url — additive, TypeScript-only, default off'
 });
 
 // ---------------------------------------------------------------------------
-// `--materialize-root`: the sibling directory the python bridge reads
+// The backend adds no construction-time failure — the ordering contract, now
+// provable by exhaustion rather than by ordering
 // ---------------------------------------------------------------------------
 
-const postgresInput = (materializeRoot: string | undefined): GatewayConfigInput => ({
+const postgresInput = (): GatewayConfigInput => ({
   ...BASE,
-  backend: { _tag: 'Postgres', databaseUrl: Redacted.make(DATABASE_URL), materializeRoot },
+  backend: { _tag: 'Postgres', databaseUrl: Redacted.make(DATABASE_URL) },
 });
 
-describe('--materialize-root — a sibling of the cache root, never a relative of it', () => {
-  test('the default is <cache-root>-saves, and it is what main.ts would have derived', async () => {
-    const config = await runFs(Effect.orDie(makeGatewayConfig(postgresInput(undefined))));
-    expect(config.backend?.materializeRoot).toBe(`${config.cacheRoot}-saves`);
-    expect(config.backend?.materializeRoot).toBe(materializeRootFor(config.cacheRoot));
-  });
-
-  test('an explicit root is resolved the way every other path is', async () => {
-    const config = await runFs(Effect.orDie(makeGatewayConfig(postgresInput('/elsewhere/saves'))));
-    expect(config.backend?.materializeRoot).toBe('/elsewhere/saves');
-  });
-
-  test('a root that equals, contains or sits inside the cache root is refused', async () => {
-    // `save_replay._cache_directory` raises `SaveReplayError("Replay cache must
-    // be separate from game saves.")` for all three, on the first replay
-    // request; here it is exit 2 before the socket binds.
-    const refused = await Promise.all(
-      ['/cache', '/cache/saves', '/'].map((root) => failureOf(postgresInput(root))),
-    );
-    expect(refused).toEqual(
-      Array.from({ length: 3 }, () => GATEWAY_CONFIG_MESSAGES.materializeRootNestsCacheRoot),
-    );
-    expect(await failureOf(postgresInput('/cache-saves'))).toBe('no failure');
-  });
-
-  test('the nesting predicate is @arena/db’s, checked rather than assumed', () => {
-    // Two copies exist on purpose — importing `@arena/db` from `config.ts` would
-    // put a database driver in the filesystem gateway's module graph — so the
-    // agreement is a test, not a comment.
-    const pairs: readonly (readonly [string, string])[] = [
-      ['/a', '/a'],
-      ['/a/b', '/a'],
-      ['/a', '/a/b'],
-      ['/a-saves', '/a'],
-      ['/a', '/b'],
-      ['/a/', '/a'],
-      ['/ab', '/a'],
-    ];
-    expect(pairs.map(([left, right]) => pathsNest(left, right))).toEqual(
-      pairs.map(([left, right]) => Materialize.nestsWith(left, right)),
-    );
-    // …and the default is a sibling for every root a caller can plausibly pass:
-    // `<root>-saves` differs from `<root>` by a suffix, and a suffix is not a
-    // path separator.
-    expect(
-      ['/c', '/a/b/replay-cache', '/tmp/x'].every(
-        (root) => !pathsNest(materializeRootFor(root), root),
-      ),
-    ).toBe(true);
-    // The one exception, stated rather than hidden: `--cache-root /` strips to
-    // the empty string, so *every* absolute path "nests" with it and the
-    // derived default is refused at startup.  Both copies of the predicate do
-    // this, so the two backends refuse the same absurd invocation together.
-    expect(pathsNest(materializeRootFor('/'), '/')).toBe(
-      Materialize.nestsWith(materializeRootFor('/'), '/'),
+describe('--backend postgres cannot be the reason a configuration is refused', () => {
+  test('every construction-time message is one CPython could have produced', () => {
+    // The strongest form of the ordering contract `makeGatewayConfig` used to
+    // keep by *running the backend check last*: there is no TypeScript-only
+    // message left to order.  `materializeRootNestsCacheRoot` was the only one,
+    // and it died with the flag that produced it.
+    expect(Object.keys(GATEWAY_CONFIG_MESSAGES).toSorted()).toEqual(
+      [
+        'hostNotLiteral',
+        'hostNotLoopback',
+        'noHomeDirectory',
+        'portOutOfRange',
+        'serviceUrlControlCharacters',
+        'serviceUrlCredentials',
+        'serviceUrlDotSegments',
+        'serviceUrlInvalidPort',
+        'serviceUrlNotHttp',
+        'timeoutNotPositive',
+      ].toSorted(),
     );
   });
 
-  test('the ordering contract holds: a Python failure still wins over a new one', async () => {
-    // Both wrong: a non-loopback host *and* a nesting materialize root.  The
-    // message must be the one CPython would have produced, which is why
-    // `resolveBackend` runs last.
-    expect(await failureOf({ ...postgresInput('/cache'), host: 'localhost' })).toBe(
-      GATEWAY_CONFIG_MESSAGES.hostNotLiteral,
-    );
+  test('a valid nine-flag argv stays valid when a backend is added to it', async () => {
+    expect(await failureOf(postgresInput())).toBe('no failure');
+  });
+
+  test('an argv that is wrong reports the Python failure, backend or no backend', async () => {
+    const wrong = { host: 'localhost' } as const;
+    expect([
+      await failureOf({ ...BASE, ...wrong }),
+      await failureOf({ ...postgresInput(), ...wrong }),
+    ]).toEqual([GATEWAY_CONFIG_MESSAGES.hostNotLiteral, GATEWAY_CONFIG_MESSAGES.hostNotLiteral]);
+  });
+
+  test('the resolved config is the plain one plus exactly the backend field', async () => {
+    const [plain, postgres] = await Promise.all([
+      runFs(Effect.orDie(makeGatewayConfig(BASE))),
+      runFs(Effect.orDie(makeGatewayConfig(postgresInput()))),
+    ]);
+    // No path, no root, no derived directory: `--backend postgres` changes
+    // *where the manifest comes from* and not one resolved value.
+    expect({ ...postgres, backend: undefined }).toEqual({ ...plain, backend: undefined });
   });
 });
 
@@ -1344,7 +1333,7 @@ describe('--materialize-root — a sibling of the cache root, never a relative o
 // main.ts: the layer selection, and the module graph the fs path keeps
 // ---------------------------------------------------------------------------
 
-/** `archiveServices`' requirements: the pg arm materializes through both. */
+/** `archiveServices`' requirements: both arms resolve real paths through them. */
 const PLATFORM = Layer.mergeAll(NodeFileSystem.layer, NodePath.layer);
 
 /** A URL `@arena/db` refuses before it opens a socket — no server is contacted. */
@@ -1370,11 +1359,7 @@ describe('main.ts — which layers the backend selects', () => {
       Effect.orDie(
         makeGatewayConfig({
           ...BASE,
-          backend: {
-            _tag: 'Postgres',
-            databaseUrl: Redacted.make(NOT_POSTGRES_URL),
-            materializeRoot: undefined,
-          },
+          backend: { _tag: 'Postgres', databaseUrl: Redacted.make(NOT_POSTGRES_URL) },
         }),
       ),
     );
@@ -1464,11 +1449,14 @@ describe('main.ts — which layers the backend selects', () => {
  *
  * It answers after a tick, and counts how many callers were inside it at once.
  * The decorator used to hold a per-game semaphore and this probe pinned it at
- * `1`; the lock now lives in `@arena/db`'s materializer, which is the object the
- * derivation bridge shares — so what this probe pins here is the *opposite*
- * claim, that the gateway adds no queue of its own on top of it. `frameFile`
- * and `videoFile` answer out of `bytea` and reconcile nothing, so a lock around
- * them would only be a queue on a `SELECT`.
+ * `1`, back when a pg gateway staged savegames into a materialization root and
+ * two concurrent reads of one game could race to write the same directory.
+ * Nothing is staged any more — both backends point the python bridge at
+ * `<--runs-root>/<game-id>` — so this probe pins the *opposite* claim: the
+ * decorator logs and does nothing else.  `terminalArchive` reads rows and a
+ * `victory.json`, and `frameFile`/`videoFile` are directory listings and an
+ * `lstat` on a tree no gateway writes, so a lock around any of them would be a
+ * queue in front of reads that cannot conflict.
  */
 const overlapProbe = (): {
   readonly repository: RunsRepositoryApi;
@@ -1485,7 +1473,7 @@ const overlapProbe = (): {
   // projection output that nothing under test looks at, and building one from
   // a fixture would make this a filesystem test.
   const archiveOf = (gameId: string): TerminalArchive =>
-    ({ gameId, runRoot: `/materialized/${gameId}` }) as unknown as TerminalArchive;
+    ({ gameId, runRoot: `/runs/${gameId}` }) as unknown as TerminalArchive;
   const guarded = <A>(value: A): Effect.Effect<A> =>
     Effect.acquireUseRelease(
       Effect.sync(enter),
@@ -1504,8 +1492,8 @@ const overlapProbe = (): {
       lastReplayTurn: () => Effect.succeedNone,
       diskGamesIndex: () => Effect.die('unused'),
       diskRowsWithInterrupted: () => Effect.die('unused'),
-      frameFile: (archive: TerminalArchive) => guarded(`/materialized/${archive.gameId}/frame.png`),
-      videoFile: (archive: TerminalArchive) => guarded(`/materialized/${archive.gameId}/game.mp4`),
+      frameFile: (archive: TerminalArchive) => guarded(`/runs/${archive.gameId}/frame.png`),
+      videoFile: (archive: TerminalArchive) => guarded(`/runs/${archive.gameId}/game.mp4`),
     } as unknown as RunsRepositoryApi,
     peak: () => state.peak,
   };
@@ -1513,11 +1501,11 @@ const overlapProbe = (): {
 
 describe('the pg repository decorator adds a log line and no lock', () => {
   test('a burst on one game is not queued by the gateway', async () => {
-    // The serialization this used to assert is `@arena/db`'s now, and it is
-    // asserted there against a real materializer and a real directory
-    // (`materialize.ts`'s per-game semaphore, `runs-repository-pg.test.ts`'s
-    // single-flight tests). A second lock here would serialize the reads that
-    // never touch a directory as well as the one that does.
+    // The serialization this used to assert had one subject — the per-game
+    // staging directory — and that subject no longer exists.  Twenty-four
+    // concurrent reads of one game must all be in flight at once; a peak of
+    // `1` here would mean the gateway had grown a queue in front of reads
+    // that share nothing.
     const probe = overlapProbe();
     const guarded = withFailureLog(probe.repository);
     await Effect.runPromise(

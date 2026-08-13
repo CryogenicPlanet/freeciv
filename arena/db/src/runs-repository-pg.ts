@@ -1,104 +1,123 @@
 /**
- * `RunsRepository`, backed by Postgres instead of by `runs_root`.
+ * `RunsRepository`, backed by the v2 domain schema instead of by a blob mirror.
  *
  * This module satisfies the *same* `Context.Tag` the filesystem backend
  * satisfies (`@arena/harness/gateway/RunsRepository`), member for member, and
  * the contract it keeps is **byte parity**: for every fixture and every method,
  * the value this repository answers with must be indistinguishable from the
- * value `makeRunsRepository(runs_root)` answers with. `test/runs-repository-pg.test.ts`
- * runs both and asserts exactly that, with the fs implementation as the oracle.
+ * value `makeRunsRepository(runs_root)` answers with.
+ * `test/runs-repository-pg.test.ts` runs both over one corpus and asserts
+ * exactly that, with the fs implementation as the oracle — `runRoot` included,
+ * which v1 had to exclude.
  *
- * ## How parity is achieved: the database contributes bytes, nothing else
+ * ## Two sources, one answer
  *
- * Every projection — `diskGameRow`, `terminalArchiveView`, `archiveVictory`,
- * `selectFramePng`, `interruptedCandidates`, `diskRowsWithInterrupted`,
- * `gamesIndex`, `sortDiskGameRows` — is **imported from `@arena/harness`'s
- * `gateway/archive.ts` and called with the same arguments**. Not one of them is
- * re-implemented here. What changes is only where the bytes came from:
- * `readFully(fd, …)` becomes a `SELECT` of a `bytea`, and the very next line is
- * the identical `decodeUtf8 → decodeJsonValueFromString → asJsonObject`
- * pipeline the fs reader runs.
+ * v1 stored the bytes of every document and re-ran the fs reader over them.
+ * v2 stores *rows*: `manifest.json` and `report.json` are decomposed into typed
+ * columns plus an `extras` envelope at ingest, and this module puts them back
+ * together (§1 of the build plan). Everything that is **not** a document —
+ * `victory.json`, `watch_frames/`, `game.mp4` — is read from
+ * `<runs-root>/<game_id>` **by the filesystem backend's own code**, which is
+ * what lets `TerminalArchive.runRoot` be a real run directory again and deletes
+ * the materializer.
  *
- * Four temptations are therefore refused on purpose, and each one is a place
- * where SQL and the fs backend's TypeScript disagree about the same question:
+ * ```
+ * readManifest / decodeManifest   DB  (reconstruction, §1.2)
+ * terminalArchive                 DB  for manifest + report, disk for victory.json + runRoot
+ * lastReplayTurn                  DB  (games.last_replay_turn, +extras.derived for int32 overflow)
+ * diskGamesIndex                  DB  (+ the disk reads terminal enrichment implies)
+ * diskRowsWithInterrupted         DB  (the same pure relabelling functions)
+ * frameFile / videoFile           disk — delegated to `makeRunsRepository`, not re-implemented
+ * ```
  *
- * - **no `ORDER BY`** anywhere. Postgres orders `text` by collation;
- *   `sortDiskGameRows` orders by *code point* and breaks `created_at` ties with
- *   float arithmetic in which `null` and `0.0` are the same key. Sorting is done
- *   in TypeScript, over the projected rows.
- * - **no `WHERE state = …`** for `terminalOnly`. The option is applied against
- *   the *projected* row's state, which came out of `manifestState` →
- *   `publicText` → `runState`; the stored `state` column is an advisory copy
- *   that can lag a re-ingest.
- * - **no `WHERE benchmark_valid`**. The archive's `benchmarkValid` is
- *   `state === 'completed' && manifest.benchmark_valid === true`, which is not
- *   the manifest field.
- * - **no `LIMIT`**. `diskGamesIndex` has none; the cap is
- *   `interruptedCandidates`' filter, applied after projection.
+ * ## Reconstruction, and the two columns it may not read
  *
- * `frame_index` is not read either, even though the column exists: the index is
- * re-derived from the stored *name* with `Gateway.decodeArchivePngName`, the
- * same function the fs listing uses. A class-B column that reached a response
- * body would be a defect, and this is the one that could have.
+ * A key of an `ok` document is stored **exactly once**: in its typed column when
+ * the column can hold it losslessly, otherwise verbatim in `extras.manifest`
+ * (the *demotion* rule). So reconstruction is "every demoted key, plus every
+ * non-`NULL` column whose key was not demoted", and the three stored shapes mean
+ * exactly what the plan says they mean:
  *
- * ## The three failure states, and where they come from
+ * | stored | reconstructed |
+ * |---|---|
+ * | column `NULL`, key absent from `extras.manifest` | the key is **omitted** — the document had none |
+ * | column `NULL`, key present in `extras.manifest` | `extras.manifest[key]`, verbatim (explicit `null`, wrong type, out of range) |
+ * | column non-`NULL` | the column, as a plain JSON `number` / `string` / `boolean` |
  *
- * | fs | pg | answer |
- * |---|---|---|
- * | run directory missing / symlinked / not a directory | no `runs` row | 404 `game not found` |
- * | `open(manifest.json)` failed | no `run_documents` row | 404 `game manifest not found` |
- * | not regular / size 0 / > 8 MiB / bad UTF-8 / not an object | `status = 'unusable'`, or the same gates re-applied to the stored bytes | 503 `game manifest is unavailable` |
+ * Two columns are **write-only projections** and are never read here:
  *
- * The size gates are re-applied here rather than trusted from ingest, because
- * `byte_size` is a *gate*, not metadata: it holds the fstat size, which a short
- * `readFully` can leave above `octet_length(bytes)`, and it is what decides the
- * `<= 0` / `> 8 MiB` 503.
+ * - `games.game_id` is the *directory name*; the manifest's `game_id` is a
+ *   *claim*, and fixture `game_parity_wrong_id_06` exists because they can
+ *   differ. The claim lives in `extras.manifest.game_id`, and {@link
+ *   makeRunsRepositoryPg}'s `readManifest` re-runs the cross-check over the
+ *   reconstructed document exactly as the fs one does. Reconstructing it from
+ *   the primary key would serve a run the fs backend 404s.
+ * - `name` / `ruleset` / `mode` / `timing_mode` / `max_turns` / `objective` are
+ *   lifted from `config` for querying and have not been through `publicText`.
+ *   The projections read `config` — the jsonb — and a pg-side answer built from
+ *   a lifted column would be silently, differently truncated.
  *
- * A `SqlError` is the one failure with no filesystem twin. It is classified the
- * way the fs backend classifies its own storage failures, which is not uniform
- * and should not be: `diskGamesIndex` and `lastReplayTurn` are declared
- * `E = never` in `services/runs.ts` because an unreadable `runs_root` there
- * produces an *empty listing*, not an error, and the index page still renders.
- * A `SqlError` on those two paths therefore answers empty as well, so the pg
- * gateway degrades exactly where the fs gateway degrades. A read of one named
- * artifact has no such fallback — an empty answer would be a lie about that
- * artifact — so it answers 503. There is no wire message for "the database is down", and `@arena/wire` is
- * read-only here, so the 503 carries `manifestUnavailable`, the port's existing
+ * `games.state` is a third: it is `NOT NULL` over a seven-value enum with an
+ * `'invalid'` sentinel, so it cannot distinguish *absent* from a manifest that
+ * literally said `"invalid"`. {@link reconstructManifest} therefore prefers
+ * `extras.manifest.state` whenever ingest recorded it — **ingest must record it
+ * whenever the key is present**, which is the one deviation this module asks of
+ * the plan's §1.2 table (see `RECONSTRUCTION` below) — and falls back to the
+ * column only when it is not the sentinel. That closes `manifestState`'s
+ * `untrustedFieldOr(manifest, 'state', 'status')` case, the single site where a
+ * *present* `null` beats `status` and an *absent* key does not.
+ *
+ * ## No `bigint` in a reconstructed document
+ *
+ * `readManifest` answers a `JsonObject`, and the fs backend produces it with
+ * `JSON.parse` under `Schema.JsonNumber`: **every number is a JS `number`.**
+ * `Gateway.decodeManifest` depends on it (`WireInt = BigIntFromNumber` decodes
+ * *from* a number), the declared return type has no `bigint` member, and the
+ * deep-equality oracle would fail on one. The only `bigint` in this module is
+ * {@link RunsRepositoryApi.lastReplayTurn}'s answer, whose value came from
+ * `parsePythonJson` and whose `int`-ness is what refuses `{"turn": 2.0}`.
+ *
+ * ## The four SQL temptations, still refused
+ *
+ * No `ORDER BY` (Postgres orders `text` by collation; `sortDiskGameRows` orders
+ * by code point and breaks `created_at` ties with float arithmetic in which
+ * `null` and `0.0` are the same key); no `WHERE state = …` for `terminalOnly`
+ * (the option applies to the *projected* state, which came through
+ * `manifestState → publicText → runState`, not to the stored enum); no `WHERE
+ * benchmark_valid` (the archive's `benchmarkValid` is `state === 'completed' &&
+ * manifest.benchmark_valid === true`); no `LIMIT`. Sorting, filtering and
+ * capping happen in TypeScript, over projected rows.
+ *
+ * ## Failure classification
+ *
+ * `manifest_status` / `report_status` are `_read_archive_json`'s verdict,
+ * recorded once at ingest: `absent` → 404, `unusable` → 503, `ok` → the row.
+ * The size gate is **not** re-applied — with no stored bytes there is nothing to
+ * re-gate, and the gate is a pure function of `(fstat size, regular, bytes)`
+ * evaluated with the same constants. A `SqlError` has no filesystem twin and is
+ * classified the way the fs backend classifies its own storage failures, which
+ * is deliberately not uniform: `diskGamesIndex` and `diskRowsWithInterrupted`
+ * are declared `E = never` because an unreadable `runs_root` there produces an
+ * *empty listing*, so a `SqlError` logs a warning and answers empty; a read of
+ * one named artifact answers 503 `manifestUnavailable`, the port's existing
  * "this archive cannot be turned into a response" text, with the `SqlError` as a
  * log-only `cause`.
  *
- * ## The one thing that is not byte-identical: `TerminalArchive.runRoot`
- *
- * `runRoot` is documented in `services/runs.ts` as "the resolved run directory,
- * for the binary routes and nothing else", and no payload is derived from it —
- * but `http/routes/archive.ts` still reaches around the repository three times:
- * it lists `runRoot/watch_frames` and `runRoot/saves` with its own `readdirSync`
- * and opens each `*.map.ppm` by path. Until
- * that route takes a `BinaryArtifact` from the repository, a pg-backed
- * `runRoot` has to be a directory that really holds those files, so it points at
- * the *materialized* archive (`./materialize.ts`) rather than at `runs_root`.
- * The bytes underneath are the stored bytes, so every listing and every response
- * body is unchanged; only the path string differs, and the differential test
- * asserts equality on everything except that field.
- *
- * {@link RunsRepositoryPgApi.frameBytes} and {@link RunsRepositoryPgApi.videoBytes}
- * are the shape the refactor wants — bytes straight out of `bytea`, no file
- * anywhere. When `frameFile`/`videoFile` become `BinaryArtifact`, they become
- * one-line wrappers over these two and the staging directory disappears.
+ * @module
  */
 
 import * as PgDrizzle from "@effect/sql-drizzle/Pg"
 import type { SqlError } from "@effect/sql/SqlError"
-import { and, eq, inArray } from "drizzle-orm"
-import type { PgColumn } from "drizzle-orm/pg-core"
+import { eq, inArray } from "drizzle-orm"
 import * as Effect from "effect/Effect"
 import * as Either from "effect/Either"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import { closeSync, fstatSync, openSync, readSync, realpathSync } from "node:fs"
+import { join } from "node:path"
 
 import {
   decodeJsonValueFromString,
-  type FrameIndex,
   Gateway,
   isGameId,
   isTerminalRunState,
@@ -109,18 +128,15 @@ import {
 } from "@arena/wire"
 
 import {
-  type ArchivePng,
   archiveVictory,
   diskGameRow,
   diskRowsWithInterrupted as relabelDiskRows,
   gamesIndex,
   interruptedCandidates,
   manifestState,
-  selectFramePng,
   sortDiskGameRows,
   terminalArchiveView
 } from "../../harness/src/gateway/archive.ts"
-import { MAX_PROXY_JSON_BYTES } from "../../harness/src/gateway/constants.ts"
 import {
   ArchiveUnavailable,
   type ArchiveUnavailableProblem,
@@ -130,19 +146,22 @@ import {
 } from "../../harness/src/gateway/errors.ts"
 import type { Canonical, Untrusted } from "../../harness/src/gateway/public.ts"
 import { untrustedField } from "../../harness/src/gateway/public.ts"
-import { parsePythonJson } from "../../harness/src/gateway/python-json.ts"
 import {
-  archiveBytes,
   type DiskGamesIndexOptions,
-  REPLAY_TAIL_BYTES,
+  makeRunsRepository,
+  O_CLOEXEC,
+  O_RDONLY,
   RunsRepository,
   type RunsRepositoryApi,
   type RunsError,
-  type TerminalArchive
+  type TerminalArchive,
+  VICTORY_FILE
 } from "../../harness/src/gateway/services/runs.ts"
 
-import { type Database, Materializer, type RunArchiveMaterializer } from "./materialize.ts"
-import { runDocuments, runFrames, runReplayTail, runs, runVideos } from "./schema.ts"
+import { games } from "./schema.ts"
+
+/** The drizzle handle every query below runs on. */
+export type Database = PgDrizzle.PgDrizzle["Type"]
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -156,9 +175,9 @@ const isNotFoundProblem = (problem: string): problem is NotFoundProblem =>
 /**
  * A problem name from `archive.ts` as the 404 it is — `services/runs.ts#asNotFound`.
  *
- * Every name `terminalArchiveView` or `selectFramePng` can return is a
- * `NotFoundProblem`; the fallback is unreachable and still right if it ever is
- * not, because `notFound` is the same 404.
+ * Every name `terminalArchiveView` can return is a `NotFoundProblem`; the
+ * fallback is unreachable and still right if it ever is not, because `notFound`
+ * is the same 404.
  */
 const asNotFound = (problem: Gateway.GatewayProblemName): NotFound =>
   new NotFound({ problem: isNotFoundProblem(problem) ? problem : "notFound" })
@@ -188,8 +207,255 @@ const ARCHIVE_JSON_PROBLEMS: {
 }
 
 // ---------------------------------------------------------------------------
-// The readers, byte for byte
+// JSON, as it comes back out of jsonb
 // ---------------------------------------------------------------------------
+
+/**
+ * Whether a driver value is spellable as JSON — recursively, and refusing the
+ * three things a `JsonValue` cannot be.
+ *
+ * The driver hands `jsonb` back as `JSON.parse`'s output, so this is a
+ * *narrowing* rather than a validation in practice. It is written out anyway
+ * because the alternative is a cast: `NaN`/`Infinity` (which no JSON document
+ * and no `jsonb` can hold), a `Date` a future column type might produce, and an
+ * `undefined` from a misspelled projection all fail here instead of reaching the
+ * canonical writer, which would refuse them one layer further from the cause.
+ */
+const isJsonValue = (value: unknown): value is JsonValue =>
+  value === null ||
+  typeof value === "string" ||
+  typeof value === "boolean" ||
+  (typeof value === "number" && Number.isFinite(value)) ||
+  (Array.isArray(value) && value.every(isJsonValue)) ||
+  (typeof value === "object" && value !== null && Object.values(value).every(isJsonValue))
+
+// `Array.isArray` does not narrow a `ReadonlyArray` member out of a union in its
+// false branch; a declared guard does.
+const isJsonArray = (value: JsonValue): value is JsonArray => Array.isArray(value)
+
+const asJsonObject = (value: unknown): Option.Option<JsonObject> =>
+  isJsonValue(value) && value !== null && typeof value === "object" && !isJsonArray(value)
+    ? Option.some(value)
+    : Option.none()
+
+// ---------------------------------------------------------------------------
+// The stored row, and the documents it reconstructs into
+// ---------------------------------------------------------------------------
+
+/** `extras`' three reserved keys — our own envelope, not the document's. */
+const EXTRAS_MANIFEST = "manifest"
+const EXTRAS_REPORT = "report"
+const EXTRAS_DERIVED = "derived"
+
+/** `extras.derived.last_replay_turn` — the decimal string of an int32 overflow. */
+const DERIVED_LAST_REPLAY_TURN = "last_replay_turn"
+
+/** `games.state`'s sentinel for "not one of the seven spellings" (§1.2). */
+const INVALID_STATE = "invalid"
+
+/**
+ * The `games` columns reconstruction reads. Every other column is either
+ * ingest bookkeeping or a write-only query projection.
+ *
+ * Declared as an interface rather than inferred from the drizzle projection so
+ * that {@link reconstructManifest} and {@link reconstructReport} are pure,
+ * testable without a database, and cannot silently start reading a column the
+ * plan forbids.
+ */
+export interface GameDocumentRow {
+  readonly gameId: string
+  /** Write-only projection **except** as {@link reconstructManifest}'s fallback. */
+  readonly state: string
+  readonly schemaVersion: number | null
+  readonly createdAt: number | null
+  readonly startedAt: number | null
+  readonly finishedAt: number | null
+  readonly currentTurn: number | null
+  readonly lastReplayTurn: number | null
+  readonly benchmarkValid: boolean | null
+  readonly config: unknown
+  readonly manifestStatus: "ok" | "unusable" | "absent"
+  readonly reportStatus: "ok" | "unusable" | "absent"
+  readonly extras: unknown
+}
+
+/**
+ * One `extras` section, or `Option.none` when the envelope is not one.
+ *
+ * A missing section is an **empty** section: a manifest all of whose keys took
+ * a column demotes nothing, and ingest is not required to write an empty object
+ * for it. An `extras` that is not an object, or a section that is not an object,
+ * is an ingest defect and answers `Option.none` — which the callers turn into
+ * the 503 the row deserves rather than into a silently short document.
+ */
+const extrasSection = (extras: unknown, section: string): Option.Option<JsonObject> => {
+  if (extras === null || extras === undefined) {
+    return Option.some({})
+  }
+  return Option.flatMap(asJsonObject(extras), (envelope) =>
+    Object.hasOwn(envelope, section) ? asJsonObject(envelope[section]) : Option.some({}))
+}
+
+type Entries = ReadonlyArray<readonly [string, JsonValue]>
+
+/** A typed column as its manifest key, or nothing when the column is `NULL`. */
+const columnEntry = (key: string, value: JsonValue | null): Entries =>
+  value === null ? [] : [[key, value]]
+
+/**
+ * `state`, from the only two places that can hold it.
+ *
+ * `extras.manifest.state` first: it is verbatim, so it round-trips a `17`, a
+ * `null` and a 10 000-character string alike. The column is the fallback for a
+ * row written by an ingest that columnized a recognized spelling without also
+ * recording it — and the sentinel is *not* a fallback, because `'invalid'` there
+ * means either "the manifest said something unrecognized" (in which case
+ * `extras.manifest.state` holds it and this branch is not reached) or "the
+ * manifest had no `state` at all", and emitting the sentinel for the second
+ * would invent a key `manifestState` then prefers over `status`.
+ */
+const stateEntries = (row: GameDocumentRow, demoted: JsonObject): Entries =>
+  Object.hasOwn(demoted, "state") || row.state === INVALID_STATE ? [] : [["state", row.state]]
+
+/**
+ * `config`, which is a whole jsonb rather than a scalar.
+ *
+ * `NULL` means either absent or explicitly `null`, and the second lives in
+ * `extras.manifest.config` — so a `NULL` here contributes nothing and the
+ * demoted key (if any) is what reconstruction emits.
+ */
+const configEntries = (config: unknown): Entries =>
+  config === null || config === undefined || !isJsonValue(config) ? [] : [["config", config]]
+
+/**
+ * `manifest.json`, put back together (§1.2).
+ *
+ * Demoted keys win over columns unconditionally. Under the storage rule the two
+ * sets are disjoint, so the filter changes nothing on a well-formed row; it is
+ * there because a row that violates the rule must still answer *one* value, and
+ * the verbatim one is the one that can be right for every input.
+ *
+ * `Option.none` is an unreadable envelope, never an absent document — the
+ * document's own absence is `manifest_status`.
+ */
+export const reconstructManifest = (row: GameDocumentRow): Option.Option<JsonObject> =>
+  Option.map(extrasSection(row.extras, EXTRAS_MANIFEST), (demoted) => {
+    const columns: Entries = [
+      ...stateEntries(row, demoted),
+      ...columnEntry("schema_version", row.schemaVersion),
+      ...columnEntry("created_at", row.createdAt),
+      ...columnEntry("started_at", row.startedAt),
+      ...columnEntry("finished_at", row.finishedAt),
+      ...columnEntry("current_turn", row.currentTurn),
+      ...columnEntry("benchmark_valid", row.benchmarkValid),
+      ...configEntries(row.config)
+    ]
+    return Object.fromEntries([
+      ...columns.filter(([key]) => !Object.hasOwn(demoted, key)),
+      ...Object.entries(demoted)
+    ])
+  })
+
+/**
+ * `report.json`, which has no typed columns at all (§1.5).
+ *
+ * `agent_stats` is a queryable projection of `report.seat_stats`, in exactly the
+ * relationship `games.mode` has to `config`, and rebuilding `seat_stats` from it
+ * cannot reproduce `mean_latency_ms`'s int-vs-float spelling or its
+ * `latency_ms` accumulator sibling. So the document is carried whole in
+ * `extras.report` and this is the entire reconstruction.
+ */
+export const reconstructReport = (row: GameDocumentRow): Option.Option<JsonObject> =>
+  Option.flatMap(
+    asJsonObject(row.extras),
+    (envelope) =>
+      Object.hasOwn(envelope, EXTRAS_REPORT)
+        ? asJsonObject(envelope[EXTRAS_REPORT])
+        : Option.none()
+  )
+
+/**
+ * `_last_replay_turn`'s answer, as ingest recorded it.
+ *
+ * The tail's `turn` is an unbounded Python `int` read through `parsePythonJson`,
+ * and `games.last_replay_turn` is an `integer`; a value that does not fit is
+ * demoted to `extras.derived.last_replay_turn` as a **decimal string**, which is
+ * the only tagged encoding this schema admits and lives in the only section that
+ * is allowed to carry one. The answer is a `bigint` either way, because that is
+ * what `asInterrupted` compares against `current_turn`.
+ */
+const DECIMAL_RE = /^-?[0-9]+$/
+
+export const reconstructLastReplayTurn = (row: GameDocumentRow): Option.Option<bigint> => {
+  const derived = Option.flatMap(
+    extrasSection(row.extras, EXTRAS_DERIVED),
+    (section) => Option.fromNullable(section[DERIVED_LAST_REPLAY_TURN])
+  )
+  return Option.match(derived, {
+    onNone: () =>
+      row.lastReplayTurn === null
+        ? Option.none<bigint>()
+        : Option.some(BigInt(row.lastReplayTurn)),
+    onSome: (value) =>
+      typeof value === "string" && DECIMAL_RE.test(value)
+        ? Option.some(BigInt(value))
+        : Option.none<bigint>()
+  })
+}
+
+// ---------------------------------------------------------------------------
+// The disk half: victory.json and the run directory
+//
+// `services/runs.ts` owns the originals and exports neither `resolveStrictly`
+// nor its `Path.read_text` reader, so both are transcribed here with their
+// citations. `frameFile`/`videoFile` are *not* transcribed — they are the fs
+// repository's own methods, called on a repository built over the same root.
+// ---------------------------------------------------------------------------
+
+const attempt = <A>(thunk: () => A): Option.Option<A> => Option.getRight(Either.try(thunk))
+
+/**
+ * `Path.resolve()` with `strict=False` — `services/runs.ts#resolveStrictly`.
+ *
+ * Resolve as far as the filesystem allows and keep the remaining components, so
+ * a run directory that does not exist still resolves to a path under the root.
+ */
+const resolveStrictly = (root: string, name: string): string =>
+  Option.getOrElse(attempt(() => realpathSync(join(root, name))), () => join(root, name))
+
+/**
+ * `read(2)` until `length` bytes are in hand or the file ends — a single
+ * `readSync` may come up short, and Python's `stream.read()` does not.
+ */
+const readFully = (fd: number, length: number): Uint8Array => {
+  const buffer = new Uint8Array(length)
+  const step = (offset: number): number => {
+    if (offset >= length) {
+      return offset
+    }
+    const read = readSync(fd, buffer, offset, length - offset, offset)
+    return read <= 0 ? offset : step(offset + read)
+  }
+  return buffer.subarray(0, step(0))
+}
+
+/**
+ * `Path.read_text` — `services/runs.ts#readWholeFile`.
+ *
+ * No `O_NOFOLLOW`, no size ceiling, and every failure collapses to "no record".
+ * `readFileSync` would be shorter and would *block* on a fifo, where the
+ * descriptor-and-`fstat` shape reads zero bytes and answers nothing — the same
+ * answer Python gives, without the hang.
+ */
+const readWholeFile = (path: string): Option.Option<Uint8Array> =>
+  Option.flatMap(attempt(() => openSync(path, O_RDONLY | O_CLOEXEC)), (fd) => {
+    const bytes = Option.flatMap(
+      attempt(() => fstatSync(fd).size),
+      (size) => attempt(() => readFully(fd, size))
+    )
+    Option.getOrElse(attempt(() => closeSync(fd)), () => undefined)
+    return bytes
+  })
 
 const UTF8 = new TextDecoder("utf-8", { fatal: true })
 
@@ -197,146 +463,28 @@ const UTF8 = new TextDecoder("utf-8", { fatal: true })
 const decodeUtf8 = (bytes: Uint8Array): Option.Option<string> =>
   Option.getRight(Either.try(() => UTF8.decode(bytes)))
 
-/** Latin-1: the lossless byte↔code-unit mapping (`services/runs.ts#decodeLatin1`). */
-const decodeLatin1 = (bytes: Uint8Array): string =>
-  Array.from(bytes, (byte) => String.fromCharCode(byte)).join("")
-
-const latin1Bytes = (line: string): Uint8Array =>
-  Uint8Array.from(line, (character) => character.charCodeAt(0))
-
 /** `json.loads`, narrowed to what `JSON.parse` accepts. */
 const parseJson = (text: string): Option.Option<JsonValue> =>
   Option.getRight(decodeJsonValueFromString(text))
 
-const isJsonArray = (value: JsonValue): value is JsonArray => Array.isArray(value)
-
-const asJsonObject = (value: JsonValue): Option.Option<JsonObject> =>
-  value !== null && typeof value === "object" && !isJsonArray(value)
-    ? Option.some(value)
-    : Option.none()
-
-/** One `run_documents` row, as everything below needs it. */
-interface DocumentRow {
-  readonly status: "ok" | "unusable"
-  readonly bytes: Uint8Array
-  readonly byteSize: number
-}
-
-/** The three documents of one run, by kind. Absent key = absent file. */
-type DocumentSet = ReadonlyMap<Gateway.ArchiveJsonLabel | "victory", DocumentRow>
-
 /**
- * `_read_archive_json` (`:573`), over a stored row.
+ * `_archive_victory`'s file read (`:684`), from the run directory on disk.
  *
- * The row's absence is the `open` failing — a **404**. A row that ingest marked
- * `unusable`, or whose stored fstat size fails the `<= 0` / `> 8 MiB` gate, or
- * whose bytes are not strict UTF-8, or which does not parse as a JSON *object*,
- * is a **503**. That is the same split, in the same order, that the fs reader
- * makes on a descriptor.
+ * `victory.json` is deliberately not stored: most games do not end cleanly yet,
+ * and the schema says so. It is read here with `Path.read_text` semantics —
+ * follows symlinks, no size ceiling, every failure collapses to "no record" —
+ * and handed to `archiveVictory` **unparsed by anything else**, because
+ * `relayedJson`'s int-vs-float guess must see the same input the fs backend
+ * feeds it.
  */
-const documentJson = (
-  row: DocumentRow | undefined,
-  label: Gateway.ArchiveJsonLabel
-): Either.Either<JsonObject, RunsError> =>
-  row === undefined
-    ? Either.left(new NotFound({ problem: ARCHIVE_JSON_PROBLEMS[label].missing }))
-    : Either.fromOption(
-      row.status !== "ok" || row.byteSize <= 0 || row.byteSize > MAX_PROXY_JSON_BYTES
-        ? Option.none<JsonObject>()
-        : Option.flatMap(
-          decodeUtf8(row.bytes),
-          (text) => Option.flatMap(parseJson(text), asJsonObject)
-        ),
-      () => new ArchiveUnavailable({ problem: ARCHIVE_JSON_PROBLEMS[label].unusable })
-    )
-
-/**
- * `_archive_victory`'s file read (`:684`), over a stored row.
- *
- * `Path.read_text`: no `O_NOFOLLOW`, no size ceiling, and every failure —
- * missing, unreadable, unparseable — collapses to "no record" without a trace.
- * So there is no gate here beyond "the bytes decode and parse", and the value is
- * handed to the same `archiveVictory`, **unparsed by anything else**. Storing a
- * decoded `Gateway.VictoryRecord` instead would feed `relayedJson`'s int-vs-float
- * guess a different input and change the published `outcome.victory`.
- */
-const victoryRecord = (
-  row: DocumentRow | undefined
-): Option.Option<Canonical<Gateway.MatchVictory>> =>
+const victoryRecord = (runRoot: string): Option.Option<Canonical<Gateway.MatchVictory>> =>
   archiveVictory(
-    row === undefined || row.status !== "ok"
-      ? Option.none()
-      : Option.flatMap(decodeUtf8(row.bytes), parseJson)
+    Option.flatMap(Option.flatMap(readWholeFile(join(runRoot, VICTORY_FILE)), decodeUtf8), parseJson)
   )
 
 /** The `state in TERMINAL_STATES` gate of `_terminal_archive` (`:778`). */
 const isTerminalManifest = (manifest: Untrusted): boolean =>
   isTerminalRunState(manifestState(manifest))
-
-// ---------------------------------------------------------------------------
-// The replay tail
-// ---------------------------------------------------------------------------
-
-/**
- * `bytes.splitlines()` — `\n`, `\r` and `\r\n`, and nothing else.
- *
- * Transcribed from `services/runs.ts`, which owns the original and does not
- * export it; the differential test is what pins the two to each other, fixture
- * `game_parity_torn_tail_08` in particular. Splitting in Latin-1 rather than
- * UTF-8 is load-bearing: the stored window starts at an arbitrary byte offset,
- * so its first line is routinely a torn multi-byte sequence that a UTF-8 decode
- * would reject outright.
- */
-const splitLines = (bytes: Uint8Array): ReadonlyArray<string> =>
-  decodeLatin1(bytes).split(/\r\n|\n|\r/)
-
-/** `bytes.strip()` — ASCII whitespace only, which is what `if not raw.strip()` tests. */
-const BLANK_LINE_RE = /^[ \t\v\f]*$/
-
-/**
- * `_last_replay_turn` (`:1178`) over the stored window.
- *
- * Scans backwards, skipping blank and unparseable lines, and **stops at the
- * first line that parses**: a parseable row without a positive integer `turn`
- * answers "no turn" rather than continuing, which is what hides a lobby husk
- * from the index instead of resurrecting an older turn.
- *
- * `parsePythonJson`, not `JSON.parse`: CPython's `isinstance(turn, int)` refuses
- * `{"turn": 2.0}`, and only a reader that keeps `2` and `2.0` apart can refuse
- * it too.
- */
-const tailTurn = (tail: Uint8Array): Option.Option<bigint> => {
-  const parsed = splitLines(tail)
-    .filter((line) => !BLANK_LINE_RE.test(line))
-    .toReversed()
-    .map((line) =>
-      Option.flatMap(decodeUtf8(latin1Bytes(line)), (text) => Option.getRight(parsePythonJson(text)))
-    )
-    .find(Option.isSome)
-  if (parsed === undefined) {
-    return Option.none()
-  }
-  const turn = untrustedField(parsed.value, "turn")
-  return typeof turn === "bigint" && turn > 0n ? Option.some(turn) : Option.none()
-}
-
-/**
- * The stored window as the fs reader would have read it.
- *
- * `byte_size` is the **whole** file's size, so `size <= 0` is `Option.none`
- * before anything is decoded, exactly as `fstat` decides it there. The window
- * itself is `[max(0, size - 65536), size)` and is stored that way; the slice
- * below is a belt-and-braces re-application for a row an over-eager ingester
- * stored whole.
- */
-const replayTurnOf = (byteSize: number, tailBytes: Uint8Array): Option.Option<bigint> =>
-  byteSize <= 0
-    ? Option.none()
-    : tailTurn(
-      tailBytes.length > REPLAY_TAIL_BYTES
-        ? tailBytes.subarray(tailBytes.length - REPLAY_TAIL_BYTES)
-        : tailBytes
-    )
 
 // ---------------------------------------------------------------------------
 // Sorting
@@ -356,11 +504,10 @@ const createdAt = (row: Canonical<Gateway.GameRow>): number =>
  * `_disk_games_index`' ordering (`:1274`), through `archive.ts`'s own comparator.
  *
  * `sortDiskGameRows` is constrained to `created_at: number | null` and therefore
- * cannot take a `Canonical<GameRow>` directly — which is why `services/runs.ts`
- * inlines a copy. Projecting through {@link createdAt} first removes the `null`
- * case entirely, and on a `null`-free key the two comparators are the same
- * function: equal keys fall to `compareCodePoints(right, left)` on the id, and
- * unequal keys to `right - left`. So the comparator is imported, not copied.
+ * cannot take a `Canonical<GameRow>` directly. Projecting through
+ * {@link createdAt} first removes the `null` case entirely, and on a `null`-free
+ * key the two comparators are the same function: equal keys fall to
+ * `compareCodePoints(right, left)` on the id, unequal keys to `right - left`.
  */
 const sortDiskRows = (
   rows: readonly Canonical<Gateway.GameRow>[]
@@ -373,171 +520,126 @@ const sortDiskRows = (
 // The service
 // ---------------------------------------------------------------------------
 
-/**
- * The `RunsRepository` surface plus the two byte-returning reads the gateway
- * cannot type yet.
- */
-export interface RunsRepositoryPgApi extends RunsRepositoryApi {
-  /** `_archive_frame_path`'s answer as **bytes**, straight out of `bytea`. */
-  readonly frameBytes: (
-    archive: TerminalArchive,
-    index: Option.Option<FrameIndex>
-  ) => Effect.Effect<Uint8Array, RunsError>
-  /** `_archive_video_path`'s answer as **bytes**. */
-  readonly videoBytes: (archive: TerminalArchive) => Effect.Effect<Uint8Array, RunsError>
-}
-
-const documentSet = (
-  rows: ReadonlyArray<{ kind: "manifest" | "report" | "victory"; status: "ok" | "unusable"; bytes: Uint8Array; byteSize: number }>
-): DocumentSet =>
-  new Map(
-    rows.map((row) => [
-      row.kind === "manifest" ? "game manifest" : row.kind === "report" ? "game report" : "victory",
-      { status: row.status, bytes: row.bytes, byteSize: row.byteSize }
-    ] as const)
-  )
-
-/** One run's rows: whether it exists at all, and its three documents. */
-interface RunRecord {
-  readonly present: boolean
-  readonly documents: DocumentSet
-}
+/** Exactly the columns reconstruction is allowed to see. */
+const GAME_COLUMNS = {
+  gameId: games.gameId,
+  state: games.state,
+  schemaVersion: games.schemaVersion,
+  createdAt: games.createdAt,
+  startedAt: games.startedAt,
+  finishedAt: games.finishedAt,
+  currentTurn: games.currentTurn,
+  lastReplayTurn: games.lastReplayTurn,
+  benchmarkValid: games.benchmarkValid,
+  config: games.config,
+  manifestStatus: games.manifestStatus,
+  reportStatus: games.reportStatus,
+  extras: games.extras
+} as const
 
 /**
- * Build the repository over one logical `runs_root`.
+ * `_read_archive_json`'s verdict (`:573`), as ingest recorded it.
  *
- * `db` and `materializer` are values, not context requirements, so every method
- * comes out with `R = never` — which is what lets this satisfy an interface
- * written for a backend that needs no environment at all. The root is the
- * materializer's, not a second parameter: the two must agree, and the cheapest
- * way to guarantee agreement is to have one of them.
+ * `absent` is the `open` failing — a **404**. `unusable` is a file that opened
+ * and was not a non-empty regular file of at most 8 MiB of UTF-8 spelling a
+ * JSON *object* — a **503**. `ok` is the document, and an envelope that cannot
+ * be reassembled is the same 503, because a half-reconstructed document is a
+ * wrong answer rather than a missing one.
  */
-export const makeRunsRepositoryPg = (
-  db: Database,
-  materializer: RunArchiveMaterializer
-): RunsRepositoryPgApi => {
-  const root = materializer.options.runsRoot
-
-  /**
-   * `(runs_root, game_id) = ($1, $2)` — the composite key every table carries.
-   *
-   * The two columns are passed individually because drizzle brands a column
-   * with its table's name, so one generic over "a table with these two columns"
-   * cannot be written without a cast.
-   */
-  const scoped = (runsRootColumn: PgColumn, gameIdColumn: PgColumn, gameId: string) =>
-    and(eq(runsRootColumn, root), eq(gameIdColumn, gameId))
-
-  // ---- the run's documents -------------------------------------------------
-
-  const loadRun = (gameId: string): Effect.Effect<RunRecord, SqlError> =>
-    Effect.map(
-      Effect.all([
-        db.select({ gameId: runs.gameId }).from(runs).where(scoped(runs.runsRoot, runs.gameId, gameId)),
-        db
-          .select({
-            kind: runDocuments.kind,
-            status: runDocuments.status,
-            bytes: runDocuments.bytes,
-            byteSize: runDocuments.byteSize
-          })
-          .from(runDocuments)
-          .where(scoped(runDocuments.runsRoot, runDocuments.gameId, gameId))
-      ]),
-      ([present, documents]) => ({
-        present: present.length > 0,
-        documents: documentSet(documents)
-      })
+const documentJson = (
+  status: "ok" | "unusable" | "absent",
+  document: Option.Option<JsonObject>,
+  label: Gateway.ArchiveJsonLabel
+): Either.Either<JsonObject, RunsError> =>
+  status === "absent"
+    ? Either.left(new NotFound({ problem: ARCHIVE_JSON_PROBLEMS[label].missing }))
+    : Either.fromOption(
+      status === "ok" ? document : Option.none<JsonObject>(),
+      () => new ArchiveUnavailable({ problem: ARCHIVE_JSON_PROBLEMS[label].unusable })
     )
 
-  /** Every run under the root, with every document, in one pair of queries. */
-  const loadRoot = (): Effect.Effect<ReadonlyMap<string, RunRecord>, SqlError> =>
+/**
+ * Build the repository over one `runs_root`.
+ *
+ * `db` is a value, not a context requirement, so every method comes out with
+ * `R = never` — which is what lets this satisfy an interface written for a
+ * backend that needs no environment at all. The root is resolved by the
+ * filesystem repository this one delegates its binaries to, so the two cannot
+ * disagree about which directory they mean.
+ */
+export const makeRunsRepositoryPg = (db: Database, runsRoot: string): RunsRepositoryApi => {
+  const disk = makeRunsRepository(runsRoot)
+  const root = disk.runsRoot
+  const runRootOf = (gameId: string): string => resolveStrictly(root, gameId)
+
+  // ---- rows ----------------------------------------------------------------
+
+  const loadGame = (gameId: string): Effect.Effect<Option.Option<GameDocumentRow>, SqlError> =>
     Effect.map(
-      Effect.all([
-        db.select({ gameId: runs.gameId }).from(runs).where(eq(runs.runsRoot, root)),
-        db
-          .select({
-            gameId: runDocuments.gameId,
-            kind: runDocuments.kind,
-            status: runDocuments.status,
-            bytes: runDocuments.bytes,
-            byteSize: runDocuments.byteSize
-          })
-          .from(runDocuments)
-          .where(eq(runDocuments.runsRoot, root))
-      ]),
-      ([games, documents]) => {
-        // Grouped once rather than filtered per run: the index reads every
-        // document under the root, and a filter inside the map would make that
-        // quadratic in the number of runs.
-        const byGame = documents.reduce(
-          (grouped, row) =>
-            grouped.set(row.gameId, [...(grouped.get(row.gameId) ?? []), row]),
-          new Map<string, ReadonlyArray<typeof documents[number]>>()
-        )
-        return new Map(
-          games.map((game) => [
-            game.gameId,
-            { present: true, documents: documentSet(byGame.get(game.gameId) ?? []) }
-          ] as const)
-        )
-      }
+      db.select(GAME_COLUMNS).from(games).where(eq(games.gameId, gameId)),
+      (rows) => Option.fromNullable(rows[0])
     )
 
+  const loadGames = (): Effect.Effect<ReadonlyArray<GameDocumentRow>, SqlError> =>
+    db.select(GAME_COLUMNS).from(games)
+
+  // ---- documents -----------------------------------------------------------
+
   /**
-   * `_read_manifest` (`:557`) over a loaded record.
+   * `_read_manifest` (`:557`) over a stored row.
    *
    * The 404s in the order Python raises them: an id failing `GAME_ID_RE`; a run
-   * that is not there at all (which is where the symlink, parent and directory
-   * refusals land, because the ingester never wrote a row for one); a manifest
+   * that is not there at all — which is where the symlinked, escaping and
+   * non-directory runs land, because ingest writes no row for one; a manifest
    * that could not be opened; and a manifest whose `game_id` disagrees with the
-   * path it was found at.
+   * directory it was found in. That last check runs over the *reconstructed*
+   * claim, never over the primary key.
    */
-  const manifestOf = (gameId: string, record: RunRecord): Either.Either<JsonObject, RunsError> =>
-    !isGameId(gameId) || !record.present
+  const manifestOf = (
+    gameId: string,
+    row: Option.Option<GameDocumentRow>
+  ): Either.Either<JsonObject, RunsError> =>
+    !isGameId(gameId) || Option.isNone(row)
       ? Either.left(gone)
       : Either.flatMap(
-        documentJson(record.documents.get("game manifest"), "game manifest"),
-        (value) => untrustedField(value, "game_id") === gameId ? Either.right(value) : Either.left(gone)
+        documentJson(row.value.manifestStatus, reconstructManifest(row.value), "game manifest"),
+        (manifest) =>
+          untrustedField(manifest, "game_id") === gameId ? Either.right(manifest) : Either.left(gone)
       )
 
   const readManifest = (gameId: string): Effect.Effect<JsonObject, RunsError> =>
     isGameId(gameId)
       ? Effect.flatMap(
-        Effect.mapError(loadRun(gameId), unreachable("manifestUnavailable")),
-        (record) => manifestOf(gameId, record)
+        Effect.mapError(loadGame(gameId), unreachable("manifestUnavailable")),
+        (row) => manifestOf(gameId, row)
       )
       : Effect.fail(gone)
 
   /**
-   * `_terminal_archive` (`:773`) over a loaded record — the pure half.
+   * `_terminal_archive` (`:773`) over a stored row — the pure half.
    *
-   * Note the order, which is Python's: manifest, then the state gate, then
-   * `report.json`, and only then `victory.json`. A live run therefore answers
-   * `terminal archive not found` without the report ever being looked at.
+   * The order is Python's: manifest, then the state gate, then `report.json`,
+   * and only then `victory.json`. A live run therefore answers `terminal
+   * archive not found` with the report never looked at and the disk never
+   * touched.
    */
   const archiveOf = (
     gameId: string,
-    record: RunRecord,
-    runRoot: string
+    row: Option.Option<GameDocumentRow>
   ): Either.Either<TerminalArchive, RunsError> =>
-    Either.flatMap(manifestOf(gameId, record), (manifest) => {
-      if (!isGameId(gameId)) {
-        // Unreachable: `manifestOf` has already validated the id.
+    Either.flatMap(manifestOf(gameId, row), (manifest) => {
+      if (!isGameId(gameId) || Option.isNone(row)) {
+        // Unreachable: `manifestOf` refuses both before it answers a manifest.
         return Either.left(gone)
       }
+      const runRoot = runRootOf(gameId)
       return Either.flatMap(
         isTerminalManifest(manifest)
-          ? documentJson(record.documents.get("game report"), "game report")
+          ? documentJson(row.value.reportStatus, reconstructReport(row.value), "game report")
           : Either.left(new NotFound({ problem: "terminalArchiveNotFound" })),
         (report) =>
           Either.mapBoth(
-            terminalArchiveView(
-              gameId,
-              manifest,
-              report,
-              victoryRecord(record.documents.get("victory"))
-            ),
+            terminalArchiveView(gameId, manifest, report, victoryRecord(runRoot)),
             {
               onLeft: asNotFound,
               onRight: (view): TerminalArchive => ({ ...view, runRoot })
@@ -548,18 +650,8 @@ export const makeRunsRepositoryPg = (
 
   const terminalArchive = (gameId: string): Effect.Effect<TerminalArchive, RunsError> =>
     Effect.flatMap(
-      Effect.mapError(loadRun(gameId), unreachable("manifestUnavailable")),
-      (record) =>
-        Effect.flatMap(
-          // Built first, materialized second: a live run never touches the disk.
-          archiveOf(gameId, record, materializer.runRoot(gameId)),
-          (archive) =>
-            Effect.mapBoth(materializer.ensureRunArchive(gameId), {
-              onFailure: (cause): RunsError =>
-                new ArchiveUnavailable({ problem: "manifestUnavailable", cause }),
-              onSuccess: (runRoot): TerminalArchive => ({ ...archive, runRoot })
-            })
-        )
+      Effect.mapError(loadGame(gameId), unreachable("manifestUnavailable")),
+      (row) => archiveOf(gameId, row)
     )
 
   // ---- the index -----------------------------------------------------------
@@ -571,51 +663,44 @@ export const makeRunsRepositoryPg = (
    * `_terminal_archive` — a terminal run whose report is missing or corrupt
    * loses its row entirely rather than appearing without a leaderboard. A
    * `SqlError` is the `readdir` failure: a logged warning and an empty index.
-   *
-   * The archive used for enrichment here is built **without** materializing:
-   * only `leaderboard` and `outcome` are read from it, and an index request must
-   * not write a byte to disk.
    */
   const diskGameRows = (
     indexOptions?: DiskGamesIndexOptions
   ): Effect.Effect<readonly Canonical<Gateway.GameRow>[]> =>
     Effect.map(
       Effect.orElseSucceed(
-        Effect.tapError(loadRoot(), (cause) =>
+        Effect.tapError(loadGames(), (cause) =>
           Effect.logWarning("disk games index is empty: the archive database is unreachable").pipe(
             Effect.annotateLogs({ cause: String(cause) })
           )),
-        (): ReadonlyMap<string, RunRecord> => new Map()
+        (): ReadonlyArray<GameDocumentRow> => []
       ),
-      (records) =>
+      (rows) =>
         sortDiskRows(
-          [...records.entries()]
-            .filter(([gameId]) => isGameId(gameId))
-            .flatMap(([gameId, record]): readonly Canonical<Gateway.GameRow>[] => {
-              const manifest = manifestOf(gameId, record)
+          rows
+            .filter((row) => isGameId(row.gameId))
+            .flatMap((row): readonly Canonical<Gateway.GameRow>[] => {
+              const manifest = manifestOf(row.gameId, Option.some(row))
               if (Either.isLeft(manifest)) {
                 return []
               }
               return Option.match(diskGameRow(manifest.right), {
                 onNone: (): readonly Canonical<Gateway.GameRow>[] => [],
-                onSome: (row) => {
-                  if (!isTerminalRunState(row.state)) {
-                    return indexOptions?.terminalOnly === true ? [] : [row]
+                onSome: (indexRow) => {
+                  if (!isTerminalRunState(indexRow.state)) {
+                    return indexOptions?.terminalOnly === true ? [] : [indexRow]
                   }
-                  return Either.match(
-                    archiveOf(gameId, record, materializer.runRoot(gameId)),
-                    {
-                      onLeft: (): readonly Canonical<Gateway.GameRow>[] => [],
-                      onRight: (found) => [
-                        // `Object.assign`, not a spread: a spread would drop the
-                        // `CanonRecord` half of `Canonical`.
-                        Object.assign({}, row, {
-                          leaderboard: found.leaderboard,
-                          outcome: found.outcome
-                        })
-                      ]
-                    }
-                  )
+                  return Either.match(archiveOf(row.gameId, Option.some(row)), {
+                    onLeft: (): readonly Canonical<Gateway.GameRow>[] => [],
+                    onRight: (found) => [
+                      // `Object.assign`, not a spread: a spread would drop the
+                      // `CanonRecord` half of `Canonical`.
+                      Object.assign({}, indexRow, {
+                        leaderboard: found.leaderboard,
+                        outcome: found.outcome
+                      })
+                    ]
+                  })
                 }
               })
             })
@@ -626,59 +711,39 @@ export const makeRunsRepositoryPg = (
 
   const lastReplayTurn = (gameId: string): Effect.Effect<Option.Option<bigint>> =>
     Effect.map(
-      Effect.orElseSucceed(
-        db
-          .select({ byteSize: runReplayTail.byteSize, tailBytes: runReplayTail.tailBytes })
-          .from(runReplayTail)
-          .where(scoped(runReplayTail.runsRoot, runReplayTail.gameId, gameId)),
-        () => []
-      ),
-      (rows) =>
-        Option.match(Option.fromNullable(rows[0]), {
-          onNone: () => Option.none<bigint>(),
-          onSome: (row) => replayTurnOf(row.byteSize, row.tailBytes)
-        })
+      Effect.orElseSucceed(loadGame(gameId), () => Option.none<GameDocumentRow>()),
+      Option.flatMap(reconstructLastReplayTurn)
     )
 
   /**
    * `_disk_rows_with_interrupted` (`:1582`) — `archive.ts`'s relabelling with the
    * one input only this layer can supply.
    *
-   * `interruptedCandidates` names exactly the rows that need a tail, and they are
-   * fetched in **one** `game_id = ANY($2)` batch rather than N opens. The
+   * `interruptedCandidates` names exactly the rows that need a turn, and they
+   * are fetched in **one** `game_id = ANY($1)` batch rather than N reads. The
    * relabelling itself is `archive.ts`'s function, called with its own
-   * arguments; nothing about it is expressed in SQL.
+   * arguments; nothing about it is expressed in SQL. `asInterrupted` still
+   * quotes the post-`max` turn and still drops a row whose answer is
+   * `Option.none` — the lobby husk that must stay hidden.
    */
   const diskRowsWithInterrupted = (
     liveIds: ReadonlySet<string>
   ): Effect.Effect<readonly Canonical<Gateway.GameRow>[]> =>
     Effect.flatMap(diskGameRows(), (rows) => {
       const candidates = interruptedCandidates(rows, liveIds)
-      const tails = candidates.length === 0
-        ? Effect.succeed([] as ReadonlyArray<{ gameId: string; byteSize: number; tailBytes: Uint8Array }>)
+      const turns = candidates.length === 0
+        ? Effect.succeed<ReadonlyArray<GameDocumentRow>>([])
         : Effect.orElseSucceed(
-          db
-            .select({
-              gameId: runReplayTail.gameId,
-              byteSize: runReplayTail.byteSize,
-              tailBytes: runReplayTail.tailBytes
-            })
-            .from(runReplayTail)
-            .where(
-              and(
-                eq(runReplayTail.runsRoot, root),
-                inArray(runReplayTail.gameId, [...candidates])
-              )
-            ),
-          () => []
+          db.select(GAME_COLUMNS).from(games).where(inArray(games.gameId, [...candidates])),
+          (): ReadonlyArray<GameDocumentRow> => []
         )
-      return Effect.map(tails, (found) =>
+      return Effect.map(turns, (found) =>
         relabelDiskRows(
           rows,
           liveIds,
           new Map(
             found.flatMap((row) =>
-              Option.match(replayTurnOf(row.byteSize, row.tailBytes), {
+              Option.match(reconstructLastReplayTurn(row), {
                 onNone: (): ReadonlyArray<readonly [string, bigint]> => [],
                 onSome: (turn) => [[row.gameId, turn] as const]
               })
@@ -686,98 +751,6 @@ export const makeRunsRepositoryPg = (
           )
         ))
     })
-
-  // ---- binaries ------------------------------------------------------------
-
-  /**
-   * `_archive_frame_path`'s listing plus `archive.ts`'s choice.
-   *
-   * `frames_dir_ok` is `safeArchiveDirectory(watch_frames)` evaluated at ingest —
-   * the containment check has no meaning in a database, so its *answer* is
-   * stored and the same 404 comes out. The index of each PNG is re-derived from
-   * its name with `Gateway.decodeArchivePngName`, not read from `frame_index`:
-   * that column is advisory, and this is the one place it could have leaked into
-   * a response.
-   */
-  const selectFrameName = (
-    archive: TerminalArchive,
-    index: Option.Option<FrameIndex>
-  ): Effect.Effect<string, RunsError> =>
-    Effect.flatMap(
-      Effect.mapError(
-        Effect.all([
-          db
-            .select({ framesDirOk: runs.framesDirOk })
-            .from(runs)
-            .where(scoped(runs.runsRoot, runs.gameId, archive.gameId)),
-          db
-            .select({ name: runFrames.name })
-            .from(runFrames)
-            .where(scoped(runFrames.runsRoot, runFrames.gameId, archive.gameId))
-        ]),
-        unreachable("manifestUnavailable")
-      ),
-      ([run, frames]) => {
-        if (run[0]?.framesDirOk !== true) {
-          return Either.left<RunsError>(new NotFound({ problem: "archiveDataNotFound" }))
-        }
-        const pngs: readonly ArchivePng[] = frames.flatMap((row) =>
-          Either.match(Gateway.decodeArchivePngName(row.name), {
-            onLeft: (): ReadonlyArray<ArchivePng> => [],
-            onRight: (found) => [{ index: found, name: row.name }]
-          })
-        )
-        return Either.mapBoth(selectFramePng(pngs, index), {
-          onLeft: asNotFound,
-          onRight: (png) => png.name
-        })
-      }
-    )
-
-  const frameBytes = (
-    archive: TerminalArchive,
-    index: Option.Option<FrameIndex>
-  ): Effect.Effect<Uint8Array, RunsError> =>
-    Effect.flatMap(selectFrameName(archive, index), (name) =>
-      Effect.flatMap(
-        Effect.mapError(
-          db
-            .select({ bytes: runFrames.bytes })
-            .from(runFrames)
-            .where(and(scoped(runFrames.runsRoot, runFrames.gameId, archive.gameId), eq(runFrames.name, name))),
-          unreachable("manifestUnavailable")
-        ),
-        (rows) =>
-          Option.match(Option.fromNullable(rows[0]), {
-            onNone: (): Effect.Effect<Uint8Array, RunsError> =>
-              // The row was listed and is gone: a concurrent re-ingest. The fs
-              // backend answers the same 404 when a frame is unlinked between
-              // the listing and the open.
-              Effect.fail(new NotFound({ problem: "archiveFileNotFound" })),
-            onSome: (row) => Effect.succeed(row.bytes)
-          })
-      ))
-
-  /** `_archive_video_path` (`:1022`) — `game.mp4`: present, and non-empty. */
-  const videoRow = (
-    archive: TerminalArchive
-  ): Effect.Effect<Uint8Array, RunsError> =>
-    Effect.flatMap(
-      Effect.mapError(
-        db
-          .select({ bytes: runVideos.bytes, byteSize: runVideos.byteSize })
-          .from(runVideos)
-          .where(scoped(runVideos.runsRoot, runVideos.gameId, archive.gameId)),
-        unreachable("manifestUnavailable")
-      ),
-      (rows) => {
-        const row = rows[0]
-        return row === undefined || row.byteSize <= 0
-          ? Either.left<RunsError>(new NotFound({ problem: "replayVideoNotFound" }))
-          : Either.right(row.bytes)
-      }
-    )
-
 
   return {
     runsRoot: root,
@@ -788,32 +761,28 @@ export const makeRunsRepositoryPg = (
     lastReplayTurn,
     diskGamesIndex: (indexOptions) => Effect.map(diskGameRows(indexOptions), gamesIndex),
     diskRowsWithInterrupted,
-    frameBytes,
-    videoBytes: videoRow,
-    // `RunsRepositoryApi` takes a `BinaryArtifact`: bytes straight out of
-    // `bytea`, no staged file anywhere. `archive.ts#sendArtifact` streams them
-    // with the same framing the fs path gets. Staging (`stagedPath`) remains
-    // only for the savegame archive the python bridge reads.
-    frameFile: (archive, index) => Effect.map(frameBytes(archive, index), archiveBytes),
-    videoFile: (archive) => Effect.map(videoRow(archive), archiveBytes)
+    // Binaries are ephemeral and regenerable, so they were never stored: these
+    // are the *filesystem* repository's own methods, and they read
+    // `archive.runRoot` — which §4 makes a real run directory in both backends.
+    // Delegation rather than transcription is the whole point: a containment
+    // check that exists twice is a containment check that drifts.
+    frameFile: disk.frameFile,
+    videoFile: disk.videoFile
   }
 }
 
 /**
- * The pg `RunsRepository`, over the materializer's logical `runs_root`.
+ * The pg `RunsRepository`, over one `runs_root`.
  *
- * It takes no options, and that is the point: both roots come from
- * {@link Materializer}, which is also where the per-game lock that keeps
- * `terminalArchive`'s reconciliation single-flight lives. A lock is only a lock
- * if the derivation bridge holds the same one, so the materializer is provided
- * once and shared rather than constructed here (`materialize.ts`'s docstring).
+ * The root is the gateway's own `--runs-root` — the same string the filesystem
+ * backend is given — because §4 resolves every run directory as
+ * `<runs-root>/<game_id>` in both backends. There is no second root, no
+ * materialized mirror and no `--materialize-root`.
  */
-export const layer: Layer.Layer<RunsRepository, never, PgDrizzle.PgDrizzle | Materializer> =
+export const layer = (
+  runsRoot: string
+): Layer.Layer<RunsRepository, never, PgDrizzle.PgDrizzle> =>
   Layer.effect(
     RunsRepository,
-    Effect.gen(function*() {
-      const db = yield* PgDrizzle.PgDrizzle
-      const materializer = yield* Materializer
-      return makeRunsRepositoryPg(db, materializer)
-    })
+    Effect.map(PgDrizzle.PgDrizzle, (db) => makeRunsRepositoryPg(db, runsRoot))
   )

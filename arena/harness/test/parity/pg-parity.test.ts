@@ -36,13 +36,17 @@
  *
  * A `--backend postgres` gateway that silently fell back to `--runs-root` would
  * score **perfect** parity on every leg below, because it would be the `tsFs`
- * gateway.  Three-way agreement is therefore not evidence that anything was
+ * gateway.  And it is no longer an absurd hypothesis: both backends now read
+ * their savegames, frames and `victory.json` out of the *same* `--runs-root`,
+ * so the only thing left that could come from a database is the pair of JSON
+ * documents.  Three-way agreement is therefore not evidence that anything was
  * read out of a database.  {@link PROVENANCE_SCENARIO} is: it ingests the
- * fixture tree, **deletes one row** (`run_documents` of kind `report` for the
- * one terminal fixture), and asserts that the `tsPg` gateway's `/result` turns
- * into CPython's `404 game report not found` while `tsFs`, reading the same
- * untouched disk, still answers `200`.  A gateway reading the filesystem cannot
- * pass that, and a gateway reading the database cannot fail it.
+ * fixture tree, **takes the stored `report.json` away from one game** (its
+ * `games.report_status` becomes `absent` and `extras -> 'report'` is dropped),
+ * and asserts that the `tsPg` gateway's `/result` turns into CPython's
+ * `404 game report not found` while `tsFs`, reading the same untouched disk,
+ * still answers `200`.  A gateway reading the filesystem cannot pass that, and
+ * a gateway reading the database cannot fail it.
  *
  * ## Postgres safety
  *
@@ -76,14 +80,13 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   aliveProcesses,
   bootGatewayTrio,
   type BySide,
   killAllBooted,
-  materializeRootFor,
   PARITY_PLATFORM_SUPPORTED,
   PARITY_REQUIRED,
   paritySkipWarning,
@@ -328,6 +331,24 @@ interface IngestOutcome {
 }
 
 /**
+ * `--skip-boards`, and why the acceptance oracle is entitled to it.
+ *
+ * `board_state` is domain data — it exists so the database is self-sufficient
+ * for scrubbing and frame regeneration later — and it is **not on any response
+ * path**: `/v1/games/{id}/board.json` derives from the savegames on every
+ * request, in every backend, through `python3 -m
+ * agent_eval.replay_derive_cli --op board` reading `--runs-root`.  Ingesting
+ * boards would spawn one python process per turn per scenario and change not
+ * one byte this file compares.
+ *
+ * Skipping them is therefore not a shortcut around the oracle, it *is* an
+ * assertion: the `board-turn-1` and `board-*` legs below are compared
+ * three-way with an empty `board_state`, so a pg gateway that had quietly
+ * started answering `board.json` out of the database would fail them.
+ */
+const SKIP_BOARDS_FLAG = '--skip-boards' as const;
+
+/**
  * Migrate and ingest `runs_root` into a fresh database.
  *
  * The CLI applies the committed `arena/db/drizzle/` migrations by default, so
@@ -337,7 +358,15 @@ interface IngestOutcome {
  */
 const ingestFixtures = async (database: string): Promise<IngestOutcome> => {
   const child = Bun.spawn(
-    ['bun', INGEST_CLI, '--runs-root', PARITY_RUNS_ROOT, '--database-url', databaseUrlFor(database)],
+    [
+      'bun',
+      INGEST_CLI,
+      '--runs-root',
+      PARITY_RUNS_ROOT,
+      '--database-url',
+      databaseUrlFor(database),
+      SKIP_BOARDS_FLAG,
+    ],
     { cwd: REPO_ROOT, stdout: 'pipe', stderr: 'pipe' },
   );
   const [stdout, stderr] = await Promise.all([streamText(child.stdout), streamText(child.stderr)]);
@@ -392,7 +421,7 @@ const ROUTE_LEGS: ReadonlyArray<MatrixLeg> = [
   }),
   get('health-query-400', '/health?x=1', 'health takes no query at all, not even an unknown one'),
   get('bare-id', `/v1/games/${VALID_GAME_ID}`, 'the bare-id alias of /status, which proxies without the suffix'),
-  get('result', `/v1/games/${VALID_GAME_ID}/result`, 'the report.json projection — on pg, a second run_documents row'),
+  get('result', `/v1/games/${VALID_GAME_ID}/result`, 'the report.json projection — on pg, `games.extras -> report`, reconstructed'),
   get('watch-json', `/v1/games/${VALID_GAME_ID}/watch.json`, 'the widest archive projection: frames, players and colors in one document'),
   get('status-trailing-slash', `/v1/games/${VALID_GAME_ID}/status/`, 'path.strip("/") routes it, and the archive family forwards the slash verbatim'),
   get('replay-json', `/v1/games/${VALID_GAME_ID}/replay.json`, 'the derivation route with no query: every default in one body'),
@@ -403,9 +432,9 @@ const ROUTE_LEGS: ReadonlyArray<MatrixLeg> = [
     `/v1/games/${VALID_GAME_ID}/replay.json?after_turn=9007199254740993`,
     'a turn no double spells, echoed back as next_after_turn',
   ),
-  get('replay-cold', `/v1/games/${VALID_GAME_ID}/replay.json?limit=5`, 'the first request after freshCaches: pays for the derivation subprocess — on pg, also for materializing the saves'),
+  get('replay-cold', `/v1/games/${VALID_GAME_ID}/replay.json?limit=5`, 'the first request after freshCaches: pays for the derivation subprocess, identically on all three'),
   get('replay-warm', `/v1/games/${VALID_GAME_ID}/replay.json?limit=5`, 'the same request again: reads what the cold leg wrote, and must be byte-identical to it'),
-  get('board-turn-1', `/v1/games/${VALID_GAME_ID}/board.json?turn=1`, 'a real autosave parsed into a board — on pg, parsed out of a materialized .sav.gz'),
+  get('board-turn-1', `/v1/games/${VALID_GAME_ID}/board.json?turn=1`, 'a real autosave parsed into a board — on pg too, straight off --runs-root: board_state is never on a response path'),
   get('board-missing-turn', `/v1/games/${VALID_GAME_ID}/board.json`, 'turn is required; absent is as wrong as duplicated'),
   get('events-json', `/v1/games/${VALID_GAME_ID}/events.json`, 'the third derivation, whose numeric fields are rebuilt as bigint'),
   get('events-query-400', `/v1/games/${VALID_GAME_ID}/events.json?turn=1`, 'events reject any query at all, from the handler rather than the router'),
@@ -630,8 +659,19 @@ interface ScenarioReport {
   readonly argv: TrioArgvParity;
   readonly stop: TrioStopReport;
   readonly pids: ReadonlyArray<number>;
-  /** The pg gateway's materialization directory existed after the derivation legs. */
-  readonly materialized: boolean;
+  /**
+   * The derivation caches the three gateways filled, by side.
+   *
+   * The replacement for the old `materialized` flag.  That flag asked "did the
+   * pg gateway stage savegames into `<cache-root>-saves`", which was the only
+   * observable proof that a *derived* answer on the pg leg had come from real
+   * files rather than from an archive so empty every side said
+   * `available: false`.  There is no staging directory any more, so the same
+   * question is asked of the thing that still exists: the python loaders'
+   * cache, which all three gateways fill, at their own `--cache-root`, only
+   * when a derivation actually ran.
+   */
+  readonly derivationCaches: BySide<boolean>;
   readonly contentLengthSelfConsistent: boolean;
 }
 
@@ -691,14 +731,32 @@ const contentLengthMatchesBody = (outcome: WireOutcome): boolean => {
 };
 
 /**
+ * Did a derivation actually run on this side?
+ *
+ * `--cache-root` is created by every gateway before it binds (`:2092`), so its
+ * *existence* says nothing; the python loaders create `<cache-root>/<game-id>`
+ * and write parsed savegames into it only when a derivation really happened.
+ * Read as "non-empty" rather than by rebuilding that path, so the rig cannot
+ * drift from `save_replay._cache_directory`'s layout.
+ *
+ * Asked before teardown removes the scratch.
+ */
+const derivationRan = (cacheRoot: string): boolean => {
+  const entries = readdirSync(cacheRoot, { withFileTypes: true });
+  return entries.length > 0;
+};
+
+/**
  * Create a database, ingest the fixture tree into it, boot the trio, replay
  * every leg, stop, and drop the database.
  *
- * The database is per scenario rather than shared, and that is not tidiness.
- * `derivation_workdirs` is keyed by `(runs_root, game_id)` and nothing else, so
- * two scenarios materializing the same fixture into two different roots would
- * be writing the same row — a cross-scenario coupling with no filesystem twin,
- * and exactly the kind of shared state a parity rig must not have.
+ * The database is per scenario rather than shared, and that is not tidiness: a
+ * scenario's database is state it mutates (it is created, migrated, ingested
+ * and dropped inside `runScenario`), and the falsification scenario below
+ * *edits rows*.  Sharing one would make the nine scenarios — which run
+ * concurrently, `SCENARIO_CONCURRENCY` at a time — able to observe each other
+ * through storage, which is a coupling the filesystem legs do not have and a
+ * parity rig therefore must not have either.
  */
 const runScenario = async (spec: ScenarioSpec): Promise<ScenarioReport> => {
   const database = databases.create(spec.name.replaceAll('-', '_'));
@@ -728,9 +786,10 @@ const runScenario = async (spec: ScenarioSpec): Promise<ScenarioReport> => {
   const pids = trio.all.map((gateway) => gateway.pid);
 
   // Cold first, and strictly in order.  `freshCaches()` removes all three
-  // derivation caches *and* the pg gateway's materialization directory, and the
-  // database is seconds old, so `derivation_cache` is empty too: the cold leg
-  // is cold on every side by construction rather than by hope.
+  // derivation caches, which is now the whole of what a side can be warm from:
+  // the loaders' cache is the only thing any gateway carries between requests,
+  // and it lives on disk on every side.  The cold leg is cold on every side by
+  // construction rather than by hope.
   await trio.freshCaches();
   const sequential = await SEQUENTIAL_LEG_NAMES.reduce<Promise<ReadonlyArray<readonly [string, Sided]>>>(
     async (previous, name) => [...(await previous), await runAll(origins, legByName(name))],
@@ -744,9 +803,11 @@ const runScenario = async (spec: ScenarioSpec): Promise<ScenarioReport> => {
   );
 
   const outcomes = new Map([...sequential, ...pooled]);
-  // Asked before teardown removes the scratch: the pg gateway must have written
-  // real files for the python bridge, because the bridge cannot read a database.
-  const materialized = existsSync(materializeRootFor(trio.tsPg.cacheRoot));
+  const derivationCaches: BySide<boolean> = {
+    python: derivationRan(trio.python.cacheRoot),
+    tsFs: derivationRan(trio.tsFs.cacheRoot),
+    tsPg: derivationRan(trio.tsPg.cacheRoot),
+  };
   const stop = await trio.stop();
   trio.cleanup();
   databases.drop(database);
@@ -760,7 +821,7 @@ const runScenario = async (spec: ScenarioSpec): Promise<ScenarioReport> => {
     argv,
     stop,
     pids,
-    materialized,
+    derivationCaches,
     contentLengthSelfConsistent: Array.from(outcomes.values()).every((sides) =>
       TRIO_SIDES.every((side) => contentLengthMatchesBody(sides[side])),
     ),
@@ -941,8 +1002,8 @@ interface MatrixState {
 /** What the falsification scenario measured. */
 interface ProvenanceReport {
   readonly database: string;
-  readonly deleted: string;
-  /** `/v1/games/<id>/result` on each side, after the row was deleted. */
+  readonly revoked: string;
+  /** `/v1/games/<id>/result` on each side, after the stored report was revoked. */
   readonly resultStatus: BySide<number | string>;
   readonly resultBody: BySide<string>;
   readonly stop: TrioStopReport;
@@ -981,7 +1042,7 @@ const renderReport = (reports: ReadonlyMap<string, ScenarioReport>): ReadonlyArr
     return [
       `${report.name}  (${report.serviceUrl}, db=${report.database}, ${String(report.outcomes.size)} legs x 3 pairs)`,
       ...rows,
-      `  unexcused divergences: ${String(rows.length)}   materialized: ${String(report.materialized)}`,
+      `  unexcused divergences: ${String(rows.length)}   derivation caches filled: ${JSON.stringify(report.derivationCaches)}`,
     ];
   });
 
@@ -1023,18 +1084,18 @@ const SCENARIO_NAMES: ReadonlyArray<string> = [
 
 /**
  * The scenarios in which the archive is read from **storage** rather than
- * relayed from the upstream — and therefore the only ones in which the pg
- * gateway has any reason to materialize a save.
+ * relayed from the upstream — and therefore the only ones in which any gateway
+ * has a reason to run a derivation at all.
  *
  * Read off `waivers.ts` rather than restated: `binary-disk-fallback-chunked`
  * is scoped to exactly this set, for exactly this reason ("the five scenarios
  * in which the archive is read from disk"), and deriving it means a scenario
  * added to that entry cannot silently fall out of this assertion.
  *
- * Measured, and it is the sharp form of the claim: `materialized` is `true` in
- * these five and `false` in the four where the stub answers, because a relayed
- * `replay.json` never reaches the derivation service at all.  Asserting
- * `true` everywhere — the first version of this rig did — is wrong in four
+ * Measured, and it is the sharp form of the claim: a derivation cache is
+ * filled in these five and empty in the four where the stub answers, because a
+ * relayed `replay.json` never reaches the derivation service at all.  Asserting
+ * "filled" everywhere — the first version of this rig did — is wrong in four
  * scenarios; asserting nothing would let the derivation legs agree for the
  * worst possible reason, an archive so empty that every side says
  * `available: false`.
@@ -1043,12 +1104,32 @@ const DISK_FALLBACK_SCENARIOS: ReadonlyArray<string> =
   MATRIX_WAIVERS.find((waiver) => waiver.id === 'binary-disk-fallback-chunked')?.scenarios ?? [];
 
 /**
+ * The one edit that makes a pg gateway answer differently from an fs one.
+ *
+ * v2 stores no document bytes, so there is no row to `DELETE` any more: a
+ * game's `report.json` lives as `games.report_status = 'ok'` plus the verbatim
+ * document under `extras -> 'report'`.  Taking it away is therefore the two of
+ * them together, and it is written as the state ingest would have written for a
+ * run whose `report.json` could not be opened — `absent`, which the read path
+ * turns into 404 `game report not found`.
+ *
+ * Both halves matter.  Flipping the status alone would leave the document
+ * sitting in `extras` for a read path that happened to trust the wrong one of
+ * the two; dropping `extras -> 'report'` alone would leave a `status = 'ok'`
+ * row with nothing behind it, which is a state ingest cannot produce and so
+ * proves nothing about the code paths that exist.
+ */
+const REVOKE_STORED_REPORT = (gameId: string): string =>
+  `update games set report_status = 'absent', report_byte_size = null, ` +
+  `extras = extras - 'report' where game_id = '${gameId}'`;
+
+/**
  * The falsification scenario, run apart from the matrix.
  *
- * Ingest, then `DELETE` the one `run_documents` row `/result` reads, then ask
- * all three.  CPython and `tsFs` read the untouched fixture tree and must still
- * answer `200`; `tsPg` has nothing to read and must answer the `404` CPython
- * itself would give for an absent `report.json`.
+ * Ingest, then take the stored `report.json` away from the one terminal
+ * fixture, then ask all three.  CPython and `tsFs` read the untouched fixture
+ * tree and must still answer `200`; `tsPg` has nothing to read and must answer
+ * the `404` CPython itself would give for an absent `report.json`.
  */
 const runProvenance = async (): Promise<ProvenanceReport> => {
   const database = databases.create('provenance');
@@ -1057,13 +1138,10 @@ const runProvenance = async (): Promise<ProvenanceReport> => {
     databases.drop(database);
     throw new Error(`arena-ingest failed for the provenance scenario:\n${ingest.stderr.trim()}`);
   }
-  const deleted = psql(
-    database,
-    `delete from run_documents where game_id = '${VALID_GAME_ID}' and kind = 'report'`,
-  );
+  const deleted = psql(database, REVOKE_STORED_REPORT(VALID_GAME_ID));
   if (!deleted.ok) {
     databases.drop(database);
-    throw new Error(`could not delete the report row: ${deleted.stderr.trim()}`);
+    throw new Error(`could not revoke the stored report: ${deleted.stderr.trim()}`);
   }
   const trio = unwrapTrio(
     await bootGatewayTrio({
@@ -1087,7 +1165,7 @@ const runProvenance = async (): Promise<ProvenanceReport> => {
 
   return {
     database,
-    deleted: `run_documents(${VALID_GAME_ID}, report): ${deleted.stdout.trim()}`,
+    revoked: `games(${VALID_GAME_ID}).report_status -> absent: ${deleted.stdout.trim()}`,
     resultStatus: {
       python: statusOf(sides.python),
       tsFs: statusOf(sides.tsFs),
@@ -1139,7 +1217,7 @@ beforeAll(async () => {
       `legs ${String(MATRIX_LEGS.length)} x scenarios ${String(SCENARIO_NAMES.length)} x pairs ${String(TRIO_PAIRS.length)} = ${String(MATRIX_LEGS.length * SCENARIO_NAMES.length * TRIO_PAIRS.length)} comparisons`,
       ...renderReport(state.reports),
       '',
-      `PROVENANCE (${provenance.deleted}): ${JSON.stringify(provenance.resultStatus)}`,
+      `PROVENANCE (${provenance.revoked}): ${JSON.stringify(provenance.resultStatus)}`,
       '',
       ...SCENARIO_NAMES.map(
         (scenario) =>
@@ -1247,18 +1325,26 @@ describe.if(RUNNABLE)('the 3-way pg matrix', () => {
         expect(missingResponses(scenarioReport(scenario))).toEqual(WAIVED_SILENCES);
       });
 
-      test('the pg gateway materialized saves exactly when the archive was read from storage', () => {
+      test('all three gateways derived — or all three did not — exactly when the archive was read from storage', () => {
         // `replay_derive_cli` is a subprocess and cannot be taught a database,
-        // so on the pg backend a *derived* answer requires real files to have
-        // appeared under `<cache-root>-saves`.  If that directory never
-        // appeared in a disk-fallback scenario, the derivation legs agreed for
-        // the worst possible reason — an archive so empty that every side said
-        // `available: false`.  And if it appeared in a *relaying* scenario, the
-        // gateway derived something it should have proxied.
-        expect({
+        // so a *derived* answer on any side requires the loaders to have parsed
+        // real savegames and cached them.  If no cache filled in a disk-fallback
+        // scenario, the derivation legs agreed for the worst possible reason —
+        // an archive so empty that every side said `available: false`.  If one
+        // filled in a *relaying* scenario, that gateway derived something it
+        // should have proxied.
+        //
+        // Three-sided rather than pg-only, and that is the upgrade this rig got
+        // when `--materialize-root` died: the old flag could only be asked of
+        // the pg leg, because only the pg leg had a staging directory.  The
+        // question is now identical on all three, so an asymmetry — a pg
+        // gateway that skipped a derivation the fs one performed — is visible
+        // instead of unaskable.
+        const expected = DISK_FALLBACK_SCENARIOS.includes(scenario);
+        expect({ scenario, caches: scenarioReport(scenario).derivationCaches }).toEqual({
           scenario,
-          materialized: scenarioReport(scenario).materialized,
-        }).toEqual({ scenario, materialized: DISK_FALLBACK_SCENARIOS.includes(scenario) });
+          caches: { python: expected, tsFs: expected, tsPg: expected },
+        });
       });
 
       MATRIX_LEGS.forEach((leg) => {
@@ -1373,7 +1459,7 @@ describe.if(RUNNABLE)('the pg gateway reads the database, not --runs-root', () =
     return state.provenance;
   };
 
-  test('deleting the report row changes only the pg gateway\'s answer', () => {
+  test('revoking the stored report changes only the pg gateway\'s answer', () => {
     const { resultStatus } = provenance();
     expect(resultStatus).toEqual({ python: 200, tsFs: 200, tsPg: 404 });
   });

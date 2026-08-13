@@ -965,18 +965,16 @@ export interface GatewayTrio {
   /** All three, in {@link TRIO_SIDES} order. */
   readonly all: readonly [BootedGateway, BootedGateway, BootedGateway];
   /**
-   * Empty every derivation cache — and the pg gateway's materialization
-   * directory — so the next request is cold on all three sides.
+   * Empty every derivation cache, so the next request is cold on all three
+   * sides.
    *
-   * The third removal is the one that is easy to forget.  On the pg backend the
-   * python bridge does not read `--runs-root`; it reads a directory the gateway
-   * materializes the saves into, whose default is `<cache-root>-saves`
-   * (a *sibling*, because `save_replay._cache_directory` refuses a cache root
-   * that nests with the saves directory).  Leaving it populated would make the
-   * "cold" leg skip the work whose parity this rig exists to check, and the
-   * skip would be invisible — a warm answer is byte-identical to a cold one,
-   * which is precisely what makes the omission dangerous rather than merely
-   * wrong.
+   * Three removals and no fourth: the python bridge reads `--runs-root` on
+   * **every** side now, so a cache root is the whole of what a side can be warm
+   * from.  There used to be a fourth — `<cache-root>-saves`, the directory a pg
+   * gateway materialized savegames into — and forgetting it would have made the
+   * "cold" leg skip the work whose parity this rig exists to check, invisibly,
+   * because a warm answer is byte-identical to a cold one.  The directory no
+   * longer exists rather than being remembered.
    */
   readonly freshCaches: () => Promise<ReadonlyArray<string>>;
   readonly stop: () => Promise<TrioStopReport>;
@@ -991,15 +989,6 @@ export type TrioResult =
       readonly failures: ReadonlyArray<BootFailure>;
       readonly cleanup: () => void;
     };
-
-/**
- * The materialization directory the pg gateway derives from a cache root.
- *
- * Spelled here because the rig has to *remove* it and the gateway has to
- * *create* it, and a rig that guessed a different name would silently stop
- * making cold legs cold.
- */
-export const materializeRootFor = (cacheRoot: string): string => `${cacheRoot}-saves`;
 
 const makeTrio = (
   spec: ResolvedBootSpec,
@@ -1046,7 +1035,6 @@ const makeTrio = (
       const roots = all.map((gateway) => gateway.cacheRoot);
       roots.forEach((root) => {
         rmSync(root, { recursive: true, force: true });
-        rmSync(materializeRootFor(root), { recursive: true, force: true });
         mkdirSync(root, { recursive: true });
       });
       return Promise.resolve(roots);

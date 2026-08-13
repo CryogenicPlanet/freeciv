@@ -1,123 +1,121 @@
 /**
- * The ingest pipeline — a `runs_root` on disk becomes rows in Postgres.
+ * The ingest pipeline v2 — a `runs_root` on disk becomes **domain rows**.
  *
- * The gateway never writes. This module is the only writer, and its job is
- * narrow and unglamorous: walk a `runs_root`, read every artifact the replay
- * gateway can ever serve, and store the bytes **verbatim** beside the handful
- * of typed columns an operator may query. Everything that shapes a response
- * body stays on the read side, in TypeScript, over the re-parsed bytes.
+ * v1 mirrored bytes: every artifact of every run was stored verbatim and the
+ * read path re-parsed them. The frozen v2 schema stores a *model of a game*
+ * (`games`/`seats`/`turns`/`board_state`/`player_turns`/`agent_stats`), no
+ * artifacts and no filesystem paths, so this module is where the decoding
+ * happens — once, at write time, with every judgement written down.
+ *
+ * ## The storage rule, in two sentences
+ *
+ * **Partition.** For a document with `status = 'ok'` every key is stored
+ * exactly once: in its typed column, or in `extras.manifest`. Never both.
+ *
+ * **Demotion.** A key takes its typed column only when the column can hold the
+ * value losslessly *and* the value's type is the column's type. Otherwise the
+ * key is demoted whole into `extras.manifest`, verbatim, and its column is
+ * `NULL`. An explicit `null` is therefore always a demotion — a column cannot
+ * distinguish "absent" from "present and null", and one site in the gateway can
+ * (`untrustedFieldOr(manifest, 'state', 'status')`: a *present* `null` `state`
+ * beats `status`, an absent one does not).
+ *
+ * The consequence, which is the whole reconstruction contract:
+ *
+ * | stored shape | the document had |
+ * |---|---|
+ * | column `NULL`, key absent from `extras.manifest` | no such key |
+ * | column `NULL`, key present in `extras.manifest` | that key, un-columnable |
+ * | column non-`NULL` | that key, and the column is its value |
  *
  * ## What ingest decides, and what it deliberately does not
  *
- * Postgres has no symlinks and no `st_mode`, so four filesystem rules the fs
- * backend applies at *read* time have to be applied here instead. They are the
- * only judgements this module makes:
- *
- * | fs rule (read time) | here | observable result |
- * |---|---|---|
- * | `GAME_ID_RE` fails → 404 `gameNotFound` | entry skipped, no row | identical 404 |
- * | run directory is a symlink → 404 | skipped (`game_parity_symlink_07`) | identical 404 |
- * | resolved parent is not `runs_root` → 404 | skipped | identical 404 |
- * | not a directory → 404 | skipped | identical 404 |
- * | `archiveRegularFiles` drops symlink / non-regular / empty | those entries are not ingested | identical listing |
- * | `safeArchiveDirectory` fails → 404 `archiveDataNotFound` | `runs.frames_dir_ok` / `saves_dir_ok` | identical 404 |
+ * Postgres has no symlinks and no `st_mode`, so the filesystem rules the fs
+ * backend applies at *read* time are applied here instead: `GAME_ID_RE` fails,
+ * the run directory is a symlink, it resolves outside `runs_root`, or it is not
+ * a directory ⇒ **no `games` row** ⇒ the pg gateway's 404 `gameNotFound` is the
+ * fs gateway's 404. Likewise `_read_archive_json`'s verdict becomes
+ * `manifest_status` / `report_status`: `open` failed ⇒ `absent` ⇒ 404; opened
+ * but not a non-empty regular file of at most 8 MiB whose bytes decode as UTF-8
+ * and parse as a JSON *object* ⇒ `unusable` ⇒ 503.
  *
  * Every *other* gate stays on the read side. A manifest whose `game_id`
- * disagrees with its directory (`game_parity_wrong_id_06`) is ingested exactly
- * as it stands, because the pg `readManifest` re-runs that cross-check over the
- * stored bytes; a manifest that is not a JSON object
- * (`game_parity_malformed_05`) is ingested with `status = 'unusable'` and its
- * bytes intact, because the 503 has to stay *reproducible* rather than merely
- * asserted. Ingest is dumb on purpose: the more it decides, the more of the
- * gateway's behaviour lives in two places.
+ * disagrees with its directory is ingested exactly as it stands, because the pg
+ * `readManifest` re-runs that cross-check over the *reconstructed* document.
  *
- * ## Two asymmetries that are load-bearing
+ * ## The one place v2 is less capable than v1, and it is loud
  *
- * `victory.json` and `replay.jsonl` are read **following symlinks**, with no
- * size ceiling and no `O_NOFOLLOW` — deliberately unlike every other read here,
- * because `readWholeFile` and `makeLastReplayTurn` in the fs backend omit it
- * too. An ingester that "hardened" them would silently change two answers.
+ * `text` silently turns a lone surrogate into U+FFFD and refuses U+0000;
+ * `jsonb` refuses both. v1 survived a manifest carrying either because it
+ * stored bytes. v2 cannot: there is no bytes-shaped carrier in the schema, and
+ * a silent repair would change `resolved_places` and with it the derivation
+ * cache key. So the decided policy is to be **honest rather than green**: a
+ * document containing U+0000 or a lone surrogate in any string — key or value —
+ * is `status = 'unusable'`, exactly as if it had failed the UTF-8 gate, and the
+ * run is reported with a {@link SkipReason} of `documentUnstorable`. That is a
+ * declared divergence (the fs gateway serves such a manifest), recorded here
+ * rather than discovered later as a waiver request.
  *
  * ## Idempotence
  *
- * `runs.content_hash` is sha256 over the canonical listing of the run's
- * artifacts — `(category, name, byte_size, status, sha256(bytes))` sorted, plus
- * the two directory booleans. Every field is length-prefixed
- * ({@link encodeFields}), because `name` is a filename off a disk this process
- * does not control and `saves/` is listed with a match-everything pattern: with
- * a separator-joined encoding, a file called
- * `x 1 whole <sha256 of x>\nsave y` reproduces the listing of a directory
- * holding `x` and `y`, and since an equal hash means "commit nothing", a
- * forged archive re-ingests as *unchanged* over a real one. A re-ingest reads
- * that one column, and when it
- * matches, the run's transaction issues **no statement that writes**: not an
- * `UPDATE`, not a no-op `INSERT ... ON CONFLICT`, not even a `SELECT ... FOR
- * UPDATE` (which would take a row lock, and a row lock is recorded in the
- * tuple's `xmax`, which assigns a transaction id). That is what makes
- * {@link IngestReport.transactionsWithWrites} — read from
- * `pg_current_xact_id_if_assigned()` inside each run's transaction — an exact
- * proof rather than a row count that happened to stay level.
+ * `games.content_hash` is sha256 over a canonical listing of what this module
+ * actually decodes — the two documents (fstat size, status, digest) and
+ * `replay.jsonl` (whole-file size, digest of the bytes read). Every field is
+ * length-prefixed ({@link encodeFields}), because a filename or a status is
+ * attacker-shaped and a separator-joined encoding lets one field imitate a
+ * whole record; an equal hash is the licence to write *nothing*, so a forgeable
+ * listing is a forgeable "unchanged".
  *
- * When the hash *does* differ, every child statement still carries its own
- * `WHERE ... IS DISTINCT FROM excluded....`, so changing one frame in a run of
- * 838 rewrites one row and leaves 837 TOAST chains alone.
+ * Boards are **not** in the hash: they are resumable by set difference (§ board
+ * phase), and folding a new autosave into the hash would rewrite every typed
+ * row of a run whose only change was an autosave.
  *
- * ## Deletion
+ * When the hash matches, the run's transaction issues no statement that writes
+ * — not an `UPDATE`, not a no-op `INSERT ... ON CONFLICT`, not a `SELECT ...
+ * FOR UPDATE` (a row lock is recorded in `xmax`, which assigns a transaction
+ * id). That is what makes {@link IngestReport.transactionsWithWrites}, read
+ * from `pg_current_xact_id_if_assigned()` inside each transaction, a proof
+ * rather than a row count that happened to stay level.
  *
- * A sweep deletes the runs it did not see, by id, cascading to every child
- * table. A sweep that aborted — an unreadable `runs_root` — deletes nothing:
- * an unreadable root makes the fs backend answer with an empty index for one
- * request, and it must not make the pg backend drop the archive. A sweep
- * restricted with `--game` deletes only within the ids it was given, for the
- * same reason.
+ * ## Deletion is opt-in now
  *
- * Two refinements, both of which are about evidence rather than bookkeeping:
- *
- * - Deletion is **not** stamped by `sweep_id`, as the obvious design would have
- *   it. Stamping an unchanged run *is a write*, and one write per unchanged run
- *   is exactly what the idempotence contract forbids. `sweep_id` records the
- *   sweep that last **changed** the run; the delete is driven by ids.
- * - The delete phase re-reads the disk. The walk happens at the start of a
- *   sweep and the delete at the end, and in between another process — an
- *   `--game` sweep, most obviously — may ingest a run this one never saw.
- *   Measured, before the recheck: sweep A over a 40-run root, sweep B ingesting
- *   one new run 1.0 s later, and A then reporting `40 unchanged, 1 deleted` —
- *   both processes exiting `0`, and the run gone from every table while sitting
- *   on disk. So {@link staleRuns} runs *inside* the delete transaction and
- *   removes only ids that are still absent from the filesystem when it looks.
- *   That is a stronger licence than any lock, because it is the same evidence
- *   the walk itself used.
+ * v1 scoped every row by `runs_root`. The frozen schema has no such column — a
+ * `games` row is a game, not a directory — so "delete the ids that are not on
+ * disk" would delete another archive's rows from a shared database. Pruning is
+ * therefore `--prune`, keeping v1's licence: {@link isRunOnDisk} is re-checked
+ * *inside* the delete transaction, so a run another process ingested while this
+ * sweep was reading survives.
  *
  * ## Interop boundaries
  *
- * Three, all declared:
- *
- * 1. the `node:fs` section below (`Either.try` via {@link attempt}, mirroring
- *    `arena/harness/src/gateway/services/runs.ts`, which needs `open(2)` with a
- *    raw flag word, `fstat` on the descriptor it already holds, and positional
- *    reads — none of which `@effect/platform`'s `FileSystem` exposes);
- * 2. {@link decodeUtf8}, one `Either.try` around `TextDecoder.decode` with
- *    `fatal: true`, which is the *only* way that decoder reports invalid UTF-8
- *    and which has to stay reachable because it decides a 503;
- * 3. the SQL driver layer in `./client.ts`.
- *
- * Nothing else here throws or catches. `BigInt(...)` in {@link nameTurn} is not
- * a fourth: its argument is a `\d+` capture, on which it is total.
+ * Three, all declared: the `node:fs` section below (mirroring
+ * `gateway/services/runs.ts`, which needs `open(2)` with a raw flag word,
+ * `fstat` on the descriptor it holds, and positional reads); {@link decodeUtf8},
+ * one `Either.try` around a `fatal: true` `TextDecoder`, which is the only way
+ * that decoder reports invalid UTF-8 and which decides a 503; and the SQL
+ * driver layer in `./client.ts`. The board phase spawns `python3` through the
+ * gateway's own bridge — that boundary belongs to `services/derivation.ts` and
+ * is used, not re-implemented.
  *
  * @module
  */
 
 import {
+  CANON_ASCII,
+  type CanonValue,
+  canonicalText,
   decodeJsonValueFromString,
+  findLoneSurrogate,
   Gateway,
   isGameId,
+  isJsonObject,
   type JsonObject,
   type JsonValue
 } from "@arena/wire"
 import * as PgDrizzle from "@effect/sql-drizzle/Pg"
 import * as SqlClient from "@effect/sql/SqlClient"
 import type { SqlError } from "@effect/sql/SqlError"
-import { and, eq, inArray, notInArray, sql } from "drizzle-orm"
+import { and, eq, getTableColumns, inArray, sql, type Table } from "drizzle-orm"
 import type { PgColumn } from "drizzle-orm/pg-core"
 import * as Arr from "effect/Array"
 import * as Data from "effect/Data"
@@ -144,25 +142,33 @@ import {
   // oxlint-disable-next-line effecttsgo/node-builtin-import
 } from "node:fs"
 // oxlint-disable-next-line effecttsgo/node-builtin-import
-import { dirname, join, resolve as resolvePath } from "node:path"
+import { basename, dirname, join, resolve as resolvePath } from "node:path"
+// oxlint-disable-next-line effecttsgo/node-builtin-import
+import { fileURLToPath } from "node:url"
 
 import { MAX_PROXY_JSON_BYTES } from "../../harness/src/gateway/constants.ts"
+import { derivationPlaces } from "../../harness/src/gateway/http/routes/replay.ts"
+import { parsePythonJson } from "../../harness/src/gateway/python-json.ts"
+import {
+  type DerivationError,
+  type DerivationRunner,
+  pythonDerivationRunner
+} from "../../harness/src/gateway/services/derivation.ts"
 import {
   MANIFEST_FILE,
   REPLAY_JSONL_FILE,
   REPLAY_TAIL_BYTES,
-  REPORT_FILE,
-  VICTORY_FILE
+  REPORT_FILE
 } from "../../harness/src/gateway/services/runs.ts"
 
 import {
-  ingestSweeps,
-  runDocuments,
-  runFrames,
-  runReplayTail,
-  runs,
-  runSaves,
-  runVideos
+  agentStats,
+  boardState,
+  games,
+  playerTurns,
+  runState,
+  seats,
+  turns
 } from "./schema.ts"
 
 // ---------------------------------------------------------------------------
@@ -170,48 +176,30 @@ import {
 //
 // Imported, not redeclared. The writer and the reader have to agree on these
 // exactly, and the only way to guarantee that is for there to be one of each.
-// `runs-repository-pg.ts` already imports the same module, so this costs the
-// package nothing it was not already paying.
 // ---------------------------------------------------------------------------
 
-/**
- * `manifest.json`, `report.json`, `victory.json`, `replay.jsonl`, and the
- * `[max(0, size - 65536), size)` tail window `_last_replay_turn` reads — all
- * five as the *reader* spells them (`services/runs.ts`), re-exported so a
- * caller of this package gets one spelling rather than two that must be kept
- * in step by hand.
- */
-export { MANIFEST_FILE, REPLAY_JSONL_FILE, REPLAY_TAIL_BYTES, REPORT_FILE, VICTORY_FILE }
+/** `manifest.json`, `report.json`, `replay.jsonl` and the 64 KiB tail window. */
+export { MANIFEST_FILE, REPLAY_JSONL_FILE, REPLAY_TAIL_BYTES, REPORT_FILE }
 
 /**
  * `MAX_PROXY_JSON_BYTES` (`gateway/constants.ts`, `replay_gateway.py:55`).
  *
- * Not a cap on what may be stored: it is the *gate* that decides
- * `status = 'unusable'`, applied to the fstat size. It doubles as the read cap
- * for a document that has already failed the gate — those bytes can never be
- * parsed by the read path, so reading more of them would be pure cost.
+ * The *gate* that decides `status = 'unusable'`, applied to the fstat size. It
+ * doubles as the read cap for a document that has already failed the gate:
+ * those bytes can never be parsed by the read path, so reading more is cost.
  */
 export const MAX_DOCUMENT_BYTES: number = MAX_PROXY_JSON_BYTES
 
 /**
- * How much of a `*.map.ppm` is stored.
+ * How much of a `replay.jsonl` is decoded into `turns` / `player_turns`.
  *
- * 128 KiB is chosen so that no lemma is required: it strictly dominates both
- * readers' hard caps. `save_replay._ppm_players` breaks at `consumed > 64 KiB`
- * with `readline(4096)` steps, and `archivePpmPlayers` stops at the first line
- * after index 0 that does not begin with `#` within 513 lines — measured at
- * byte 214 on the corpus, 3254 bytes for an all-comment worst case.
+ * The fs backend never reads more than the 64 KiB tail, so this cap changes no
+ * response: it bounds the *domain* rows only. A file past it is decoded up to
+ * the cap, its final (possibly torn) line dropped, and the run reported with a
+ * `replayTruncated` skip — loudly, because "some turns are missing" must not be
+ * indistinguishable from "the game had that many turns".
  */
-export const DEFAULT_PPM_HEAD_BYTES = 131072
-
-/**
- * The largest single row payload ingest will store.
- *
- * `bytea` tops out at 1 GB, but the pg read path buffers a whole row where the
- * fs path streams 64 KiB at a time. Anything larger is refused, reported as an
- * oversized artifact, and left out of the run — loudly, not silently.
- */
-export const DEFAULT_MAX_BINARY_ROW_BYTES = 64 * 1024 * 1024
+export const DEFAULT_MAX_REPLAY_BYTES = 256 * 1024 * 1024
 
 /** darwin `O_RDONLY` / `O_NOFOLLOW` / `O_CLOEXEC` (`services/runs.ts`). */
 const O_RDONLY = 0x0000_0000
@@ -220,13 +208,66 @@ const O_CLOEXEC = 0x0100_0000
 
 /**
  * `SAVE_NAME_RE` — `agent_eval/save_replay.py:35`. The autosaves the python
- * bridge discovers, and the only saves it ever decompresses.
+ * bridge discovers, and therefore the only turns a board can be derived for.
  */
 export const SAVE_NAME_RE: RegExp = /^turn-(\d+)-(?:auto|final)\.sav(?:\.gz|\.bz2|\.xz|\.zst)?$/
+
+/** One of the seven lifecycle states `games.state` can hold. */
+export type StorableRunState = (typeof runState.enumValues)[number]
+
+/** The seven storable lifecycle states, taken from the frozen enum itself. */
+export const RUN_STATE_VALUES: ReadonlyArray<StorableRunState> = runState.enumValues
+
+/** Is this exactly one of the seven spellings the column accepts? */
+export const isStorableRunState = (value: JsonValue | undefined): value is StorableRunState =>
+  typeof value === "string" &&
+  RUN_STATE_VALUES.some((candidate): boolean => candidate === value)
+
+/**
+ * The sentinel `games.state` carries when the manifest's `state` is not one of
+ * the seven.
+ *
+ * `games.state` is `NOT NULL` over a seven-value enum and a manifest may carry
+ * any string, a number, or nothing at all. A domain query must read
+ * `state = 'invalid' AND extras->'manifest' ? 'state'` as *unrecognized*, not
+ * as "the run was invalid".
+ */
+export const UNRECOGNIZED_STATE = "invalid" as const
+
+/** int32, the width of every `integer` column in the schema. */
+const INT32_MIN = -2147483648
+const INT32_MAX = 2147483647
 
 // ---------------------------------------------------------------------------
 // Options
 // ---------------------------------------------------------------------------
+
+/**
+ * The board phase's configuration. `Option.none()` on {@link IngestOptions}
+ * means `--skip-boards`: the fast, parity-shaped sweep.
+ */
+export interface BoardOptions {
+  /**
+   * `--cache-root`, passed to the bridge verbatim. Stable across sweeps on
+   * purpose: `save_replay._load_cache` validates each entry against the source
+   * save's `{device, inode, size, mtime_ns, ctime_ns}`, so a second sweep over
+   * the same disk re-uses every parse, while a per-sweep `mkdtemp` throws the
+   * whole cache away.
+   */
+  readonly cacheRoot: string
+  /** The checkout holding `agent_eval/` — the bridge's working directory. */
+  readonly repoRoot: string
+  /** At most this many turns per game per sweep; `0` is "no limit". */
+  readonly turnLimit: number
+  /** How many *games* derive concurrently. Within a game it is always serial. */
+  readonly concurrency: number
+  /**
+   * The derivation backend. `Option.none()` builds the python bridge from
+   * `cacheRoot`/`repoRoot`; a test injects its own so the phase is exercisable
+   * without a python checkout.
+   */
+  readonly runner: Option.Option<DerivationRunner>
+}
 
 /** Everything a sweep needs. Build one with {@link ingestOptions}. */
 export interface IngestOptions {
@@ -234,49 +275,82 @@ export interface IngestOptions {
   readonly runsRoot: string
   /** Restrict the sweep to these ids. Empty means "every run under the root". */
   readonly gameIds: ReadonlySet<string>
-  /** Read and compare, write nothing — not even the sweep row. */
+  /** Read and compare, write nothing. */
   readonly dryRun: boolean
-  /** How much of a PPM to store. See {@link DEFAULT_PPM_HEAD_BYTES}. */
-  readonly ppmHeadBytes: number
-  /** The refusal threshold for a single stored payload. */
-  readonly maxBinaryRowBytes: number
+  /**
+   * Delete stored games that are not on the disk. Opt-in because the schema has
+   * no `runs_root` column: an unscoped prune against a database that also holds
+   * another archive deletes rows whose files are alive.
+   */
+  readonly prune: boolean
+  /** How much `replay.jsonl` is decoded. See {@link DEFAULT_MAX_REPLAY_BYTES}. */
+  readonly maxReplayBytes: number
+  /** The board phase, or `Option.none()` for `--skip-boards`. */
+  readonly boards: Option.Option<BoardOptions>
 }
 
-/** Default options for a root: whole sweep, real writes, 128 KiB PPM heads. */
+/** The checkout this package lives in — the bridge's default `repoRoot`. */
+export const PACKAGE_REPO_ROOT: string = fileURLToPath(new URL("../../..", import.meta.url))
+
+/** Default board options for a cache root: every turn, four games at a time. */
+export const boardOptions = (cacheRoot: string): BoardOptions => ({
+  cacheRoot,
+  repoRoot: PACKAGE_REPO_ROOT,
+  turnLimit: 0,
+  concurrency: 4,
+  runner: Option.none()
+})
+
+/**
+ * Defaults for a root: whole sweep, real writes, no pruning, **no boards**.
+ *
+ * Boards are off by default because they spawn processes: a caller that wants
+ * them says so, and the parity rig — which must not couple the oracle to
+ * `board_state` at all — gets the cheap sweep for free.
+ */
 export const ingestOptions = (runsRoot: string): IngestOptions => ({
   runsRoot,
   gameIds: new Set<string>(),
   dryRun: false,
-  ppmHeadBytes: DEFAULT_PPM_HEAD_BYTES,
-  maxBinaryRowBytes: DEFAULT_MAX_BINARY_ROW_BYTES
+  prune: false,
+  maxReplayBytes: DEFAULT_MAX_REPLAY_BYTES,
+  boards: Option.none()
 })
 
 /**
  * The `runs_root` could not be listed.
  *
- * The sweep is marked `aborted` and nothing is deleted. This is the one place
- * ingest is *less* tolerant than the gateway, on purpose: the gateway answers
- * an unreadable root with an empty index for one request, while an ingester
- * that reported success on a root it never read would licence a deletion pass
- * over an archive it cannot see.
+ * The sweep aborts and nothing is deleted. This is the one place ingest is
+ * *less* tolerant than the gateway, on purpose: the gateway answers an
+ * unreadable root with an empty index for one request, while an ingester that
+ * reported success on a root it never read would licence a deletion pass over
+ * an archive it cannot see.
  */
 export class RunsRootUnreadable extends Data.TaggedError("RunsRootUnreadable")<{
   readonly runsRoot: string
 }> {}
 
 /**
- * Everything {@link ingest} can fail with — the walk refusing, or the database.
+ * The board cache root is unusable.
  *
- * Named so a caller (the CLI, above all) can spell the channel once instead of
- * transcribing the union and drifting from it.
+ * `save_replay` raises `SaveReplayError` when the cache root nests with a run's
+ * `saves/` directory, and a cache root inside `runs_root` would also make the
+ * sweep's own output look like archive content on the next walk. Both are
+ * command-line mistakes, so they fail the sweep before it writes anything.
  */
-export type IngestError = SqlError | RunsRootUnreadable
+export class BoardCacheRootInvalid extends Data.TaggedError("BoardCacheRootInvalid")<{
+  readonly cacheRoot: string
+  readonly runsRoot: string
+}> {}
+
+/** Everything {@link ingest} can fail with. */
+export type IngestError = SqlError | RunsRootUnreadable | BoardCacheRootInvalid
 
 // ---------------------------------------------------------------------------
 // Report
 // ---------------------------------------------------------------------------
 
-/** Why a directory entry produced no run. */
+/** Why a directory entry, a document, a row or a board produced nothing. */
 export type SkipReason =
   /** The name fails `GAME_ID_RE`. */
   | "notAGameId"
@@ -286,12 +360,21 @@ export type SkipReason =
   | "notADirectory"
   /** It resolves outside `runs_root`. */
   | "escapesRunsRoot"
-  /** An artifact was larger than {@link IngestOptions.maxBinaryRowBytes}. */
-  | "oversizedArtifact"
-  /** An artifact was listed but could not be read. */
-  | "unreadableArtifact"
   /** `--game` named an id that is not a run under the root. */
   | "requestedButAbsent"
+  /**
+   * A document parsed but carries U+0000 or a lone surrogate, which no column
+   * in this schema can hold. Stored `unusable`; a declared divergence.
+   */
+  | "documentUnstorable"
+  /** `replay.jsonl` is larger than `maxReplayBytes`; later turns are missing. */
+  | "replayTruncated"
+  /** A replay line, seat or player row could not be represented and was dropped. */
+  | "rowUnstorable"
+  /** The bridge had no artifacts for a turn, or refused it. Retried next sweep. */
+  | "boardUnavailable"
+  /** An autosave exists for a turn `replay.jsonl` never recorded (FK forbids it). */
+  | "boardTurnNotRecorded"
   /**
    * The database refused this run's rows. Its transaction rolled back, the run
    * kept whatever it had before, and **the sweep carried on** — the fs backend
@@ -300,96 +383,98 @@ export type SkipReason =
    */
   | "databaseRefused"
 
-/** One directory entry, or one artifact, that did not make it into the run. */
+/** One entry, document, row or board that did not make it in. */
 export interface IngestSkip {
   /** The directory entry, which is a game id only when `reason` says so. */
   readonly entry: string
   readonly reason: SkipReason
-  /** The artifact name, for the two artifact-scoped reasons. */
+  /** What exactly, for the reasons that scope to something inside a run. */
   readonly detail: Option.Option<string>
 }
+
+const skip = (
+  entry: string,
+  reason: SkipReason,
+  detail?: string
+): IngestSkip => ({
+  entry,
+  reason,
+  detail: detail === undefined ? Option.none() : Option.some(detail)
+})
 
 /**
  * Rows actually written, by table.
  *
  * "Actually" is exact: every statement returns the rows it changed, and the
  * `IS DISTINCT FROM` guards mean an unchanged row inside a changed run does not
- * count. {@link dataWrites} is the number the idempotence contract is about;
- * `sweeps` is bookkeeping and is always non-zero on a real sweep.
+ * count.
  */
 export interface WriteCounters {
-  readonly runs: number
-  readonly documents: number
-  readonly replayTails: number
-  readonly frames: number
-  readonly videos: number
-  readonly saves: number
-  /** Rows removed: stale children, plus whole runs deleted by the sweep. */
+  readonly games: number
+  readonly seats: number
+  readonly turns: number
+  readonly playerTurns: number
+  readonly agentStats: number
+  readonly boards: number
+  /** Rows removed: stale children of a changed run, plus pruned games. */
   readonly deletes: number
-  /** `ingest_sweeps` rows opened and closed. Never part of {@link dataWrites}. */
-  readonly sweeps: number
 }
 
 /** No rows written. */
 export const NO_WRITES: WriteCounters = {
-  runs: 0,
-  documents: 0,
-  replayTails: 0,
-  frames: 0,
-  videos: 0,
-  saves: 0,
-  deletes: 0,
-  sweeps: 0
+  games: 0,
+  seats: 0,
+  turns: 0,
+  playerTurns: 0,
+  agentStats: 0,
+  boards: 0,
+  deletes: 0
 }
 
 /** Add two counter sets. */
 export const addWrites = (left: WriteCounters, right: WriteCounters): WriteCounters => ({
-  runs: left.runs + right.runs,
-  documents: left.documents + right.documents,
-  replayTails: left.replayTails + right.replayTails,
-  frames: left.frames + right.frames,
-  videos: left.videos + right.videos,
-  saves: left.saves + right.saves,
-  deletes: left.deletes + right.deletes,
-  sweeps: left.sweeps + right.sweeps
+  games: left.games + right.games,
+  seats: left.seats + right.seats,
+  turns: left.turns + right.turns,
+  playerTurns: left.playerTurns + right.playerTurns,
+  agentStats: left.agentStats + right.agentStats,
+  boards: left.boards + right.boards,
+  deletes: left.deletes + right.deletes
 })
 
 const sumWrites = (parts: ReadonlyArray<WriteCounters>): WriteCounters =>
   parts.reduce(addWrites, NO_WRITES)
 
-/**
- * Every row written except the sweep bookkeeping — the number that must be `0`
- * when nothing under `runs_root` changed.
- */
+/** Every row written — the number that must be `0` when nothing changed. */
 export const dataWrites = (counters: WriteCounters): number =>
-  counters.runs +
-  counters.documents +
-  counters.replayTails +
-  counters.frames +
-  counters.videos +
-  counters.saves +
+  counters.games +
+  counters.seats +
+  counters.turns +
+  counters.playerTurns +
+  counters.agentStats +
+  counters.boards +
   counters.deletes
 
-/** What one run's transaction did. */
+/** What one run's document transaction did. */
 export type RunOutcome = "inserted" | "updated" | "unchanged"
 
 /** One run, as the sweep saw it. */
 export interface RunResult {
   readonly gameId: string
   readonly outcome: RunOutcome
-  /** Documents stored with `status = 'unusable'`, i.e. a reproducible 503. */
-  readonly unusableDocuments: number
-  /** `Gateway.decodeManifest` failed — advisory columns stay null. Never fatal. */
-  readonly manifestUndecodable: boolean
+  /** `manifest_status`, as stored. */
+  readonly manifestStatus: DocumentStatus
+  /** `report_status`, as stored. */
+  readonly reportStatus: DocumentStatus
+  /** Turns whose board was derived and stored by this sweep. */
+  readonly boardsWritten: number
   readonly writes: WriteCounters
 }
 
 /** The outcome of one sweep. */
 export interface IngestReport {
-  /** The resolved root, exactly as it is stored on every row. */
+  /** The resolved root the sweep walked. */
   readonly runsRoot: string
-  /** `Option.none` for a dry run, which opens no sweep. */
-  readonly sweepId: Option.Option<number>
   readonly dryRun: boolean
   readonly status: "complete" | "aborted"
   /** Directory entries examined. */
@@ -409,31 +494,32 @@ export interface IngestReport {
 const count = (results: readonly RunResult[], outcome: RunOutcome): number =>
   results.filter((result) => result.outcome === outcome).length
 
-const skipLine = (skip: IngestSkip): string =>
-  `    ${skip.entry}: ${skip.reason}${
-    Option.match(skip.detail, { onNone: () => "", onSome: (detail) => ` (${detail})` })
+const skipLine = (entry: IngestSkip): string =>
+  `    ${entry.entry}: ${entry.reason}${
+    Option.match(entry.detail, { onNone: () => "", onSome: (detail) => ` (${detail})` })
   }`
 
 /** The CLI's summary. Contains no connection string, by construction. */
 export const describeReport = (report: IngestReport): string => {
   const writes = report.writes
   const lines: ReadonlyArray<string> = [
-    `runs_root      ${report.runsRoot}`,
-    `sweep          ${
-      Option.match(report.sweepId, { onNone: () => "(dry run)", onSome: String })
-    } — ${report.status}`,
+    `runs_root      ${report.runsRoot}${report.dryRun ? " (dry run)" : ""} — ${report.status}`,
     `entries seen   ${report.seen}`,
-    `runs           ${count(report.runs, "inserted")} inserted, ${
+    `games          ${count(report.runs, "inserted")} inserted, ${
       count(report.runs, "updated")
     } updated, ${count(report.runs, "unchanged")} unchanged, ${report.deleted.length} deleted`,
-    `rows written   ${dataWrites(writes)} (runs ${writes.runs}, documents ${writes.documents}, ` +
-    `tails ${writes.replayTails}, frames ${writes.frames}, videos ${writes.videos}, ` +
-    `saves ${writes.saves}, deletes ${writes.deletes})`,
+    `rows written   ${dataWrites(writes)} (games ${writes.games}, seats ${writes.seats}, ` +
+    `turns ${writes.turns}, player_turns ${writes.playerTurns}, ` +
+    `agent_stats ${writes.agentStats}, boards ${writes.boards}, deletes ${writes.deletes})`,
     `writing txns   ${report.transactionsWithWrites}`,
     // Called out on its own line rather than left to be counted out of the skip
-    // list: a run the database refused is the one skip an operator has to act on.
+    // list: a run the database refused, and a document this schema cannot hold,
+    // are the two skips an operator has to act on.
     `refused runs   ${
-      report.skipped.filter((skip) => skip.reason === "databaseRefused").length
+      report.skipped.filter((entry) => entry.reason === "databaseRefused").length
+    }`,
+    `unstorable     ${
+      report.skipped.filter((entry) => entry.reason === "documentUnstorable").length
     }`,
     `skipped        ${report.skipped.length}`,
     ...report.skipped.map(skipLine)
@@ -499,7 +585,7 @@ const statFd = (fd: number): Either.Either<FileInfo, FsFailure> =>
  * `read(2)` until `length` bytes are in hand or the file ends — a single
  * `readSync` may come up short, and Python's `stream.read()` does not. The
  * result may therefore be shorter than `length`, which is precisely why the
- * fstat size is stored separately from `octet_length(bytes)`.
+ * fstat size is stored separately from the digest of what was read.
  */
 const readFully = (
   fd: number,
@@ -530,9 +616,10 @@ interface ReadFile {
 /**
  * Open, fstat, and read at most `cap` bytes from the start.
  *
- * `flags` is the caller's, because the asymmetry matters: `manifest.json`,
- * `report.json`, the frames, the video and the saves are opened with
- * `O_NOFOLLOW`, while `victory.json` and `replay.jsonl` are not.
+ * `flags` is the caller's, because the asymmetry matters: `manifest.json` and
+ * `report.json` are opened with `O_NOFOLLOW`, while `replay.jsonl` is not —
+ * `makeLastReplayTurn` follows a symlinked replay, and hardening it here would
+ * change an answer.
  */
 const readHead = (
   path: string,
@@ -540,8 +627,7 @@ const readHead = (
   cap: number
 ): Either.Either<ReadFile, FsFailure> =>
   Either.flatMap(attempt("open", path, () => openSync(path, flags)), (fd) => {
-    const info = statFd(fd)
-    const result = Either.flatMap(info, (stat) =>
+    const result = Either.flatMap(statFd(fd), (stat) =>
       Either.map(
         readFully(fd, 0, Math.max(0, Math.min(stat.size, cap))),
         (bytes): ReadFile => ({ size: stat.size, regular: stat.regular, bytes })
@@ -568,9 +654,9 @@ const readTail = (path: string): Either.Either<ReadFile, FsFailure> =>
   )
 
 /**
- * `_safe_archive_directory` (`replay_gateway.py:871`) — `watch_frames/` and
- * `saves/` must exist, not be a symlink, be a directory, and resolve to a
- * direct child of the run root.
+ * `_safe_archive_directory` (`replay_gateway.py:871`) — `saves/` must exist,
+ * not be a symlink, be a directory, and resolve to a direct child of the run
+ * root. The board phase needs it; nothing is stored about it.
  */
 const safeArchiveDirectory = (root: string, name: string): Option.Option<string> => {
   const info = attempt("lstat", join(root, name), () => lstatSync(join(root, name)))
@@ -603,16 +689,8 @@ const archiveRegularFiles = (directory: string, pattern: RegExp): ReadonlyArray<
     )
   })
 
-/**
- * Matches every name, so {@link archiveRegularFiles} yields every regular,
- * non-symlink, non-empty entry. `saves/` is listed this way because the python
- * bridge globs the whole directory, unlike `watch_frames/`, whose listing the
- * gateway filters with `ARCHIVE_PNG_RE`.
- */
-const ANY_NAME = /^/
-
 // ---------------------------------------------------------------------------
-// Hashing and JSON
+// Hashing, decoding, and what Postgres can actually hold
 // ---------------------------------------------------------------------------
 
 const sha256 = (bytes: Uint8Array): Uint8Array =>
@@ -627,396 +705,773 @@ const UTF8 = new TextDecoder("utf-8", { fatal: true })
 const decodeUtf8 = (bytes: Uint8Array): Option.Option<string> =>
   Option.getRight(Either.try(() => UTF8.decode(bytes)))
 
-const isJsonArray = (value: JsonValue): value is ReadonlyArray<JsonValue> => Array.isArray(value)
-
 const asJsonObject = (value: JsonValue): Option.Option<JsonObject> =>
-  value !== null && typeof value === "object" && !isJsonArray(value)
+  isJsonObject(value) ? Option.some(value) : Option.none()
+
+const parseJsonObject = (bytes: Uint8Array): Option.Option<JsonObject> =>
+  Option.flatMap(
+    Option.flatMap(decodeUtf8(bytes), (text) => Option.getRight(decodeJsonValueFromString(text))),
+    asJsonObject
+  )
+
+/**
+ * Can Postgres hold this string faithfully?
+ *
+ * Measured on PGlite 0.5.x: a `text` column refuses U+0000 outright
+ * (`invalid byte sequence for encoding "UTF8": 0x00`) and silently rewrites a
+ * lone surrogate to U+FFFD; `jsonb` refuses both. There is no repair that is
+ * not a lie, so a string containing either is *unstorable* and the caller
+ * decides what that costs.
+ */
+export const isStorableText = (text: string): boolean =>
+  !text.includes("\u0000") && Option.isNone(findLoneSurrogate(text))
+
+const firstSome = (found: ReadonlyArray<Option.Option<string>>): Option.Option<string> =>
+  found.find(Option.isSome) ?? Option.none()
+
+/** The first key or string in `value` Postgres cannot hold, as a JSON pointer. */
+const unstorableAt = (value: JsonValue, path: string): Option.Option<string> => {
+  if (typeof value === "string") {
+    return isStorableText(value) ? Option.none() : Option.some(path === "" ? "/" : path)
+  }
+  if (Array.isArray(value)) {
+    return firstSome(value.map((entry, index) => unstorableAt(entry, `${path}/${String(index)}`)))
+  }
+  if (isJsonObject(value)) {
+    return firstSome(
+      Object.entries(value).map(([key, entry]) =>
+        isStorableText(key)
+          ? unstorableAt(entry, `${path}/${pointerToken(key)}`)
+          : Option.some(`${path}/<key>`)
+      )
+    )
+  }
+  return Option.none()
+}
+
+/** RFC 6901 token escaping, so a pointer stays readable and unambiguous. */
+const pointerToken = (key: string): string => key.replaceAll("~", "~0").replaceAll("/", "~1")
+
+/** Every JSON pointer at which `value` carries a negative zero. */
+const negativeZeroPointers = (value: JsonValue, path: string): ReadonlyArray<string> =>
+  typeof value === "number"
+    ? Object.is(value, -0) ? [path === "" ? "/" : path] : []
+    : Array.isArray(value)
+    ? value.flatMap((entry, index) => negativeZeroPointers(entry, `${path}/${String(index)}`))
+    : isJsonObject(value)
+    ? Object.entries(value).flatMap(([key, entry]) =>
+      negativeZeroPointers(entry, `${path}/${pointerToken(key)}`)
+    )
+    : []
+
+/**
+ * A `CanonValue` as plain JSON, refusing to launder.
+ *
+ * `canonToJson` (the gateway's, for `resolved_places`) maps every `bigint`
+ * through `Number`, which is right for places — they are small and the loaders
+ * want plain JSON — and wrong for a column: `9007199254740993` would arrive as
+ * `…992` with nothing said. Here an unsafe integer makes the whole value
+ * unstorable, and the caller stores `NULL` instead of a quiet lie.
+ */
+const exactJson = (value: CanonValue): Option.Option<JsonValue> => {
+  if (typeof value === "bigint") {
+    return Number.isSafeInteger(Number(value))
+      ? Option.some(Number(value))
+      : Option.none()
+  }
+  if (typeof value === "string") {
+    return isStorableText(value) ? Option.some(value) : Option.none()
+  }
+  if (Array.isArray(value)) {
+    return Option.map(
+      Option.all(value.map(exactJson)),
+      (parts): JsonValue => parts
+    )
+  }
+  if (typeof value === "object" && value !== null) {
+    return Option.map(
+      Option.all(
+        Object.entries(value).map(([key, entry]) =>
+          isStorableText(key)
+            ? Option.map(exactJson(entry), (part) => [key, part] as const)
+            : Option.none<readonly [string, JsonValue]>()
+        )
+      ),
+      (pairs): JsonValue => Object.fromEntries(pairs)
+    )
+  }
+  return typeof value === "number" || typeof value === "boolean" || value === null
+    ? Option.some(value)
+    : Option.none()
+}
+
+// ---------------------------------------------------------------------------
+// Column guards
+//
+// Every one of these is a *demotion* decision, and every one of them exists
+// because the driver does something silent when it is skipped:
+// `bigint({mode:"number"})` launders 9007199254740993 to …992 with no error,
+// and `integer` rounds 5.5 to 6.
+// ---------------------------------------------------------------------------
+
+/** A JSON number that a `double precision` column holds exactly. */
+const float8Of = (value: JsonValue | undefined): Option.Option<number> =>
+  typeof value === "number" && !Object.is(value, -0) ? Option.some(value) : Option.none()
+
+/** A JSON number that an `integer` column holds exactly. */
+const int32Of = (value: JsonValue | undefined): Option.Option<number> =>
+  typeof value === "number" &&
+    Number.isInteger(value) &&
+    !Object.is(value, -0) &&
+    value >= INT32_MIN &&
+    value <= INT32_MAX
     ? Option.some(value)
     : Option.none()
 
+/** A JSON number that a `bigint({mode:"number"})` column holds exactly. */
+const safeIntOf = (value: JsonValue | undefined): Option.Option<number> =>
+  typeof value === "number" && Number.isSafeInteger(value) && !Object.is(value, -0)
+    ? Option.some(value)
+    : Option.none()
+
+const booleanOf = (value: JsonValue | undefined): Option.Option<boolean> =>
+  typeof value === "boolean" ? Option.some(value) : Option.none()
+
+/** A string a `text` column holds faithfully. */
+const textOf = (value: JsonValue | undefined): Option.Option<string> =>
+  typeof value === "string" && isStorableText(value) ? Option.some(value) : Option.none()
+
+/** A `jsonb` value: anything JSON, as long as every string in it can be stored. */
+const jsonbOf = (value: JsonValue | undefined): Option.Option<JsonValue> =>
+  value === undefined || Option.isSome(unstorableAt(value, ""))
+    ? Option.none()
+    : Option.some(value)
+
+// ---------------------------------------------------------------------------
+// Canonical (`parsePythonJson`) accessors, for `replay.jsonl`
+//
+// The replay tail is read the way the fs backend reads it — a Python `int` is a
+// `bigint`, a Python `float` is a `number` — because `_last_replay_turn`'s
+// `isinstance(turn, int)` is what makes `{"turn": 2.0}` answer "no turn". The
+// same reader is used for the whole file so that `9007199254740993` in a row is
+// *seen* as itself rather than as the double it would have collapsed to.
+// ---------------------------------------------------------------------------
+
+const canonField = (value: CanonValue, key: string): CanonValue | undefined =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as { readonly [k: string]: CanonValue })[key]
+    : undefined
+
+/** An `integer` column from a canonical value: a Python `int` or an integral float. */
+const canonInt32 = (value: CanonValue | undefined): Option.Option<number> =>
+  typeof value === "bigint"
+    ? value >= BigInt(INT32_MIN) && value <= BigInt(INT32_MAX)
+      ? Option.some(Number(value))
+      : Option.none()
+    : int32Of(typeof value === "number" ? value : undefined)
+
+const canonSafeInt = (value: CanonValue | undefined): Option.Option<number> =>
+  typeof value === "bigint"
+    ? Number.isSafeInteger(Number(value)) && BigInt(Number(value)) === value
+      ? Option.some(Number(value))
+      : Option.none()
+    : safeIntOf(typeof value === "number" ? value : undefined)
+
+const canonFloat = (value: CanonValue | undefined): Option.Option<number> =>
+  typeof value === "bigint"
+    ? Number.isSafeInteger(Number(value)) ? Option.some(Number(value)) : Option.none()
+    : float8Of(typeof value === "number" ? value : undefined)
+
+const canonText = (value: CanonValue | undefined): Option.Option<string> =>
+  typeof value === "string" && isStorableText(value) ? Option.some(value) : Option.none()
+
+const canonBoolean = (value: CanonValue | undefined): Option.Option<boolean> =>
+  typeof value === "boolean" ? Option.some(value) : Option.none()
+
+const canonJsonb = (value: CanonValue | undefined): Option.Option<JsonValue> =>
+  value === undefined ? Option.none() : exactJson(value)
+
+// ---------------------------------------------------------------------------
+// The three documents of one run
+// ---------------------------------------------------------------------------
+
+/** `document_status`, as the frozen enum spells it. */
+export type DocumentStatus = "ok" | "unusable" | "absent"
+
+/** One archive document, as ingest judged it. */
+export interface ReadDocument {
+  readonly file: string
+  readonly status: DocumentStatus
+  /** The **fstat** size that the gate saw. `0` when the file is absent. */
+  readonly byteSize: number
+  /** sha256 over the bytes read. Empty when the file is absent. */
+  readonly digest: Uint8Array
+  /** The parsed object, present exactly when `status === 'ok'`. */
+  readonly value: Option.Option<JsonObject>
+  /** Where the document held something Postgres cannot store, if it did. */
+  readonly unstorable: Option.Option<string>
+}
+
+const ABSENT_DIGEST = new Uint8Array(0)
+
 /**
- * `_read_archive_json`'s verdict (`replay_gateway.py:573`), as a status.
+ * `manifest.json` / `report.json`, per `_read_archive_json`
+ * (`replay_gateway.py:573`) plus this schema's storability policy.
  *
- * `ok` exactly when the fs backend would have parsed the document: a non-empty
- * regular file of at most 8 MiB whose bytes decode as UTF-8 and parse as a JSON
- * *object*. Anything else is `unusable`, which the read path turns into the
- * same 503 the fs backend raises.
+ * `open` failing is `absent` — the fs backend's 404. A file that opens and
+ * fails a gate is `unusable` — the fs backend's 503 — and its `byte_size` is
+ * the fstat size *that failed the gate*, not the number of bytes read (a 3 GiB
+ * document is `unusable` at 3 GiB, having been read only to the 8 MiB cap).
  */
-const documentVerdict = (file: ReadFile): "ok" | "unusable" =>
-  !file.regular || file.size <= 0 || file.size > MAX_DOCUMENT_BYTES
-    ? "unusable"
-    : Option.match(
-      Option.flatMap(
-        Option.flatMap(decodeUtf8(file.bytes), (text) =>
-          Option.getRight(decodeJsonValueFromString(text))),
-        asJsonObject
-      ),
-      { onNone: (): "ok" | "unusable" => "unusable", onSome: () => "ok" }
-    )
+const readDocument = (runRoot: string, file: string): ReadDocument => {
+  const read = Option.getRight(
+    readHead(join(runRoot, file), O_RDONLY | O_NOFOLLOW | O_CLOEXEC, MAX_DOCUMENT_BYTES)
+  )
+  return Option.match(read, {
+    onNone: (): ReadDocument => ({
+      file,
+      status: "absent",
+      byteSize: 0,
+      digest: ABSENT_DIGEST,
+      value: Option.none(),
+      unstorable: Option.none()
+    }),
+    onSome: (found) => {
+      const gated = found.regular && found.size > 0 && found.size <= MAX_DOCUMENT_BYTES
+        ? parseJsonObject(found.bytes)
+        : Option.none<JsonObject>()
+      const unstorable = Option.flatMap(gated, (value) => unstorableAt(value, ""))
+      return {
+        file,
+        status: Option.isNone(gated) || Option.isSome(unstorable) ? "unusable" : "ok",
+        byteSize: found.size,
+        digest: sha256(found.bytes),
+        value: Option.isSome(unstorable) ? Option.none() : gated,
+        unstorable
+      }
+    }
+  })
+}
 
 // ---------------------------------------------------------------------------
-// The artifacts of one run
+// `replay.jsonl` — the tail answer, and the rows
 // ---------------------------------------------------------------------------
 
-/** One of the three archive JSON documents, verbatim. */
-export interface StoredDocument {
-  readonly kind: "manifest" | "report" | "victory"
-  readonly status: "ok" | "unusable"
-  readonly bytes: Uint8Array
+/**
+ * `bytes.splitlines()` — `\n`, `\r` and `\r\n`, and nothing else.
+ *
+ * Latin-1 is a lossless byte↔code-unit mapping, so splitting there and mapping
+ * back gives exactly the byte ranges Python's `splitlines` produces, without a
+ * UTF-8 decode that a torn multi-byte sequence at a window boundary would fail.
+ */
+/**
+ * `bytes.decode("latin-1")`, spelled the way `services/runs.ts` spells it.
+ *
+ * Not `new TextDecoder("latin1")`: Bun's `TextDecoder` types admit only
+ * `utf-8` / `utf-16` / `windows-1252`, and `windows-1252` is *not* latin-1 —
+ * it maps 0x80–0x9F to typographic characters instead of to the control range,
+ * which would move a byte's code unit and break the round trip
+ * {@link latin1Bytes} depends on. The chunking is only so that a 256 MiB replay
+ * does not spread a quarter of a billion arguments into one call.
+ */
+const LATIN1_CHUNK = 8192
+
+const decodeLatin1 = (bytes: Uint8Array): string =>
+  Array.from(
+    { length: Math.ceil(bytes.length / LATIN1_CHUNK) },
+    (_, index) =>
+      String.fromCharCode(
+        ...bytes.subarray(index * LATIN1_CHUNK, (index + 1) * LATIN1_CHUNK)
+      )
+  ).join("")
+
+const splitLines = (bytes: Uint8Array): ReadonlyArray<string> =>
+  decodeLatin1(bytes).split(/\r\n|\n|\r/)
+
+/** `bytes.strip()` — ASCII whitespace only, which is what `if not raw.strip()` tests. */
+const BLANK_LINE_RE = /^[ \t\v\f]*$/
+
+const latin1Bytes = (line: string): Uint8Array =>
+  Uint8Array.from(line, (character) => character.charCodeAt(0))
+
+const parseLine = (line: string): Option.Option<CanonValue> =>
+  Option.flatMap(
+    decodeUtf8(latin1Bytes(line)),
+    (text) => Option.getRight(parsePythonJson(text))
+  )
+
+/**
+ * `_last_replay_turn` (`replay_gateway.py:1178`), computed at ingest.
+ *
+ * Scans the 64 KiB tail backwards, skipping blank lines and lines that do not
+ * parse (a torn final write), and **stops at the first line that does**: a
+ * parseable row without a positive integer `turn` answers "no turn", it does
+ * not keep looking. That single `return None` is what hides a lobby husk from
+ * the index instead of resurrecting an older turn — and it is why this column
+ * is not `max(turns.turn)`.
+ */
+const lastReplayTurnOf = (bytes: Uint8Array, size: number): Option.Option<bigint> => {
+  if (size <= 0) {
+    return Option.none()
+  }
+  const parsed = splitLines(bytes)
+    .filter((line) => !BLANK_LINE_RE.test(line))
+    .toReversed()
+    .map(parseLine)
+    .find(Option.isSome)
+  if (parsed === undefined) {
+    return Option.none()
+  }
+  const turn = canonField(parsed.value, "turn")
+  return typeof turn === "bigint" && turn > 0n ? Option.some(turn) : Option.none()
+}
+
+/** One `turns` row. */
+export interface TurnRow {
+  readonly turn: number
+  readonly year: number | null
+}
+
+/** One `player_turns` row. */
+export interface PlayerTurnRow {
+  readonly turn: number
+  readonly seatId: string
+  readonly playerId: number | null
+  readonly playerName: string | null
+  readonly nation: string | null
+  readonly government: string | null
+  readonly alive: boolean | null
+  readonly score: number | null
+  readonly cities: number | null
+  readonly citizens: number | null
+  readonly population: number | null
+  readonly units: number | null
+  readonly gold: number | null
+  readonly culture: number | null
+  readonly futureTechs: number | null
+  readonly knownTechIds: JsonValue | null
+  readonly research: JsonValue | null
+}
+
+/** Everything `replay.jsonl` contributed. */
+interface ReplayData {
+  /** Whether the file exists at all. */
+  readonly present: boolean
+  /** The whole file's size — `<= 0` is what makes the tail answer "no turn". */
   readonly byteSize: number
-  readonly sha256: Uint8Array
-}
-
-/** The `replay.jsonl` byte window. */
-export interface StoredTail {
-  /** The **whole** file's size; `<= 0` is what makes `lastReplayTurn` answer none. */
-  readonly byteSize: number
-  readonly tailBytes: Uint8Array
-  readonly sha256: Uint8Array
-}
-
-/** One `watch_frames/*.png`. */
-export interface StoredFrame {
-  readonly name: string
-  readonly frameIndex: Option.Option<number>
-  readonly bytes: Uint8Array
-  readonly byteSize: number
-  readonly sha256: Uint8Array
-}
-
-/** `game.mp4`. */
-export interface StoredVideo {
-  readonly bytes: Uint8Array
-  readonly byteSize: number
-  readonly sha256: Uint8Array
-}
-
-/** One entry of `saves/`. */
-export interface StoredSave {
-  readonly name: string
-  readonly kind: "autosave" | "ppm" | "other"
-  readonly saveTurn: Option.Option<number>
-  /** The true on-disk size, even when {@link headBytes} is only a head. */
-  readonly byteSize: number
-  readonly headBytes: Uint8Array
-  readonly isWhole: boolean
-  readonly sha256: Uint8Array
-}
-
-/** The class-B advisory columns, read through `@arena/wire`'s manifest schema. */
-export interface RunAdvisory {
-  readonly state: string | null
-  readonly createdAt: number | null
-  readonly finishedAt: number | null
-  readonly benchmarkValid: boolean | null
-  /** The manifest failed the strict schema. Advisory only, never fatal. */
-  readonly undecodable: boolean
-}
-
-const NO_ADVISORY: RunAdvisory = {
-  state: null,
-  createdAt: null,
-  finishedAt: null,
-  benchmarkValid: null,
-  undecodable: false
-}
-
-/** Everything one run directory holds, ready to be written. */
-export interface RunArtifacts {
-  readonly gameId: string
-  readonly framesDirOk: boolean
-  readonly savesDirOk: boolean
-  readonly documents: readonly StoredDocument[]
-  readonly replayTail: Option.Option<StoredTail>
-  readonly frames: readonly StoredFrame[]
-  readonly video: Option.Option<StoredVideo>
-  readonly saves: readonly StoredSave[]
-  readonly advisory: RunAdvisory
-  readonly contentHash: Uint8Array
-  /** Artifacts refused or unreadable. Reported, never fatal. */
+  /** sha256 over the bytes decoded into rows (the whole file, up to the cap). */
+  readonly digest: Uint8Array
+  readonly lastReplayTurn: Option.Option<bigint>
+  readonly turns: readonly TurnRow[]
+  readonly playerTurns: readonly PlayerTurnRow[]
   readonly skips: readonly IngestSkip[]
 }
 
+const NO_REPLAY: ReplayData = {
+  present: false,
+  byteSize: 0,
+  digest: ABSENT_DIGEST,
+  lastReplayTurn: Option.none(),
+  turns: [],
+  playerTurns: [],
+  skips: []
+}
+
+/** One player entry of one replay line, as a row — or a reason it is not one. */
+const playerRow = (
+  turn: number,
+  entry: CanonValue
+): Either.Either<PlayerTurnRow, string> => {
+  const seatId = canonText(canonField(entry, "seat_id"))
+  if (Option.isNone(seatId)) {
+    return Either.left(`turn ${String(turn)}: a player row has no storable seat_id`)
+  }
+  return Either.right({
+    turn,
+    seatId: seatId.value,
+    playerId: Option.getOrNull(canonInt32(canonField(entry, "player_id"))),
+    playerName: Option.getOrNull(canonText(canonField(entry, "player_name"))),
+    nation: Option.getOrNull(canonText(canonField(entry, "nation"))),
+    government: Option.getOrNull(canonText(canonField(entry, "government"))),
+    alive: Option.getOrNull(canonBoolean(canonField(entry, "alive"))),
+    score: Option.getOrNull(canonFloat(canonField(entry, "score"))),
+    cities: Option.getOrNull(canonInt32(canonField(entry, "cities"))),
+    citizens: Option.getOrNull(canonInt32(canonField(entry, "citizens"))),
+    population: Option.getOrNull(canonSafeInt(canonField(entry, "population"))),
+    units: Option.getOrNull(canonInt32(canonField(entry, "units"))),
+    gold: Option.getOrNull(canonFloat(canonField(entry, "gold"))),
+    culture: Option.getOrNull(canonFloat(canonField(entry, "culture"))),
+    futureTechs: Option.getOrNull(canonInt32(canonField(entry, "future_techs"))),
+    knownTechIds: Option.getOrNull(canonJsonb(canonField(entry, "known_tech_ids"))),
+    research: Option.getOrNull(canonJsonb(canonField(entry, "research")))
+  })
+}
+
+/** The rows one parsed replay line contributes. */
+interface LineRows {
+  readonly turn: Option.Option<TurnRow>
+  readonly players: readonly PlayerTurnRow[]
+  readonly skips: readonly string[]
+}
+
+const NO_LINE_ROWS: LineRows = { turn: Option.none(), players: [], skips: [] }
+
 /**
- * `manifest.json` / `report.json`.
+ * One `replay.jsonl` line as rows.
  *
- * `open` failing is the *absence* of a row — the fs backend answers 404 for it
- * — while a file that opens and fails a gate is a row with
- * `status = 'unusable'`, which is the 503. Only those two shapes exist, which
- * is why the read side needs no third case.
+ * `turn` must be a Python `int` inside int32 — the same int-ness the tail
+ * reader demands, so a line the gateway would refuse to count is a line this
+ * refuses to store, and an `integer` column never sees a value it would round.
  */
-const readDocument = (
+const lineRows = (value: CanonValue): LineRows => {
+  const turn = canonField(value, "turn")
+  if (typeof turn !== "bigint") {
+    return NO_LINE_ROWS
+  }
+  const stored = canonInt32(turn)
+  if (Option.isNone(stored)) {
+    return { ...NO_LINE_ROWS, skips: [`turn ${String(turn)} does not fit an integer column`] }
+  }
+  const players = canonField(value, "players")
+  const rows = (Array.isArray(players) ? players : []).map((entry) =>
+    playerRow(stored.value, entry)
+  )
+  return {
+    turn: Option.some({
+      turn: stored.value,
+      year: Option.getOrNull(canonInt32(canonField(value, "year")))
+    }),
+    players: Arr.getRights(rows),
+    skips: Arr.getLefts(rows)
+  }
+}
+
+/** Last write wins, keyed by `key`, preserving first-seen order. */
+const dedupe = <A>(rows: readonly A[], key: (row: A) => string): readonly A[] => {
+  const index = new Map<string, A>()
+  rows.forEach((row) => index.set(key(row), row))
+  return [...index.values()]
+}
+
+/**
+ * `replay.jsonl`, read twice on purpose.
+ *
+ * The tail window is read positionally, exactly as `_last_replay_turn` reads
+ * it, so `games.last_replay_turn` is the fs backend's answer rather than a
+ * re-derivation of it. The whole file (up to `maxReplayBytes`) is then read for
+ * the domain rows; if the cap cut it short the final line is dropped as
+ * possibly torn and the run carries a `replayTruncated` skip.
+ */
+const readReplay = (
   runRoot: string,
-  file: string,
-  kind: "manifest" | "report"
-): Option.Option<StoredDocument> =>
-  Option.map(
-    Option.getRight(
-      readHead(join(runRoot, file), O_RDONLY | O_NOFOLLOW | O_CLOEXEC, MAX_DOCUMENT_BYTES)
+  gameId: string,
+  maxReplayBytes: number
+): ReplayData => {
+  const tail = Option.getRight(readTail(join(runRoot, REPLAY_JSONL_FILE)))
+  if (Option.isNone(tail)) {
+    return NO_REPLAY
+  }
+  const whole = Option.getRight(
+    readHead(join(runRoot, REPLAY_JSONL_FILE), O_RDONLY | O_CLOEXEC, maxReplayBytes)
+  )
+  const bytes = Option.match(whole, {
+    onNone: () => new Uint8Array(0),
+    onSome: (read) => read.bytes
+  })
+  const truncated = tail.value.size > maxReplayBytes
+  const lines = splitLines(bytes).filter((line) => !BLANK_LINE_RE.test(line))
+  const decoded = (truncated ? lines.slice(0, -1) : lines)
+    .map(parseLine)
+    .flatMap(Option.toArray)
+    .map(lineRows)
+  return {
+    present: true,
+    byteSize: tail.value.size,
+    digest: sha256(bytes),
+    lastReplayTurn: lastReplayTurnOf(tail.value.bytes, tail.value.size),
+    turns: dedupe(decoded.flatMap((row) => Option.toArray(row.turn)), (row) => String(row.turn)),
+    playerTurns: dedupe(
+      decoded.flatMap((row) => row.players),
+      (row) => `${String(row.turn)}${row.seatId}`
     ),
-    (read): StoredDocument => ({
-      kind,
-      status: documentVerdict(read),
-      bytes: read.bytes,
-      byteSize: read.size,
-      sha256: sha256(read.bytes)
-    })
-  )
+    skips: [
+      ...(truncated
+        ? [skip(gameId, "replayTruncated", `${String(tail.value.size)} bytes`)]
+        : []),
+      ...decoded.flatMap((row) => row.skips).map((detail) => skip(gameId, "rowUnstorable", detail))
+    ]
+  }
+}
+
+// ---------------------------------------------------------------------------
+// `manifest.json` → the `games` row
+// ---------------------------------------------------------------------------
 
 /**
- * `victory.json` — `Path.read_text`: follows symlinks, no `O_NOFOLLOW`, no size
- * ceiling, and every failure collapses to "no record" without a trace.
+ * `games.extras` — our own envelope, with exactly three reserved keys.
  *
- * It is stored with `status = 'ok'` unconditionally, because the read path has
- * no third answer for it: `archiveVictory` takes an `Option` and treats a
- * missing, unreadable or unparseable file identically. The only refusal is the
- * row-size ceiling, which a one-line file written by `bridge.lua` cannot reach.
+ * `manifest` and `report` are **verbatim JSON**: no tagging, no rewriting, so
+ * reconstruction is a merge rather than a decode. `derived` is the only place a
+ * tagged encoding (a bigint as a decimal string) is legal, and nothing
+ * reconstructs from it.
  */
-const readVictory = (
-  runRoot: string,
-  maxBytes: number
-): Either.Either<Option.Option<StoredDocument>, IngestSkip> =>
-  Option.match(
-    Option.getRight(readHead(join(runRoot, VICTORY_FILE), O_RDONLY | O_CLOEXEC, maxBytes)),
-    {
-      onNone: () => Either.right(Option.none()),
-      onSome: (read) =>
-        read.size > maxBytes
-          ? Either.left({
-            entry: VICTORY_FILE,
-            reason: "oversizedArtifact" as const,
-            detail: Option.some(`${VICTORY_FILE} is ${read.size} bytes`)
-          })
-          : Either.right(
-            Option.some({
-              kind: "victory" as const,
-              status: "ok" as const,
-              bytes: read.bytes,
-              byteSize: read.size,
-              sha256: sha256(read.bytes)
-            })
-          )
-    }
-  )
+export interface ExtrasEnvelope {
+  /** Demoted and un-columned manifest keys, verbatim. Present iff `manifest_status = 'ok'`. */
+  readonly manifest?: JsonObject
+  /** The whole report document, verbatim. Present iff `report_status = 'ok'`. */
+  readonly report?: JsonObject
+  /** Facts ingest computed. Diagnostic, plus the one overflow carrier. */
+  readonly derived?: JsonObject
+}
+
+/** The `games` columns lifted out of one manifest, plus its extras. */
+export interface GameFields {
+  readonly state: StorableRunState
+  readonly schemaVersion: number | null
+  readonly createdAt: number | null
+  readonly startedAt: number | null
+  readonly finishedAt: number | null
+  readonly currentTurn: number | null
+  readonly benchmarkValid: boolean | null
+  readonly name: string | null
+  readonly ruleset: string | null
+  readonly mode: string | null
+  readonly timingMode: string | null
+  readonly maxTurns: number | null
+  readonly objective: string | null
+  readonly config: JsonValue | null
+  readonly extrasManifest: JsonObject
+}
 
 /**
- * The `replay.jsonl` window. No `O_NOFOLLOW` — `makeLastReplayTurn` follows a
- * symlinked replay too, and hardening it here would change an answer.
+ * The manifest keys that have a typed column, and the guard each one takes.
  *
- * A file of size `0` still gets a row: `byte_size <= 0` is how the read path
- * says "no turn", and storing the row keeps a later append detectable by the
- * content hash.
+ * `game_id` is deliberately **not** here: it is never reconstructed from the
+ * primary key. `games.game_id` is the *directory name* while the manifest's
+ * `game_id` is a *claim*, and `game_parity_wrong_id_06` exists precisely
+ * because they can differ — the fs backend answers 404 by re-running that
+ * cross-check, and the pg backend can only do the same if the claim survives.
+ * So it is stored unconditionally in `extras.manifest`.
  */
-const readReplayTail = (runRoot: string): Option.Option<StoredTail> =>
+type ColumnGuard = (value: JsonValue | undefined) => Option.Option<JsonValue>
+
+const COLUMN_GUARDS: ReadonlyArray<readonly [string, ColumnGuard]> = [
+  ["schema_version", int32Of],
+  ["created_at", float8Of],
+  ["started_at", float8Of],
+  ["finished_at", float8Of],
+  ["current_turn", int32Of],
+  ["benchmark_valid", booleanOf]
+]
+
+/** The keys of `manifest` that their column can hold, and so are not demoted. */
+const columnizedKeys = (manifest: JsonObject): ReadonlyArray<string> =>
+  COLUMN_GUARDS
+    .filter(([key, guard]) => key in manifest && Option.isSome(guard(manifest[key])))
+    .map(([key]) => key)
+
+const columnValue = <A>(
+  manifest: JsonObject,
+  key: string,
+  guard: (value: JsonValue | undefined) => Option.Option<A>
+): A | null => (key in manifest ? Option.getOrNull(guard(manifest[key])) : null)
+
+/**
+ * `manifest.json` decoded into columns and `extras.manifest`.
+ *
+ * Every key of the document ends up in exactly one of the two, which is what
+ * makes reconstruction a total function rather than a best effort.
+ */
+export const gameFields = (manifest: JsonObject): GameFields => {
+  const rawState = manifest["state"]
+  const stateColumn = isStorableRunState(rawState)
+  const config = manifest["config"]
+  // `config: null` is a **demotion**, not a column: `jsonb` holds a JSON `null`
+  // perfectly well, but the column cannot then be told apart from an absent
+  // key, and reconstruction would drop a key the document had. Every other
+  // guard refuses `null` for the same reason; this one has to say so, because
+  // `jsonbOf(null)` is legitimately `Some(null)`.
+  const configColumn = "config" in manifest && config !== null
+    ? jsonbOf(config)
+    : Option.none<JsonValue>()
+  const lifted = isJsonObject(config) ? config : {}
+  const columnKeys = new Set<string>([
+    // `'invalid'` is both an enum spelling and the column's unrecognized
+    // sentinel; a manifest that spells it literally must ALSO keep the key in
+    // extras, or reconstruction cannot tell it from an absent key.
+    ...(stateColumn && rawState !== UNRECOGNIZED_STATE ? ["state"] : []),
+    ...(Option.isSome(configColumn) ? ["config"] : []),
+    ...columnizedKeys(manifest)
+  ])
+  return {
+    state: isStorableRunState(rawState) ? rawState : UNRECOGNIZED_STATE,
+    schemaVersion: columnValue(manifest, "schema_version", int32Of),
+    createdAt: columnValue(manifest, "created_at", float8Of),
+    startedAt: columnValue(manifest, "started_at", float8Of),
+    finishedAt: columnValue(manifest, "finished_at", float8Of),
+    currentTurn: columnValue(manifest, "current_turn", int32Of),
+    benchmarkValid: columnValue(manifest, "benchmark_valid", booleanOf),
+    // The lifted config columns are **write-only query projections**. Nothing
+    // reconstructs from them and no response body may read one: the fs backend
+    // applies `publicText(config.mode, 'unknown', 32)` and these have not been
+    // through `publicText`.
+    name: Option.getOrNull(textOf(lifted["name"])),
+    ruleset: Option.getOrNull(textOf(lifted["ruleset"])),
+    mode: Option.getOrNull(textOf(lifted["mode"])),
+    timingMode: Option.getOrNull(textOf(lifted["timing_mode"])),
+    maxTurns: Option.getOrNull(
+      Option.orElse(int32Of(lifted["max_turns"]), () => int32Of(lifted["turns"]))
+    ),
+    objective: Option.getOrNull(textOf(lifted["objective"])),
+    config: Option.getOrNull(configColumn),
+    extrasManifest: Object.fromEntries(
+      Object.entries(manifest).filter(([key]) => !columnKeys.has(key))
+    )
+  }
+}
+
+// ---------------------------------------------------------------------------
+// `config.seats[]` + `manifest.resolved_places[]` → the `seats` rows
+// ---------------------------------------------------------------------------
+
+/** One `seats` row. */
+export interface SeatRow {
+  readonly seatIndex: number
+  readonly seatId: string | null
+  readonly kind: "agent" | "cpu" | null
+  readonly label: string | null
+  readonly fingerprint: string | null
+  readonly metadata: JsonValue | null
+}
+
+/** The seat's identity, as a stable digest across games. */
+const SEAT_IDENTITY_FIELDS = ["id", "type", "model", "instructions", "base_url", "options"] as const
+
+/**
+ * sha256 over the seat's identity config — "the same agent setup" across games.
+ *
+ * Canonical text, not `JSON.stringify`: `options` is an object whose key order
+ * is the writer's, and a fingerprint that moved with key order would join
+ * nothing. A seat the canonicaliser refuses (a lone surrogate, 100 levels of
+ * nesting) simply has no fingerprint; it is a join key, not a response field.
+ */
+const seatFingerprint = (seat: JsonObject): Option.Option<string> =>
   Option.map(
-    Option.getRight(readTail(join(runRoot, REPLAY_JSONL_FILE))),
-    (read): StoredTail => ({
-      byteSize: read.size,
-      tailBytes: read.bytes,
-      sha256: sha256(read.bytes)
-    })
-  )
-
-/** One artifact skip, for the two artifact-scoped reasons. */
-const artifactSkip = (
-  name: string,
-  reason: "oversizedArtifact" | "unreadableArtifact",
-  detail: string
-): IngestSkip => ({ entry: name, reason, detail: Option.some(detail) })
-
-/**
- * `watch_frames/*.png`.
- *
- * The listing rule is `archiveRegularFiles(dir, ARCHIVE_PNG_RE)` verbatim, so
- * a symlinked, empty or non-regular frame is absent here exactly as it is
- * absent from the fs listing. `frame_index` is `decodeArchivePngName`'s result;
- * a name that matches the pattern but fails to decode is unreachable
- * (`FrameIndex` is any non-negative integer and the pattern admits six digits),
- * and if it ever happens the row carries a null index, which the repository
- * drops from the listing exactly as `listFramePngs` drops it.
- */
-const readFrames = (
-  directory: string,
-  maxBytes: number
-): { readonly frames: readonly StoredFrame[]; readonly skips: readonly IngestSkip[] } => {
-  const results = archiveRegularFiles(directory, Gateway.ARCHIVE_PNG_RE).map((name) =>
-    Either.match(readHead(join(directory, name), O_RDONLY | O_NOFOLLOW | O_CLOEXEC, maxBytes), {
-      onLeft: (): Either.Either<StoredFrame, IngestSkip> =>
-        Either.left(artifactSkip(name, "unreadableArtifact", `watch_frames/${name}`)),
-      onRight: (read) =>
-        read.size > maxBytes
-          ? Either.left(
-            artifactSkip(name, "oversizedArtifact", `watch_frames/${name} is ${read.size} bytes`)
-          )
-          : Either.right({
-            name,
-            frameIndex: Option.getRight(Gateway.decodeArchivePngName(name)),
-            bytes: read.bytes,
-            byteSize: read.size,
-            sha256: sha256(read.bytes)
-          })
-    })
-  )
-  return { frames: Arr.getRights(results), skips: Arr.getLefts(results) }
-}
-
-/** `game.mp4` — non-symlink, regular, non-empty, per `_archive_video_path`. */
-const readVideo = (
-  runRoot: string,
-  maxBytes: number
-): Either.Either<Option.Option<StoredVideo>, IngestSkip> => {
-  const name = Gateway.ARCHIVE_VIDEO_FILE
-  const path = join(runRoot, name)
-  const info = attempt("lstat", path, () => lstatSync(path))
-  if (
-    Either.isLeft(info) ||
-    info.right.isSymbolicLink() ||
-    !info.right.isFile() ||
-    info.right.size <= 0
-  ) {
-    return Either.right(Option.none())
-  }
-  if (info.right.size > maxBytes) {
-    return Either.left(artifactSkip(name, "oversizedArtifact", `${name} is ${info.right.size} bytes`))
-  }
-  return Either.match(readHead(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC, maxBytes), {
-    onLeft: (): Either.Either<Option.Option<StoredVideo>, IngestSkip> =>
-      Either.left(artifactSkip(name, "unreadableArtifact", name)),
-    onRight: (read) =>
-      Either.right(
-        Option.some({ bytes: read.bytes, byteSize: read.size, sha256: sha256(read.bytes) })
+    Option.all(
+      SEAT_IDENTITY_FIELDS.map((field) =>
+        Option.getRight(canonicalText((seat[field] ?? null) as CanonValue, CANON_ASCII))
       )
-  })
-}
+    ),
+    (parts) => hex(sha256(new TextEncoder().encode(encodeFields(parts))))
+  )
 
 /**
- * `SAVE_NAME_RE` / `ARCHIVE_PPM_RE` group 1, as a turn.
+ * `seat_kind` — `cpu` iff the seat is configured `native` **or** the resolved
+ * place with the same `seat_id` is controlled by `native_classic_ai`.
  *
- * Both patterns capture `(\d+)` — *unbounded*, because a filename is whatever
- * a filesystem allowed someone to create. `Number` is therefore not a decoder
- * here but a hazard: `turn-99999999999999999999-auto.sav.gz` yields `1e20`,
- * which `bigint` refuses and which used to fail the run's `INSERT` and, before
- * per-run isolation, the whole sweep; `turn-9007199254740993-auto.sav.gz`
- * yields `9007199254740992`, which is worse, because it is stored silently.
- *
- * `save_turn` is class-B — advisory, indexed, never on a response path — so the
- * right answer for a turn no `number` can hold exactly is `NULL`. `BigInt` is
- * total on a `\d+` capture (leading zeros included), so the comparison below is
- * exact rather than a round trip through the float that is the problem.
+ * The reverse mapping is deliberately not here (see `seats.ts` if it is ever
+ * wanted): it would invent `publicPlaces`' defaults from an enum that has
+ * already thrown away which of label/type/model were recorded, and a place row
+ * whose `controller_label` was absent publishes *no key* while the reverse map
+ * would publish one.
  */
-const nameTurn = (name: string, pattern: RegExp): Option.Option<number> =>
-  Option.filterMap(Option.fromNullable(pattern.exec(name)?.[1]), (digits) => {
-    const exact = BigInt(digits)
-    return exact <= BigInt(Number.MAX_SAFE_INTEGER)
-      ? Option.some(Number(exact))
-      : Option.none()
-  })
-
-const saveClassification = (
-  name: string
-): { readonly kind: "autosave" | "ppm" | "other"; readonly turn: Option.Option<number> } =>
-  SAVE_NAME_RE.test(name)
-    ? { kind: "autosave", turn: nameTurn(name, SAVE_NAME_RE) }
-    : Gateway.ARCHIVE_PPM_RE.test(name)
-    ? { kind: "ppm", turn: nameTurn(name, Gateway.ARCHIVE_PPM_RE) }
-    : { kind: "other", turn: Option.none() }
-
-/**
- * `saves/*`.
- *
- * An autosave is stored whole, because `save_replay` decompresses it. A PPM is
- * stored as its first `ppmHeadBytes`, because no reader ever looks past its
- * header — and `is_whole` records which of the two happened, so a materialised
- * PPM's deliberate shortness is never mistaken for the real length. Everything
- * else in the directory is stored whole under `kind = 'other'`: nothing reads
- * it today, and a materialised workdir that silently lost a file would be a
- * different directory from the one the fs backend hands the bridge.
- */
-const readSaves = (
-  directory: string,
-  ppmHeadBytes: number,
-  maxBytes: number
-): { readonly saves: readonly StoredSave[]; readonly skips: readonly IngestSkip[] } => {
-  const results = archiveRegularFiles(directory, ANY_NAME).map((name) => {
-    const classified = saveClassification(name)
-    const cap = classified.kind === "ppm" ? Math.min(ppmHeadBytes, maxBytes) : maxBytes
-    return Either.match(readHead(join(directory, name), O_RDONLY | O_NOFOLLOW | O_CLOEXEC, cap), {
-      onLeft: (): Either.Either<StoredSave, IngestSkip> =>
-        Either.left(artifactSkip(name, "unreadableArtifact", `saves/${name}`)),
-      onRight: (read) =>
-        classified.kind !== "ppm" && read.size > maxBytes
-          ? Either.left(
-            artifactSkip(name, "oversizedArtifact", `saves/${name} is ${read.size} bytes`)
-          )
-          : Either.right({
-            name,
-            kind: classified.kind,
-            saveTurn: classified.turn,
-            byteSize: read.size,
-            headBytes: read.bytes,
-            isWhole: read.bytes.length === read.size,
-            sha256: sha256(read.bytes)
-          })
-    })
-  })
-  return { saves: Arr.getRights(results), skips: Arr.getLefts(results) }
-}
-
-/**
- * The class-B columns, through `@arena/wire`'s strict manifest schema.
- *
- * This is the *only* use of the schema in the ingester, and it touches nothing
- * a response body can reach: a manifest the schema rejects is still stored
- * verbatim and still serves, because the gateway's projections read a dict
- * through `publicText`/`publicInt` and coerce whatever they find. The
- * rejection is reported so an operator learns about it, and that is all.
- */
-const readAdvisory = (documents: readonly StoredDocument[]): RunAdvisory => {
-  const manifest = documents.find((document) => document.kind === "manifest")
-  if (manifest === undefined || manifest.status !== "ok") {
-    return NO_ADVISORY
+const seatKindOf = (seat: JsonObject, places: ReadonlyArray<JsonValue>): "agent" | "cpu" => {
+  if (seat["type"] === "native") {
+    return "cpu"
   }
-  const parsed = Option.flatMap(decodeUtf8(manifest.bytes), (text) =>
-    Option.getRight(decodeJsonValueFromString(text)))
-  return Option.match(parsed, {
-    onNone: () => NO_ADVISORY,
-    onSome: (value) =>
-      Either.match(Gateway.decodeManifest(value), {
-        onLeft: (): RunAdvisory => ({ ...NO_ADVISORY, undecodable: true }),
-        onRight: (decoded) => ({
-          state: String(decoded.state),
-          createdAt: decoded.created_at,
-          finishedAt: decoded.finished_at,
-          benchmarkValid: decoded.benchmark_valid,
-          undecodable: false
-        })
-      })
-  })
+  const seatId = seat["id"]
+  const place = places.find((entry) =>
+    isJsonObject(entry) && typeof seatId === "string" && entry["seat_id"] === seatId
+  )
+  return isJsonObject(place) && place["controller"] === Gateway.NATIVE_CONTROLLER ? "cpu" : "agent"
 }
 
 /**
- * `content_hash` — sha256 over the canonical listing.
+ * The configured seat list.
  *
- * Every byte, size, status, name or presence change moves it; two runs with
- * identical archives hash identically. `byte_size` is in the listing beside the
- * digest because a short `read(2)` can leave the stored bytes shorter than the
- * file, and that difference has to be a *change*.
+ * `label` is `controller_label` when it is a non-blank string and `NULL`
+ * otherwise — **not** `NATIVE_CONTROLLER_LABEL`. `publicPlaces` applies
+ * `orDefault(rawLabel, 'Freeciv Classic AI')` at serve time, and baking that
+ * into storage would apply it twice.
  */
-interface HashEntry {
-  readonly category: string
-  readonly name: string
-  readonly byteSize: number
-  readonly status: string
-  readonly digest: Uint8Array
+export const seatRows = (manifest: JsonObject): readonly SeatRow[] => {
+  const config = manifest["config"]
+  const configured = isJsonObject(config) ? config["seats"] : undefined
+  const places = manifest["resolved_places"]
+  const placeRows = Array.isArray(places) ? places : []
+  return (Array.isArray(configured) ? configured : []).map((seat, seatIndex): SeatRow =>
+    isJsonObject(seat)
+      ? {
+        seatIndex,
+        seatId: Option.getOrNull(textOf(seat["id"])),
+        kind: seatKindOf(seat, placeRows),
+        label: Option.getOrNull(
+          Option.filter(textOf(seat["controller_label"]), (label) => label.trim() !== "")
+        ),
+        fingerprint: Option.getOrNull(seatFingerprint(seat)),
+        metadata: Option.getOrNull(jsonbOf(seat["controller_metadata"]))
+      }
+      : {
+        seatIndex,
+        seatId: null,
+        kind: null,
+        label: null,
+        fingerprint: null,
+        metadata: null
+      }
+  )
 }
 
-const hashEntry = (
-  category: string,
-  name: string,
-  byteSize: number,
-  status: string,
-  digest: Uint8Array
-): HashEntry => ({ category, name, byteSize, status, digest })
+// ---------------------------------------------------------------------------
+// `report.json` → `agent_stats` (a projection, never a source of truth)
+// ---------------------------------------------------------------------------
+
+/** One `agent_stats` row. */
+export interface AgentStatRow {
+  readonly seatId: string
+  readonly controllerFingerprint: string | null
+  readonly turns: number | null
+  readonly decisions: number | null
+  readonly fallbacks: number | null
+  readonly inputTokens: number | null
+  readonly outputTokens: number | null
+  readonly meanLatencyMs: number | null
+}
+
+/**
+ * `report.seat_stats` as rows.
+ *
+ * This is a **queryable projection**, exactly the relationship `games.mode` has
+ * to `config`: the whole report document lives in `extras.report` and
+ * reconstruction reads only that. The alternative — partition `seat_stats` out
+ * and rebuild it — would have to reproduce `mean_latency_ms`'s int-vs-float
+ * spelling (`scoring.py` writes the integer `0` when `decisions === 0`, a float
+ * otherwise) and its `latency_ms` accumulator sibling, which exists exactly
+ * then and has no column. That value is unrecoverable from these rows.
+ */
+export const agentStatRows = (report: JsonObject): readonly AgentStatRow[] => {
+  const stats = report["seat_stats"]
+  return isJsonObject(stats)
+    ? Object.entries(stats).flatMap(([seatId, value]): readonly AgentStatRow[] =>
+      isStorableText(seatId) && isJsonObject(value)
+        ? [{
+          seatId,
+          controllerFingerprint: Option.getOrNull(textOf(value["controller_fingerprint"])),
+          turns: Option.getOrNull(int32Of(value["turns"])),
+          decisions: Option.getOrNull(int32Of(value["decisions"])),
+          fallbacks: Option.getOrNull(int32Of(value["fallbacks"])),
+          inputTokens: Option.getOrNull(safeIntOf(value["input_tokens"])),
+          outputTokens: Option.getOrNull(safeIntOf(value["output_tokens"])),
+          meanLatencyMs: Option.getOrNull(float8Of(value["mean_latency_ms"]))
+        }]
+        : []
+    )
+    : []
+}
+
+// ---------------------------------------------------------------------------
+// `content_hash`
+// ---------------------------------------------------------------------------
 
 /**
  * Fields as one unambiguous string: `<length>:<field>` per field, concatenated.
@@ -1026,22 +1481,30 @@ const hashEntry = (
  * consumes exactly that many units, and starts again. Nothing a field contains
  * can imitate a separator, because there is none.
  *
- * This is what makes {@link contentHash} an idempotency key rather than a
- * suggestion. With the separator-joined encoding it replaces, a `saves/` holding
- * `x` (1 byte) and `y` (1 byte) hashed *identically* to a `saves/` holding the
- * single file `x 1 whole <sha256 of x>\nsave y` with `y`'s content — and an
- * equal hash is precisely the licence {@link ingestRun} takes to write nothing
- * at all, so the forgery would have kept the real archive out of the database
- * with both processes exiting `0`.
+ * This is what makes the content hash an idempotency key rather than a
+ * suggestion. With a separator-joined encoding, a crafted status or filename
+ * reproduces a whole record, and since an equal hash means "commit nothing", a
+ * forged listing re-ingests as *unchanged* over a real one.
  */
 export const encodeFields = (fields: ReadonlyArray<string>): string =>
   fields.map((field) => `${String(field.length)}:${field}`).join("")
 
-const contentHash = (
-  framesDirOk: boolean,
-  savesDirOk: boolean,
-  entries: readonly HashEntry[]
-): Uint8Array => {
+/**
+ * The listing this version of ingest hashes. Bumped when the decoded surface
+ * changes, so an upgrade re-reads every run instead of trusting a hash that
+ * was taken over different questions.
+ */
+const HASH_HEADER = "arena-ingest v2\n"
+
+interface HashEntry {
+  readonly category: string
+  readonly name: string
+  readonly byteSize: number
+  readonly status: string
+  readonly digest: Uint8Array
+}
+
+const contentHash = (entries: readonly HashEntry[]): Uint8Array => {
   const lines = entries
     .map((entry) =>
       `${
@@ -1055,110 +1518,176 @@ const contentHash = (
       }\n`
     )
     .toSorted()
-  // The header is fixed-shape and precedes every record, and no field of a
-  // record can reach back past it, so it needs no prefixing of its own.
-  const header = `frames_dir_ok ${String(framesDirOk)}\nsaves_dir_ok ${String(savesDirOk)}\n`
-  return sha256(new TextEncoder().encode(header + lines.join("")))
+  return sha256(new TextEncoder().encode(HASH_HEADER + lines.join("")))
 }
 
-/** The file each document kind was read from — its stable name in the listing. */
-const DOCUMENT_FILE: Record<StoredDocument["kind"], string> = {
-  manifest: MANIFEST_FILE,
-  report: REPORT_FILE,
-  victory: VICTORY_FILE
+// ---------------------------------------------------------------------------
+// One run, read
+// ---------------------------------------------------------------------------
+
+/** Everything one run directory contributes to the database. */
+export interface RunData {
+  readonly gameId: string
+  readonly manifest: ReadDocument
+  readonly report: ReadDocument
+  readonly replay: ReplayData
+  readonly fields: Option.Option<GameFields>
+  readonly seats: readonly SeatRow[]
+  readonly agentStats: readonly AgentStatRow[]
+  readonly extras: ExtrasEnvelope
+  /** `games.last_replay_turn`, `NULL` when the answer does not fit `integer`. */
+  readonly lastReplayTurn: number | null
+  readonly contentHash: Uint8Array
+  readonly skips: readonly IngestSkip[]
 }
 
 /**
- * Read one run directory. Never fails: an artifact that cannot be read is a
- * reported skip and an absent row, which is what the fs backend's 404 for the
- * same file already looks like from a client's side.
+ * `extras.derived` — the two facts that are not document keys.
+ *
+ * `last_replay_turn` is a decimal **string**, present only when the tail's
+ * answer does not fit `integer`: the turn is an unbounded Python `int` read
+ * through `parsePythonJson`, and `lastReplayTurn` must answer the same `bigint`
+ * the fs backend answers.
+ *
+ * `manifest_negative_zero` / `report_negative_zero` record the pointers at
+ * which a `-0` was seen and flattened. `String(-0) === "0"` in the parameter
+ * binding and `JSON.stringify(-0) === "0"` in extras, so v2 cannot carry one;
+ * this makes the loss legible instead of silent.
+ */
+const derivedFacts = (
+  manifest: Option.Option<JsonObject>,
+  report: Option.Option<JsonObject>,
+  lastReplayTurn: Option.Option<bigint>,
+  storedLastReplayTurn: number | null
+): JsonObject => {
+  const manifestZeros = Option.match(manifest, {
+    onNone: (): ReadonlyArray<string> => [],
+    onSome: (value) => negativeZeroPointers(value, "")
+  })
+  const reportZeros = Option.match(report, {
+    onNone: (): ReadonlyArray<string> => [],
+    onSome: (value) => negativeZeroPointers(value, "")
+  })
+  return {
+    ...(storedLastReplayTurn === null && Option.isSome(lastReplayTurn)
+      ? { last_replay_turn: String(lastReplayTurn.value) }
+      : {}),
+    ...(manifestZeros.length > 0 ? { manifest_negative_zero: [...manifestZeros] } : {}),
+    ...(reportZeros.length > 0 ? { report_negative_zero: [...reportZeros] } : {})
+  }
+}
+
+const documentSkips = (gameId: string, document: ReadDocument): readonly IngestSkip[] =>
+  Option.match(document.unstorable, {
+    onNone: (): readonly IngestSkip[] => [],
+    onSome: (pointer) => [
+      skip(
+        gameId,
+        "documentUnstorable",
+        `${document.file} holds U+0000 or a lone surrogate at ${pointer}`
+      )
+    ]
+  })
+
+/**
+ * Read one run directory. Never fails: an unreadable document is a status, not
+ * an exception, which is what the fs backend's 404/503 for the same file
+ * already looks like from a client's side.
  */
 export const collectRun = (
   runsRoot: string,
   gameId: string,
   options: IngestOptions
-): RunArtifacts => {
+): RunData => {
   const runRoot = resolveStrictly(runsRoot, gameId)
-  const framesDirectory = safeArchiveDirectory(runRoot, Gateway.ARCHIVE_FRAMES_DIRECTORY)
-  const savesDirectory = safeArchiveDirectory(runRoot, Gateway.ARCHIVE_SAVES_DIRECTORY)
+  const manifest = readDocument(runRoot, MANIFEST_FILE)
+  const report = readDocument(runRoot, REPORT_FILE)
+  const replay = readReplay(runRoot, gameId, options.maxReplayBytes)
 
-  const victory = readVictory(runRoot, options.maxBinaryRowBytes)
-  const video = readVideo(runRoot, options.maxBinaryRowBytes)
-  const frames = Option.match(framesDirectory, {
-    onNone: () => ({ frames: [] as readonly StoredFrame[], skips: [] as readonly IngestSkip[] }),
-    onSome: (directory) => readFrames(directory, options.maxBinaryRowBytes)
-  })
-  const saves = Option.match(savesDirectory, {
-    onNone: () => ({ saves: [] as readonly StoredSave[], skips: [] as readonly IngestSkip[] }),
-    onSome: (directory) =>
-      readSaves(directory, options.ppmHeadBytes, options.maxBinaryRowBytes)
-  })
-
-  const documents: readonly StoredDocument[] = [
-    ...Option.toArray(readDocument(runRoot, MANIFEST_FILE, "manifest")),
-    ...Option.toArray(readDocument(runRoot, REPORT_FILE, "report")),
-    ...Option.toArray(Either.getOrElse(victory, () => Option.none<StoredDocument>()))
-  ]
-  const replayTail = readReplayTail(runRoot)
-  const framesDirOk = Option.isSome(framesDirectory)
-  const savesDirOk = Option.isSome(savesDirectory)
-  const storedVideo = Either.getOrElse(video, () => Option.none<StoredVideo>())
+  const fields = Option.map(manifest.value, gameFields)
+  const storedLastReplayTurn = Option.getOrNull(
+    Option.filterMap(replay.lastReplayTurn, (turn) =>
+      turn >= BigInt(INT32_MIN) && turn <= BigInt(INT32_MAX)
+        ? Option.some(Number(turn))
+        : Option.none())
+  )
+  const derived = derivedFacts(
+    manifest.value,
+    report.value,
+    replay.lastReplayTurn,
+    storedLastReplayTurn
+  )
 
   return {
     gameId,
-    framesDirOk,
-    savesDirOk,
-    documents,
-    replayTail,
-    frames: frames.frames,
-    video: storedVideo,
-    saves: saves.saves,
-    advisory: readAdvisory(documents),
-    contentHash: contentHash(framesDirOk, savesDirOk, [
-      ...documents.map((document) =>
-        hashEntry(
-          "document",
-          DOCUMENT_FILE[document.kind],
-          document.byteSize,
-          document.status,
-          document.sha256
-        )
-      ),
-      ...Option.toArray(replayTail).map((tail) =>
-        hashEntry("replay-tail", REPLAY_JSONL_FILE, tail.byteSize, "ok", tail.sha256)
-      ),
-      ...frames.frames.map((frame) =>
-        hashEntry("frame", frame.name, frame.byteSize, "ok", frame.sha256)
-      ),
-      ...Option.toArray(storedVideo).map((found) =>
-        hashEntry("video", Gateway.ARCHIVE_VIDEO_FILE, found.byteSize, "ok", found.sha256)
-      ),
-      ...saves.saves.map((save) =>
-        hashEntry(
-          "save",
-          save.name,
-          save.byteSize,
-          save.isWhole ? "whole" : "head",
-          save.sha256
-        )
-      )
+    manifest,
+    report,
+    replay,
+    fields,
+    seats: Option.match(manifest.value, {
+      onNone: (): readonly SeatRow[] => [],
+      onSome: seatRows
+    }),
+    agentStats: Option.match(report.value, {
+      onNone: (): readonly AgentStatRow[] => [],
+      onSome: agentStatRows
+    }),
+    extras: {
+      ...Option.match(fields, {
+        onNone: () => ({}),
+        onSome: (value) => ({ manifest: value.extrasManifest })
+      }),
+      ...Option.match(report.value, {
+        onNone: () => ({}),
+        onSome: (value) => ({ report: value })
+      }),
+      ...(Object.keys(derived).length > 0 ? { derived } : {})
+    },
+    lastReplayTurn: storedLastReplayTurn,
+    contentHash: contentHash([
+      ...(manifest.status === "absent"
+        ? []
+        : [{
+          category: "document",
+          name: MANIFEST_FILE,
+          byteSize: manifest.byteSize,
+          status: manifest.status,
+          digest: manifest.digest
+        }]),
+      ...(report.status === "absent"
+        ? []
+        : [{
+          category: "document",
+          name: REPORT_FILE,
+          byteSize: report.byteSize,
+          status: report.status,
+          digest: report.digest
+        }]),
+      // The whole file, not v1's tail window: v2 decodes every line into
+      // `turns`/`player_turns`, so a change in the middle of a long replay is a
+      // change to the stored rows and must move the hash.
+      ...(replay.present
+        ? [{
+          category: "replay",
+          name: REPLAY_JSONL_FILE,
+          byteSize: replay.byteSize,
+          status: "ok",
+          digest: replay.digest
+        }]
+        : [])
     ]),
-    // An artifact skip is reported against the run it belongs to; the artifact
-    // itself is named in `detail`.
     skips: [
-      ...Option.toArray(Either.getLeft(victory)),
-      ...Option.toArray(Either.getLeft(video)),
-      ...frames.skips,
-      ...saves.skips
-    ].map((skip): IngestSkip => ({ ...skip, entry: gameId }))
+      ...documentSkips(gameId, manifest),
+      ...documentSkips(gameId, report),
+      ...replay.skips
+    ]
   }
 }
 
 /**
  * The `runs_root` as the repository resolves it (`replay_gateway.py:196`,
- * `Path(...).expanduser().resolve()`): the logical scope key stored on every
- * row. It has to be resolved identically on both sides or the gateway's
- * `WHERE runs_root = $1` finds nothing.
+ * `Path(...).expanduser().resolve()`). The gateway resolves it identically and
+ * both backends answer `runsRoot` with the same string.
  */
 export const resolveRunsRoot = (runsRoot: string): string =>
   Either.getOrElse(
@@ -1170,7 +1699,7 @@ export const resolveRunsRoot = (runsRoot: string): string =>
  * Is this directory entry a run? The four filesystem judgements the fs backend
  * makes at *read* time, in the order it makes them.
  *
- * Shared with {@link isRunOnDisk} deliberately: the delete phase re-asks this
+ * Shared with {@link isRunOnDisk} deliberately: the prune phase re-asks this
  * exact question at the end of a sweep, and a second copy of the rule that
  * drifted would decide to delete a run the walk would have kept.
  */
@@ -1179,30 +1708,27 @@ const classifyEntry = (
   entry: string
 ): Either.Either<string, IngestSkip> => {
   if (!isGameId(entry)) {
-    return Either.left({ entry, reason: "notAGameId", detail: Option.none() })
+    return Either.left(skip(entry, "notAGameId"))
   }
   if (isSymlink(join(runsRoot, entry))) {
-    return Either.left({ entry, reason: "symlink", detail: Option.none() })
+    return Either.left(skip(entry, "symlink"))
   }
   const runRoot = resolveStrictly(runsRoot, entry)
   if (dirname(runRoot) !== runsRoot) {
-    return Either.left({ entry, reason: "escapesRunsRoot", detail: Option.none() })
+    return Either.left(skip(entry, "escapesRunsRoot"))
   }
   return isDirectory(runRoot)
     ? Either.right(entry)
-    : Either.left({ entry, reason: "notADirectory", detail: Option.none() })
+    : Either.left(skip(entry, "notADirectory"))
 }
 
 /**
  * Is `gameId` a run under `runsRoot` **now**?
  *
- * Asked in the delete transaction, about ids the walk did not see. A run that is
- * on the disk at that moment was ingested by somebody else while this sweep was
- * reading, and deleting it — which is what a seen-set captured at readdir time
- * does — silently destroys another process's work.
- *
- * Exported because it is the whole of the delete phase's licence, and a licence
- * that can only be observed by winning a race is a licence nothing tests.
+ * Asked inside the prune transaction, about ids the walk did not see. A run
+ * that is on the disk at that moment was ingested by somebody else while this
+ * sweep was reading, and deleting it — which is what a seen-set captured at
+ * readdir time does — silently destroys another process's work.
  */
 export const isRunOnDisk = (runsRoot: string, gameId: string): boolean =>
   Either.isRight(classifyEntry(runsRoot, gameId))
@@ -1222,15 +1748,13 @@ const walk = (
         ? entries
         : entries.filter((entry) => filter.has(entry))
       const classified = considered.map((entry) => classifyEntry(runsRoot, entry))
-      const gameIds = Arr.getRights(classified)
       const absent = Array.from(filter)
         .filter((id) => !considered.includes(id))
-        .map((entry): IngestSkip => ({
-          entry,
-          reason: "requestedButAbsent",
-          detail: Option.none()
-        }))
-      return Either.right({ gameIds, skipped: [...Arr.getLefts(classified), ...absent] })
+        .map((entry): IngestSkip => skip(entry, "requestedButAbsent"))
+      return Either.right({
+        gameIds: Arr.getRights(classified),
+        skipped: [...Arr.getLefts(classified), ...absent]
+      })
     }
   })
 
@@ -1244,45 +1768,30 @@ const rowsWritten = (rows: ReadonlyArray<unknown>): number => rows.length
 
 /**
  * The parameter budget for one statement — the **smaller** of the two ceilings
- * this code actually runs against, and both were measured rather than assumed.
+ * this code runs against, both measured rather than assumed.
  *
- * A multi-row `INSERT` spends one parameter per column per row, so the ceiling
- * is a row count: `run_saves` has nine columns and `run_frames` seven. It is not
- * theoretical. `saves/` holds an autosave **and** a `*.map.ppm` per turn, the
- * corpus already carries runs with 1506 saves, and a long game walks straight
- * into it.
+ * - **Live Postgres**: the extended protocol's `Bind` counts parameters in an
+ *   unsigned int16 (65535) and refuses the statement past it.
+ * - **PGlite 0.5.x**: the ceiling is a *signed* int16 (32767) and crossing it is
+ *   **silent** — no error, no rows, and the transaction's earlier statements
+ *   lost with it.
  *
- * - **Live Postgres**: the extended protocol's `Bind` message counts parameters
- *   in an unsigned int16 — 65535 — and refuses the statement with an error past
- *   it. Measured: 7281 saves in one statement succeed, 7282 fail, and before
- *   per-run isolation the failure took the whole sweep with it.
- * - **PGlite 0.5.4**: the ceiling is a *signed* int16, 32767, and crossing it is
- *   **silent** — no error, no rows, and the surrounding transaction's earlier
- *   statements are lost too. Measured exactly: 3640 nine-column rows (32760
- *   parameters) insert; 3641 (32769) return zero rows with `Exit.Success`.
- *
- * The lower bound is therefore the one to honour: it is the only value at which
- * the hermetic tests predict the live server, which is the whole reason the
- * schema pins `bigint` to `{ mode: "number" }` as well. A budget that respected
- * only Postgres' 65535 would pass every hermetic test by writing nothing.
+ * The lower bound is the one to honour: it is the only value at which the
+ * hermetic tests predict the live server.
  */
-const MAX_BIND_PARAMETERS = 32767
+export const MAX_BIND_PARAMETERS = 32767
 
-/**
- * Room left for the parameters a statement spends outside its `VALUES` list.
- * Generous on purpose: the exact number is a drizzle rendering detail, and the
- * cost of a spare slot is nothing while the cost of one too few is a failed run.
- */
+/** Room for the parameters a statement spends outside its `VALUES` list. */
 const RESERVED_BIND_PARAMETERS = 64
 
 /**
  * `rows` split so no chunk can exceed {@link MAX_BIND_PARAMETERS}.
  *
- * `Arr.chunksOf` on an empty array is `[]`, not `[[]]`, so a caller that has
+ * `Arr.chunksOf` on an empty array is `[]`, not `[[]]`, so a caller with
  * nothing to write issues no statement — which is what the idempotence contract
  * needs, since an empty `INSERT` is still a statement.
  */
-const chunkRows = <A>(
+export const chunkRows = <A>(
   rows: ReadonlyArray<A>,
   columnsPerRow: number
 ): ReadonlyArray<ReadonlyArray<A>> =>
@@ -1291,335 +1800,325 @@ const chunkRows = <A>(
     Math.max(1, Math.floor((MAX_BIND_PARAMETERS - RESERVED_BIND_PARAMETERS) / columnsPerRow))
   )
 
-/**
- * `name <> ALL($1::text[])` — the deletion predicate as **one** parameter.
- *
- * `notInArray(column, names)` renders `name not in ($1, $2, …)`, which spends a
- * parameter per surviving name and so has the same int16 ceiling the inserts
- * do, one directory listing away. The array form spends exactly one however
- * many names there are. The explicit `::text[]` is required: without it the
- * planner sees an untyped parameter on the right of `ALL` and refuses.
- *
- * An empty `names` makes the predicate true for every row, which is the wanted
- * answer — nothing is expected, so everything stored is stale.
- */
-const nameNotAmong = (column: PgColumn, names: ReadonlyArray<string>) =>
-  sql`${column} <> all(${sql.param([...names])}::text[])`
-
-/** Columns per `run_frames` row, which is what its chunk size is derived from. */
-const FRAME_COLUMNS = 7
-
-/** Columns per `run_saves` row. */
-const SAVE_COLUMNS = 9
-
 const chunkedRowsWritten = (chunks: ReadonlyArray<ReadonlyArray<unknown>>): number =>
   chunks.reduce((total, rows) => total + rows.length, 0)
 
 /**
- * The run row.
+ * Columns per row, **counted off the table** rather than written down.
  *
- * The `IS DISTINCT FROM` guard is belt and braces — this statement is only
- * reached when the hash already differs — but it also means `ingested_at` does
- * not move for a run whose content did not, which keeps the column meaning
- * "when these bytes arrived".
+ * A hand-maintained count is one edit away from being wrong, and being wrong is
+ * silent: `player_turns` was budgeted at 17 columns when the frozen schema
+ * declares 18, so a chunk of 1 923 rows spent 34 614 parameters against a
+ * ceiling of 32 767 — measured, PGlite accepted the statement, wrote **zero**
+ * rows, returned no error, and took the rest of that run's transaction with it.
+ * A game of ~1 000 turns and two seats is enough to reach it. The count now
+ * comes from the same declaration the `INSERT` is built from, so the two cannot
+ * disagree.
  */
-const upsertRun = (
-  db: Database,
-  runsRoot: string,
-  sweepId: number,
-  artifacts: RunArtifacts
-): Effect.Effect<number, SqlError> =>
-  Effect.map(
-    db
-      .insert(runs)
-      .values({
-        runsRoot,
-        gameId: artifacts.gameId,
-        contentHash: artifacts.contentHash,
-        sweepId,
-        framesDirOk: artifacts.framesDirOk,
-        savesDirOk: artifacts.savesDirOk,
-        state: artifacts.advisory.state,
-        createdAt: artifacts.advisory.createdAt,
-        finishedAt: artifacts.advisory.finishedAt,
-        benchmarkValid: artifacts.advisory.benchmarkValid
-      })
-      .onConflictDoUpdate({
-        target: [runs.runsRoot, runs.gameId],
-        set: {
-          contentHash: sql`excluded.content_hash`,
-          ingestedAt: sql`now()`,
-          sweepId: sql`excluded.sweep_id`,
-          framesDirOk: sql`excluded.frames_dir_ok`,
-          savesDirOk: sql`excluded.saves_dir_ok`,
-          state: sql`excluded.state`,
-          createdAt: sql`excluded.created_at`,
-          finishedAt: sql`excluded.finished_at`,
-          benchmarkValid: sql`excluded.benchmark_valid`
-        },
-        setWhere: sql`${runs.contentHash} is distinct from excluded.content_hash`
-      })
-      .returning({ gameId: runs.gameId }),
-    rowsWritten
-  )
+export const columnCount = (table: Table): number => Object.keys(getTableColumns(table)).length
 
 /**
- * `WHERE (runs_root, game_id) = ($1, $2)`, spelled per table.
+ * `<column> <> all($1::<type>[])` — a whole delete predicate as **one**
+ * parameter.
  *
- * Written out five times rather than made generic: drizzle types a column by
- * its table, and the one-line duplication costs less than the type gymnastics
- * that would unify them. Every statement in this module carries this predicate,
- * so nothing can ever touch a row belonging to another root.
+ * `notInArray(column, values)` renders `x not in ($1, $2, …)`, which spends a
+ * parameter per surviving value and so has the same int16 ceiling the inserts
+ * do, one long game away. The explicit cast is required: without it the planner
+ * sees an untyped parameter on the right of `ALL` and refuses. An empty array
+ * makes the predicate true for every row, which is the wanted answer — nothing
+ * is expected, so everything stored is stale.
  */
-const scopeDocuments = (runsRoot: string, gameId: string) =>
-  and(eq(runDocuments.runsRoot, runsRoot), eq(runDocuments.gameId, gameId))
+const notAmongInts = (column: PgColumn, values: ReadonlyArray<number>) =>
+  sql`${column} <> all(${sql.param([...values])}::int[])`
 
-const scopeReplayTail = (runsRoot: string, gameId: string) =>
-  and(eq(runReplayTail.runsRoot, runsRoot), eq(runReplayTail.gameId, gameId))
+const notAmongTexts = (column: PgColumn, values: ReadonlyArray<string>) =>
+  sql`${column} <> all(${sql.param([...values])}::text[])`
 
-const scopeFrames = (runsRoot: string, gameId: string) =>
-  and(eq(runFrames.runsRoot, runsRoot), eq(runFrames.gameId, gameId))
-
-const scopeVideos = (runsRoot: string, gameId: string) =>
-  and(eq(runVideos.runsRoot, runsRoot), eq(runVideos.gameId, gameId))
-
-const scopeSaves = (runsRoot: string, gameId: string) =>
-  and(eq(runSaves.runsRoot, runsRoot), eq(runSaves.gameId, gameId))
-
-const writeDocuments = (
+/**
+ * The `games` row.
+ *
+ * Reached only when the content hash already differs, so the `IS DISTINCT FROM`
+ * guard is belt and braces — but it also keeps `ingested_at` still for a run
+ * whose content did not move, which is what the column means.
+ */
+const upsertGame = (
   db: Database,
-  runsRoot: string,
-  artifacts: RunArtifacts
-): Effect.Effect<WriteCounters, SqlError> =>
-  Effect.gen(function*() {
-    const kinds = artifacts.documents.map((document) => document.kind)
-    const removed = yield* db
-      .delete(runDocuments)
-      .where(
-        and(scopeDocuments(runsRoot, artifacts.gameId), notInArray(runDocuments.kind, kinds))
-      )
-      .returning({ kind: runDocuments.kind })
-    if (artifacts.documents.length === 0) {
-      return { ...NO_WRITES, deletes: rowsWritten(removed) }
-    }
-    const written = yield* db
-      .insert(runDocuments)
-      .values(
-        artifacts.documents.map((document) => ({
-          runsRoot,
-          gameId: artifacts.gameId,
-          kind: document.kind,
-          status: document.status,
-          bytes: document.bytes,
-          byteSize: document.byteSize,
-          sha256: document.sha256
-        }))
-      )
-      .onConflictDoUpdate({
-        target: [runDocuments.runsRoot, runDocuments.gameId, runDocuments.kind],
-        set: {
-          status: sql`excluded.status`,
-          bytes: sql`excluded.bytes`,
-          byteSize: sql`excluded.byte_size`,
-          sha256: sql`excluded.sha256`
-        },
-        setWhere: sql`${runDocuments.sha256} is distinct from excluded.sha256
-          or ${runDocuments.byteSize} is distinct from excluded.byte_size
-          or ${runDocuments.status} is distinct from excluded.status`
+  data: RunData
+): Effect.Effect<number, SqlError> => {
+  const fields = Option.getOrNull(data.fields)
+  const extras = Object.keys(data.extras).length > 0 ? data.extras : null
+  return Effect.map(
+    db
+      .insert(games)
+      .values({
+        gameId: data.gameId,
+        state: fields?.state ?? UNRECOGNIZED_STATE,
+        schemaVersion: fields?.schemaVersion ?? null,
+        createdAt: fields?.createdAt ?? null,
+        startedAt: fields?.startedAt ?? null,
+        finishedAt: fields?.finishedAt ?? null,
+        currentTurn: fields?.currentTurn ?? null,
+        lastReplayTurn: data.lastReplayTurn,
+        benchmarkValid: fields?.benchmarkValid ?? null,
+        name: fields?.name ?? null,
+        ruleset: fields?.ruleset ?? null,
+        mode: fields?.mode ?? null,
+        timingMode: fields?.timingMode ?? null,
+        maxTurns: fields?.maxTurns ?? null,
+        objective: fields?.objective ?? null,
+        config: fields?.config ?? null,
+        manifestStatus: data.manifest.status,
+        manifestByteSize: Option.getOrNull(safeIntOf(data.manifest.byteSize)),
+        reportStatus: data.report.status,
+        reportByteSize: Option.getOrNull(safeIntOf(data.report.byteSize)),
+        contentHash: data.contentHash,
+        extras
       })
-      .returning({ kind: runDocuments.kind })
-    return { ...NO_WRITES, documents: rowsWritten(written), deletes: rowsWritten(removed) }
-  })
+      .onConflictDoUpdate({
+        target: games.gameId,
+        set: {
+          state: sql`excluded.state`,
+          schemaVersion: sql`excluded.schema_version`,
+          createdAt: sql`excluded.created_at`,
+          startedAt: sql`excluded.started_at`,
+          finishedAt: sql`excluded.finished_at`,
+          currentTurn: sql`excluded.current_turn`,
+          lastReplayTurn: sql`excluded.last_replay_turn`,
+          benchmarkValid: sql`excluded.benchmark_valid`,
+          name: sql`excluded.name`,
+          ruleset: sql`excluded.ruleset`,
+          mode: sql`excluded.mode`,
+          timingMode: sql`excluded.timing_mode`,
+          maxTurns: sql`excluded.max_turns`,
+          objective: sql`excluded.objective`,
+          config: sql`excluded.config`,
+          manifestStatus: sql`excluded.manifest_status`,
+          manifestByteSize: sql`excluded.manifest_byte_size`,
+          reportStatus: sql`excluded.report_status`,
+          reportByteSize: sql`excluded.report_byte_size`,
+          contentHash: sql`excluded.content_hash`,
+          ingestedAt: sql`now()`,
+          extras: sql`excluded.extras`
+        },
+        setWhere: sql`${games.contentHash} is distinct from excluded.content_hash`
+      })
+      .returning({ gameId: games.gameId }),
+    rowsWritten
+  )
+}
 
-const writeReplayTail = (
+const writeSeats = (
   db: Database,
-  runsRoot: string,
-  artifacts: RunArtifacts
-): Effect.Effect<WriteCounters, SqlError> =>
-  Option.match(artifacts.replayTail, {
-    onNone: () =>
-      Effect.map(
-        db
-          .delete(runReplayTail)
-          .where(scopeReplayTail(runsRoot, artifacts.gameId))
-          .returning({ gameId: runReplayTail.gameId }),
-        (removed): WriteCounters => ({ ...NO_WRITES, deletes: rowsWritten(removed) })
-      ),
-    onSome: (tail) =>
-      Effect.map(
-        db
-          .insert(runReplayTail)
-          .values({
-            runsRoot,
-            gameId: artifacts.gameId,
-            byteSize: tail.byteSize,
-            tailBytes: tail.tailBytes,
-            sha256: tail.sha256
-          })
-          .onConflictDoUpdate({
-            target: [runReplayTail.runsRoot, runReplayTail.gameId],
-            set: {
-              byteSize: sql`excluded.byte_size`,
-              tailBytes: sql`excluded.tail_bytes`,
-              sha256: sql`excluded.sha256`
-            },
-            setWhere: sql`${runReplayTail.sha256} is distinct from excluded.sha256
-              or ${runReplayTail.byteSize} is distinct from excluded.byte_size`
-          })
-          .returning({ gameId: runReplayTail.gameId }),
-        (written): WriteCounters => ({ ...NO_WRITES, replayTails: rowsWritten(written) })
-      )
-  })
-
-const writeFrames = (
-  db: Database,
-  runsRoot: string,
-  artifacts: RunArtifacts
+  data: RunData
 ): Effect.Effect<WriteCounters, SqlError> =>
   Effect.gen(function*() {
-    const names = artifacts.frames.map((frame) => frame.name)
     const removed = yield* db
-      .delete(runFrames)
-      .where(and(scopeFrames(runsRoot, artifacts.gameId), nameNotAmong(runFrames.name, names)))
-      .returning({ name: runFrames.name })
-    // Seven columns per row — see MAX_BIND_PARAMETERS.
-    const written = yield* Effect.forEach(
-      chunkRows(artifacts.frames, FRAME_COLUMNS),
-      (chunk) =>
-        db
-          .insert(runFrames)
-          .values(
-            chunk.map((frame) => ({
-              runsRoot,
-              gameId: artifacts.gameId,
-              name: frame.name,
-              frameIndex: Option.getOrNull(frame.frameIndex),
-              bytes: frame.bytes,
-              byteSize: frame.byteSize,
-              sha256: frame.sha256
-            }))
-          )
-          .onConflictDoUpdate({
-            target: [runFrames.runsRoot, runFrames.gameId, runFrames.name],
-            set: {
-              frameIndex: sql`excluded.frame_index`,
-              bytes: sql`excluded.bytes`,
-              byteSize: sql`excluded.byte_size`,
-              sha256: sql`excluded.sha256`
-            },
-            setWhere: sql`${runFrames.sha256} is distinct from excluded.sha256
-              or ${runFrames.byteSize} is distinct from excluded.byte_size
-              or ${runFrames.frameIndex} is distinct from excluded.frame_index`
-          })
-          .returning({ name: runFrames.name }),
-      { concurrency: 1 }
-    )
-    return { ...NO_WRITES, frames: chunkedRowsWritten(written), deletes: rowsWritten(removed) }
-  })
-
-const writeVideo = (
-  db: Database,
-  runsRoot: string,
-  artifacts: RunArtifacts
-): Effect.Effect<WriteCounters, SqlError> =>
-  Option.match(artifacts.video, {
-    onNone: () =>
-      Effect.map(
-        db
-          .delete(runVideos)
-          .where(scopeVideos(runsRoot, artifacts.gameId))
-          .returning({ gameId: runVideos.gameId }),
-        (removed): WriteCounters => ({ ...NO_WRITES, deletes: rowsWritten(removed) })
-      ),
-    onSome: (video) =>
-      Effect.map(
-        db
-          .insert(runVideos)
-          .values({
-            runsRoot,
-            gameId: artifacts.gameId,
-            bytes: video.bytes,
-            byteSize: video.byteSize,
-            sha256: video.sha256
-          })
-          .onConflictDoUpdate({
-            target: [runVideos.runsRoot, runVideos.gameId],
-            set: {
-              bytes: sql`excluded.bytes`,
-              byteSize: sql`excluded.byte_size`,
-              sha256: sql`excluded.sha256`
-            },
-            setWhere: sql`${runVideos.sha256} is distinct from excluded.sha256
-              or ${runVideos.byteSize} is distinct from excluded.byte_size`
-          })
-          .returning({ gameId: runVideos.gameId }),
-        (written): WriteCounters => ({ ...NO_WRITES, videos: rowsWritten(written) })
+      .delete(seats)
+      .where(
+        and(
+          eq(seats.gameId, data.gameId),
+          notAmongInts(seats.seatIndex, data.seats.map((row) => row.seatIndex))
+        )
       )
-  })
-
-const writeSaves = (
-  db: Database,
-  runsRoot: string,
-  artifacts: RunArtifacts
-): Effect.Effect<WriteCounters, SqlError> =>
-  Effect.gen(function*() {
-    const names = artifacts.saves.map((save) => save.name)
-    const removed = yield* db
-      .delete(runSaves)
-      .where(and(scopeSaves(runsRoot, artifacts.gameId), nameNotAmong(runSaves.name, names)))
-      .returning({ name: runSaves.name })
-    // Nine columns per row — the tightest ceiling in the schema.
+      .returning({ seatIndex: seats.seatIndex })
     const written = yield* Effect.forEach(
-      chunkRows(artifacts.saves, SAVE_COLUMNS),
+      chunkRows(data.seats, columnCount(seats)),
       (chunk) =>
         db
-          .insert(runSaves)
-          .values(
-            chunk.map((save) => ({
-              runsRoot,
-              gameId: artifacts.gameId,
-              name: save.name,
-              kind: save.kind,
-              saveTurn: Option.getOrNull(save.saveTurn),
-              byteSize: save.byteSize,
-              headBytes: save.headBytes,
-              isWhole: save.isWhole,
-              sha256: save.sha256
-            }))
-          )
+          .insert(seats)
+          .values(chunk.map((row) => ({ gameId: data.gameId, ...row })))
           .onConflictDoUpdate({
-            target: [runSaves.runsRoot, runSaves.gameId, runSaves.name],
+            target: [seats.gameId, seats.seatIndex],
             set: {
+              seatId: sql`excluded.seat_id`,
               kind: sql`excluded.kind`,
-              saveTurn: sql`excluded.save_turn`,
-              byteSize: sql`excluded.byte_size`,
-              headBytes: sql`excluded.head_bytes`,
-              isWhole: sql`excluded.is_whole`,
-              sha256: sql`excluded.sha256`
+              label: sql`excluded.label`,
+              fingerprint: sql`excluded.fingerprint`,
+              metadata: sql`excluded.metadata`
             },
-            setWhere: sql`${runSaves.sha256} is distinct from excluded.sha256
-              or ${runSaves.byteSize} is distinct from excluded.byte_size
-              or ${runSaves.isWhole} is distinct from excluded.is_whole
-              or ${runSaves.saveTurn} is distinct from excluded.save_turn
-              or ${runSaves.kind} is distinct from excluded.kind`
+            setWhere: sql`${seats.seatId} is distinct from excluded.seat_id
+              or ${seats.kind} is distinct from excluded.kind
+              or ${seats.label} is distinct from excluded.label
+              or ${seats.fingerprint} is distinct from excluded.fingerprint
+              or ${seats.metadata} is distinct from excluded.metadata`
           })
-          .returning({ name: runSaves.name }),
+          .returning({ seatIndex: seats.seatIndex }),
       { concurrency: 1 }
     )
-    return { ...NO_WRITES, saves: chunkedRowsWritten(written), deletes: rowsWritten(removed) }
+    return { ...NO_WRITES, seats: chunkedRowsWritten(written), deletes: rowsWritten(removed) }
   })
 
-/** The stored hash for a run, if it has ever been ingested. */
+/**
+ * `turns`, then `player_turns`.
+ *
+ * The delete comes first and is a *set difference*, not a truncate: a run whose
+ * manifest changed keeps every turn row it already had, which is what keeps
+ * `board_state` — whose composite FK cascades from `turns` — alive across an
+ * unrelated edit.
+ */
+const writeTurns = (
+  db: Database,
+  data: RunData
+): Effect.Effect<WriteCounters, SqlError> =>
+  Effect.gen(function*() {
+    const removed = yield* db
+      .delete(turns)
+      .where(
+        and(
+          eq(turns.gameId, data.gameId),
+          notAmongInts(turns.turn, data.replay.turns.map((row) => row.turn))
+        )
+      )
+      .returning({ turn: turns.turn })
+    const written = yield* Effect.forEach(
+      chunkRows(data.replay.turns, columnCount(turns)),
+      (chunk) =>
+        db
+          .insert(turns)
+          .values(chunk.map((row) => ({ gameId: data.gameId, turn: row.turn, year: row.year })))
+          .onConflictDoUpdate({
+            target: [turns.gameId, turns.turn],
+            set: { year: sql`excluded.year` },
+            setWhere: sql`${turns.year} is distinct from excluded.year`
+          })
+          .returning({ turn: turns.turn }),
+      { concurrency: 1 }
+    )
+    return { ...NO_WRITES, turns: chunkedRowsWritten(written), deletes: rowsWritten(removed) }
+  })
+
+/**
+ * The stale-row predicate for a two-column key, as **two** parameters.
+ *
+ * `unnest($1::int[], $2::text[])` walks the two arrays in step, so the whole
+ * surviving key set costs two binds however many turns a game has — which
+ * matters at 5 000 turns × 8 seats, where a pair-per-parameter predicate would
+ * cross the int16 ceiling that PGlite crosses *silently*.
+ */
+const playerTurnsNotAmong = (rows: readonly PlayerTurnRow[]) =>
+  sql`not exists (
+    select 1 from unnest(
+      ${sql.param(rows.map((row) => row.turn))}::int[],
+      ${sql.param(rows.map((row) => row.seatId))}::text[]
+    ) as expected(turn, seat_id)
+    where expected.turn = ${playerTurns.turn} and expected.seat_id = ${playerTurns.seatId}
+  )`
+
+const writePlayerTurns = (
+  db: Database,
+  data: RunData
+): Effect.Effect<WriteCounters, SqlError> =>
+  Effect.gen(function*() {
+    const removed = yield* db
+      .delete(playerTurns)
+      .where(
+        and(eq(playerTurns.gameId, data.gameId), playerTurnsNotAmong(data.replay.playerTurns))
+      )
+      .returning({ turn: playerTurns.turn })
+    const written = yield* Effect.forEach(
+      chunkRows(data.replay.playerTurns, columnCount(playerTurns)),
+      (chunk) =>
+        db
+          .insert(playerTurns)
+          .values(chunk.map((row) => ({ gameId: data.gameId, ...row })))
+          .onConflictDoUpdate({
+            target: [playerTurns.gameId, playerTurns.turn, playerTurns.seatId],
+            set: {
+              playerId: sql`excluded.player_id`,
+              playerName: sql`excluded.player_name`,
+              nation: sql`excluded.nation`,
+              government: sql`excluded.government`,
+              alive: sql`excluded.alive`,
+              score: sql`excluded.score`,
+              cities: sql`excluded.cities`,
+              citizens: sql`excluded.citizens`,
+              population: sql`excluded.population`,
+              units: sql`excluded.units`,
+              gold: sql`excluded.gold`,
+              culture: sql`excluded.culture`,
+              futureTechs: sql`excluded.future_techs`,
+              knownTechIds: sql`excluded.known_tech_ids`,
+              research: sql`excluded.research`
+            },
+            setWhere: sql`${playerTurns.playerId} is distinct from excluded.player_id
+              or ${playerTurns.playerName} is distinct from excluded.player_name
+              or ${playerTurns.nation} is distinct from excluded.nation
+              or ${playerTurns.government} is distinct from excluded.government
+              or ${playerTurns.alive} is distinct from excluded.alive
+              or ${playerTurns.score} is distinct from excluded.score
+              or ${playerTurns.cities} is distinct from excluded.cities
+              or ${playerTurns.citizens} is distinct from excluded.citizens
+              or ${playerTurns.population} is distinct from excluded.population
+              or ${playerTurns.units} is distinct from excluded.units
+              or ${playerTurns.gold} is distinct from excluded.gold
+              or ${playerTurns.culture} is distinct from excluded.culture
+              or ${playerTurns.futureTechs} is distinct from excluded.future_techs
+              or ${playerTurns.knownTechIds} is distinct from excluded.known_tech_ids
+              or ${playerTurns.research} is distinct from excluded.research`
+          })
+          .returning({ turn: playerTurns.turn }),
+      { concurrency: 1 }
+    )
+    return {
+      ...NO_WRITES,
+      playerTurns: chunkedRowsWritten(written),
+      deletes: rowsWritten(removed)
+    }
+  })
+
+const writeAgentStats = (
+  db: Database,
+  data: RunData
+): Effect.Effect<WriteCounters, SqlError> =>
+  Effect.gen(function*() {
+    const removed = yield* db
+      .delete(agentStats)
+      .where(
+        and(
+          eq(agentStats.gameId, data.gameId),
+          notAmongTexts(agentStats.seatId, data.agentStats.map((row) => row.seatId))
+        )
+      )
+      .returning({ seatId: agentStats.seatId })
+    const written = yield* Effect.forEach(
+      chunkRows(data.agentStats, columnCount(agentStats)),
+      (chunk) =>
+        db
+          .insert(agentStats)
+          .values(chunk.map((row) => ({ gameId: data.gameId, ...row })))
+          .onConflictDoUpdate({
+            target: [agentStats.gameId, agentStats.seatId],
+            set: {
+              controllerFingerprint: sql`excluded.controller_fingerprint`,
+              turns: sql`excluded.turns`,
+              decisions: sql`excluded.decisions`,
+              fallbacks: sql`excluded.fallbacks`,
+              inputTokens: sql`excluded.input_tokens`,
+              outputTokens: sql`excluded.output_tokens`,
+              meanLatencyMs: sql`excluded.mean_latency_ms`
+            },
+            setWhere:
+              sql`${agentStats.controllerFingerprint} is distinct from excluded.controller_fingerprint
+              or ${agentStats.turns} is distinct from excluded.turns
+              or ${agentStats.decisions} is distinct from excluded.decisions
+              or ${agentStats.fallbacks} is distinct from excluded.fallbacks
+              or ${agentStats.inputTokens} is distinct from excluded.input_tokens
+              or ${agentStats.outputTokens} is distinct from excluded.output_tokens
+              or ${agentStats.meanLatencyMs} is distinct from excluded.mean_latency_ms`
+          })
+          .returning({ seatId: agentStats.seatId }),
+      { concurrency: 1 }
+    )
+    return { ...NO_WRITES, agentStats: chunkedRowsWritten(written), deletes: rowsWritten(removed) }
+  })
+
+/** The stored hash for a game, if it has ever been ingested. */
 const storedHash = (
   db: Database,
-  runsRoot: string,
   gameId: string
 ): Effect.Effect<Option.Option<Uint8Array>, SqlError> =>
   Effect.map(
-    db
-      .select({ contentHash: runs.contentHash })
-      .from(runs)
-      .where(and(eq(runs.runsRoot, runsRoot), eq(runs.gameId, gameId))),
+    db.select({ contentHash: games.contentHash }).from(games).where(eq(games.gameId, gameId)),
     (rows) => Option.map(Option.fromNullable(rows[0]), (row) => row.contentHash)
   )
 
@@ -1629,8 +2128,8 @@ const sameBytes = (left: Uint8Array, right: Uint8Array): boolean =>
 /**
  * `pg_current_xact_id_if_assigned()` — `NULL` until the transaction writes.
  *
- * Reading it is itself free: the `_if_assigned` variant never allocates an id.
- * This is the hermetic proof behind {@link IngestReport.transactionsWithWrites}.
+ * Reading it is free: the `_if_assigned` variant never allocates an id. This is
+ * the hermetic proof behind {@link IngestReport.transactionsWithWrites}.
  */
 const transactionWrote = (
   client: SqlClient.SqlClient
@@ -1645,77 +2144,314 @@ interface RunWrite {
   readonly wroteInTransaction: boolean
 }
 
+const runResult = (
+  data: RunData,
+  outcome: RunOutcome,
+  writes: WriteCounters
+): RunResult => ({
+  gameId: data.gameId,
+  outcome,
+  manifestStatus: data.manifest.status,
+  reportStatus: data.report.status,
+  boardsWritten: 0,
+  writes
+})
+
 /**
- * One run, in one transaction.
+ * One run's documents, in one transaction.
  *
- * The hash comparison is a plain `SELECT`. The dossier's `FOR UPDATE` is
- * deliberately absent: a row lock is recorded in the tuple's `xmax`, so it
- * assigns a transaction id and would destroy the zero-write proof — while
- * buying nothing, because the upsert that follows is idempotent by content and
- * atomic under `ON CONFLICT`.
+ * The hash comparison is a plain `SELECT`. A `FOR UPDATE` is deliberately
+ * absent: a row lock is recorded in the tuple's `xmax`, so it assigns a
+ * transaction id and would destroy the zero-write proof — while buying nothing,
+ * because the upsert that follows is idempotent by content and atomic under
+ * `ON CONFLICT`.
  */
 const ingestRun = (
   db: Database,
   client: SqlClient.SqlClient,
-  runsRoot: string,
-  sweepId: number,
-  artifacts: RunArtifacts
+  data: RunData
 ): Effect.Effect<RunWrite, SqlError> =>
   client.withTransaction(
     Effect.gen(function*() {
-      const existing = yield* storedHash(db, runsRoot, artifacts.gameId)
+      const existing = yield* storedHash(db, data.gameId)
       const unchanged = Option.match(existing, {
         onNone: () => false,
-        onSome: (hash) => sameBytes(hash, artifacts.contentHash)
+        onSome: (hash) => sameBytes(hash, data.contentHash)
       })
-      const unusableDocuments =
-        artifacts.documents.filter((document) => document.status === "unusable").length
-
       if (unchanged) {
         return {
-          result: {
-            gameId: artifacts.gameId,
-            outcome: "unchanged" as const,
-            unusableDocuments,
-            manifestUndecodable: artifacts.advisory.undecodable,
-            writes: NO_WRITES
-          },
+          result: runResult(data, "unchanged", NO_WRITES),
           wroteInTransaction: yield* transactionWrote(client)
         }
       }
-
-      const runWrites = yield* upsertRun(db, runsRoot, sweepId, artifacts)
+      const gameWrites = yield* upsertGame(db, data)
       const children = yield* Effect.all(
         [
-          writeDocuments(db, runsRoot, artifacts),
-          writeReplayTail(db, runsRoot, artifacts),
-          writeFrames(db, runsRoot, artifacts),
-          writeVideo(db, runsRoot, artifacts),
-          writeSaves(db, runsRoot, artifacts)
+          writeSeats(db, data),
+          writeTurns(db, data),
+          writePlayerTurns(db, data),
+          writeAgentStats(db, data)
         ],
         { concurrency: 1 }
       )
       return {
-        result: {
-          gameId: artifacts.gameId,
-          outcome: Option.isNone(existing) ? ("inserted" as const) : ("updated" as const),
-          unusableDocuments,
-          manifestUndecodable: artifacts.advisory.undecodable,
-          writes: addWrites({ ...NO_WRITES, runs: runWrites }, sumWrites(children))
-        },
+        result: runResult(
+          data,
+          Option.isNone(existing) ? "inserted" : "updated",
+          addWrites({ ...NO_WRITES, games: gameWrites }, sumWrites(children))
+        ),
         wroteInTransaction: yield* transactionWrote(client)
       }
     })
   )
 
 // ---------------------------------------------------------------------------
-// Sweeps
+// The board phase — domain data, explicitly off the parity path
+//
+// `/v1/games/{id}/board.json` derives from the savegames on **every** request,
+// in **both** backends, through the same python bridge. `board_state` exists so
+// the database is self-sufficient for scrubbing, frame regeneration and replay
+// later; it is written here and read by nothing the 3-way oracle looks at. A
+// parity test that reads `board_state` is a defect.
 // ---------------------------------------------------------------------------
 
 /**
- * A record `object` — the narrowing {@link describeSqlProblem} needs to read a
- * driver error without an unchecked cast.
+ * A path with every existing component resolved, even when the leaf does not
+ * exist yet.
+ *
+ * `resolve` alone is not enough for {@link nestsWith}: a `--cache-root` under a
+ * symlinked ancestor (`/var/folders/…` → `/private/var/folders/…` on darwin, the
+ * shape every `mkdtemp` produces) is lexically unrelated to the realpath'd
+ * `runs_root` and would slip past the check into the archive it was meant to be
+ * kept out of. The cache root is *created* by the bridge, so its leaf is
+ * routinely absent — hence the walk up to the deepest ancestor that resolves.
  */
+const resolveExisting = (path: string): string => {
+  const absolute = resolvePath(path)
+  return Either.match(attempt("realpath", absolute, () => realpathSync(absolute)), {
+    onRight: (resolved) => resolved,
+    onLeft: () => {
+      const parent = dirname(absolute)
+      return parent === absolute ? absolute : join(resolveExisting(parent), basename(absolute))
+    }
+  })
+}
+
+/** Does one path nest with the other, in either direction? */
+const nestsWith = (left: string, right: string): boolean => {
+  const a = resolveExisting(left)
+  const b = resolveExisting(right)
+  return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`)
+}
+
+/**
+ * The cache root must live outside `runs_root`.
+ *
+ * `save_replay` raises `SaveReplayError` when its cache root nests with a run's
+ * `saves/` directory, and a cache root *inside* the archive would also make the
+ * sweep's own output look like archive content on the next walk.
+ */
+export const boardCacheRootValid = (runsRoot: string, cacheRoot: string): boolean =>
+  !nestsWith(runsRoot, cacheRoot)
+
+/** `turn-N-(auto|final).sav*` in `<run>/saves`, as turns that fit `integer`. */
+const savedTurns = (runsRoot: string, gameId: string): readonly number[] =>
+  Option.match(
+    safeArchiveDirectory(resolveStrictly(runsRoot, gameId), Gateway.ARCHIVE_SAVES_DIRECTORY),
+    {
+      onNone: (): readonly number[] => [],
+      onSome: (directory) =>
+        archiveRegularFiles(directory, SAVE_NAME_RE).flatMap((name): readonly number[] => {
+          const digits = SAVE_NAME_RE.exec(name)?.[1]
+          if (digits === undefined) {
+            return []
+          }
+          // `BigInt` is total on a `\d+` capture and exact where `Number` is
+          // not: `turn-9007199254740993-auto.sav` must not become …992.
+          const exact = BigInt(digits)
+          return exact >= BigInt(INT32_MIN) && exact <= BigInt(INT32_MAX) ? [Number(exact)] : []
+        })
+    }
+  )
+
+const recordedTurns = (
+  db: Database,
+  gameId: string
+): Effect.Effect<ReadonlySet<number>, SqlError> =>
+  Effect.map(
+    db.select({ turn: turns.turn }).from(turns).where(eq(turns.gameId, gameId)),
+    (rows) => new Set(rows.map((row) => row.turn))
+  )
+
+const storedBoardTurns = (
+  db: Database,
+  gameId: string
+): Effect.Effect<ReadonlySet<number>, SqlError> =>
+  Effect.map(
+    db.select({ turn: boardState.turn }).from(boardState).where(eq(boardState.gameId, gameId)),
+    (rows) => new Set(rows.map((row) => row.turn))
+  )
+
+/** One derived board, ready to store. */
+interface BoardRow {
+  readonly turn: number
+  readonly board: JsonValue
+}
+
+/**
+ * The turns this sweep will attempt, and the ones it recorded as skips.
+ *
+ * ```
+ * candidates = { N : turn-N-(auto|final).sav* exists }        (SAVE_NAME_RE)
+ *            ∩ { N : a `turns` row exists }                   (replay.jsonl had it)
+ *            \ { N : a `board_state` row exists }             (resumability)
+ * ```
+ *
+ * An autosave with no `turns` row cannot be stored — the composite FK forbids
+ * it — so it is a recorded skip rather than an error, and a turn with a replay
+ * line but no autosave is never attempted at all.
+ */
+const boardCandidates = (
+  gameId: string,
+  saved: readonly number[],
+  recorded: ReadonlySet<number>,
+  stored: ReadonlySet<number>,
+  limit: number
+): { readonly turns: readonly number[]; readonly skips: readonly IngestSkip[] } => {
+  const missingTurnRow = saved.filter((turn) => !recorded.has(turn))
+  const attempted = saved
+    .filter((turn) => recorded.has(turn) && !stored.has(turn))
+    .toSorted((left, right) => left - right)
+  return {
+    turns: limit > 0 ? attempted.slice(0, limit) : attempted,
+    skips: missingTurnRow.map((turn) =>
+      skip(gameId, "boardTurnNotRecorded", `turn ${String(turn)}`)
+    )
+  }
+}
+
+const writeBoards = (
+  db: Database,
+  client: SqlClient.SqlClient,
+  gameId: string,
+  rows: readonly BoardRow[]
+): Effect.Effect<{ readonly written: number; readonly wrote: boolean }, SqlError> =>
+  rows.length === 0
+    ? Effect.succeed({ written: 0, wrote: false })
+    : client.withTransaction(
+      Effect.gen(function*() {
+        // Chunked at 200 rather than at the bind ceiling: a board is a large
+        // jsonb document, and a failed statement should cost a little work
+        // rather than a whole game's derivation.
+        const written = yield* Effect.forEach(
+          Arr.chunksOf(rows, Math.min(200, Math.floor(MAX_BIND_PARAMETERS / columnCount(boardState)))),
+          (chunk) =>
+            db
+              .insert(boardState)
+              .values(chunk.map((row) => ({ gameId, turn: row.turn, board: row.board })))
+              .onConflictDoNothing({ target: [boardState.gameId, boardState.turn] })
+              .returning({ turn: boardState.turn }),
+          { concurrency: 1 }
+        )
+        return { written: chunkedRowsWritten(written), wrote: yield* transactionWrote(client) }
+      })
+    )
+
+/**
+ * Derive one turn's board through the bridge.
+ *
+ * The stored value is plain JSON — `board_state.board` is `jsonb`, which has no
+ * `bigint`, and boards are domain data. {@link exactJson} refuses to launder an
+ * integer past 2^53 rather than storing a quiet lie; nothing on a savegame's
+ * board can reach that, and if one ever does the turn is skipped and said so.
+ */
+const deriveBoard = (
+  runner: DerivationRunner,
+  gameId: string,
+  places: ReadonlyArray<JsonObject>,
+  turn: number
+): Effect.Effect<Either.Either<BoardRow, IngestSkip>> =>
+  Effect.map(
+    Effect.either(runner({ operation: "board", gameId, places, turn: BigInt(turn) })),
+    Either.match({
+      onLeft: (error: DerivationError): Either.Either<BoardRow, IngestSkip> =>
+        Either.left(
+          skip(gameId, "boardUnavailable", `turn ${String(turn)}: ${error._tag}`)
+        ),
+      onRight: (record) =>
+        Option.match(exactJson(record), {
+          onNone: (): Either.Either<BoardRow, IngestSkip> =>
+            Either.left(
+              skip(gameId, "boardUnavailable", `turn ${String(turn)}: board is not storable JSON`)
+            ),
+          onSome: (board) => Either.right({ turn, board })
+        })
+    })
+  )
+
+/** What one game's board phase did. */
+interface BoardPass {
+  readonly written: number
+  readonly wroteInTransaction: boolean
+  readonly skips: readonly IngestSkip[]
+}
+
+const NO_BOARDS: BoardPass = { written: 0, wroteInTransaction: false, skips: [] }
+
+/**
+ * One game's boards: discover, resume, derive serially, commit separately.
+ *
+ * Serial *within* a game because the python loaders share
+ * `<cache_root>/<game_id>` and are not concurrency-safe — the same reason
+ * `replay_lock` exists in the gateway. The commit is its own transaction,
+ * after the run's document transaction: a board failure must never roll back a
+ * run's `games`/`turns`/`player_turns` rows.
+ */
+const ingestBoards = (
+  db: Database,
+  client: SqlClient.SqlClient,
+  boards: BoardOptions,
+  runner: DerivationRunner,
+  runsRoot: string,
+  data: RunData
+): Effect.Effect<BoardPass, SqlError> =>
+  Effect.gen(function*() {
+    const saved = savedTurns(runsRoot, data.gameId)
+    if (saved.length === 0) {
+      return NO_BOARDS
+    }
+    const candidates = boardCandidates(
+      data.gameId,
+      saved,
+      yield* recordedTurns(db, data.gameId),
+      yield* storedBoardTurns(db, data.gameId),
+      boards.turnLimit
+    )
+    if (candidates.turns.length === 0) {
+      return { ...NO_BOARDS, skips: candidates.skips }
+    }
+    const places = Option.match(data.manifest.value, {
+      onNone: (): ReadonlyArray<JsonObject> => [],
+      onSome: derivationPlaces
+    })
+    const derived = yield* Effect.forEach(
+      candidates.turns,
+      (turn) => deriveBoard(runner, data.gameId, places, turn),
+      { concurrency: 1 }
+    )
+    const committed = yield* writeBoards(db, client, data.gameId, Arr.getRights(derived))
+    return {
+      written: committed.written,
+      wroteInTransaction: committed.wrote,
+      skips: [...candidates.skips, ...Arr.getLefts(derived)]
+    }
+  })
+
+// ---------------------------------------------------------------------------
+// Sweeps
+// ---------------------------------------------------------------------------
+
+/** A record `object` — the narrowing {@link describeSqlProblem} needs. */
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null
 
@@ -1734,22 +2470,9 @@ const readStringField = (source: unknown, key: string): Option.Option<string> =>
 const SQL_SERVER_FIELDS: ReadonlyArray<string> = ["code", "table", "column", "constraint"]
 
 /**
- * What may be said about a `SqlError` in a report line.
- *
- * `ingest-cli.ts` never prints a `SqlError`'s `cause`, because `pg` puts the
- * connection parameters on some of them. That is right, and on its own it left
- * every data-driven failure undiagnosable: one line reading `error: Failed to
- * execute QueryPromise`, with no table, no column, no value and no game id. The
- * game id is the call site's and is not a secret; these four fields are the
- * server's own and are not either.
- */
-/**
- * How far down `cause` to look, and why there is a limit at all.
- *
- * The server's fields are not at a fixed depth: `pg` puts them on the
+ * How far down `cause` to look: `pg` puts the server's fields on the
  * `DatabaseError` that *is* `SqlError.cause`, while PGlite wraps that error once
- * more, so the same fields sit one level further down. Four links reaches both
- * with room to spare and cannot loop on a cyclic `cause`.
+ * more. Four links reaches both and cannot loop on a cyclic `cause`.
  */
 const MAX_CAUSE_DEPTH = 4
 
@@ -1764,6 +2487,7 @@ const problemFields = (link: unknown): ReadonlyArray<string> =>
     })
   )
 
+/** What may be said about a `SqlError` in a report line. Never its `cause`. */
 export const describeSqlProblem = (error: unknown): string =>
   Option.match(
     Arr.findFirst(
@@ -1776,128 +2500,12 @@ export const describeSqlProblem = (error: unknown): string =>
     }
   )
 
-/**
- * How long a sweep may say `running` before it is presumed dead.
- *
- * A `kill -9` mid-sweep leaves the row saying `running` and nothing reconciles
- * it, so without this the word means "at some point since install". It cannot be
- * shorter than a real sweep of a real archive, and it need not be tight: nothing
- * *decides* anything from `status` — deletion is licensed by a fresh look at the
- * disk — so this only keeps the ledger readable.
- */
-const ABANDONED_SWEEP = "24 hours"
-
-/**
- * Close out this root's sweeps that have been `running` implausibly long.
- *
- * Scoped to one `runs_root` so a sweep of one archive never touches another's
- * ledger, and bounded by the *server's* clock rather than the client's, which is
- * the clock every other timestamp in this table was written by.
- */
-const reconcileAbandonedSweeps = (
-  db: Database,
-  runsRoot: string
-): Effect.Effect<number, SqlError> =>
-  Effect.map(
-    db
-      .update(ingestSweeps)
-      .set({ status: "aborted", finishedAt: sql`now()` })
-      .where(
-        and(
-          eq(ingestSweeps.runsRoot, runsRoot),
-          eq(ingestSweeps.status, "running"),
-          sql`${ingestSweeps.startedAt} < now() - interval '${sql.raw(ABANDONED_SWEEP)}'`
-        )
-      )
-      .returning({ sweepId: ingestSweeps.sweepId }),
-    rowsWritten
-  )
-
-const openSweep = (db: Database, runsRoot: string): Effect.Effect<number, SqlError> =>
-  Effect.map(
-    db
-      .insert(ingestSweeps)
-      .values({ runsRoot, status: "running" })
-      .returning({ sweepId: ingestSweeps.sweepId }),
-    (rows) => rows[0]?.sweepId ?? 0
-  )
-
-const closeSweep = (
-  db: Database,
-  sweepId: number,
-  status: "complete" | "aborted",
-  seenCount: number
-): Effect.Effect<number, SqlError> =>
-  Effect.map(
-    db
-      .update(ingestSweeps)
-      .set({ status, seenCount, finishedAt: sql`now()` })
-      .where(eq(ingestSweeps.sweepId, sweepId))
-      .returning({ sweepId: ingestSweeps.sweepId }),
-    rowsWritten
-  )
-
-/**
- * The runs under this root that are stored, that the sweep did not see, **and
- * that are not on the disk now**.
- *
- * The third clause is the one that matters. The walk happens at the start of a
- * sweep and this runs at the end, and a captured seen-set says nothing about the
- * window in between: measured on a live server, a 40-run sweep A plus an
- * `--game` sweep B that ingested one new run 1.0 s in ended with A reporting
- * `40 unchanged, 1 deleted`, both processes exiting `0`, and B's run gone from
- * every table while sitting on disk. Re-asking the filesystem costs one `lstat`
- * per *candidate* — a set that is empty on every healthy sweep — and it is the
- * same evidence, from the same source, that put the row there.
- *
- * Scoped to `--game`'s ids when there are any: a sweep that only looked at two
- * runs may only delete those two, and a run it never examined is not evidence
- * of anything.
- */
-const staleRuns = (
-  db: Database,
-  runsRoot: string,
-  seen: readonly string[],
-  filter: ReadonlySet<string>
-): Effect.Effect<readonly string[], SqlError> =>
-  Effect.map(
-    db
-      .select({ gameId: runs.gameId })
-      .from(runs)
-      .where(eq(runs.runsRoot, runsRoot)),
-    (rows) =>
-      rows
-        .map((row) => row.gameId)
-        .filter((gameId) =>
-          !seen.includes(gameId) &&
-          (filter.size === 0 || filter.has(gameId)) &&
-          !isRunOnDisk(runsRoot, gameId)
-        )
-  )
-
-const deleteRuns = (
-  db: Database,
-  runsRoot: string,
-  gameIds: readonly string[]
-): Effect.Effect<number, SqlError> =>
-  gameIds.length === 0
-    ? Effect.succeed(0)
-    : Effect.map(
-      db
-        .delete(runs)
-        // `inArray`, emphatically not `notInArray(…, [])`: drizzle renders an
-        // empty `notInArray` as the literal `true`, which would have deleted
-        // every run under the root the moment one run went stale.
-        .where(and(eq(runs.runsRoot, runsRoot), inArray(runs.gameId, [...gameIds])))
-        .returning({ gameId: runs.gameId }),
-      rowsWritten
-    )
-
 /** One run's pass through the sweep: what it wrote, and what it could not. */
 interface RunPass {
   /** `Option.none()` exactly when the database refused the run. */
   readonly write: Option.Option<RunWrite>
   readonly skips: readonly IngestSkip[]
+  readonly data: RunData
 }
 
 /**
@@ -1905,44 +2513,35 @@ interface RunPass {
  *
  * Two properties, both structural:
  *
- * 1. **Bounded residency.** `collectRun` is called *inside* `Effect.suspend`, so
- *    the run's bytes are read when this step runs and are unreachable the moment
- *    it finishes. Building the whole root's artifacts up front — which is what a
- *    `gameIds.map(collectRun)` before the loop does — makes peak memory linear
- *    in the *archive*: measured at 477 MB of resident growth for a 480 MiB root,
- *    and the real corpus is 845 MB at the default PPM head. Collect, write,
- *    drop costs nothing and bounds it by the largest single run.
+ * 1. **Bounded residency.** `collectRun` runs *inside* `Effect.suspend`, so the
+ *    run's bytes are read when this step runs and are unreachable the moment it
+ *    finishes. Building every run's data up front makes peak memory linear in
+ *    the *archive*; collect, write, drop bounds it by the largest single run.
  * 2. **Isolation.** A `SqlError` from one run's transaction becomes that run's
- *    reported skip and nothing more. Without this, one refused row aborted the
- *    `Effect.forEach` and every run *after* it in `readdir` order — an arbitrary
- *    subset, chosen by the directory's hash order — never reached the database
- *    at all. The fs backend answers per run; so does this.
+ *    reported skip and nothing more. The fs backend answers per run; so does
+ *    this.
  */
 const ingestOne = (
   db: Database,
   client: SqlClient.SqlClient,
   runsRoot: string,
-  sweepId: number,
   gameId: string,
   options: IngestOptions
 ): Effect.Effect<RunPass> =>
   Effect.suspend(() => {
-    const artifacts = collectRun(runsRoot, gameId, options)
+    const data = collectRun(runsRoot, gameId, options)
     return Effect.map(
-      Effect.either(ingestRun(db, client, runsRoot, sweepId, artifacts)),
+      Effect.either(ingestRun(db, client, data)),
       Either.match({
         onLeft: (error): RunPass => ({
           write: Option.none(),
           skips: [
-            ...artifacts.skips,
-            {
-              entry: gameId,
-              reason: "databaseRefused" as const,
-              detail: Option.some(describeSqlProblem(error))
-            }
-          ]
+            ...data.skips,
+            skip(gameId, "databaseRefused", describeSqlProblem(error))
+          ],
+          data
         }),
-        onRight: (write): RunPass => ({ write: Option.some(write), skips: artifacts.skips })
+        onRight: (write): RunPass => ({ write: Option.some(write), skips: data.skips, data })
       })
     )
   })
@@ -1955,31 +2554,73 @@ const inspectOne = (
   options: IngestOptions
 ): Effect.Effect<{ readonly result: RunResult; readonly skips: readonly IngestSkip[] }, SqlError> =>
   Effect.suspend(() => {
-    const artifacts = collectRun(runsRoot, gameId, options)
-    return Effect.map(storedHash(db, runsRoot, gameId), (existing) => ({
-      result: {
-        gameId,
-        outcome: Option.match(existing, {
+    const data = collectRun(runsRoot, gameId, options)
+    return Effect.map(storedHash(db, gameId), (existing) => ({
+      result: runResult(
+        data,
+        Option.match(existing, {
           onNone: (): RunOutcome => "inserted",
-          onSome: (hash) => (sameBytes(hash, artifacts.contentHash) ? "unchanged" : "updated")
+          onSome: (hash) => (sameBytes(hash, data.contentHash) ? "unchanged" : "updated")
         }),
-        unusableDocuments:
-          artifacts.documents.filter((document) => document.status === "unusable").length,
-        manifestUndecodable: artifacts.advisory.undecodable,
-        writes: NO_WRITES
-      },
-      skips: artifacts.skips
+        NO_WRITES
+      ),
+      skips: data.skips
     }))
   })
 
 /**
+ * The stored games that the sweep did not see **and that are not on the disk
+ * now**.
+ *
+ * The third clause is the one that matters. The walk happens at the start of a
+ * sweep and this at the end; a captured seen-set says nothing about the window
+ * between. Re-asking the filesystem costs one `lstat` per *candidate* — a set
+ * that is empty on every healthy sweep — and it is the same evidence, from the
+ * same source, that put the row there.
+ */
+const staleGames = (
+  db: Database,
+  runsRoot: string,
+  seen: readonly string[],
+  filter: ReadonlySet<string>
+): Effect.Effect<readonly string[], SqlError> =>
+  Effect.map(
+    db.select({ gameId: games.gameId }).from(games),
+    (rows) =>
+      rows
+        .map((row) => row.gameId)
+        .filter((gameId) =>
+          !seen.includes(gameId) &&
+          (filter.size === 0 || filter.has(gameId)) &&
+          !isRunOnDisk(runsRoot, gameId)
+        )
+  )
+
+const deleteGames = (
+  db: Database,
+  gameIds: readonly string[]
+): Effect.Effect<number, SqlError> =>
+  gameIds.length === 0
+    ? Effect.succeed(0)
+    : Effect.map(
+      db
+        .delete(games)
+        // `inArray`, emphatically not `notInArray(…, [])`: drizzle renders an
+        // empty `notInArray` as the literal `true`, which would delete every
+        // game the moment one went stale.
+        .where(inArray(games.gameId, [...gameIds]))
+        .returning({ gameId: games.gameId }),
+      rowsWritten
+    )
+
+/**
  * Walk a `runs_root` and reconcile it into the database.
  *
- * The whole pipeline: close out any abandoned sweep of this root, open a sweep,
- * classify every directory entry, read and write each run in its own
- * transaction, delete the runs that are neither seen nor on the disk, close the
- * sweep. A dry run does all of the reading and none of the writing — it does not
- * even open a sweep row — and reports exactly what would have changed.
+ * The whole pipeline: classify every directory entry, read and write each run's
+ * documents in its own transaction, derive the boards each run is missing (in
+ * their own transactions, after the documents), prune when asked. A dry run
+ * does all of the reading and none of the writing, and reports exactly what
+ * would have changed.
  *
  * A run the database refused is a reported skip, not the end of the sweep, and
  * it is *not* a licence to delete anything: it was seen, so it stays out of the
@@ -1997,6 +2638,18 @@ export const ingest = (
     const client = yield* SqlClient.SqlClient
     const runsRoot = resolveRunsRoot(options.runsRoot)
 
+    const boards = Option.filter(options.boards, () => !options.dryRun)
+    yield* Effect.forEach(
+      Option.toArray(boards),
+      (configured) =>
+        boardCacheRootValid(runsRoot, configured.cacheRoot)
+          ? Effect.void
+          : Effect.fail(
+            new BoardCacheRootInvalid({ cacheRoot: configured.cacheRoot, runsRoot })
+          ),
+      { discard: true }
+    )
+
     const walked = yield* walk(runsRoot, options.gameIds)
     const seen = walked.gameIds.length + walked.skipped.length
 
@@ -2006,10 +2659,11 @@ export const ingest = (
         (gameId) => inspectOne(db, runsRoot, gameId, options),
         { concurrency: 1 }
       )
-      const stale = yield* staleRuns(db, runsRoot, walked.gameIds, options.gameIds)
+      const stale = options.prune
+        ? yield* staleGames(db, runsRoot, walked.gameIds, options.gameIds)
+        : []
       return {
         runsRoot,
-        sweepId: Option.none(),
         dryRun: true,
         status: "complete" as const,
         seen,
@@ -2021,48 +2675,84 @@ export const ingest = (
       }
     }
 
-    const reconciled = yield* reconcileAbandonedSweeps(db, runsRoot)
-    const sweepId = yield* openSweep(db, runsRoot)
-    // Anything that fails after the sweep is open leaves it `aborted`, never
-    // `running`. That is bookkeeping, not a safety property: the ledger licenses
-    // nothing, because the delete phase re-reads the disk.
-    const swept = <A>(effect: Effect.Effect<A, SqlError>): Effect.Effect<A, SqlError> =>
-      Effect.tapError(effect, () => Effect.ignore(closeSweep(db, sweepId, "aborted", 0)))
-
     const passes = yield* Effect.forEach(
       walked.gameIds,
-      (gameId) => ingestOne(db, client, runsRoot, sweepId, gameId, options),
+      (gameId) => ingestOne(db, client, runsRoot, gameId, options),
       { concurrency: 1 }
     )
     const written = passes.flatMap((pass) => Option.toArray(pass.write))
 
-    // The `SELECT` that finds the stale ids, the filesystem recheck that
-    // confirms them and the `DELETE` that removes them are one transaction, so
-    // no row can be inserted between the decision and the deletion.
-    const removal = yield* swept(
-      client.withTransaction(
+    // The board phase runs after every document transaction has committed, so a
+    // board derived here is derived against rows that already exist. Across
+    // games it is concurrent; within one it is serial.
+    const boarded = yield* Option.match(boards, {
+      onNone: () => Effect.succeed<ReadonlyArray<readonly [string, BoardPass]>>([]),
+      onSome: (configured) => {
+        const runner = Option.getOrElse(
+          configured.runner,
+          () =>
+            pythonDerivationRunner({
+              repoRoot: configured.repoRoot,
+              runsRoot,
+              cacheRoot: configured.cacheRoot
+            })
+        )
+        return Effect.forEach(
+          passes.filter((pass) => Option.isSome(pass.write)),
+          (pass) =>
+            Effect.map(
+              Effect.either(ingestBoards(db, client, configured, runner, runsRoot, pass.data)),
+              (outcome) =>
+                [
+                  pass.data.gameId,
+                  Either.getOrElse(outcome, (error): BoardPass => ({
+                    ...NO_BOARDS,
+                    skips: [skip(pass.data.gameId, "databaseRefused", describeSqlProblem(error))]
+                  }))
+                ] as const
+            ),
+          { concurrency: Math.max(1, configured.concurrency) }
+        )
+      }
+    })
+    const boardsByGame = new Map(boarded)
+
+    const stale = options.prune
+      // The `SELECT` that finds the stale ids, the filesystem recheck that
+      // confirms them and the `DELETE` that removes them are one transaction, so
+      // no row can be inserted between the decision and the deletion.
+      ? yield* client.withTransaction(
         Effect.flatMap(
-          staleRuns(db, runsRoot, walked.gameIds, options.gameIds),
-          (stale) =>
-            Effect.map(deleteRuns(db, runsRoot, stale), (deleted) => ({ stale, deleted }))
+          staleGames(db, runsRoot, walked.gameIds, options.gameIds),
+          (ids) => Effect.map(deleteGames(db, ids), (deleted) => ({ ids, deleted }))
         )
       )
-    )
-    const closed = yield* closeSweep(db, sweepId, "complete", walked.gameIds.length)
+      : { ids: [] as readonly string[], deleted: 0 }
 
+    const boardWrites = [...boardsByGame.values()].reduce(
+      (total, pass) => total + pass.written,
+      0
+    )
     return {
       runsRoot,
-      sweepId: Option.some(sweepId),
       dryRun: false,
       status: "complete" as const,
       seen,
-      runs: written.map((entry) => entry.result),
-      deleted: removal.stale,
-      skipped: [...walked.skipped, ...passes.flatMap((pass) => pass.skips)],
+      runs: written.map((entry) => ({
+        ...entry.result,
+        boardsWritten: boardsByGame.get(entry.result.gameId)?.written ?? 0
+      })),
+      deleted: stale.ids,
+      skipped: [
+        ...walked.skipped,
+        ...passes.flatMap((pass) => pass.skips),
+        ...[...boardsByGame.values()].flatMap((pass) => pass.skips)
+      ],
       writes: addWrites(
         sumWrites(written.map((entry) => entry.result.writes)),
-        { ...NO_WRITES, deletes: removal.deleted, sweeps: 1 + closed + reconciled }
+        { ...NO_WRITES, boards: boardWrites, deletes: stale.deleted }
       ),
-      transactionsWithWrites: written.filter((entry) => entry.wroteInTransaction).length
+      transactionsWithWrites: written.filter((entry) => entry.wroteInTransaction).length +
+        [...boardsByGame.values()].filter((pass) => pass.wroteInTransaction).length
     }
   })
