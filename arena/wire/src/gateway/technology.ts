@@ -13,12 +13,13 @@
 
 import { Schema } from 'effect';
 import { WireInt, WireNonNegativeInt, WireNumber } from '../numeric.ts';
+import { SchemaVersion1 } from './games.ts';
 import {
-  decodeTolerant,
-  encodeTolerant,
-  type TolerantDecoder,
-  type TolerantEncoder,
-} from '../tolerant.ts';
+  decodeWire,
+  encodeWire,
+  type WireDecoder,
+  type WireEncoder,
+} from '../codec.ts';
 
 /** Highest Freeciv technology id accepted by the catalog reader (`supervisor.py:427`). */
 export const MAX_TECHNOLOGY_ID = 511;
@@ -50,20 +51,20 @@ export type Technology = typeof Technology.Type;
 
 /** The catalog used identically on disk and when embedded in a replay response. */
 export const TechnologyCatalog = Schema.Struct({
-  schema_version: WireNonNegativeInt,
+  schema_version: SchemaVersion1,
   technologies: Schema.Array(Technology),
 }).annotations({ identifier: 'TechnologyCatalog' });
 /** A replay technology catalog. */
 export type TechnologyCatalog = typeof TechnologyCatalog.Type;
 
 /** Decode either an on-disk or embedded technology catalog. */
-export const decodeTechnologyCatalog: TolerantDecoder<TechnologyCatalog> = decodeTolerant(
+export const decodeTechnologyCatalog: WireDecoder<TechnologyCatalog> = decodeWire(
   TechnologyCatalog,
   'TechnologyCatalog',
 );
 
-/** Re-encode a decoded technology catalog, preserving unknown fields. */
-export const encodeTechnologyCatalog: TolerantEncoder<
+/** Re-encode a decoded technology catalog, preserving the current schema. */
+export const encodeTechnologyCatalog: WireEncoder<
   TechnologyCatalog,
   typeof TechnologyCatalog.Encoded
-> = encodeTolerant(TechnologyCatalog, 'TechnologyCatalog');
+> = encodeWire(TechnologyCatalog, 'TechnologyCatalog');

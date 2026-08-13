@@ -61,6 +61,7 @@ import { GameId } from '../ids.ts';
 import { JsonObject } from '../json.ts';
 import { WireInt, WireNonNegativeInt } from '../numeric.ts';
 import { GATEWAY_PROBLEM_MESSAGES } from './problem.ts';
+import { SchemaVersion1 } from './games.ts';
 import {
   MAX_TECHNOLOGY_ID,
   Technology,
@@ -79,11 +80,11 @@ export {
   encodeTechnologyCatalog,
 };
 import {
-  decodeTolerant,
-  encodeTolerant,
-  type TolerantDecoder,
-  type TolerantEncoder,
-} from '../tolerant.ts';
+  decodeWire,
+  encodeWire,
+  type WireDecoder,
+  type WireEncoder,
+} from '../codec.ts';
 
 // ---------------------------------------------------------------------------
 // Numbers
@@ -125,7 +126,7 @@ export const ReplayWarning = Schema.Struct({
 export type ReplayWarning = typeof ReplayWarning.Type;
 
 /** Decode one {@link ReplayWarning}. */
-export const decodeReplayWarning: TolerantDecoder<ReplayWarning> = decodeTolerant(
+export const decodeReplayWarning: WireDecoder<ReplayWarning> = decodeWire(
   ReplayWarning,
   'ReplayWarning',
 );
@@ -151,7 +152,7 @@ export const ResearchState = Schema.Struct({
 export type ResearchState = typeof ResearchState.Type;
 
 /** Decode one {@link ResearchState}. */
-export const decodeResearchState: TolerantDecoder<ResearchState> = decodeTolerant(
+export const decodeResearchState: WireDecoder<ResearchState> = decodeWire(
   ResearchState,
   'ResearchState',
 );
@@ -224,7 +225,7 @@ export type ReplayPlayer = typeof ReplayPlayer.Type;
  * Players are sorted `(place is None, place ?? player_id, player_name)`.
  */
 export const ReplaySnapshot = Schema.Struct({
-  schema_version: WireNonNegativeInt,
+  schema_version: SchemaVersion1,
   game_id: GameId,
   turn: WireNonNegativeInt,
   year: WireInt,
@@ -234,7 +235,7 @@ export const ReplaySnapshot = Schema.Struct({
 export type ReplaySnapshot = typeof ReplaySnapshot.Type;
 
 /** Decode one {@link ReplaySnapshot}. */
-export const decodeReplaySnapshot: TolerantDecoder<ReplaySnapshot> = decodeTolerant(
+export const decodeReplaySnapshot: WireDecoder<ReplaySnapshot> = decodeWire(
   ReplaySnapshot,
   'ReplaySnapshot',
 );
@@ -266,7 +267,7 @@ export const decodeReplaySnapshot: TolerantDecoder<ReplaySnapshot> = decodeToler
  * (`supervisor.py:10051`) — so it is accepted on decode and never required.
  */
 export const ReplayResponse = Schema.Struct({
-  schema_version: WireNonNegativeInt,
+  schema_version: SchemaVersion1,
   game_id: GameId,
   available: Schema.Boolean,
   catalog: Schema.NullOr(TechnologyCatalog),
@@ -281,16 +282,16 @@ export const ReplayResponse = Schema.Struct({
 export type ReplayResponse = typeof ReplayResponse.Type;
 
 /** Decode a {@link ReplayResponse}. */
-export const decodeReplayResponse: TolerantDecoder<ReplayResponse> = decodeTolerant(
+export const decodeReplayResponse: WireDecoder<ReplayResponse> = decodeWire(
   ReplayResponse,
   'ReplayResponse',
 );
 
-/** Re-encode a {@link ReplayResponse}, unknown fields included. */
-export const encodeReplayResponse: TolerantEncoder<
+/** Re-encode a {@link ReplayResponse}, the current schema. */
+export const encodeReplayResponse: WireEncoder<
   ReplayResponse,
   typeof ReplayResponse.Encoded
-> = encodeTolerant(ReplayResponse, 'ReplayResponse');
+> = encodeWire(ReplayResponse, 'ReplayResponse');
 
 // ---------------------------------------------------------------------------
 // replay.json — the query envelope
@@ -329,7 +330,7 @@ export const ReplayQuery = Schema.Struct({
 export type ReplayQuery = typeof ReplayQuery.Type;
 
 /** Decode a {@link ReplayQuery} from already-parsed values. */
-export const decodeReplayQuery: TolerantDecoder<ReplayQuery> = decodeTolerant(
+export const decodeReplayQuery: WireDecoder<ReplayQuery> = decodeWire(
   ReplayQuery,
   'ReplayQuery',
 );
@@ -472,7 +473,7 @@ export type BoardPlayer = typeof BoardPlayer.Type;
  * `"WRAPX"`) and may be `""`.
  */
 export const BoardResponse = Schema.Struct({
-  schema_version: WireNonNegativeInt,
+  schema_version: SchemaVersion1,
   game_id: GameId,
   turn: WireNonNegativeInt,
   width: WireNonNegativeInt,
@@ -493,16 +494,16 @@ export const BoardResponse = Schema.Struct({
 export type BoardResponse = typeof BoardResponse.Type;
 
 /** Decode a {@link BoardResponse}. */
-export const decodeBoardResponse: TolerantDecoder<BoardResponse> = decodeTolerant(
+export const decodeBoardResponse: WireDecoder<BoardResponse> = decodeWire(
   BoardResponse,
   'BoardResponse',
 );
 
-/** Re-encode a {@link BoardResponse}, unknown fields included. */
-export const encodeBoardResponse: TolerantEncoder<
+/** Re-encode a {@link BoardResponse}, the current schema. */
+export const encodeBoardResponse: WireEncoder<
   BoardResponse,
   typeof BoardResponse.Encoded
-> = encodeTolerant(BoardResponse, 'BoardResponse');
+> = encodeWire(BoardResponse, 'BoardResponse');
 
 /**
  * The validated `?turn=` parameter (`_board_query`,
@@ -521,7 +522,7 @@ export const BoardQuery = Schema.Struct({
 export type BoardQuery = typeof BoardQuery.Type;
 
 /** Decode a {@link BoardQuery} from an already-parsed value. */
-export const decodeBoardQuery: TolerantDecoder<BoardQuery> = decodeTolerant(
+export const decodeBoardQuery: WireDecoder<BoardQuery> = decodeWire(
   BoardQuery,
   'BoardQuery',
 );
@@ -583,7 +584,7 @@ export const GameEvent = Schema.Struct({
 export type GameEvent = typeof GameEvent.Type;
 
 /** Decode one {@link GameEvent}. */
-export const decodeGameEvent: TolerantDecoder<GameEvent> = decodeTolerant(GameEvent, 'GameEvent');
+export const decodeGameEvent: WireDecoder<GameEvent> = decodeWire(GameEvent, 'GameEvent');
 
 /**
  * `GET /v1/games/{id}/events.json` — the spectator event log
@@ -609,7 +610,7 @@ export const decodeGameEvent: TolerantDecoder<GameEvent> = decodeTolerant(GameEv
  * guaranteed to be keyed by any `kind` that actually appears in `events`.
  */
 export const GameEventsResponse = Schema.Struct({
-  schema_version: WireNonNegativeInt,
+  schema_version: SchemaVersion1,
   game_id: GameId,
   available: Schema.Boolean,
   events: Schema.Array(GameEvent),
@@ -626,16 +627,16 @@ export const GameEventsResponse = Schema.Struct({
 export type GameEventsResponse = typeof GameEventsResponse.Type;
 
 /** Decode a {@link GameEventsResponse}. */
-export const decodeGameEventsResponse: TolerantDecoder<GameEventsResponse> = decodeTolerant(
+export const decodeGameEventsResponse: WireDecoder<GameEventsResponse> = decodeWire(
   GameEventsResponse,
   'GameEventsResponse',
 );
 
-/** Re-encode a {@link GameEventsResponse}, unknown fields included. */
-export const encodeGameEventsResponse: TolerantEncoder<
+/** Re-encode a {@link GameEventsResponse}, the current schema. */
+export const encodeGameEventsResponse: WireEncoder<
   GameEventsResponse,
   typeof GameEventsResponse.Encoded
-> = encodeTolerant(GameEventsResponse, 'GameEventsResponse');
+> = encodeWire(GameEventsResponse, 'GameEventsResponse');
 
 // ---------------------------------------------------------------------------
 // The problem messages these three routes can produce

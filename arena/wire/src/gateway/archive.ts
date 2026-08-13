@@ -55,7 +55,7 @@
  * - **No server-chosen string is spelled as a `Schema.Literal`.**  `label`,
  *   `video.kind` and `schema_version` are hardcoded in Python today, but
  *   locking them in the schema would turn a harmless server bump into a failed
- *   decode — exactly the failure `decodeTolerant` exists to prevent.  The
+ *   decode — exactly the failure `decodeWire` exists to prevent.  The
  *   expected values are exported as constants instead, so drift is a *branch*
  *   a caller can take, not an exception.  *Formats* (a `#RRGGBB` colour, a
  *   `NNNNNN.png` file name, a game id) are refined, because those are
@@ -80,12 +80,12 @@ import { Option, Schema } from 'effect';
 import { FrameIndex, GameId } from '../ids.ts';
 import { WireInt, WireNonNegativeInt } from '../numeric.ts';
 import {
-  decodeTolerant,
-  encodeTolerant,
-  type TolerantDecoder,
-  type TolerantEncoder,
-} from '../tolerant.ts';
-import { GameStatus } from './games.ts';
+  decodeWire,
+  encodeWire,
+  type WireDecoder,
+  type WireEncoder,
+} from '../codec.ts';
+import { GameStatus, SchemaVersion1 } from './games.ts';
 
 // ---------------------------------------------------------------------------
 // Constants the producers hardcode
@@ -209,11 +209,11 @@ export const ArchivePngName: Schema.Schema<FrameIndex, string> = Schema.transfor
 ).annotations({ identifier: 'ArchivePngName' });
 
 /** Decode a `watch_frames/` file name as a {@link FrameIndex}. */
-export const decodeArchivePngName: TolerantDecoder<FrameIndex> = decodeTolerant(ArchivePngName);
+export const decodeArchivePngName: WireDecoder<FrameIndex> = decodeWire(ArchivePngName);
 
 /** Encode a {@link FrameIndex} back to its zero-padded on-disk file name. */
-export const encodeArchivePngName: TolerantEncoder<FrameIndex, string> =
-  encodeTolerant(ArchivePngName);
+export const encodeArchivePngName: WireEncoder<FrameIndex, string> =
+  encodeWire(ArchivePngName);
 
 /**
  * The turn an autosave name declares, per {@link ARCHIVE_PPM_RE} — `None` in
@@ -301,8 +301,7 @@ export const MAP_PLAYER_COLOR_RE: RegExp = /^#[0-9A-F]{6}$/;
  *
  * The viewer's `MapPlayer` (`viewer/src/types.ts:108-118`) declares a `nation`
  * key no producer emits and marks `seat_id`/`place`/`controller_*` optional;
- * this schema follows the producers, and an unexpected `nation` would survive
- * on the decoded value anyway (excess properties are preserved).
+ * this schema follows the producers and rejects the viewer-only `nation` key.
  */
 export const MapPlayer = Schema.Struct({
   player_id: PpmPlayerId,
@@ -325,7 +324,7 @@ export const MapPlayer = Schema.Struct({
 export type MapPlayer = typeof MapPlayer.Type;
 
 /** Decode one {@link MapPlayer}. */
-export const decodeMapPlayer: TolerantDecoder<MapPlayer> = decodeTolerant(MapPlayer);
+export const decodeMapPlayer: WireDecoder<MapPlayer> = decodeWire(MapPlayer);
 
 /**
  * True when this row was matched to a configured place — i.e. it is scored
@@ -356,11 +355,11 @@ export const ReplayFrame = Schema.Struct({
 export type ReplayFrame = typeof ReplayFrame.Type;
 
 /** Decode one {@link ReplayFrame}. */
-export const decodeReplayFrame: TolerantDecoder<ReplayFrame> = decodeTolerant(ReplayFrame);
+export const decodeReplayFrame: WireDecoder<ReplayFrame> = decodeWire(ReplayFrame);
 
 /** Re-encode one frame row, unknown server fields included. */
-export const encodeReplayFrame: TolerantEncoder<ReplayFrame, typeof ReplayFrame.Encoded> =
-  encodeTolerant(ReplayFrame);
+export const encodeReplayFrame: WireEncoder<ReplayFrame, typeof ReplayFrame.Encoded> =
+  encodeWire(ReplayFrame);
 
 /**
  * The viewer's `legacyFrameTurn` (`viewer/src/api.ts:84-90`), ported exactly:
@@ -391,7 +390,7 @@ export const legacyFrameTurn = (frame: {
  * `watch.json` instead, so this schema's only oracle is the Python.
  */
 export const FrameManifest = Schema.Struct({
-  schema_version: WireInt,
+  schema_version: SchemaVersion1,
   game_id: GameId,
   label: Schema.String,
   frames: Schema.Array(ReplayFrame),
@@ -401,13 +400,13 @@ export const FrameManifest = Schema.Struct({
 export type FrameManifest = typeof FrameManifest.Type;
 
 /** Decode a `/frames` listing. */
-export const decodeFrameManifest: TolerantDecoder<FrameManifest> = decodeTolerant(FrameManifest);
+export const decodeFrameManifest: WireDecoder<FrameManifest> = decodeWire(FrameManifest);
 
 /** Re-encode a `/frames` listing, unknown server fields included. */
-export const encodeFrameManifest: TolerantEncoder<
+export const encodeFrameManifest: WireEncoder<
   FrameManifest,
   typeof FrameManifest.Encoded
-> = encodeTolerant(FrameManifest);
+> = encodeWire(FrameManifest);
 
 /**
  * One `timeline` row of `watch.json`.
@@ -432,8 +431,8 @@ export const TurnTimelineEntry = Schema.Struct({
 export type TurnTimelineEntry = typeof TurnTimelineEntry.Type;
 
 /** Decode one `timeline` row. */
-export const decodeTurnTimelineEntry: TolerantDecoder<TurnTimelineEntry> =
-  decodeTolerant(TurnTimelineEntry);
+export const decodeTurnTimelineEntry: WireDecoder<TurnTimelineEntry> =
+  decodeWire(TurnTimelineEntry);
 
 /**
  * `watch.json`'s `replay` block.  `available` is hardcoded `true` on the disk
@@ -471,7 +470,7 @@ export type WatchVideoLink = typeof WatchVideoLink.Type;
  * required here and a missing one is real drift worth failing on.
  */
 export const WatchResponse = Schema.Struct({
-  schema_version: WireInt,
+  schema_version: SchemaVersion1,
   label: Schema.String,
   /**
    * The full status document (`_archive_status`, `replay_gateway.py:827-868`,
@@ -482,9 +481,7 @@ export const WatchResponse = Schema.Struct({
    * to a `gateway/status.ts` that was never going to land: `GameStatus` shipped
    * in this same package, in `./games.ts`.  The stub cost real safety —
    * `watch.json`'s `game` block is ~30 fields, so `watch.game.current_turn` was
-   * a type error for every consumer, and a corrupt embedded status (a missing
-   * `outcome`, a `resolved_places` row that would fail `GamePlace`) decoded
-   * clean as preserved excess.
+   * a type error for every consumer and let malformed embedded status data pass.
    */
   game: GameStatus,
   timeline: Schema.Array(TurnTimelineEntry),
@@ -496,13 +493,13 @@ export const WatchResponse = Schema.Struct({
 export type WatchResponse = typeof WatchResponse.Type;
 
 /** Decode a `watch.json` document. */
-export const decodeWatchResponse: TolerantDecoder<WatchResponse> = decodeTolerant(WatchResponse);
+export const decodeWatchResponse: WireDecoder<WatchResponse> = decodeWire(WatchResponse);
 
 /** Re-encode a `watch.json` document, unknown server fields included. */
-export const encodeWatchResponse: TolerantEncoder<
+export const encodeWatchResponse: WireEncoder<
   WatchResponse,
   typeof WatchResponse.Encoded
-> = encodeTolerant(WatchResponse);
+> = encodeWire(WatchResponse);
 
 /** Who built a `watch.json`: the gateway's archive reader, or the supervisor. */
 export type WatchProducer = 'archive' | 'live' | 'unknown';

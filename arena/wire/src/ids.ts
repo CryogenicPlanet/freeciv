@@ -18,7 +18,7 @@
  */
 
 import { Either, Schema } from 'effect';
-import { decodeTolerant, type TolerantDecoder } from './tolerant.ts';
+import { decodeWire, type WireDecoder } from './codec.ts';
 
 /**
  * `GAME_ID_RE` — `agent_eval/replay_gateway.py:35`:
@@ -53,7 +53,7 @@ export const GameId = Schema.String.pipe(
 export type GameId = typeof GameId.Type;
 
 /** Decode an unknown value as a {@link GameId}. */
-export const decodeGameId: TolerantDecoder<GameId> = decodeTolerant(GameId, 'GameId');
+export const decodeGameId: WireDecoder<GameId> = decodeWire(GameId, 'GameId');
 
 /** True when `input` is a well-formed game id. */
 export const isGameId = (input: string): input is GameId => GAME_ID_RE.test(input);
@@ -111,7 +111,7 @@ export const FrameIndex = Schema.Number.pipe(
 export type FrameIndex = typeof FrameIndex.Type;
 
 /** Decode an unknown value as a {@link FrameIndex}. */
-export const decodeFrameIndex: TolerantDecoder<FrameIndex> = decodeTolerant(
+export const decodeFrameIndex: WireDecoder<FrameIndex> = decodeWire(
   FrameIndex,
   'FrameIndex',
 );
@@ -140,8 +140,8 @@ export const FrameIndexFromString: Schema.Schema<FrameIndex, string> = Schema.tr
 ).annotations({ identifier: 'FrameIndexFromString' });
 
 /** Decode a frame index from its canonical decimal string. */
-export const decodeFrameIndexFromString: TolerantDecoder<FrameIndex> =
-  decodeTolerant(FrameIndexFromString);
+export const decodeFrameIndexFromString: WireDecoder<FrameIndex> =
+  decodeWire(FrameIndexFromString);
 
 /**
  * The frame's URL path segment, `"{index}.png"` — the exact thing
@@ -163,8 +163,8 @@ export const FrameIndexFromPngName: Schema.Schema<FrameIndex, string> = Schema.t
 ).annotations({ identifier: 'FrameIndexFromPngName' });
 
 /** Decode a frame index from a `"{n}.png"` path segment. */
-export const decodeFrameIndexFromPngName: TolerantDecoder<FrameIndex> =
-  decodeTolerant(FrameIndexFromPngName);
+export const decodeFrameIndexFromPngName: WireDecoder<FrameIndex> =
+  decodeWire(FrameIndexFromPngName);
 
 /**
  * `TERMINAL_STATES` — `agent_eval/replay_gateway.py:43`:
@@ -203,11 +203,8 @@ export const DERIVED_RUN_STATES = ['interrupted', 'unknown'] as const;
 /**
  * Every run state the gateway is known to emit.
  *
- * Not a closed set at runtime: `_public_text` will pass through *any* string
- * a manifest carries, truncated to 32 characters, so a hand-edited or
- * newer-than-this-build manifest can produce a state outside this union.
- * Decode with {@link RunStateTolerant} when the payload is untrusted; use
- * this schema when a value must be one of the states the port understands.
+ * This is the current version's closed vocabulary. A future state requires a
+ * new schema version and an explicit migration rather than a branded fallback.
  */
 export const RunState = Schema.Literal(
   ...LIVE_RUN_STATES,
@@ -221,34 +218,7 @@ export const RunState = Schema.Literal(
 export type RunState = typeof RunState.Type;
 
 /** Decode an unknown value as a known {@link RunState}. */
-export const decodeRunState: TolerantDecoder<RunState> = decodeTolerant(RunState, 'RunState');
-
-/**
- * A state string the gateway emitted that this build does not recognize.
- * Branded so it cannot be compared against a {@link RunState} by accident:
- * the point is to force the "we don't know what this means" branch into the
- * open instead of letting it fall through a default.
- */
-export const UnrecognizedRunState = Schema.String.pipe(
-  Schema.brand('UnrecognizedRunState'),
-).annotations({ identifier: 'UnrecognizedRunState' });
-/** A state string outside {@link RunState}. */
-export type UnrecognizedRunState = typeof UnrecognizedRunState.Type;
-
-/**
- * The tolerant decode target for a run state: a known {@link RunState} when
- * the string is one, an {@link UnrecognizedRunState} brand otherwise.  Union
- * members are tried in order, so a known state never lands in the fallback.
- */
-export const RunStateTolerant = Schema.Union(RunState, UnrecognizedRunState).annotations({
-  identifier: 'RunStateTolerant',
-});
-/** A known run state, or an unrecognized one kept as a distinct brand. */
-export type RunStateTolerant = typeof RunStateTolerant.Type;
-
-/** Decode any state string, keeping unknown vocabulary rather than failing. */
-export const decodeRunStateTolerant: TolerantDecoder<RunStateTolerant> =
-  decodeTolerant(RunStateTolerant);
+export const decodeRunState: WireDecoder<RunState> = decodeWire(RunState, 'RunState');
 
 const TERMINAL_RUN_STATE_SET: ReadonlySet<string> = new Set<string>(TERMINAL_RUN_STATES);
 
@@ -260,6 +230,6 @@ const TERMINAL_RUN_STATE_SET: ReadonlySet<string> = new Set<string>(TERMINAL_RUN
 export const isTerminalRunState = (state: string): state is (typeof TERMINAL_RUN_STATES)[number] =>
   TERMINAL_RUN_STATE_SET.has(state);
 
-/** True when a decoded run state is one this build knows by name. */
-export const isKnownRunState = (state: RunStateTolerant): state is RunState =>
+/** True when a string belongs to the current schema version. */
+export const isKnownRunState = (state: string): state is RunState =>
   Either.isRight(decodeRunState(state));

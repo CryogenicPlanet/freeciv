@@ -68,22 +68,17 @@
 
 import { Schema } from 'effect';
 import { ControlProtocol } from '../control-protocol.ts';
-import { GameId, RunStateTolerant } from '../ids.ts';
+import { GameId, RunState } from '../ids.ts';
 import { JsonValue } from '../json.ts';
 import { WireFloat, WireInt, WireNumber } from '../numeric.ts';
+import { SchemaVersion1 } from './games.ts';
+import { MAX_TECHNOLOGY_ID } from './technology.ts';
 import {
-  MAX_TECHNOLOGY_ID,
-  Technology,
-  TechnologyCatalog,
-  type Technology as TechnologyType,
-  type TechnologyCatalog as TechnologyCatalogType,
-} from './technology.ts';
-import {
-  decodeTolerant,
-  encodeTolerant,
-  type TolerantDecoder,
-  type TolerantEncoder,
-} from '../tolerant.ts';
+  decodeWire,
+  encodeWire,
+  type WireDecoder,
+  type WireEncoder,
+} from '../codec.ts';
 
 // ---------------------------------------------------------------------------
 // Numbers
@@ -101,39 +96,6 @@ import {
 // ---------------------------------------------------------------------------
 // Vocabularies
 // ---------------------------------------------------------------------------
-
-/**
- * `CONTROL_PROTOCOLS` (`full_control_v2.py:19`), the {@link ControlProtocol}
- * schema over it, and the `candidate in PUBLIC_CONTROL_PROTOCOLS` membership
- * test (`replay_gateway.py:475`) all live in `../control-protocol.ts`.  This
- * module and `./games.ts` had declared them independently and identically.
- *
- * What stays here is what is specific to *this* producer: the manifest is
- * written by the supervisor, not the gateway, so an unrecognized protocol has
- * to survive the round trip rather than be dropped — hence
- * {@link UnrecognizedControlProtocol} and {@link ControlProtocolTolerant}
- * below.
- */
-
-/**
- * A `control_protocol` string outside {@link CONTROL_PROTOCOLS}.  Branded for
- * the same reason `UnrecognizedRunState` is: the gateway's response to an
- * unknown protocol is to drop the field, and that decision has to be taken in
- * the open rather than fall out of a `===` comparison.
- */
-export const UnrecognizedControlProtocol = Schema.String.pipe(
-  Schema.brand('UnrecognizedControlProtocol'),
-).annotations({ identifier: 'UnrecognizedControlProtocol' });
-/** A `control_protocol` string outside {@link CONTROL_PROTOCOLS}. */
-export type UnrecognizedControlProtocol = typeof UnrecognizedControlProtocol.Type;
-
-/** A known {@link ControlProtocol}, or an unknown one kept as a distinct brand. */
-export const ControlProtocolTolerant = Schema.Union(
-  ControlProtocol,
-  UnrecognizedControlProtocol,
-).annotations({ identifier: 'ControlProtocolTolerant' });
-/** A known {@link ControlProtocol}, or an unknown one kept as a distinct brand. */
-export type ControlProtocolTolerant = typeof ControlProtocolTolerant.Type;
 
 /**
  * Every `config.timing_mode` the supervisor can write (`supervisor.py:10601`).
@@ -234,7 +196,7 @@ export type ManifestServerConfig = typeof ManifestServerConfig.Type;
  * `"action_timeout_s": 600.0`, never `600`.
  */
 export const ManifestConfig = Schema.Struct({
-  schema_version: WireInt,
+  schema_version: SchemaVersion1,
   /** `f"session-{game_id[:12]}"`. */
   name: Schema.String,
   /** One of {@link GAME_MODES}. */
@@ -250,7 +212,7 @@ export const ManifestConfig = Schema.Struct({
   /** `"classic"`; the slice refuses anything else (`supervisor.py:10562`). */
   ruleset: Schema.String,
   objective: Schema.String,
-  control_protocol: Schema.optional(ControlProtocolTolerant),
+  control_protocol: Schema.optional(ControlProtocol),
   /** One of {@link AI_DIFFICULTY_LEVELS}. */
   difficulty: Schema.optional(Schema.String),
   /** One of {@link MANIFEST_TIMING_MODES}. */
@@ -338,7 +300,7 @@ export type RecoverySummary = typeof RecoverySummary.Type;
  *   Nothing keeps them in sync afterwards except that both come from one
  *   expression; the gateway reads `state` and falls back to `status` (`:1131`).
  *   Neither is an enum — `_public_text(..., "unknown", 32)` passes any string
- *   through, so this decodes as {@link RunStateTolerant}.
+ *   through, so this decodes as {@link RunState}.
  * - **`benchmark_valid` is tri-state** (`:1087`): `true`/`false` once the run
  *   is terminal, `null` while it is not (unless a reason was already
  *   recorded, which forces `false`).  The gateway hardens it to a strict bool
@@ -357,13 +319,13 @@ export type RecoverySummary = typeof RecoverySummary.Type;
  */
 export const Manifest = Schema.Struct({
   /** `1` in every archived run; present but not yet a discriminator. */
-  schema_version: WireInt,
+  schema_version: SchemaVersion1,
   /** Must equal the requested id or the gateway 404s (`replay_gateway.py:568`). */
   game_id: GameId,
-  state: RunStateTolerant,
+  state: RunState,
   /** The same value as {@link state}, written a second time. */
-  status: RunStateTolerant,
-  control_protocol: Schema.optional(ControlProtocolTolerant),
+  status: RunState,
+  control_protocol: Schema.optional(ControlProtocol),
   benchmark_valid: Schema.NullOr(Schema.Boolean),
   error: Schema.NullOr(Schema.String),
   invalid_reasons: Schema.Array(Schema.String),
@@ -396,11 +358,11 @@ export const Manifest = Schema.Struct({
 export type Manifest = typeof Manifest.Type;
 
 /** Decode a run's `manifest.json`. */
-export const decodeManifest: TolerantDecoder<Manifest> = decodeTolerant(Manifest, 'Manifest');
+export const decodeManifest: WireDecoder<Manifest> = decodeWire(Manifest, 'Manifest');
 
-/** Re-encode a decoded manifest, unknown fields and key order intact. */
-export const encodeManifest: TolerantEncoder<Manifest, Schema.Schema.Encoded<typeof Manifest>> =
-  encodeTolerant(Manifest, 'Manifest');
+/** Re-encode a decoded manifest, the current schema. */
+export const encodeManifest: WireEncoder<Manifest, Schema.Schema.Encoded<typeof Manifest>> =
+  encodeWire(Manifest, 'Manifest');
 
 // ---------------------------------------------------------------------------
 // report.json
@@ -541,11 +503,11 @@ export const Report = Schema.Struct({
 export type Report = typeof Report.Type;
 
 /** Decode a run's `report.json`. */
-export const decodeReport: TolerantDecoder<Report> = decodeTolerant(Report, 'Report');
+export const decodeReport: WireDecoder<Report> = decodeWire(Report, 'Report');
 
-/** Re-encode a decoded report, unknown fields and key order intact. */
-export const encodeReport: TolerantEncoder<Report, Schema.Schema.Encoded<typeof Report>> =
-  encodeTolerant(Report, 'Report');
+/** Re-encode a decoded report, the current schema. */
+export const encodeReport: WireEncoder<Report, Schema.Schema.Encoded<typeof Report>> =
+  encodeWire(Report, 'Report');
 
 // ---------------------------------------------------------------------------
 // victory.json
@@ -623,7 +585,7 @@ export const victoryLabel = (code: string): string => VICTORY_LABEL_LOOKUP.get(c
  */
 export const VictoryRecord = Schema.Struct({
   /** `1` from the writer; the reader never looks at it. */
-  schema_version: Schema.optional(WireInt),
+  schema_version: SchemaVersion1,
   /** The engine's reason code — a {@link VictoryCode} or something newer. */
   victory: Schema.NonEmptyString,
   /** Winning player names; empty on a turn-limit finish. */
@@ -637,46 +599,15 @@ export const VictoryRecord = Schema.Struct({
 export type VictoryRecord = typeof VictoryRecord.Type;
 
 /** Decode a run's `victory.json`. */
-export const decodeVictoryRecord: TolerantDecoder<VictoryRecord> = decodeTolerant(
+export const decodeVictoryRecord: WireDecoder<VictoryRecord> = decodeWire(
   VictoryRecord,
   'VictoryRecord',
 );
 
 /** Re-encode a decoded victory record. */
-export const encodeVictoryRecord: TolerantEncoder<
+export const encodeVictoryRecord: WireEncoder<
   VictoryRecord,
   Schema.Schema.Encoded<typeof VictoryRecord>
-> = encodeTolerant(VictoryRecord, 'VictoryRecord');
-
-// ---------------------------------------------------------------------------
-// replay-catalog.json
-// ---------------------------------------------------------------------------
-
-/**
- * Backwards-compatible name for the shared technology schema.
- *
- * This is the same schema object used by embedded replay catalogs; the alias
- * remains only so existing direct imports do not create a second contract.
- */
-export const TechnologyEntry = Technology;
-/** Backwards-compatible type name for {@link Technology}. */
-export type TechnologyEntry = TechnologyType;
-
-/** Backwards-compatible name for the authoritative on-disk/embedded catalog schema. */
-export const ReplayCatalog = TechnologyCatalog;
-/** Backwards-compatible type name for {@link TechnologyCatalog}. */
-export type ReplayCatalog = TechnologyCatalogType;
-
-/** Decode the authoritative catalog schema under the legacy public error label. */
-export const decodeReplayCatalog: TolerantDecoder<ReplayCatalog> = decodeTolerant(
-  ReplayCatalog,
-  'ReplayCatalog',
-);
-
-/** Encode the authoritative catalog schema under the legacy public error label. */
-export const encodeReplayCatalog: TolerantEncoder<
-  ReplayCatalog,
-  Schema.Schema.Encoded<typeof ReplayCatalog>
-> = encodeTolerant(ReplayCatalog, 'ReplayCatalog');
+> = encodeWire(VictoryRecord, 'VictoryRecord');
 
 export { MAX_TECHNOLOGY_ID };

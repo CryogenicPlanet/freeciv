@@ -11,7 +11,6 @@ import {
   decodeFrameIndexFromString,
   decodeGameId,
   decodeRunState,
-  decodeRunStateTolerant,
   FRAME_INDEX_DIGITS_RE,
   FRAME_INDEX_RE,
   FrameIndex,
@@ -178,18 +177,13 @@ describe('run states', () => {
     expect(accepts(decodeRunState(''))).toBe(false);
   });
 
-  test('the tolerant schema keeps an unknown state instead of failing', () => {
-    expect(rightOrThrow(decodeRunStateTolerant('completed'))).toBe('completed');
-    // `String(...)` because an unrecognized state is branded: the type refuses
-    // to be compared against a bare string, which is the whole point of it.
-    expect(String(rightOrThrow(decodeRunStateTolerant('paused')))).toBe('paused');
-    expect(accepts(decodeRunStateTolerant(7))).toBe(false);
-    expect(accepts(decodeRunStateTolerant(null))).toBe(false);
-  });
-
-  test('isKnownRunState is the branch that forces unknown vocabulary into the open', () => {
-    expect(isKnownRunState(rightOrThrow(decodeRunStateTolerant('running')))).toBe(true);
-    expect(isKnownRunState(rightOrThrow(decodeRunStateTolerant('paused')))).toBe(false);
+  test('the current schema rejects unknown states and non-strings', () => {
+    expect(rightOrThrow(decodeRunState('completed'))).toBe('completed');
+    expect(accepts(decodeRunState('paused'))).toBe(false);
+    expect(accepts(decodeRunState(7))).toBe(false);
+    expect(accepts(decodeRunState(null))).toBe(false);
+    expect(isKnownRunState('running')).toBe(true);
+    expect(isKnownRunState('paused')).toBe(false);
   });
 
   test('isTerminalRunState matches the gateway set exactly', () => {

@@ -5,7 +5,7 @@
  * on-disk files it serves them from — the half of the protocol a *spectator*
  * sees.  The other half, the packets an agent exchanges with the supervisor,
  * is `../agent/index.ts`; the two share `../canon.ts`, `../json.ts`,
- * `../numeric.ts`, `../tolerant.ts` and the vocabularies in `../ids.ts` and
+ * `../numeric.ts`, `../codec.ts` and the vocabularies in `../ids.ts` and
  * `../control-protocol.ts`, and nothing else.
  *
  * Reached as `Gateway` from the package barrel: `Wire.Gateway.decodeManifest`.
@@ -67,7 +67,6 @@ export {
   decodeLeaderboardEntry,
   decodeMatchOutcome,
   decodeMatchOutcomeStatus,
-  decodeMatchOutcomeStatusTolerant,
   decodeMatchVictory,
   decodeUpstreamResult,
   DEFAULT_OBJECTIVE,
@@ -100,7 +99,6 @@ export {
   MATCH_OUTCOME_STATUSES,
   MatchOutcome,
   MatchOutcomeStatus,
-  MatchOutcomeStatusTolerant,
   MatchVictory,
   NATIVE_CONTROLLER,
   NATIVE_CONTROLLER_LABEL,
@@ -118,21 +116,17 @@ export {
   ScoreMetrics,
   TimingMode,
   UNCLAIMED_CONTROLLER_LABEL,
-  UnrecognizedOutcomeStatus,
   UPSTREAM_OUTCOME_STATUSES,
   UpstreamResult,
 } from './games.ts';
 
 export {
   AI_DIFFICULTY_LEVELS,
-  ControlProtocolTolerant,
   decodeManifest,
-  decodeReplayCatalog,
   decodeReport,
   decodeVictoryRecord,
   EmptyManifest,
   encodeManifest,
-  encodeReplayCatalog,
   encodeReport,
   encodeVictoryRecord,
   GAME_MODES,
@@ -144,15 +138,12 @@ export {
   MAX_TECHNOLOGY_ID,
   PLACE_CONTROLLERS,
   RecoverySummary,
-  ReplayCatalog,
   Report,
   ResolvedPlace,
   Score,
   ScorePlayer,
   SEAT_TYPES,
   SeatStats,
-  TechnologyEntry,
-  UnrecognizedControlProtocol,
   VICTORY_LABELS,
   type VictoryCode,
   victoryLabel,

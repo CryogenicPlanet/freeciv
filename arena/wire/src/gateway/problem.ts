@@ -30,14 +30,8 @@
  *
  * ## What this schema deliberately does *not* do
  *
- * It does not prove a payload *is* an error.  Success payloads carry a
- * top-level string `error` too — a manifest's failure note (`manifest.json`
- * `error`), the archive status doc's constant `"Archived game ended with an
- * error."` (`:859`, trap T6), the supervisor's live status — and those decode
- * here perfectly well, because tolerant decoding preserves the rest of the
- * document rather than rejecting it.  Discriminate on the HTTP status, or on
- * {@link isBareGatewayProblem}, which encodes the one structural fact that
- * separates them today: a problem body has exactly one key.
+ * Success payloads may also contain an `error` field, but strict decoding
+ * rejects their additional keys. HTTP status remains the primary discriminator.
  *
  * Nor does it cover full-control-v2 structured errors.  Those are a different
  * envelope entirely — `{schema_version, control_protocol, error: {code,
@@ -53,12 +47,12 @@
 import { Either, Option, Schema } from 'effect';
 import { CANON_UTF8, type CanonError, canonicalBytes, canonicalText } from '../canon.ts';
 import {
-  decodeTolerant,
-  encodeTolerant,
-  isTolerant,
-  type TolerantDecoder,
-  type TolerantEncoder,
-} from '../tolerant.ts';
+  decodeWire,
+  encodeWire,
+  isWire,
+  type WireDecoder,
+  type WireEncoder,
+} from '../codec.ts';
 
 // ---------------------------------------------------------------------------
 // Transport constants
@@ -322,9 +316,7 @@ export const upstreamProblem = (upstreamStatus: number): GatewayProblemResponse 
 
 /**
  * `{"error": "<message>"}` — the gateway's only error body (`:1381-1382`).
- *
- * Tolerant like every schema in this package: a future `{"error": ...,
- * "code": ...}` still decodes, and the unknown key survives a re-encode.
+ * Additional fields require a new explicitly supported problem schema.
  */
 export const GatewayProblem = Schema.Struct({
   /** The public, intentionally non-sensitive message. See {@link GATEWAY_PROBLEM_MESSAGES}. */
@@ -337,27 +329,27 @@ export const GatewayProblem = Schema.Struct({
 export type GatewayProblem = typeof GatewayProblem.Type;
 
 /** Decode an error body the gateway sent. */
-export const decodeGatewayProblem: TolerantDecoder<GatewayProblem> = decodeTolerant(
+export const decodeGatewayProblem: WireDecoder<GatewayProblem> = decodeWire(
   GatewayProblem,
   'GatewayProblem',
 );
 
-/** Re-encode a problem body, unknown keys and their order intact. */
-export const encodeGatewayProblem: TolerantEncoder<
+/** Encode the current problem shape. */
+export const encodeGatewayProblem: WireEncoder<
   GatewayProblem,
   typeof GatewayProblem.Encoded
-> = encodeTolerant(GatewayProblem, 'GatewayProblem');
+> = encodeWire(GatewayProblem, 'GatewayProblem');
 
 /** True when `input` has a string `error`. Not proof it is an *error* body — see {@link isBareGatewayProblem}. */
 export const isGatewayProblem: (input: unknown) => input is GatewayProblem =
-  isTolerant(GatewayProblem);
+  isWire(GatewayProblem);
 
 /** The problem body parsed straight from response text. */
 export const GatewayProblemFromString: Schema.Schema<GatewayProblem, string> =
   Schema.parseJson(GatewayProblem).annotations({ identifier: 'GatewayProblemFromString' });
 
 /** Decode an error body from the raw response text. */
-export const decodeGatewayProblemFromString: TolerantDecoder<GatewayProblem> = decodeTolerant(
+export const decodeGatewayProblemFromString: WireDecoder<GatewayProblem> = decodeWire(
   GatewayProblemFromString,
   'GatewayProblemFromString',
 );

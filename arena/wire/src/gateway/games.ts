@@ -50,16 +50,16 @@
 
 import { Option, Schema } from 'effect';
 import { CONTROL_PROTOCOLS } from '../control-protocol.ts';
-import { GameId, RunStateTolerant } from '../ids.ts';
+import { GameId, RunState } from '../ids.ts';
 import { JsonObject, JsonValue } from '../json.ts';
 import { WireInt } from '../numeric.ts';
 import {
-  decodeTolerant,
-  encodeTolerant,
-  isTolerant,
-  type TolerantDecoder,
-  type TolerantEncoder,
-} from '../tolerant.ts';
+  decodeWire,
+  encodeWire,
+  isWire,
+  type WireDecoder,
+  type WireEncoder,
+} from '../codec.ts';
 
 // ---------------------------------------------------------------------------
 // Numeric primitives
@@ -339,13 +339,7 @@ export const MATCH_OUTCOME_STATUSES = [
 /**
  * The outcome status vocabulary.
  *
- * Unlike `state` — which `_public_text` will pass through from an untrusted
- * manifest, and which is therefore decoded as
- * {@link RunStateTolerant} — every value here is a literal in the gateway's or
- * the supervisor's own source. A status outside this set means the Python side
- * grew a case this build does not model, which is exactly what a parity run
- * should fail on. Use {@link MatchOutcomeStatusTolerant} at boundaries that
- * must survive that instead of failing.
+ * A status outside this set belongs to an unsupported schema version.
  */
 export const MatchOutcomeStatus = Schema.Literal(...MATCH_OUTCOME_STATUSES).annotations({
   identifier: 'MatchOutcomeStatus',
@@ -354,29 +348,10 @@ export const MatchOutcomeStatus = Schema.Literal(...MATCH_OUTCOME_STATUSES).anno
 export type MatchOutcomeStatus = typeof MatchOutcomeStatus.Type;
 
 /** Decode an outcome status, failing on unknown vocabulary. */
-export const decodeMatchOutcomeStatus: TolerantDecoder<MatchOutcomeStatus> = decodeTolerant(
+export const decodeMatchOutcomeStatus: WireDecoder<MatchOutcomeStatus> = decodeWire(
   MatchOutcomeStatus,
   'MatchOutcomeStatus',
 );
-
-/** A status string outside {@link MATCH_OUTCOME_STATUSES}, kept as a brand. */
-export const UnrecognizedOutcomeStatus = Schema.String.pipe(
-  Schema.brand('UnrecognizedOutcomeStatus'),
-).annotations({ identifier: 'UnrecognizedOutcomeStatus' });
-/** A status string outside {@link MATCH_OUTCOME_STATUSES}. */
-export type UnrecognizedOutcomeStatus = typeof UnrecognizedOutcomeStatus.Type;
-
-/** A known status, or an unknown one kept as a distinct brand. */
-export const MatchOutcomeStatusTolerant = Schema.Union(
-  MatchOutcomeStatus,
-  UnrecognizedOutcomeStatus,
-).annotations({ identifier: 'MatchOutcomeStatusTolerant' });
-/** A known status, or an unknown one kept as a distinct brand. */
-export type MatchOutcomeStatusTolerant = typeof MatchOutcomeStatusTolerant.Type;
-
-/** Decode any status string, keeping unknown vocabulary rather than failing. */
-export const decodeMatchOutcomeStatusTolerant: TolerantDecoder<MatchOutcomeStatusTolerant> =
-  decodeTolerant(MatchOutcomeStatusTolerant);
 
 const MATCH_OUTCOME_STATUS_SET: ReadonlySet<string> = new Set<string>(MATCH_OUTCOME_STATUSES);
 
@@ -405,7 +380,7 @@ export const MatchVictory = Schema.Struct({
 export type MatchVictory = typeof MatchVictory.Type;
 
 /** Decode a {@link MatchVictory}. */
-export const decodeMatchVictory: TolerantDecoder<MatchVictory> = decodeTolerant(
+export const decodeMatchVictory: WireDecoder<MatchVictory> = decodeWire(
   MatchVictory,
   'MatchVictory',
 );
@@ -434,7 +409,7 @@ export const MatchOutcome = Schema.Struct({
 export type MatchOutcome = typeof MatchOutcome.Type;
 
 /** Decode a {@link MatchOutcome}. */
-export const decodeMatchOutcome: TolerantDecoder<MatchOutcome> = decodeTolerant(
+export const decodeMatchOutcome: WireDecoder<MatchOutcome> = decodeWire(
   MatchOutcome,
   'MatchOutcome',
 );
@@ -491,7 +466,7 @@ export const GamePlace = Schema.Struct({
 export type GamePlace = typeof GamePlace.Type;
 
 /** Decode a {@link GamePlace}. */
-export const decodeGamePlace: TolerantDecoder<GamePlace> = decodeTolerant(GamePlace, 'GamePlace');
+export const decodeGamePlace: WireDecoder<GamePlace> = decodeWire(GamePlace, 'GamePlace');
 
 // ---------------------------------------------------------------------------
 // LeaderboardEntry
@@ -535,7 +510,7 @@ export const LeaderboardEntry = Schema.Struct({
 export type LeaderboardEntry = typeof LeaderboardEntry.Type;
 
 /** Decode a {@link LeaderboardEntry}. */
-export const decodeLeaderboardEntry: TolerantDecoder<LeaderboardEntry> = decodeTolerant(
+export const decodeLeaderboardEntry: WireDecoder<LeaderboardEntry> = decodeWire(
   LeaderboardEntry,
   'LeaderboardEntry',
 );
@@ -572,11 +547,11 @@ export const decodeLeaderboardEntry: TolerantDecoder<LeaderboardEntry> = decodeT
  *   narrows it to a strict `bool` (dossier T5).
  * - `state`: an open string. `_public_text(..., "unknown", 32)` passes through
  *   whatever a manifest says, so this decodes through
- *   {@link RunStateTolerant} and an unfamiliar state is branded, not rejected.
+ *   {@link RunState} and an unfamiliar state is branded, not rejected.
  */
 export const GameRow = Schema.Struct({
   game_id: GameId,
-  state: RunStateTolerant,
+  state: RunState,
   created_at: Schema.NullOr(Schema.Number),
   finished_at: Schema.NullOr(Schema.Number),
   current_turn: Schema.NullOr(WireInt),
@@ -602,10 +577,10 @@ export const GameRow = Schema.Struct({
 export type GameRow = typeof GameRow.Type;
 
 /** Decode a {@link GameRow}. */
-export const decodeGameRow: TolerantDecoder<GameRow> = decodeTolerant(GameRow, 'GameRow');
+export const decodeGameRow: WireDecoder<GameRow> = decodeWire(GameRow, 'GameRow');
 
-/** Re-encode a {@link GameRow}, unknown fields included. */
-export const encodeGameRow: TolerantEncoder<GameRow, typeof GameRow.Encoded> = encodeTolerant(
+/** Re-encode a {@link GameRow}, the current schema. */
+export const encodeGameRow: WireEncoder<GameRow, typeof GameRow.Encoded> = encodeWire(
   GameRow,
   'GameRow',
 );
@@ -633,16 +608,16 @@ export const GamesIndexResponse = Schema.Struct({
 export type GamesIndexResponse = typeof GamesIndexResponse.Type;
 
 /** Decode a {@link GamesIndexResponse}. */
-export const decodeGamesIndexResponse: TolerantDecoder<GamesIndexResponse> = decodeTolerant(
+export const decodeGamesIndexResponse: WireDecoder<GamesIndexResponse> = decodeWire(
   GamesIndexResponse,
   'GamesIndexResponse',
 );
 
-/** Re-encode a {@link GamesIndexResponse}, unknown fields included. */
-export const encodeGamesIndexResponse: TolerantEncoder<
+/** Re-encode a {@link GamesIndexResponse}, the current schema. */
+export const encodeGamesIndexResponse: WireEncoder<
   GamesIndexResponse,
   typeof GamesIndexResponse.Encoded
-> = encodeTolerant(GamesIndexResponse, 'GamesIndexResponse');
+> = encodeWire(GamesIndexResponse, 'GamesIndexResponse');
 
 // ---------------------------------------------------------------------------
 // The interrupted relabel
@@ -695,19 +670,19 @@ export const InterruptedGameRow = Schema.Struct({
 export type InterruptedGameRow = typeof InterruptedGameRow.Type;
 
 /** Decode an {@link InterruptedGameRow} from its JSON form. */
-export const decodeInterruptedGameRow: TolerantDecoder<InterruptedGameRow> = decodeTolerant(
+export const decodeInterruptedGameRow: WireDecoder<InterruptedGameRow> = decodeWire(
   InterruptedGameRow,
   'InterruptedGameRow',
 );
 
 /**
  * Re-encode an {@link InterruptedGameRow} — the gateway *serves* relabelled
- * rows, so a port needs to write one back out, unknown fields and all.
+ * rows, so a port needs to write one back out, the current schema.
  */
-export const encodeInterruptedGameRow: TolerantEncoder<
+export const encodeInterruptedGameRow: WireEncoder<
   InterruptedGameRow,
   typeof InterruptedGameRow.Encoded
-> = encodeTolerant(InterruptedGameRow, 'InterruptedGameRow');
+> = encodeWire(InterruptedGameRow, 'InterruptedGameRow');
 
 /**
  * Check a *decoded* row (bigint turns, not JSON numbers) against the
@@ -715,7 +690,7 @@ export const encodeInterruptedGameRow: TolerantEncoder<
  * this reads the form {@link asInterruptedRow} produces.
  */
 export const isInterruptedGameRow: (input: unknown) => input is InterruptedGameRow =
-  isTolerant(InterruptedGameRow);
+  isWire(InterruptedGameRow);
 
 const maxBigInt = (left: bigint, right: bigint): bigint => (left > right ? left : right);
 
@@ -807,7 +782,7 @@ export type ArchiveUrls = typeof ArchiveUrls.Type;
 export const GameStatus = Schema.Struct({
   schema_version: SchemaVersion1,
   game_id: GameId,
-  state: RunStateTolerant,
+  state: RunState,
   created_at: Schema.optional(Schema.NullOr(Schema.Number)),
   finished_at: Schema.optional(Schema.NullOr(Schema.Number)),
   benchmark_valid: Schema.NullOr(Schema.Boolean),
@@ -839,14 +814,14 @@ export const GameStatus = Schema.Struct({
 export type GameStatus = typeof GameStatus.Type;
 
 /** Decode a {@link GameStatus}. */
-export const decodeGameStatus: TolerantDecoder<GameStatus> = decodeTolerant(
+export const decodeGameStatus: WireDecoder<GameStatus> = decodeWire(
   GameStatus,
   'GameStatus',
 );
 
-/** Re-encode a {@link GameStatus}, unknown fields included. */
-export const encodeGameStatus: TolerantEncoder<GameStatus, typeof GameStatus.Encoded> =
-  encodeTolerant(GameStatus, 'GameStatus');
+/** Re-encode a {@link GameStatus}, the current schema. */
+export const encodeGameStatus: WireEncoder<GameStatus, typeof GameStatus.Encoded> =
+  encodeWire(GameStatus, 'GameStatus');
 
 // ---------------------------------------------------------------------------
 // GET /v1/games/{id}/result — two unrelated documents
@@ -859,7 +834,7 @@ export const encodeGameStatus: TolerantEncoder<GameStatus, typeof GameStatus.Enc
  * scorer's `alive`, `added_turn`, `removed_turn`, `last_score_turn` and
  * `controller_fingerprint` are dropped, and `metrics` is filtered to
  * {@link PUBLIC_SCORE_METRICS}. The upstream document keeps all of them, which
- * this schema tolerates as unknown fields.
+ * this schema tolerates as the current schema.
  */
 export const ResultPlayer = Schema.Struct({
   seat_id: Schema.String,
@@ -909,7 +884,7 @@ export type ArtifactUrls = typeof ArtifactUrls.Type;
 export const ArchiveResult = Schema.Struct({
   schema_version: SchemaVersion1,
   artifact_id: GameId,
-  state: RunStateTolerant,
+  state: RunState,
   /** Strict bool, as on {@link GameStatus} (`:790`). */
   benchmark_valid: Schema.Boolean,
   timing_mode: omittedOrNull(Schema.String),
@@ -924,14 +899,14 @@ export const ArchiveResult = Schema.Struct({
 export type ArchiveResult = typeof ArchiveResult.Type;
 
 /** Decode an {@link ArchiveResult}. */
-export const decodeArchiveResult: TolerantDecoder<ArchiveResult> = decodeTolerant(
+export const decodeArchiveResult: WireDecoder<ArchiveResult> = decodeWire(
   ArchiveResult,
   'ArchiveResult',
 );
 
-/** Re-encode an {@link ArchiveResult}, unknown fields included. */
-export const encodeArchiveResult: TolerantEncoder<ArchiveResult, typeof ArchiveResult.Encoded> =
-  encodeTolerant(ArchiveResult, 'ArchiveResult');
+/** Re-encode an {@link ArchiveResult}, the current schema. */
+export const encodeArchiveResult: WireEncoder<ArchiveResult, typeof ArchiveResult.Encoded> =
+  encodeWire(ArchiveResult, 'ArchiveResult');
 
 /**
  * `GET /v1/games/{id}/result` relayed from **upstream** (supervisor `:10054`)
@@ -956,7 +931,7 @@ export const encodeArchiveResult: TolerantEncoder<ArchiveResult, typeof ArchiveR
  */
 export const UpstreamResult = Schema.Struct({
   artifact_id: GameId,
-  state: RunStateTolerant,
+  state: RunState,
   benchmark_valid: Schema.NullOr(Schema.Boolean),
   invalid_reasons: Schema.Array(Schema.String),
   leaderboard: Schema.Array(LeaderboardEntry),
@@ -972,14 +947,14 @@ export const UpstreamResult = Schema.Struct({
 export type UpstreamResult = typeof UpstreamResult.Type;
 
 /** Decode an {@link UpstreamResult}. */
-export const decodeUpstreamResult: TolerantDecoder<UpstreamResult> = decodeTolerant(
+export const decodeUpstreamResult: WireDecoder<UpstreamResult> = decodeWire(
   UpstreamResult,
   'UpstreamResult',
 );
 
-/** Re-encode an {@link UpstreamResult}, unknown fields included. */
-export const encodeUpstreamResult: TolerantEncoder<UpstreamResult, typeof UpstreamResult.Encoded> =
-  encodeTolerant(UpstreamResult, 'UpstreamResult');
+/** Re-encode an {@link UpstreamResult}, the current schema. */
+export const encodeUpstreamResult: WireEncoder<UpstreamResult, typeof UpstreamResult.Encoded> =
+  encodeWire(UpstreamResult, 'UpstreamResult');
 
 /**
  * Either document `/result` can answer with, discriminated by structure.
@@ -997,14 +972,14 @@ export const GameResult = Schema.Union(UpstreamResult, ArchiveResult).annotation
 export type GameResult = typeof GameResult.Type;
 
 /** Decode either `/result` document. */
-export const decodeGameResult: TolerantDecoder<GameResult> = decodeTolerant(
+export const decodeGameResult: WireDecoder<GameResult> = decodeWire(
   GameResult,
   'GameResult',
 );
 
-/** Re-encode either `/result` document, unknown fields included. */
-export const encodeGameResult: TolerantEncoder<GameResult, typeof GameResult.Encoded> =
-  encodeTolerant(GameResult, 'GameResult');
+/** Re-encode either `/result` document, the current schema. */
+export const encodeGameResult: WireEncoder<GameResult, typeof GameResult.Encoded> =
+  encodeWire(GameResult, 'GameResult');
 
 /** True when a decoded `/result` is the upstream document rather than the archive one. */
 export const isUpstreamResult = (result: GameResult): result is UpstreamResult =>

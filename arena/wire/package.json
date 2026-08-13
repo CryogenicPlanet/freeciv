@@ -3,10 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Arena wire protocol: packet schemas and codecs shared by every arena package",
+  "description": "Versioned schemas and canonical JSON for the Arena gateway",
   "exports": {
     ".": "./src/index.ts",
-    "./agent": "./src/agent/index.ts",
     "./gateway": "./src/gateway/index.ts"
   },
   "scripts": {

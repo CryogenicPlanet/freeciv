@@ -32,11 +32,6 @@ import {
   formatCanonPath,
   formatFloat,
 } from 'src/index';
-import { NATIVE_SCHEMA_CANONICAL } from 'test/native-schema-fixture';
-
-/** The oracle constant, from `agent_eval.v2_control`. */
-const ORACLE_SCHEMA_ID =
-  'sha256-3471520648d923f16fda4e1b58858301f343a64165b7e6cd2e3dd93af79cd3f4';
 
 const FNV_OFFSET_BASIS = 14695981039346656037n;
 
@@ -54,9 +49,6 @@ const bytesOf = (value: CanonValue, options: CanonOptions = CANON_ASCII): Uint8A
 
 const errorOf = <A>(either: Either.Either<A, CanonError>): CanonError | null =>
   Either.getOrElse(Either.flip(either), () => null);
-
-const sha256Hex = (bytes: Uint8Array): string =>
-  new Bun.CryptoHasher('sha256').update(bytes).digest('hex');
 
 // ---------------------------------------------------------------------------
 // The oracle
@@ -582,68 +574,5 @@ describe('canon / differential against python3', () => {
     );
     expect(refused).toBe('refused');
     expect(Either.isLeft(canonicalBytes('\ud800', CANON_UTF8))).toBe(true);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// THE GATE
-// ---------------------------------------------------------------------------
-
-const isRecord = (value: CanonValue | undefined): value is CanonRecord =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
-
-const field = (value: CanonValue | undefined, key: string): CanonValue | undefined =>
-  isRecord(value) ? value[key] : undefined;
-
-describe('canon / THE GATE: NATIVE_OBSERVATION_ACTION_SCHEMA_ID', () => {
-  test('the hashed structure carries the > 2^53 offset basis as an integer', () => {
-    expect(field(field(NATIVE_SCHEMA_CANONICAL, 'research_choices_digest'), 'offset_basis')).toBe(
-      FNV_OFFSET_BASIS,
-    );
-    expect(field(field(NATIVE_SCHEMA_CANONICAL, 'treaty_clauses_digest'), 'offset_basis')).toBe(
-      FNV_OFFSET_BASIS,
-    );
-  });
-
-  test('the canonical bytes are pure ASCII and carry the literal basis', () => {
-    const bytes = bytesOf(NATIVE_SCHEMA_CANONICAL);
-    expect(bytes.every((byte) => byte < 0x80)).toBe(true);
-    expect(decoder.decode(bytes)).toContain('"offset_basis":14695981039346656037');
-    expect(bytes.byteLength).toBe(50038);
-  });
-
-  test('sha256 of those bytes IS the oracle schema id', () => {
-    expect(`sha256-${sha256Hex(bytesOf(NATIVE_SCHEMA_CANONICAL))}`).toBe(ORACLE_SCHEMA_ID);
-  });
-
-  test('the naive JS route does not reach this digest by accident', () => {
-    const naive = JSON.stringify(NATIVE_SCHEMA_CANONICAL, (_key, value: unknown) =>
-      typeof value === 'bigint' ? Number(value) : value,
-    );
-    expect(naive).not.toContain('14695981039346656037');
-    expect(`sha256-${sha256Hex(encoder.encode(naive))}`).not.toBe(ORACLE_SCHEMA_ID);
-  });
-
-  test('the whole document matches v2_control byte for byte', () => {
-    const theirs = pythonText(
-      [
-        'import json,sys,inspect',
-        'from agent_eval import v2_control as V',
-        'src = inspect.getsource(V._derive_native_schema_id)',
-        'body = src.split(chr(34)*3 + chr(10), 2)[-1].rsplit("    encoded = json.dumps", 1)[0]',
-        'ns = dict(vars(V))',
-        'exec("if True:\\n" + body, ns)',
-        'sys.stdout.buffer.write(json.dumps(ns["canonical"], ensure_ascii=True,',
-        '  allow_nan=False, sort_keys=True, separators=(",",":")).encode("ascii"))',
-      ].join('\n'),
-    );
-    expect(decoder.decode(bytesOf(NATIVE_SCHEMA_CANONICAL))).toBe(theirs);
-  });
-
-  test('the oracle constant is still what v2_control exports today', () => {
-    const exported = pythonText(
-      'from agent_eval.v2_control import NATIVE_OBSERVATION_ACTION_SCHEMA_ID as s; print(s)',
-    );
-    expect(exported.trim()).toBe(ORACLE_SCHEMA_ID);
   });
 });

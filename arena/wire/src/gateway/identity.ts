@@ -40,8 +40,8 @@
 
 import { Schema } from 'effect';
 import { WireInt, WireNonNegativeInt } from '../numeric.ts';
-import { decodeTolerant, encodeTolerant, isTolerant } from '../tolerant.ts';
-import type { TolerantDecoder, TolerantEncoder } from '../tolerant.ts';
+import { decodeWire, encodeWire, isWire } from '../codec.ts';
+import type { WireDecoder, WireEncoder } from '../codec.ts';
 
 /**
  * `GATEWAY_KIND` — `agent_eval/replay_gateway.py:52`.  The self-identifying
@@ -103,7 +103,7 @@ export const GatewayIdentityToken = Schema.String.pipe(
 export type GatewayIdentityToken = typeof GatewayIdentityToken.Type;
 
 /** Decode an unknown value as a {@link GatewayIdentityToken}. */
-export const decodeGatewayIdentityToken: TolerantDecoder<GatewayIdentityToken> = decodeTolerant(
+export const decodeGatewayIdentityToken: WireDecoder<GatewayIdentityToken> = decodeWire(
   GatewayIdentityToken,
   'GatewayIdentityToken',
 );
@@ -210,7 +210,7 @@ export const ServiceUrl = Schema.String.pipe(
 export type ServiceUrl = typeof ServiceUrl.Type;
 
 /** Decode an unknown value as a {@link ServiceUrl}. */
-export const decodeServiceUrl: TolerantDecoder<ServiceUrl> = decodeTolerant(
+export const decodeServiceUrl: WireDecoder<ServiceUrl> = decodeWire(
   ServiceUrl,
   'ServiceUrl',
 );
@@ -312,26 +312,26 @@ export const GatewayIdentity = Schema.Struct({
 /** A decoded `GET /health` payload. */
 export type GatewayIdentity = typeof GatewayIdentity.Type;
 
-/** Decode a `GET /health` payload, keeping fields this build does not know. */
-export const decodeGatewayIdentity: TolerantDecoder<GatewayIdentity> = decodeTolerant(
+/** Decode the current `GET /health` payload. */
+export const decodeGatewayIdentity: WireDecoder<GatewayIdentity> = decodeWire(
   GatewayIdentity,
   'GatewayIdentity',
 );
 
-/** Re-encode a `GET /health` payload, unknown fields and key order intact. */
-export const encodeGatewayIdentity: TolerantEncoder<
+/** Re-encode a `GET /health` payload, the current schema. */
+export const encodeGatewayIdentity: WireEncoder<
   GatewayIdentity,
   typeof GatewayIdentity.Encoded
-> = encodeTolerant(GatewayIdentity, 'GatewayIdentity');
+> = encodeWire(GatewayIdentity, 'GatewayIdentity');
 
 /**
  * True when `input` is a well-formed **decoded** `GET /health` payload — one
  * whose integers are already `bigint`.  To ask whether raw JSON off the socket
  * would decode, use {@link decodeGatewayIdentity} and test the `Either`; see
- * `isTolerant` in `../tolerant.ts` for why the two differ here.
+ * `isWire` in `../codec.ts` for why the two differ here.
  */
 export const isGatewayIdentity: (input: unknown) => input is GatewayIdentity =
-  isTolerant(GatewayIdentity);
+  isWire(GatewayIdentity);
 
 /**
  * The exact preimage `_identity` hashes (`:175-183`):
