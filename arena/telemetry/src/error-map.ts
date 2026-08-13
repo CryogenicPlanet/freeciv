@@ -52,7 +52,7 @@ export interface Remedy {
  * Deliberately a plain record rather than a closed union: this package sits
  * *below* the modules whose errors it describes and must not import them, so
  * the keys are their tags spelled out. `@arena/wire`'s entries are transcribed
- * from `arena/wire/src/canon.ts` and `arena/wire/src/tolerant.ts`; the
+ * from `arena/wire/src/canon.ts` and `arena/wire/src/codec.ts`; the
  * `Telemetry*` entries are this package's own, from `./evlog-adapter.ts`.
  */
 export const REMEDIES: Readonly<Record<string, Remedy>> = {
