@@ -5,6 +5,7 @@
 
 import { FileSystem } from '@effect/platform';
 import { Context, Data, Effect, Either, Layer, Option } from 'effect';
+import type { Redacted } from 'effect';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 
@@ -41,6 +42,14 @@ export const GATEWAY_CONFIG_MESSAGES = {
   portOutOfRange: 'gateway port must be in [0, 65535]',
   /** `Path.expanduser()` with no resolvable home (`pathlib`, not the gateway). */
   noHomeDirectory: 'Could not determine home directory.',
+  /**
+   * `--materialize-root` equals, contains or sits inside `--cache-root`.
+   *
+   * TypeScript-only, like the flag pair that can produce it: it is the
+   * construction-time form of `save_replay`'s own refusal, moved to the one
+   * exit-2 site so it cannot become a 503 on the first replay request.
+   */
+  materializeRootNestsCacheRoot: 'materialize root must be separate from the replay cache root',
 } as const;
 
 /** One of the construction-time failure texts. */
@@ -842,6 +851,72 @@ export const gatewayIdentity = (material: GatewayIdentityMaterial): string =>
 // ---------------------------------------------------------------------------
 
 /**
+ * `--backend postgres` and the URL that goes with it.
+ *
+ * There is no `Fs` twin on purpose: the filesystem backend is spelled as the
+ * **absence** of this value, so an argv that names neither `--backend` nor
+ * `--database-url` — which is every argv `local_stack.py` and the parity rig
+ * have ever spawned — produces exactly the record it produced before the two
+ * flags existed.  `undefined` is the default, and the default is the port.
+ *
+ * The URL is {@link Redacted.Redacted} from the moment it leaves the parser and
+ * is never unwrapped in this module.  Unlike `--service-url` it may carry a
+ * password, so it must not reach `/health`, the ready record, a log line or
+ * `describeStartupError` — and it is deliberately **not** part of
+ * {@link gatewayIdentity}'s material either: `local_stack.py` derives
+ * `replay-gateway-{identity}.json` from that digest, so hashing the URL in
+ * would both orphan existing state files and hash a password into a filename.
+ */
+export interface PostgresBackend {
+  readonly _tag: 'Postgres';
+  readonly databaseUrl: Redacted.Redacted<string>;
+  /**
+   * `--materialize-root`, resolved, with `<cacheRoot>-saves` filled in.
+   *
+   * Always present once the configuration is validated: the python bridge
+   * needs real files, so a Postgres-backed gateway always has somewhere to put
+   * them, whether or not an operator named it.
+   */
+  readonly materializeRoot: string;
+}
+
+/**
+ * {@link PostgresBackend} as the parser produces it, before resolution.
+ *
+ * `materializeRoot` is the flag's text or `undefined`; {@link makeGatewayConfig}
+ * is what turns it into a resolved path and what refuses one that nests with
+ * the cache root.
+ */
+export interface PostgresBackendInput {
+  readonly _tag: 'Postgres';
+  readonly databaseUrl: Redacted.Redacted<string>;
+  readonly materializeRoot: string | undefined;
+}
+
+/**
+ * Does one path contain, equal or sit inside the other?
+ *
+ * `save_replay._cache_directory` raises `SaveReplayError("Replay cache must be
+ * separate from game saves.")` for exactly this relation between the resolved
+ * cache root and the saves directory — checked twice, before and after
+ * `_safe_directory` — so a `--materialize-root` that nests with `--cache-root`
+ * would surface as a 503 on the first replay request instead of as a refusal to
+ * start.  `@arena/db`'s `Materialize.nestsWith` is the same predicate for
+ * callers on the other side of the package boundary; `test/gateway/cli.test.ts`
+ * asserts the two agree rather than trusting that they do.  It is duplicated
+ * here, three lines of it, because importing `@arena/db` from this module would
+ * put a database driver in the *filesystem* gateway's module graph.
+ */
+export const pathsNest = (left: string, right: string): boolean => {
+  const a = left.replace(/\/+$/, '');
+  const b = right.replace(/\/+$/, '');
+  return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+};
+
+/** `<cacheRoot>-saves` — the sibling `--materialize-root` defaults to. */
+export const defaultMaterializeRoot = (cacheRoot: string): string => `${cacheRoot}-saves`;
+
+/**
  * Everything the gateway needs before it binds, resolved and validated.
  *
  * The first eight fields are the Python `GatewayConfig` dataclass (`:114-122`)
@@ -872,6 +947,14 @@ export interface GatewayConfigValues {
   readonly port: number;
   /** `--ready-file`, resolved; the 0600 record written after the socket serves (`:2146`). */
   readonly readyFile: string;
+  /**
+   * `--backend postgres`'s target, absent for the filesystem backend.
+   *
+   * TypeScript-only and additive: `_parser()` has no such flag, and `main.ts`
+   * reads this field — and nothing else — to choose which `RunsRepository` and
+   * which derivation layer the stack gets.  See {@link PostgresBackend}.
+   */
+  readonly backend?: PostgresBackend | undefined;
 }
 
 /** The gateway's configuration, as a service. */
@@ -891,12 +974,43 @@ export interface GatewayConfigInput {
   readonly readyFile: string;
   readonly upstreamTimeoutSeconds: number;
   readonly viewerPublicUrl: Option.Option<string>;
+  /** The TS-only backend selection, unresolved; absent is the filesystem. */
+  readonly backend?: PostgresBackendInput | undefined;
 }
 
 const checkPort = (port: bigint): Either.Either<number, GatewayConfigError> =>
   port >= 0n && port <= 65535n
     ? Either.right(Number(port))
     : fail(GATEWAY_CONFIG_MESSAGES.portOutOfRange);
+
+/**
+ * Resolve the backend's paths, or refuse the pair.
+ *
+ * Runs **last** in {@link makeGatewayConfig}, after every Python check, so that
+ * a gateway invoked exactly as `local_stack.py` invokes one cannot reach a new
+ * failure — and so that an argv that is wrong in two ways still reports the
+ * error the Python would have reported first.
+ */
+const resolveBackend = (
+  backend: PostgresBackendInput | undefined,
+  cacheRoot: string,
+  environment: PathEnvironment,
+): Effect.Effect<PostgresBackend | undefined, GatewayConfigError, FileSystem.FileSystem> =>
+  backend === undefined
+    ? Effect.succeed(undefined)
+    : Effect.gen(function* () {
+        const materializeRoot = yield* resolvePath(
+          backend.materializeRoot ?? defaultMaterializeRoot(cacheRoot),
+          environment,
+        );
+        return yield* pathsNest(materializeRoot, cacheRoot)
+          ? fail(GATEWAY_CONFIG_MESSAGES.materializeRootNestsCacheRoot)
+          : Either.right({
+              _tag: 'Postgres' as const,
+              databaseUrl: backend.databaseUrl,
+              materializeRoot,
+            });
+      });
 
 const checkTimeout = (seconds: number): Either.Either<number, GatewayConfigError> =>
   Number.isFinite(seconds) && seconds > 0
@@ -908,6 +1022,13 @@ const checkTimeout = (seconds: number): Either.Either<number, GatewayConfigError
  * `make_replay_gateway_server` → `gateway_config` does, reporting the *first*
  * failure in the same order they do: host, port, timeout, then the paths and
  * the two URLs.
+ *
+ * `backend` is carried through untouched and validated **nowhere here**: the
+ * flag pair's own consistency (`--database-url` present iff
+ * `--backend postgres`) is a parse-time `ValidationError` in `cli.ts`, and the
+ * URL's shape is `@arena/db`'s to judge, at the one place that opens a
+ * connection.  Adding a check here would put a *new* failure into the order
+ * above, which is the one thing this function's contract forbids.
  */
 export const makeGatewayConfig = (
   input: GatewayConfigInput,
@@ -926,6 +1047,7 @@ export const makeGatewayConfig = (
       onNone: () => Effect.succeedNone,
       onSome: (value) => Effect.asSome(normalizeServiceUrl(value)),
     });
+    const backend = yield* resolveBackend(input.backend, cacheRoot, environment);
     return {
       repoRoot,
       upstreamServiceUrl,
@@ -943,6 +1065,7 @@ export const makeGatewayConfig = (
       host,
       port,
       readyFile,
+      backend,
     };
   });
 

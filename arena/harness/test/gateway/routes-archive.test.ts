@@ -1,6 +1,6 @@
 /** Archive route fallback, relay, streaming, local-file security, and exact body coverage. */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { Gateway, isJsonObject, type JsonObject } from '@arena/wire';
+import { compareCodePoints, Gateway, isJsonObject, type JsonObject } from '@arena/wire';
 import { HttpServerResponse } from '@effect/platform';
 import { Effect, Either, Exit, Layer, Scope } from 'effect';
 import {
@@ -31,7 +31,12 @@ import {
   archiveRouteOptions,
   type ArchiveRouteOptions,
 } from 'src/gateway/http/routes/archive';
-import { layer as runsLayer, type RunsRepository } from 'src/gateway/services/runs';
+import {
+  archiveBytes,
+  isArchiveBytes,
+  layer as runsLayer,
+  RunsRepository,
+} from 'src/gateway/services/runs';
 import {
   layerLive as upstreamLayer,
   UpstreamBodyError,
@@ -1038,5 +1043,114 @@ describe('what never reaches this module', () => {
     const encoded = await serve(`/v1/games/${ARCHIVED}%2Fstatus/frames/0.png`);
     expect(encoded.status).toBe(404);
     expect(stub().targets()).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The bytes arm of `sendArtifact` — the Postgres backend's half of the route
+// ---------------------------------------------------------------------------
+
+/**
+ * A repository that answers the two binary reads with bytes instead of a path.
+ *
+ * Everything else is the real filesystem repository, so the archive is found,
+ * the state gate runs and `terminalArchive` is unchanged — only the artifact's
+ * arm differs.  That is exactly the difference `@arena/db`'s repository makes,
+ * without a database in the test.
+ */
+const bytesBackedRuns = (payload: Uint8Array): Layer.Layer<RunsRepository> =>
+  Layer.effect(
+    RunsRepository,
+    Effect.map(RunsRepository, (disk) => ({
+      ...disk,
+      frameFile: () => Effect.succeed(archiveBytes(payload)),
+      videoFile: () => Effect.succeed(archiveBytes(payload)),
+    })),
+  ).pipe(Layer.provide(runsLayer(runsRoot())));
+
+const serveFrom = async (
+  runs: Layer.Layer<RunsRepository>,
+  target: string,
+  serviceUrl: string,
+): Promise<Served> => {
+  const scope = await Effect.runPromise(Scope.make());
+  const response = await Effect.runPromise(
+    Scope.extend(
+      Effect.provide(
+        respondGateway(handle(target)),
+        Layer.merge(runs, upstreamLayer({ serviceUrl })),
+      ),
+      scope,
+    ),
+  );
+  const web = HttpServerResponse.toWeb(response);
+  const bytes = new Uint8Array(await web.arrayBuffer());
+  await Effect.runPromise(Scope.close(scope, Exit.void));
+  return { status: web.status, headers: web.headers, bytes, text: decoder.decode(bytes) };
+};
+
+describe('a bytes-backed artifact is indistinguishable from a file-backed one', () => {
+  test('the same frame, served both ways, agrees on every observable', async () => {
+    stub().reset();
+    stub().setMode('not-found');
+    const fromDisk = await serve(`/v1/games/${ARCHIVED}/frames/1.png`);
+    stub().setMode('not-found');
+    const fromBytes = await serveFrom(
+      bytesBackedRuns(FRAME_ONE),
+      `/v1/games/${ARCHIVED}/frames/1.png`,
+      stub().url,
+    );
+    expect(fromDisk.status).toBe(200);
+    expect(fromBytes.status).toBe(fromDisk.status);
+    expect(Array.from(fromBytes.bytes)).toEqual(Array.from(FRAME_ONE));
+    expect(Array.from(fromBytes.bytes)).toEqual(Array.from(fromDisk.bytes));
+    // Every header, not a chosen few: this is the claim that the pg leg
+    // inherits `waivers.ts#binary-disk-fallback-chunked` instead of needing an
+    // entry of its own.
+    const headerPairs = (served: Served): readonly string[] =>
+      [...served.headers].map(([name, value]) => `${name}: ${value}`).toSorted(compareCodePoints);
+    expect(headerPairs(fromBytes)).toEqual(headerPairs(fromDisk));
+    expect(fromBytes.headers.get('content-type')).toBe(Gateway.ARCHIVE_FRAME_CONTENT_TYPE);
+    expect(fromBytes.headers.get('cache-control')).toBe(Gateway.ARCHIVE_BINARY_CACHE_CONTROL);
+    // Both declare the same `Content-Length` on the response *value* — the
+    // byte count of the same nine bytes — and both bodies are Effect streams,
+    // so Bun drops it identically on the way to the socket and answers
+    // `Transfer-Encoding: chunked` for each.  That is the whole reason the pg
+    // leg inherits `binary-disk-fallback-chunked` rather than diverging from
+    // it: the framing decision is made by the body's *type*, which is now the
+    // same type for both backends.
+    expect([fromDisk.headers.get('content-length'), fromBytes.headers.get('content-length')]).toEqual(
+      [String(FRAME_ONE.byteLength), String(FRAME_ONE.byteLength)],
+    );
+  });
+
+  test('a video answers with the video content type, from bytes', async () => {
+    stub().reset();
+    stub().setMode('not-found');
+    const served = await serveFrom(
+      bytesBackedRuns(FRAME_ONE),
+      `/v1/games/${ARCHIVED}/video.mp4`,
+      stub().url,
+    );
+    expect(served.status).toBe(200);
+    expect(served.headers.get('content-type')).toBe(Gateway.ARCHIVE_VIDEO_CONTENT_TYPE);
+    expect(Array.from(served.bytes)).toEqual(Array.from(FRAME_ONE));
+  });
+
+  test('an empty artifact is the 404 a zero-length file is', async () => {
+    stub().reset();
+    stub().setMode('not-found');
+    const served = await serveFrom(
+      bytesBackedRuns(new Uint8Array(0)),
+      `/v1/games/${ARCHIVED}/frames/1.png`,
+      stub().url,
+    );
+    expect([served.status, served.text]).toEqual([404, problemOf('archiveFileNotFound').body]);
+  });
+
+  test('the artifact union is closed: a string is a path, an object is bytes', () => {
+    expect(isArchiveBytes('/tmp/x.png')).toBe(false);
+    expect(isArchiveBytes(archiveBytes(FRAME_ONE))).toBe(true);
+    expect(archiveBytes(FRAME_ONE)).toEqual({ _tag: 'Bytes', bytes: FRAME_ONE });
   });
 });

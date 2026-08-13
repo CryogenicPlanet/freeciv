@@ -1,11 +1,14 @@
 {
-  "name": "@arena/harness",
+  "name": "@arena/db",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Arena harness: the CLI entrypoint that drives matches over the wire and reports through telemetry",
+  "description": "Arena persistence: the Postgres schema, migrations and Effect SQL layers behind the pg-backed gateway",
   "exports": {
     ".": "./src/index.ts"
+  },
+  "bin": {
+    "arena-ingest": "./src/ingest-cli.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
@@ -14,19 +17,24 @@
     "test": "bun test"
   },
   "dependencies": {
-    "@arena/db": "workspace:*",
-    "@arena/telemetry": "workspace:*",
+    "@arena/harness": "workspace:*",
     "@arena/wire": "workspace:*",
     "@effect/cli": "^0.77.0",
+    "@effect/experimental": "^0.61.1",
     "@effect/platform": "^0.97.1",
     "@effect/platform-bun": "^0.91.2",
-    "@effect/platform-node": "^0.108.0",
+    "@effect/sql": "^0.52.0",
+    "@effect/sql-drizzle": "^0.51.0",
+    "@effect/sql-pg": "^0.53.0",
+    "drizzle-orm": "^0.45.2",
     "effect": "^3.22.1"
   },
   "devDependencies": {
     "@effect/language-service": "^0.87.2",
     "@effect/tsgo": "^0.36.4",
+    "@electric-sql/pglite": "^0.5.4",
     "@types/bun": "^1.3.14",
+    "drizzle-kit": "^0.31.10",
     "oxlint": "1.77.0",
     "oxlint-tsgolint": "^7.0.2001",
     "typescript": "^7"

@@ -112,8 +112,13 @@ export const REFUSED_UPSTREAM_URL = 'http://127.0.0.1:1' as const;
 /** The two implementations under comparison. */
 export type Impl = 'python' | 'typescript';
 
-/** The suffix each implementation's private files carry. */
-const SLOT = { python: 'py', typescript: 'ts' } satisfies Readonly<Record<Impl, string>>;
+/** The three gateway process slots: Python, TS/filesystem, and TS/Postgres. */
+export type Slot = Impl | 'postgres';
+
+/** The suffix each slot's private files carry. */
+const SLOT = { python: 'py', typescript: 'ts', postgres: 'pg' } satisfies Readonly<
+  Record<Slot, string>
+>;
 
 /**
  * The only flags whose values may differ between the two processes, and the
@@ -166,13 +171,85 @@ export const DEFAULT_READY_TIMEOUT_MS = 40_000;
 
 const READY_POLL_MS = 25;
 
-const slotName = (scenario: string, impl: Impl): string => `${scenario}-${SLOT[impl]}`;
+const slotName = (scenario: string, suffix: string): string => `${scenario}-${suffix}`;
+
+/**
+ * The private-file names, keyed by a **suffix** rather than by {@link Impl}.
+ *
+ * The pair has one slot per implementation, so "which implementation" and
+ * "whose files are these" were the same question and one parameter answered
+ * both.  The trio breaks that: two of its three gateways are the *same*
+ * TypeScript binary pointed at different backends, and they need different
+ * ready files and different derivation caches for exactly the reasons the
+ * module doc gives.  So the file naming is keyed by the slot suffix, and
+ * {@link readyFileFor}/{@link cacheRootFor} stay the pair's spelling of it.
+ */
+export const readyFileForSuffix = (scratch: string, scenario: string, suffix: string): string =>
+  join(scratch, `${slotName(scenario, suffix)}.ready.json`);
+
+/** @see {@link readyFileForSuffix} */
+export const cacheRootForSuffix = (scratch: string, scenario: string, suffix: string): string =>
+  join(scratch, `cache-${slotName(scenario, suffix)}`);
 
 export const readyFileFor = (scratch: string, scenario: string, impl: Impl): string =>
-  join(scratch, `${slotName(scenario, impl)}.ready.json`);
+  readyFileForSuffix(scratch, scenario, SLOT[impl]);
 
 export const cacheRootFor = (scratch: string, scenario: string, impl: Impl): string =>
-  join(scratch, `cache-${slotName(scenario, impl)}`);
+  cacheRootForSuffix(scratch, scenario, SLOT[impl]);
+
+// ---------------------------------------------------------------------------
+// Slots — which launcher, whose files, and what argv it adds
+// ---------------------------------------------------------------------------
+
+/**
+ * One gateway's slot in a fleet.
+ *
+ * Three fields, and the third is the whole reason this type exists: a slot may
+ * append flags the other slots do not have.  Today exactly one does — the
+ * Postgres-backed TypeScript gateway — and {@link PG_ONLY_FLAGS} is the closed
+ * list of what it may append.  Everything before {@link GatewaySlot.extraFlags}
+ * is still built by one function body from one spec, which is the structural
+ * claim `argvParity` checks.
+ */
+export interface GatewaySlot {
+  /** Which launcher runs it, and therefore which cwd it is spawned in. */
+  readonly impl: Impl;
+  /** Names its private files: `<scenario>-<suffix>.ready.json`, `cache-<scenario>-<suffix>`. */
+  readonly suffix: string;
+  /** Appended after the shared flags.  Empty for both members of a pair. */
+  readonly extraFlags: ReadonlyArray<string>;
+}
+
+/** CPython, in the pair's own slot. */
+export const PYTHON_SLOT: GatewaySlot = { impl: 'python', suffix: SLOT.python, extraFlags: [] };
+
+/** The filesystem-backed TypeScript gateway, in the pair's own slot. */
+export const TS_FS_SLOT: GatewaySlot = {
+  impl: 'typescript',
+  suffix: SLOT.typescript,
+  extraFlags: [],
+};
+
+/** The third slot's file suffix — `<scenario>-pg.ready.json`, `cache-<scenario>-pg`. */
+export const PG_SLOT_SUFFIX = 'pg' as const;
+
+/**
+ * The flags the Postgres slot adds, and the *only* ones it may.
+ *
+ * They are TS-only by construction: `agent_eval/replay_gateway.py`'s parser has
+ * nine options and knows neither of these, so they can never be part of the
+ * shared array {@link gatewayFlags} builds.  {@link SLOT_SCOPED_FLAGS} is not
+ * the right home for them either — that list is about two processes disagreeing
+ * on a *shared* flag's value, and this is a flag one process does not have.
+ */
+export const PG_ONLY_FLAGS: ReadonlyArray<string> = ['--backend', '--database-url'];
+
+/** `--backend postgres --database-url <url>`, in the third slot. */
+export const tsPgSlot = (databaseUrl: string): GatewaySlot => ({
+  impl: 'typescript',
+  suffix: PG_SLOT_SUFFIX,
+  extraFlags: ['--backend', 'postgres', '--database-url', databaseUrl],
+});
 
 /**
  * The flags, built once per slot from one function body.
@@ -187,19 +264,27 @@ export const cacheRootFor = (scratch: string, scenario: string, impl: Impl): str
  * own defaults inside what the rig compares — the same reason
  * `local_stack.py:540-548` passes eight flags and not ten.
  */
-export const gatewayFlags = (spec: ResolvedBootSpec, impl: Impl): ReadonlyArray<string> => [
+export const gatewayFlagsForSlot = (
+  spec: ResolvedBootSpec,
+  slot: GatewaySlot,
+): ReadonlyArray<string> => [
   '--host', GATEWAY_HOST,
   '--port', '0',
   '--service-url', spec.serviceUrl,
   '--runs-root', spec.runsRoot,
-  '--cache-root', cacheRootFor(spec.scratch, spec.scenario, impl),
+  '--cache-root', cacheRootForSuffix(spec.scratch, spec.scenario, slot.suffix),
   '--repo-root', spec.repoRoot,
-  '--ready-file', readyFileFor(spec.scratch, spec.scenario, impl),
+  '--ready-file', readyFileForSuffix(spec.scratch, spec.scenario, slot.suffix),
   ...(spec.upstreamTimeoutSeconds === undefined
     ? []
     : ['--upstream-timeout-s', String(spec.upstreamTimeoutSeconds)]),
   ...(spec.viewerPublicUrl === undefined ? [] : ['--viewer-public-url', spec.viewerPublicUrl]),
+  ...slot.extraFlags,
 ];
+
+/** The pair's spelling: one implementation, one slot, no extra flags. */
+export const gatewayFlags = (spec: ResolvedBootSpec, impl: Impl): ReadonlyArray<string> =>
+  gatewayFlagsForSlot(spec, impl === 'python' ? PYTHON_SLOT : TS_FS_SLOT);
 
 // ---------------------------------------------------------------------------
 // argv parity
@@ -227,10 +312,19 @@ export interface ArgvParity {
   readonly divergent: ReadonlyArray<string>;
 }
 
-/** Read the two argvs back off a booted pair and report where they differ. */
-export const argvParity = (pair: GatewayPair): ArgvParity => {
-  const py = flagPairs(pair.python.flags);
-  const ts = flagPairs(pair.typescript.flags);
+/**
+ * Two flag arrays, compared position by position.
+ *
+ * Split out of {@link argvParity} so the trio can ask the same question of a
+ * pair that is not a {@link GatewayPair} — the two *TypeScript* gateways — with
+ * one comparison rule rather than two.
+ */
+export const flagsParity = (
+  pythonFlags: ReadonlyArray<string>,
+  typescriptFlags: ReadonlyArray<string>,
+): ArgvParity => {
+  const py = flagPairs(pythonFlags);
+  const ts = flagPairs(typescriptFlags);
   const pythonOrder = py.map(([name]) => name);
   const typescriptOrder = ts.map(([name]) => name);
   const paired = py.map(([name, value], index) => {
@@ -247,6 +341,10 @@ export const argvParity = (pair: GatewayPair): ArgvParity => {
     divergent: paired.flatMap(({ name, same }) => (same ? [] : [name])),
   };
 };
+
+/** Read the two argvs back off a booted pair and report where they differ. */
+export const argvParity = (pair: GatewayPair): ArgvParity =>
+  flagsParity(pair.python.flags, pair.typescript.flags);
 
 // ---------------------------------------------------------------------------
 // The child registry
@@ -496,11 +594,12 @@ export const awaitReady = async (
   return poll();
 };
 
-const bootGateway = async (spec: ResolvedBootSpec, impl: Impl): Promise<BootResult> => {
-  const flags = gatewayFlags(spec, impl);
+const bootGateway = async (spec: ResolvedBootSpec, slot: GatewaySlot): Promise<BootResult> => {
+  const impl = slot.impl;
+  const flags = gatewayFlagsForSlot(spec, slot);
   const argv = [...(impl === 'python' ? PYTHON_LAUNCHER : TYPESCRIPT_LAUNCHER), ...flags];
-  const readyFile = readyFileFor(spec.scratch, spec.scenario, impl);
-  const cacheRoot = cacheRootFor(spec.scratch, spec.scenario, impl);
+  const readyFile = readyFileForSuffix(spec.scratch, spec.scenario, slot.suffix);
+  const cacheRoot = cacheRootForSuffix(spec.scratch, spec.scenario, slot.suffix);
   const child = registry.add(
     Bun.spawn(argv, {
       // CPython needs the checkout on `sys.path` for `-m agent_eval…`; the
@@ -674,8 +773,8 @@ export const bootGatewayPair = async (spec: BootSpec): Promise<PairResult> => {
     };
   }
   mkdirSync(resolved.scratch, { recursive: true });
-  const python = await bootGateway(resolved, 'python');
-  const typescript = await bootGateway(resolved, 'typescript');
+  const python = await bootGateway(resolved, PYTHON_SLOT);
+  const typescript = await bootGateway(resolved, TS_FS_SLOT);
   if (python._tag !== 'Booted' || typescript._tag !== 'Booted') {
     // One of them may have started; it must not outlive the other's failure.
     await Promise.all(
@@ -803,3 +902,268 @@ export const withGatewayPair = async <A>(
   pair.cleanup();
   return outcome.ok ? outcome.value : Promise.reject(outcome.error);
 };
+
+// ---------------------------------------------------------------------------
+// The trio — CPython, the fs-backed port, and the pg-backed port
+// ---------------------------------------------------------------------------
+
+/**
+ * Three gateways over **one** run archive, two of which are the same binary.
+ *
+ * The pair's premise — "one flags array, two processes" — survives intact and
+ * gains one clause.  `ts-pg` is handed the *same* shared flags as `ts-fs`
+ * (`gatewayFlagsForSlot` is one function body, called three times) and appends
+ * {@link PG_ONLY_FLAGS}; `--runs-root` in particular is byte-identical across
+ * all three, because on the pg backend it is the logical scope key every row
+ * carries rather than a directory to read, and `/health` publishes it verbatim.
+ * A rig that gave the pg gateway a *different* `--runs-root` would compare two
+ * archives and call the result parity.
+ *
+ * What the trio does **not** own is the database.  It takes a URL and assumes
+ * the rows are already there: creating an ephemeral database, migrating it and
+ * ingesting the fixture tree are the caller's, because they are the operations
+ * with the safety rules attached.
+ */
+export type TrioSide = 'python' | 'tsFs' | 'tsPg';
+
+/** A value keyed by trio side.  The three-way analogue of {@link ByImpl}. */
+export type BySide<A> = Readonly<Record<TrioSide, A>>;
+
+const bySide = <A>(python: A, tsFs: A, tsPg: A): BySide<A> => ({ python, tsFs, tsPg });
+
+/** The three sides, in a fixed order, for a rig that iterates rather than names. */
+export const TRIO_SIDES: ReadonlyArray<TrioSide> = ['python', 'tsFs', 'tsPg'];
+
+/** A {@link BootSpec} plus the one thing only the third gateway needs. */
+export interface TrioSpec extends BootSpec {
+  /**
+   * `--database-url`.  Handed to the pg slot only, and never compared, logged
+   * or published: a database URL may carry credentials, which is why
+   * `config.ts` holds it `Redacted` and `/health` does not report it.
+   */
+  readonly databaseUrl: string;
+}
+
+/** What a stopped trio leaves behind.  {@link StopReport}, three-sided. */
+export interface TrioStopReport {
+  readonly scenario: string;
+  readonly exitCodes: BySide<number | null>;
+  readonly stdout: BySide<string>;
+  readonly stderr: BySide<string>;
+  readonly readyFilesRemoved: BySide<boolean>;
+  readonly orphans: ReadonlyArray<number>;
+}
+
+export interface GatewayTrio {
+  readonly scenario: string;
+  readonly scratch: string;
+  readonly runsRoot: string;
+  readonly serviceUrl: string;
+  readonly python: BootedGateway;
+  readonly tsFs: BootedGateway;
+  readonly tsPg: BootedGateway;
+  /** All three, in {@link TRIO_SIDES} order. */
+  readonly all: readonly [BootedGateway, BootedGateway, BootedGateway];
+  /**
+   * Empty every derivation cache — and the pg gateway's materialization
+   * directory — so the next request is cold on all three sides.
+   *
+   * The third removal is the one that is easy to forget.  On the pg backend the
+   * python bridge does not read `--runs-root`; it reads a directory the gateway
+   * materializes the saves into, whose default is `<cache-root>-saves`
+   * (a *sibling*, because `save_replay._cache_directory` refuses a cache root
+   * that nests with the saves directory).  Leaving it populated would make the
+   * "cold" leg skip the work whose parity this rig exists to check, and the
+   * skip would be invisible — a warm answer is byte-identical to a cold one,
+   * which is precisely what makes the omission dangerous rather than merely
+   * wrong.
+   */
+  readonly freshCaches: () => Promise<ReadonlyArray<string>>;
+  readonly stop: () => Promise<TrioStopReport>;
+  readonly cleanup: () => void;
+}
+
+export type TrioResult =
+  | { readonly _tag: 'Booted'; readonly trio: GatewayTrio }
+  | { readonly _tag: 'Refused'; readonly reason: string; readonly cleanup: () => void }
+  | {
+      readonly _tag: 'BootFailed';
+      readonly failures: ReadonlyArray<BootFailure>;
+      readonly cleanup: () => void;
+    };
+
+/**
+ * The materialization directory the pg gateway derives from a cache root.
+ *
+ * Spelled here because the rig has to *remove* it and the gateway has to
+ * *create* it, and a rig that guessed a different name would silently stop
+ * making cold legs cold.
+ */
+export const materializeRootFor = (cacheRoot: string): string => `${cacheRoot}-saves`;
+
+const makeTrio = (
+  spec: ResolvedBootSpec,
+  python: BootedGateway,
+  tsFs: BootedGateway,
+  tsPg: BootedGateway,
+  cleanup: () => void,
+): GatewayTrio => {
+  const state: { report: TrioStopReport | null } = { report: null };
+  const all = [python, tsFs, tsPg] as const;
+
+  const stop = async (): Promise<TrioStopReport> => {
+    if (state.report !== null) return state.report;
+    all.forEach((gateway) => {
+      if (gateway.process.exitCode === null) gateway.process.kill('SIGINT');
+    });
+    await Promise.all(all.map((gateway) => gateway.process.exited));
+    const report: TrioStopReport = {
+      scenario: spec.scenario,
+      exitCodes: bySide(python.process.exitCode, tsFs.process.exitCode, tsPg.process.exitCode),
+      stdout: bySide(await python.stdout(), await tsFs.stdout(), await tsPg.stdout()),
+      stderr: bySide(await python.stderr(), await tsFs.stderr(), await tsPg.stderr()),
+      readyFilesRemoved: bySide(
+        !(await Bun.file(python.readyFile).exists()),
+        !(await Bun.file(tsFs.readyFile).exists()),
+        !(await Bun.file(tsPg.readyFile).exists()),
+      ),
+      orphans: aliveProcesses(all.map((gateway) => gateway.pid)),
+    };
+    state.report = report;
+    return report;
+  };
+
+  return {
+    scenario: spec.scenario,
+    scratch: spec.scratch,
+    runsRoot: spec.runsRoot,
+    serviceUrl: spec.serviceUrl,
+    python,
+    tsFs,
+    tsPg,
+    all,
+    freshCaches: () => {
+      const roots = all.map((gateway) => gateway.cacheRoot);
+      roots.forEach((root) => {
+        rmSync(root, { recursive: true, force: true });
+        rmSync(materializeRootFor(root), { recursive: true, force: true });
+        mkdirSync(root, { recursive: true });
+      });
+      return Promise.resolve(roots);
+    },
+    stop,
+    cleanup,
+  };
+};
+
+/**
+ * Spawn all three and wait for all three ready records.
+ *
+ * Never throws; the failure shape is {@link bootGatewayPair}'s, so a pg gateway
+ * that refuses its configuration comes back carrying the `error: …` line it
+ * printed rather than as a forty-second timeout.
+ */
+export const bootGatewayTrio = async (spec: TrioSpec): Promise<TrioResult> => {
+  const resolved = resolveSpec(spec);
+  const cleanup = (): void => {
+    if (resolved.ownsScratch) rmSync(resolved.scratch, { recursive: true, force: true });
+  };
+  const forbidden = [resolved.scratch, resolved.runsRoot].filter(insideLiveStack);
+  if (forbidden.length > 0) {
+    return {
+      _tag: 'Refused',
+      reason: `refusing to run inside the live stack state directory: ${forbidden.join(', ')}`,
+      cleanup,
+    };
+  }
+  const claimed = liveStackServiceUrl(resolved.serviceUrl);
+  if (claimed.length > 0) {
+    return {
+      _tag: 'Refused',
+      reason:
+        `refusing to proxy ${resolved.serviceUrl}: a RUNNING local_stack claims port ` +
+        `${claimed.join(', ')} — the user's stack and any live game are never touched`,
+      cleanup,
+    };
+  }
+  mkdirSync(resolved.scratch, { recursive: true });
+  const python = await bootGateway(resolved, PYTHON_SLOT);
+  const tsFs = await bootGateway(resolved, TS_FS_SLOT);
+  const tsPg = await bootGateway(resolved, tsPgSlot(spec.databaseUrl));
+  const results = [python, tsFs, tsPg];
+  if (results.some((result) => result._tag !== 'Booted')) {
+    await Promise.all(
+      results.map(async (result) => {
+        if (result._tag !== 'Booted') return;
+        result.gateway.process.kill('SIGKILL');
+        await result.gateway.process.exited;
+      }),
+    );
+    return {
+      _tag: 'BootFailed',
+      failures: results.flatMap((result) => (result._tag === 'BootFailed' ? [result] : [])),
+      cleanup,
+    };
+  }
+  return python._tag === 'Booted' && tsFs._tag === 'Booted' && tsPg._tag === 'Booted'
+    ? {
+        _tag: 'Booted',
+        trio: makeTrio(resolved, python.gateway, tsFs.gateway, tsPg.gateway, cleanup),
+      }
+    : { _tag: 'BootFailed', failures: [], cleanup };
+};
+
+/** {@link unwrapPair}, for the trio.  The only place this section throws. */
+export const unwrapTrio = (result: TrioResult): GatewayTrio => {
+  if (result._tag === 'Booted') return result.trio;
+  result.cleanup();
+  throw new Error(
+    result._tag === 'Refused'
+      ? result.reason
+      : result.failures
+          .map(
+            (failure) =>
+              `${failure.impl} gateway did not boot: ${failure.reason}\n` +
+              `  argv: ${failure.argv.join(' ')}\n` +
+              `  stderr: ${failure.stderr.trim()}`,
+          )
+          .join('\n'),
+  );
+};
+
+/** What the trio's three argvs agree and disagree on. */
+export interface TrioArgvParity {
+  /** CPython against the fs-backed port — {@link argvParity}, unchanged. */
+  readonly pair: ArgvParity;
+  /** Flags `ts-pg` carries that `ts-fs` does not.  Must be {@link PG_ONLY_FLAGS}. */
+  readonly pgOnly: ReadonlyArray<string>;
+  /** Shared flags whose values matched between the two TypeScript gateways. */
+  readonly pgSharedIdentical: ReadonlyArray<string>;
+  /**
+   * Shared flags whose values differed between the two TypeScript gateways.
+   * Must be {@link SLOT_SCOPED_FLAGS} — and for the same reasons: a shared
+   * ready file is an exclusive `flock` one of them loses, and a shared
+   * derivation cache would let whichever answered first answer for the other,
+   * which on *this* rig would fabricate the exact parity it is measuring.
+   */
+  readonly pgSharedDivergent: ReadonlyArray<string>;
+}
+
+/** Read the three argvs back off a booted trio and report where they differ. */
+export const trioArgvParity = (trio: GatewayTrio): TrioArgvParity => {
+  const fs = flagPairs(trio.tsFs.flags);
+  const pg = flagPairs(trio.tsPg.flags);
+  const fsNames = fs.map(([name]) => name);
+  const shared = pg.filter(([name]) => fsNames.includes(name));
+  const paired = shared.map(([name, value]) => ({
+    name,
+    same: fs.some(([other, otherValue]) => other === name && otherValue === value),
+  }));
+  return {
+    pair: flagsParity(trio.python.flags, trio.tsFs.flags),
+    pgOnly: pg.flatMap(([name]) => (fsNames.includes(name) ? [] : [name])),
+    pgSharedIdentical: paired.flatMap(({ name, same }) => (same ? [name] : [])),
+    pgSharedDivergent: paired.flatMap(({ name, same }) => (same ? [] : [name])),
+  };
+};
+

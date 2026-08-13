@@ -4,7 +4,7 @@ import { CliConfig, CommandDescriptor, HelpDoc } from '@effect/cli';
 import { type FileSystem } from '@effect/platform';
 import { NodeFileSystem, NodePath, NodeTerminal } from '@effect/platform-node';
 import { Gateway } from '@arena/wire';
-import { Effect, Either, Layer, Option } from 'effect';
+import { Effect, Either, Layer, Option, Redacted } from 'effect';
 import { mkdir, mkdtemp, realpath, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -26,17 +26,42 @@ import {
 } from '../../src/gateway/config.ts';
 import type { GatewayConfigInput } from '../../src/gateway/config.ts';
 import {
+  DATABASE_URL_FLAG,
+  DATABASE_URL_WITHOUT_POSTGRES,
+  MATERIALIZE_ROOT_FLAG,
+  MATERIALIZE_ROOT_WITHOUT_POSTGRES,
+  DEFAULT_GATEWAY_BACKEND,
   DEFAULT_GATEWAY_HOST,
   DEFAULT_GATEWAY_PORT,
   DEFAULT_REPO_ROOT,
   DEFAULT_UPSTREAM_TIMEOUT_SECONDS,
+  GATEWAY_BACKENDS,
+  GATEWAY_BACKEND_FLAG,
   GATEWAY_CLI_ERROR_EXIT_CODE,
   GATEWAY_CLI_NAME,
   PYTHON_GATEWAY_PROG,
   formatStartupError,
   gatewayCommand,
+  missingOptionMessage,
 } from '../../src/gateway/cli.ts';
 import type { GatewayCliArgs } from '../../src/gateway/cli.ts';
+import type { PostgresBackendInput } from '../../src/gateway/config.ts';
+import { pathsNest } from '../../src/gateway/config.ts';
+import {
+  GATEWAY_DB_APPLICATION_NAME,
+  GATEWAY_MAX_DB_CONNECTIONS,
+  POSTGRES_BACKEND_UNAVAILABLE,
+  UNUSABLE_DATABASE_URL,
+  archiveServices,
+  describeRepositoryFailure,
+  describeStartupError,
+  materializeRootFor,
+  withFailureLog,
+} from '../../src/gateway/main.ts';
+import { Materialize } from '@arena/db';
+import { ReplayDerivation } from '../../src/gateway/services/derivation.ts';
+import { RunsRepository } from '../../src/gateway/services/runs.ts';
+import type { RunsRepositoryApi, TerminalArchive } from '../../src/gateway/services/runs.ts';
 
 // ---------------------------------------------------------------------------
 // The Python oracle
@@ -1076,5 +1101,458 @@ describe('the Python primitives the rest of the port will reuse', () => {
     expect(error).toBeInstanceOf(GatewayConfigError);
     expect(error._tag).toBe('GatewayConfigError');
     expect(formatStartupError(error)).toBe('error: service URL must be an http(s) URL');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `--backend` / `--database-url` — the two TypeScript-only flags
+// ---------------------------------------------------------------------------
+
+/**
+ * The record the nine shared flags produced *before* a backend could be
+ * selected, copied from `_parser() — the flag surface`'s first test.
+ *
+ * Its job here is the opposite of that test's: not "the defaults are
+ * argparse's" but "adding two flags did not move one of them".  A parse of an
+ * argv that names neither flag must still equal this object — `backend` is
+ * `undefined`, which is exactly what `toEqual` ignores and what the layer
+ * selection reads as "the filesystem".
+ */
+const NINE_FLAG_SNAPSHOT: GatewayCliArgs = {
+  host: DEFAULT_GATEWAY_HOST,
+  port: 0n,
+  serviceUrl: 'http://h',
+  runsRoot: '/r',
+  cacheRoot: '/c',
+  repoRoot: DEFAULT_REPO_ROOT,
+  readyFile: '/ready.json',
+  upstreamTimeoutSeconds: 10,
+  viewerPublicUrl: Option.none(),
+};
+
+const DATABASE_URL = 'postgres://arena:hunter2@127.0.0.1:5432/arena_wf_demo';
+
+const backendOf = (
+  result: Either.Either<GatewayCliArgs, string>,
+): PostgresBackendInput | undefined => Either.getOrThrow(result).backend;
+
+describe('--backend / --database-url — additive, TypeScript-only, default off', () => {
+  test('an argv naming neither flag parses to the record it always did', async () => {
+    const parsed = Either.getOrThrow(await parseArgs(REQUIRED));
+    expect(parsed).toEqual(NINE_FLAG_SNAPSHOT);
+    // Spelled out, because `toEqual` is what ignores an undefined value and
+    // this is the property the whole scoping argument rests on: the key exists
+    // and carries nothing.
+    expect(parsed.backend).toBeUndefined();
+    expect(Object.keys(parsed).toSorted()).toEqual(
+      [...Object.keys(NINE_FLAG_SNAPSHOT), 'backend'].toSorted(),
+    );
+  });
+
+  test('--backend fs is the default spelled out, and needs no database URL', async () => {
+    expect(DEFAULT_GATEWAY_BACKEND).toBe('fs');
+    expect(GATEWAY_BACKENDS).toEqual(['fs', 'postgres']);
+    const parsed = Either.getOrThrow(await parseArgs([...REQUIRED, GATEWAY_BACKEND_FLAG, 'fs']));
+    expect(parsed).toEqual(NINE_FLAG_SNAPSHOT);
+    expect(parsed.backend).toBeUndefined();
+  });
+
+  test('--backend postgres carries the URL, redacted, and nothing else changes', async () => {
+    const parsed = Either.getOrThrow(
+      await parseArgs([...REQUIRED, GATEWAY_BACKEND_FLAG, 'postgres', DATABASE_URL_FLAG, DATABASE_URL]),
+    );
+    expect(parsed.backend?._tag).toBe('Postgres');
+    expect(parsed).toEqual({
+      ...NINE_FLAG_SNAPSHOT,
+      backend: {
+        _tag: 'Postgres',
+        databaseUrl: Redacted.make(DATABASE_URL),
+        materializeRoot: undefined,
+      },
+    });
+    const backend = parsed.backend;
+    expect(backend === undefined ? '' : Redacted.value(backend.databaseUrl)).toBe(DATABASE_URL);
+  });
+
+  test('the URL is not printable: it survives only through Redacted.value', async () => {
+    const backend = backendOf(
+      await parseArgs([...REQUIRED, GATEWAY_BACKEND_FLAG, 'postgres', DATABASE_URL_FLAG, DATABASE_URL]),
+    );
+    // The three renderings a leak would travel by: a serialized record, the
+    // value on its own, and the one function that turns a startup failure into
+    // the `error: …` line on stderr.
+    const rendered = [
+      JSON.stringify(backend),
+      JSON.stringify(backend?.databaseUrl),
+      describeStartupError(backend),
+    ].join('\n');
+    expect(rendered).not.toContain('hunter2');
+    expect(rendered).not.toContain(DATABASE_URL);
+    expect(JSON.stringify(backend?.databaseUrl)).toContain('redacted');
+  });
+
+  test('--backend postgres without --database-url fails exactly as a missing required flag does', async () => {
+    // The differential: the message for a flag argparse-style *declares*
+    // required, with the flag name swapped.  If `@effect/cli` rewords one, the
+    // two expectations move together or this test fails.
+    const declaredRequired = messageOf(
+      await parseArgs(['--runs-root', '/r', '--cache-root', '/c', '--ready-file', '/f']),
+    );
+    expect(declaredRequired).toContain(missingOptionMessage('--service-url'));
+    const conditional = messageOf(await parseArgs([...REQUIRED, GATEWAY_BACKEND_FLAG, 'postgres']));
+    expect(conditional).toContain(missingOptionMessage(DATABASE_URL_FLAG));
+    expect(conditional).toContain(DATABASE_URL_FLAG);
+  });
+
+  test('--database-url without --backend postgres is refused, not ignored', async () => {
+    const messages = await Promise.all(
+      [[...REQUIRED], [...REQUIRED, GATEWAY_BACKEND_FLAG, 'fs']].map(async (base) =>
+        messageOf(await parseArgs([...base, DATABASE_URL_FLAG, DATABASE_URL])),
+      ),
+    );
+    expect(messages.map((message) => message.includes(DATABASE_URL_WITHOUT_POSTGRES))).toEqual([
+      true,
+      true,
+    ]);
+    expect(messages.join('\n')).not.toContain('hunter2');
+  });
+
+  test('a backend that is neither fs nor postgres is a validation error', async () => {
+    const message = messageOf(await parseArgs([...REQUIRED, GATEWAY_BACKEND_FLAG, 'sqlite']));
+    expect(message).not.toBe('parsed');
+    // `@effect/cli` reports the alternatives rather than echoing the value.
+    expect(message).toBe(`Expected one of the following cases: ${GATEWAY_BACKENDS.join(', ')}`);
+  });
+
+  test('both flags are discoverable in the usage block, beside the nine', async () => {
+    const usage = HelpDoc.toAnsiText(
+      CommandDescriptor.getHelp(gatewayCommand.descriptor, CliConfig.defaultConfig),
+    );
+    expect([GATEWAY_BACKEND_FLAG, DATABASE_URL_FLAG].filter((flag) => usage.includes(flag))).toEqual(
+      [GATEWAY_BACKEND_FLAG, DATABASE_URL_FLAG],
+    );
+    // …and the nine `_parser()` shares are still there, unmoved.
+    expect(usage.includes('--service-url') && usage.includes('--viewer-public-url')).toBe(true);
+  });
+
+
+  test('--materialize-root is discoverable too, and refused without postgres', async () => {
+    const usage = HelpDoc.toAnsiText(
+      CommandDescriptor.getHelp(gatewayCommand.descriptor, CliConfig.defaultConfig),
+    );
+    expect(usage).toContain(MATERIALIZE_ROOT_FLAG);
+    const message = messageOf(await parseArgs([...REQUIRED, MATERIALIZE_ROOT_FLAG, '/elsewhere']));
+    expect(message).toContain(MATERIALIZE_ROOT_WITHOUT_POSTGRES);
+  });
+
+  test('the config resolves the backend, and the identity digest still ignores it', async () => {
+    const backend: PostgresBackendInput = {
+      _tag: 'Postgres',
+      databaseUrl: Redacted.make(DATABASE_URL),
+      materializeRoot: undefined,
+    };
+    const [plain, postgres] = await Promise.all([
+      runFs(Effect.orDie(makeGatewayConfig(BASE))),
+      runFs(Effect.orDie(makeGatewayConfig({ ...BASE, backend }))),
+    ]);
+    expect(plain.backend).toBeUndefined();
+    expect(postgres.backend?.databaseUrl).toBe(backend.databaseUrl);
+    // `local_stack.py` derives `replay-gateway-{identity}.json` from this
+    // digest, and the URL may hold a password: neither may enter it.
+    expect(postgres.identity).toBe(plain.identity);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `--materialize-root`: the sibling directory the python bridge reads
+// ---------------------------------------------------------------------------
+
+const postgresInput = (materializeRoot: string | undefined): GatewayConfigInput => ({
+  ...BASE,
+  backend: { _tag: 'Postgres', databaseUrl: Redacted.make(DATABASE_URL), materializeRoot },
+});
+
+describe('--materialize-root — a sibling of the cache root, never a relative of it', () => {
+  test('the default is <cache-root>-saves, and it is what main.ts would have derived', async () => {
+    const config = await runFs(Effect.orDie(makeGatewayConfig(postgresInput(undefined))));
+    expect(config.backend?.materializeRoot).toBe(`${config.cacheRoot}-saves`);
+    expect(config.backend?.materializeRoot).toBe(materializeRootFor(config.cacheRoot));
+  });
+
+  test('an explicit root is resolved the way every other path is', async () => {
+    const config = await runFs(Effect.orDie(makeGatewayConfig(postgresInput('/elsewhere/saves'))));
+    expect(config.backend?.materializeRoot).toBe('/elsewhere/saves');
+  });
+
+  test('a root that equals, contains or sits inside the cache root is refused', async () => {
+    // `save_replay._cache_directory` raises `SaveReplayError("Replay cache must
+    // be separate from game saves.")` for all three, on the first replay
+    // request; here it is exit 2 before the socket binds.
+    const refused = await Promise.all(
+      ['/cache', '/cache/saves', '/'].map((root) => failureOf(postgresInput(root))),
+    );
+    expect(refused).toEqual(
+      Array.from({ length: 3 }, () => GATEWAY_CONFIG_MESSAGES.materializeRootNestsCacheRoot),
+    );
+    expect(await failureOf(postgresInput('/cache-saves'))).toBe('no failure');
+  });
+
+  test('the nesting predicate is @arena/db’s, checked rather than assumed', () => {
+    // Two copies exist on purpose — importing `@arena/db` from `config.ts` would
+    // put a database driver in the filesystem gateway's module graph — so the
+    // agreement is a test, not a comment.
+    const pairs: readonly (readonly [string, string])[] = [
+      ['/a', '/a'],
+      ['/a/b', '/a'],
+      ['/a', '/a/b'],
+      ['/a-saves', '/a'],
+      ['/a', '/b'],
+      ['/a/', '/a'],
+      ['/ab', '/a'],
+    ];
+    expect(pairs.map(([left, right]) => pathsNest(left, right))).toEqual(
+      pairs.map(([left, right]) => Materialize.nestsWith(left, right)),
+    );
+    // …and the default is a sibling for every root a caller can plausibly pass:
+    // `<root>-saves` differs from `<root>` by a suffix, and a suffix is not a
+    // path separator.
+    expect(
+      ['/c', '/a/b/replay-cache', '/tmp/x'].every(
+        (root) => !pathsNest(materializeRootFor(root), root),
+      ),
+    ).toBe(true);
+    // The one exception, stated rather than hidden: `--cache-root /` strips to
+    // the empty string, so *every* absolute path "nests" with it and the
+    // derived default is refused at startup.  Both copies of the predicate do
+    // this, so the two backends refuse the same absurd invocation together.
+    expect(pathsNest(materializeRootFor('/'), '/')).toBe(
+      Materialize.nestsWith(materializeRootFor('/'), '/'),
+    );
+  });
+
+  test('the ordering contract holds: a Python failure still wins over a new one', async () => {
+    // Both wrong: a non-loopback host *and* a nesting materialize root.  The
+    // message must be the one CPython would have produced, which is why
+    // `resolveBackend` runs last.
+    expect(await failureOf({ ...postgresInput('/cache'), host: 'localhost' })).toBe(
+      GATEWAY_CONFIG_MESSAGES.hostNotLiteral,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// main.ts: the layer selection, and the module graph the fs path keeps
+// ---------------------------------------------------------------------------
+
+/** `archiveServices`' requirements: the pg arm materializes through both. */
+const PLATFORM = Layer.mergeAll(NodeFileSystem.layer, NodePath.layer);
+
+/** A URL `@arena/db` refuses before it opens a socket — no server is contacted. */
+const NOT_POSTGRES_URL = 'mysql://arena:hunter2@127.0.0.1:3306/arena_wf_demo';
+
+describe('main.ts — which layers the backend selects', () => {
+  test('no backend builds the filesystem repository and the python derivation bridge', async () => {
+    const config = await runFs(Effect.orDie(makeGatewayConfig(BASE)));
+    const services = await Effect.runPromise(
+      Effect.provide(
+        Effect.provide(Effect.all([RunsRepository, ReplayDerivation]), archiveServices(config)),
+        PLATFORM,
+      ).pipe(Effect.orDie),
+    );
+    expect(services[0].runsRoot).toBe(config.runsRoot);
+    expect([services[1].replay, services[1].board, services[1].events].map((f) => typeof f)).toEqual(
+      ['function', 'function', 'function'],
+    );
+  });
+
+  test('--backend postgres builds @arena/db’s layers, and an unusable URL is exit 2', async () => {
+    const config = await runFs(
+      Effect.orDie(
+        makeGatewayConfig({
+          ...BASE,
+          backend: {
+            _tag: 'Postgres',
+            databaseUrl: Redacted.make(NOT_POSTGRES_URL),
+            materializeRoot: undefined,
+          },
+        }),
+      ),
+    );
+    const outcome = await Effect.runPromise(
+      Effect.provide(
+        Effect.either(Effect.provide(RunsRepository, archiveServices(config))),
+        PLATFORM,
+      ),
+    );
+    expect(Either.isLeft(outcome)).toBe(true);
+    const message = Either.match(outcome, {
+      onLeft: (error) => describeStartupError(error),
+      onRight: () => 'no failure',
+    });
+    // The layer was really built — this is `@arena/db`'s own refusal, reported
+    // as the gateway's startup error.
+    expect(message).toContain('DatabaseUnavailable');
+    expect(message).toContain(UNUSABLE_DATABASE_URL);
+    expect(message).toContain('postgres://');
+    // …and it names no credential, no host and no URL of its own.
+    expect(message).not.toContain('hunter2');
+    expect(message).not.toContain(NOT_POSTGRES_URL);
+  });
+
+  test('the pool is pinned small enough for a matrix of gateways', () => {
+    // `max_connections` is 100 on a stock server; the rig boots one gateway per
+    // scenario, nine of them, and can run two matrices at once.  The driver's
+    // unset default of 10 asks for 180 — measured as a rig failure.
+    const SCENARIOS = 9;
+    const CONCURRENT_MATRICES = 2;
+    const STOCK_MAX_CONNECTIONS = 100;
+    expect(GATEWAY_MAX_DB_CONNECTIONS * SCENARIOS * CONCURRENT_MATRICES).toBeLessThan(
+      STOCK_MAX_CONNECTIONS,
+    );
+    // …and still more than one, so a request that reads two rows concurrently
+    // does not serialize on the pool.
+    expect(GATEWAY_MAX_DB_CONNECTIONS).toBeGreaterThan(1);
+    expect(GATEWAY_DB_APPLICATION_NAME).toContain('gateway');
+  });
+
+  test('a failed @arena/db load says what to do about it', () => {
+    expect(POSTGRES_BACKEND_UNAVAILABLE).toContain('bun install');
+    expect(POSTGRES_BACKEND_UNAVAILABLE).toContain(`${GATEWAY_BACKEND_FLAG} postgres`);
+  });
+
+  test('the filesystem gateway never resolves @arena/db or a database driver', async () => {
+    // The claim the dynamic import exists for, as a measurement: a Bun plugin
+    // records every module resolution the gateway's entry point performs, and
+    // the pg half must not appear among them.  A static import would.
+    const probe = `
+      const seen = [];
+      Bun.plugin({
+        name: 'module-graph-probe',
+        setup(build) {
+          build.onResolve({ filter: /.*/ }, (args) => { seen.push(args.path); return undefined; });
+        },
+      });
+      await import(${JSON.stringify(join(REPO_ROOT, 'arena/harness/src/gateway/main.ts'))});
+      const hit = (needle) => seen.filter((path) => path.includes(needle)).length;
+      console.log(JSON.stringify({
+        total: seen.length,
+        db: hit('@arena/db'),
+        sqlPg: hit('sql-pg'),
+        driver: seen.filter((path) => path === 'pg' || path.startsWith('pg/')).length,
+      }));
+    `;
+    const child = Bun.spawnSync(['bun', '-e', probe], { cwd: join(REPO_ROOT, 'arena/harness') });
+    const report = JSON.parse(child.stdout.toString().trim()) as {
+      total: number;
+      db: number;
+      sqlPg: number;
+      driver: number;
+    };
+    expect(child.exitCode).toBe(0);
+    // A real graph was walked, and none of it was the database.
+    expect(report.total).toBeGreaterThan(100);
+    expect([report.db, report.sqlPg, report.driver]).toEqual([0, 0, 0]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The pg repository decorator: logging, and nothing else
+// ---------------------------------------------------------------------------
+
+/**
+ * A repository whose reads record their overlap.
+ *
+ * It answers after a tick, and counts how many callers were inside it at once.
+ * The decorator used to hold a per-game semaphore and this probe pinned it at
+ * `1`; the lock now lives in `@arena/db`'s materializer, which is the object the
+ * derivation bridge shares — so what this probe pins here is the *opposite*
+ * claim, that the gateway adds no queue of its own on top of it. `frameFile`
+ * and `videoFile` answer out of `bytea` and reconcile nothing, so a lock around
+ * them would only be a queue on a `SELECT`.
+ */
+const overlapProbe = (): {
+  readonly repository: RunsRepositoryApi;
+  readonly peak: () => number;
+} => {
+  const state = { inside: 0, peak: 0 };
+  const enter = (): void => {
+    state.inside += 1;
+    state.peak = Math.max(state.peak, state.inside);
+  };
+  // The decorator reads exactly one field of a `TerminalArchive` — `gameId`,
+  // for the log line — so the stub carries it and is cast
+  // rather than built: a full archive here would be twelve fields of
+  // projection output that nothing under test looks at, and building one from
+  // a fixture would make this a filesystem test.
+  const archiveOf = (gameId: string): TerminalArchive =>
+    ({ gameId, runRoot: `/materialized/${gameId}` }) as unknown as TerminalArchive;
+  const guarded = <A>(value: A): Effect.Effect<A> =>
+    Effect.acquireUseRelease(
+      Effect.sync(enter),
+      () => Effect.as(Effect.sleep('5 millis'), value),
+      () =>
+        Effect.sync(() => {
+          state.inside -= 1;
+        }),
+    );
+  return {
+    repository: {
+      runsRoot: '/runs',
+      readManifest: () => Effect.succeed({}),
+      decodeManifest: () => Effect.die('unused'),
+      terminalArchive: (gameId: string) => guarded(archiveOf(gameId)),
+      lastReplayTurn: () => Effect.succeedNone,
+      diskGamesIndex: () => Effect.die('unused'),
+      diskRowsWithInterrupted: () => Effect.die('unused'),
+      frameFile: (archive: TerminalArchive) => guarded(`/materialized/${archive.gameId}/frame.png`),
+      videoFile: (archive: TerminalArchive) => guarded(`/materialized/${archive.gameId}/game.mp4`),
+    } as unknown as RunsRepositoryApi,
+    peak: () => state.peak,
+  };
+};
+
+describe('the pg repository decorator adds a log line and no lock', () => {
+  test('a burst on one game is not queued by the gateway', async () => {
+    // The serialization this used to assert is `@arena/db`'s now, and it is
+    // asserted there against a real materializer and a real directory
+    // (`materialize.ts`'s per-game semaphore, `runs-repository-pg.test.ts`'s
+    // single-flight tests). A second lock here would serialize the reads that
+    // never touch a directory as well as the one that does.
+    const probe = overlapProbe();
+    const guarded = withFailureLog(probe.repository);
+    await Effect.runPromise(
+      Effect.all(
+        Array.from({ length: 24 }, () => guarded.terminalArchive('game_parity_terminal_valid_01')),
+        { concurrency: 'unbounded' },
+      ),
+    );
+    expect(probe.peak()).toBe(24);
+  });
+
+  test('the frame and video reads are not queued behind the archive read', async () => {
+    const probe = overlapProbe();
+    const archive = { gameId: 'game_shared' } as unknown as TerminalArchive;
+    const guarded = withFailureLog(probe.repository);
+    await Effect.runPromise(
+      Effect.all(
+        [
+          guarded.terminalArchive('game_shared'),
+          guarded.frameFile(archive, Option.none()),
+          guarded.videoFile(archive),
+        ],
+        { concurrency: 'unbounded' },
+      ),
+    );
+    expect(probe.peak()).toBe(3);
+  });
+
+  test('the failure line names the operation and the cause, and nothing else', () => {
+    const line = describeRepositoryFailure('terminalArchive', 'game_x', {
+      _tag: 'ArchiveUnavailable',
+      problem: 'manifestUnavailable',
+    });
+    expect(line).toContain('pg-backend: terminalArchive game_x failed');
+    expect(line).toContain('ArchiveUnavailable');
+    expect(line).not.toContain(DATABASE_URL);
   });
 });
