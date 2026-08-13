@@ -382,7 +382,7 @@ export const publicEvents = (
   );
   const weights = events.map((event) => event.weight);
   return {
-    schema_version: BigInt(Gateway.ARCHIVE_SCHEMA_VERSION),
+    schema_version: 1n,
     game_id: gameId,
     available: untrustedField(value, 'available') === true,
     events,

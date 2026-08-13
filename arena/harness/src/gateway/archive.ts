@@ -60,14 +60,13 @@ import { Either, Option } from 'effect';
 import {
   type CanonValue,
   compareCodePoints,
-  decodeRunState,
   type FrameIndex,
   type GameId,
   Gateway,
   isGameId,
+  isKnownRunState,
   isTerminalRunState,
-  type RunStateTolerant,
-  UnrecognizedRunState,
+  type RunState,
 } from '@arena/wire';
 import {
   type Canonical,
@@ -90,17 +89,6 @@ import {
 // ---------------------------------------------------------------------------
 
 /**
- * Narrow a state string into the union the wire payloads are typed with.
- *
- * Total: a state the port knows stays a literal, anything else keeps its text
- * behind the `UnrecognizedRunState` brand rather than being rejected —
- * `_public_text` passes through whatever a manifest says (`:1130`), so the
- * port must too.
- */
-export const runState = (value: string): RunStateTolerant =>
-  Either.getOrElse(decodeRunState(value), () => UnrecognizedRunState.make(value));
-
-/**
  * `TerminalArchive` (`:88`) with `run_root` removed — the directory is the
  * I/O layer's business and nothing in a *payload* is derived from it.
  *
@@ -111,7 +99,7 @@ export interface ArchiveView {
   readonly gameId: GameId;
   readonly manifest: Untrusted;
   readonly report: Untrusted;
-  readonly state: RunStateTolerant;
+  readonly state: RunState;
   readonly benchmarkValid: boolean;
   readonly places: readonly Canonical<Gateway.GamePlace>[];
   readonly leaderboard: readonly Canonical<Gateway.LeaderboardEntry>[];
@@ -128,9 +116,11 @@ export interface ArchiveView {
  */
 const SCHEMA_VERSION = 1n;
 
-/** `_public_text(manifest.get("state", manifest.get("status")), "unknown", 32)`. */
-export const manifestState = (manifest: unknown): RunStateTolerant =>
-  runState(publicText(untrustedFieldOr(manifest, 'state', 'status'), 'unknown', 32));
+/** Current-version state; malformed or legacy values project to `unknown`. */
+export const manifestState = (manifest: unknown): RunState => {
+  const state = publicText(untrustedFieldOr(manifest, 'state', 'status'), 'unknown', 32);
+  return isKnownRunState(state) ? state : 'unknown';
+};
 
 // ---------------------------------------------------------------------------
 // _archive_reasons
