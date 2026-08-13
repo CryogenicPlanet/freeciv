@@ -43,9 +43,10 @@
  *
  * The one place that shows is `V2_SIDECAR_FIELDS`, which the Python uses to
  * **reject** an unknown sidecar key outright (`client.py:2091-2099`).  Here the
- * key is preserved and the verdict is offered as {@link unexpectedSidecarFields},
- * so a play surface can still refuse while a proxy can forward a field it was
- * built too early to name.
+ * key is preserved and the verdict is offered as {@link unexpectedSidecarFields}.
+ * The default decoders remain tolerant for proxies and recorders; an actual
+ * play surface can opt into the Python client's refusal through
+ * {@link decodeHealthForPythonClient}.
  *
  * ## Two divergences worth naming
  *
@@ -1001,3 +1002,47 @@ export const healthEnvelopeFor = (
 /** Decode a health envelope and bind it to `session`. */
 export const decodeHealthFor = (session: SessionIdentity): TolerantDecoder<HealthEnvelope> =>
   decodeTolerant(healthEnvelopeFor(session), 'HealthEnvelope');
+
+const pythonClientSidecarIssues = (
+  value: HealthEnvelopeShape,
+): ReadonlyArray<Schema.FilterIssue> => {
+  const unexpected = unexpectedSidecarFields(value.sidecar);
+  return unexpected.length === 0
+    ? []
+    : [
+        {
+          path: ['sidecar'],
+          message:
+            `unexpected sidecar field(s) ${unexpected.join(', ')} — ` +
+            "this workspace's client predates the server; re-materialize it with " +
+            "the repository root's play launcher or refresh client.py",
+        },
+      ];
+};
+
+/**
+ * The session-bound health schema with the Python client's unknown-sidecar-key
+ * refusal restored.
+ *
+ * This is deliberately an opt-in schema rather than a change to
+ * {@link HealthEnvelope}: additive fields must remain decodable by proxies,
+ * archives, and newer-server/older-reader interoperability paths. Use this
+ * schema only at the concrete Python-client compatibility boundary.
+ */
+export const healthEnvelopeForPythonClient = (
+  session: SessionIdentity,
+): Schema.Schema<HealthEnvelope, HealthEnvelopeEncoded> =>
+  healthEnvelopeFor(session)
+    .pipe(Schema.filter(pythonClientSidecarIssues))
+    .annotations({ identifier: 'PythonClientHealthEnvelope' });
+
+/**
+ * Decode health at the Python-client boundary with its unknown-sidecar-key
+ * refusal restored. The ordinary {@link decodeHealth} and
+ * {@link decodeHealthFor} decoders intentionally remain tolerant; this path
+ * does not claim to erase the separately documented JSON representation gaps.
+ */
+export const decodeHealthForPythonClient = (
+  session: SessionIdentity,
+): TolerantDecoder<HealthEnvelope> =>
+  decodeTolerant(healthEnvelopeForPythonClient(session), 'PythonClientHealthEnvelope');

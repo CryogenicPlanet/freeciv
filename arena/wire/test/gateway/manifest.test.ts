@@ -47,6 +47,10 @@ import {
   victoryLabel,
 } from 'src/gateway/manifest';
 import { CONTROL_PROTOCOLS, isControlProtocol } from 'src/control-protocol';
+import {
+  Technology as EmbeddedTechnology,
+  TechnologyCatalog as EmbeddedTechnologyCatalog,
+} from 'src/gateway/replay';
 import { WireInt } from 'src/numeric';
 import { formatIssuePath, isTolerant } from 'src/tolerant';
 
@@ -723,7 +727,7 @@ describe('victory.json', () => {
 // ---------------------------------------------------------------------------
 
 /** A minimal well-formed technology row, varying only its id. */
-const technologyWithId = (id: number): unknown => ({
+const technologyWithId = (id: number) => ({
   id,
   rule_name: 'Alphabet',
   name: 'Alphabet',
@@ -733,6 +737,12 @@ const technologyWithId = (id: number): unknown => ({
 describe('replay-catalog.json', () => {
   const withDepth = decoded(decodeReplayCatalog, catalogFile('tech-tree-with-depth-and-requires.json'));
   const withoutDepth = decoded(decodeReplayCatalog, catalogFile('tech-tree-without-depth.json'));
+
+  test('disk compatibility names are aliases of the embedded authoritative schemas', () => {
+    expect(TechnologyEntry).toBe(EmbeddedTechnology);
+    expect(ReplayCatalog).toBe(EmbeddedTechnologyCatalog);
+  });
+
   test('both writers claim schema_version 1', () => {
     expect(withDepth.schema_version).toBe(1n);
     expect(withoutDepth.schema_version).toBe(1n);
@@ -783,7 +793,7 @@ describe('replay-catalog.json', () => {
     expect(JSON.stringify(round.right)).not.toBe(raw.trim());
     expect(JSON.stringify(round.right)).toBe(JSON.stringify(JSON.parse(raw)));
   });
-  test('the reader rejects an id outside 0..511 and a fractional one', () => {
+  test('every catalog technology id, including prerequisites, is bounded 0..511', () => {
     // supervisor.py:424-434 — finite, integral and in range, or the whole
     // catalog is "malformed" and the replay degrades to catalog: null.
     const decode = Schema.decodeUnknownEither(TechnologyEntry);
@@ -792,6 +802,9 @@ describe('replay-catalog.json', () => {
     expect(Either.isLeft(decode(technologyWithId(512)))).toBe(true);
     expect(Either.isLeft(decode(technologyWithId(-1)))).toBe(true);
     expect(Either.isLeft(decode(technologyWithId(1.5)))).toBe(true);
+    expect(Either.isRight(decode({ ...technologyWithId(1), requires: [0, 511] }))).toBe(true);
+    expect(Either.isLeft(decode({ ...technologyWithId(1), requires: [512] }))).toBe(true);
+    expect(Either.isLeft(decode({ ...technologyWithId(1), requires: [-1] }))).toBe(true);
   });
 });
 

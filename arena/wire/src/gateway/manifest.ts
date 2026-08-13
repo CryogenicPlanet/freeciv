@@ -72,6 +72,13 @@ import { GameId, RunStateTolerant } from '../ids.ts';
 import { JsonValue } from '../json.ts';
 import { WireFloat, WireInt, WireNumber } from '../numeric.ts';
 import {
+  MAX_TECHNOLOGY_ID,
+  Technology,
+  TechnologyCatalog,
+  type Technology as TechnologyType,
+  type TechnologyCatalog as TechnologyCatalogType,
+} from './technology.ts';
+import {
   decodeTolerant,
   encodeTolerant,
   type TolerantDecoder,
@@ -645,87 +652,31 @@ export const encodeVictoryRecord: TolerantEncoder<
 // replay-catalog.json
 // ---------------------------------------------------------------------------
 
-/** Highest technology id the Lua writer scans, and the reader accepts (`supervisor.py:427`). */
-export const MAX_TECHNOLOGY_ID = 511;
-
 /**
- * One technology.
+ * Backwards-compatible name for the shared technology schema.
  *
- * Two writers produce this file and they disagree about the optional half:
- *
- * - `bridge.lua:350` (strategic-v1) writes `{id, rule_name, name, cost_base}`
- *   with the ruleset's real research costs, and spells the id with Lua's
- *   `tostring`, which yields `1.0` for a float-typed id — the archived
- *   strategic-v1 catalog is full of `"id":1.0`.
- * - `v2_replay._write_catalog` (`v2_replay.py:349`) writes what
- *   `save_replay._technology_catalog` (`save_replay.py:322`) reconstructed from
- *   an autosave, which adds `requires` and `depth` and, because an autosave
- *   cannot answer research cost, sets `cost_base` to the integer `0`.
- *
- * Both are `schema_version: 1`; the version does not distinguish them.
- *
- * `id` decodes to `bigint` for both spellings, matching the reader's
- * `int(tech_id)` normalization (`supervisor.py:435`) — the `1.0` spelling
- * cannot survive a round trip and does not need to, because the reader
- * normalizes it away before anything is published.
- *
- * `cost_base` is {@link WireNumber} and *is* passed through unchanged, so its
- * spelling is observable on the wire.  Lua types every cost as a float, and 9
- * of the 87 classic technologies have a round one (`640.0`, `3430.0`, ...),
- * which `JSON.parse` renders indistinguishable from an int; those decode to
- * `bigint` and would re-encode a fraction narrower than Lua wrote them.  The
- * ported gateway does not hit this — its disk path reconstructs the catalog
- * from autosaves rather than republishing this file — but a port that does
- * must take the spelling from the writer's identity, not from the value.
- *
- * The row-local filters are the reader's (`supervisor.py:424`): finite,
- * integral, 0..511 id and a finite non-negative cost.  The *closure* checks it
- * also applies — 87 unique Classic technologies, acyclic, every prerequisite
- * present — belong to the loader, not to the file format, and are deliberately
- * not encoded here.
+ * This is the same schema object used by embedded replay catalogs; the alias
+ * remains only so existing direct imports do not create a second contract.
  */
-export const TechnologyEntry = Schema.Struct({
-  /** Freeciv technology id, 0..511. */
-  id: WireInt.pipe(Schema.betweenBigInt(0n, BigInt(MAX_TECHNOLOGY_ID))),
-  /** Ruleset rule name, e.g. `"Bronze Working"`. */
-  rule_name: Schema.String,
-  /** Translated display name. */
-  name: Schema.String,
-  /** Base research cost; the integer `0` when reconstructed from an autosave. */
-  cost_base: WireNumber,
-  /** Prerequisite technology ids.  Absent from the Lua-written catalog. */
-  requires: Schema.optional(Schema.Array(WireInt)),
-  /** Longest prerequisite chain to this technology.  Absent from the Lua-written catalog. */
-  depth: Schema.optional(WireInt),
-}).annotations({ identifier: 'TechnologyEntry' });
-/** One technology. */
-export type TechnologyEntry = typeof TechnologyEntry.Type;
+export const TechnologyEntry = Technology;
+/** Backwards-compatible type name for {@link Technology}. */
+export type TechnologyEntry = TechnologyType;
 
-/**
- * `replay-catalog.json` — the technology tree a replay's research numbers are
- * read against.
- *
- * The gateway does not serve this file directly; the supervisor validates and
- * closes it with `_classic_technology_catalog` (`supervisor.py:408`) and
- * republishes the result as `catalog` inside `replay.json`.  A `ValueError`
- * there is not fatal — it degrades to the warning "Technology telemetry is
- * temporarily unavailable." and a `catalog: null` (`supervisor.py:9903`).
- */
-export const ReplayCatalog = Schema.Struct({
-  schema_version: WireInt,
-  technologies: Schema.Array(TechnologyEntry),
-}).annotations({ identifier: 'ReplayCatalog' });
-/** A run's `replay-catalog.json`. */
-export type ReplayCatalog = typeof ReplayCatalog.Type;
+/** Backwards-compatible name for the authoritative on-disk/embedded catalog schema. */
+export const ReplayCatalog = TechnologyCatalog;
+/** Backwards-compatible type name for {@link TechnologyCatalog}. */
+export type ReplayCatalog = TechnologyCatalogType;
 
-/** Decode a run's `replay-catalog.json`. */
+/** Decode the authoritative catalog schema under the legacy public error label. */
 export const decodeReplayCatalog: TolerantDecoder<ReplayCatalog> = decodeTolerant(
   ReplayCatalog,
   'ReplayCatalog',
 );
 
-/** Re-encode a decoded technology catalog. */
+/** Encode the authoritative catalog schema under the legacy public error label. */
 export const encodeReplayCatalog: TolerantEncoder<
   ReplayCatalog,
   Schema.Schema.Encoded<typeof ReplayCatalog>
 > = encodeTolerant(ReplayCatalog, 'ReplayCatalog');
+
+export { MAX_TECHNOLOGY_ID };

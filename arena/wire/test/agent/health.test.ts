@@ -16,6 +16,7 @@ import {
   AWAITING_AGENT,
   decodeHealth,
   decodeHealthFor,
+  decodeHealthForPythonClient,
   decodePhaseEndEvent,
   decodeRecoveryEvent,
   evaluationArity,
@@ -280,19 +281,25 @@ describe('the sidecar block', () => {
     expect(accepted(decodeHealth(withSidecar({ client_state: ['a'] })))).toBe(false);
   });
 
-  test('an unknown sidecar key is PRESERVED, not fatal — and reported on request', () => {
-    // client.py:2093-2100 refuses this payload outright.  @arena/wire keeps the
-    // field so a proxy can forward it, and hands the same verdict to a play
-    // surface through unexpectedSidecarFields.
+  test('the tolerant default preserves an unknown sidecar key and reports it on request', () => {
     const payload = withSidecar({ zeta_probe: 1, alpha_probe: 'x' });
     const value = decoded(decodeHealth(payload));
     expect(unexpectedSidecarFields(value.sidecar)).toEqual(['alpha_probe', 'zeta_probe']);
     expect(JSON.stringify(decoded(encodeTolerant(HealthEnvelope, 'HealthEnvelope')(value)))).toBe(JSON.stringify(payload));
   });
 
-  test('a sidecar of only known fields reports nothing unexpected', () => {
-    const known: SidecarBlock = decoded(decodeHealth(healthWire())).sidecar;
+  test('the explicit Python-client decoder rejects unknown sidecar keys', () => {
+    const strict = decodeHealthForPythonClient(session());
+    const error = refusal(strict(withSidecar({ zeta_probe: 1, alpha_probe: 'x' })));
+    expect(mentions(error, 'unexpected sidecar field(s) alpha_probe, zeta_probe')).toBe(true);
+    expect(mentions(error, "this workspace's client predates the server")).toBe(true);
+  });
+
+  test('both tolerant and Python-client paths accept a sidecar of only known fields', () => {
+    const payload = withSidecar({ exit_signal_name: 'SIGABRT', process_alive: false });
+    const known: SidecarBlock = decoded(decodeHealth(payload)).sidecar;
     expect(unexpectedSidecarFields(known)).toEqual([]);
+    expect(accepted(decodeHealthForPythonClient(session())(payload))).toBe(true);
     expect(V2_SIDECAR_FIELDS).toContain('exit_signal_name');
   });
 });

@@ -33,6 +33,7 @@ import {
   nextReplayQuery,
   REPLAY_DEFAULT_LIMIT,
   REPLAY_ROUTE_PROBLEMS,
+  TechnologyId,
 } from 'src/gateway/replay';
 import { WireInt, WireNumber } from 'src/numeric';
 import {
@@ -71,6 +72,13 @@ const BOARD_TURN1 = 'live/gateway-board-turn1.json';
 const EVENTS = 'live/gateway-events.json';
 const CATALOG_MODERN = 'runs/replay-catalog/tech-tree-with-depth-and-requires.json';
 const CATALOG_LEGACY = 'runs/replay-catalog/tech-tree-without-depth.json';
+
+const researchStateWithTechId = (tech_id: number) => ({
+  tech_id,
+  name: 'Alphabet',
+  bulbs: 0,
+  cost: 0,
+});
 
 /**
  * Decode, re-encode, and render — the whole parity claim in one string, so a
@@ -298,6 +306,17 @@ describe('replay.json — snapshots and players', () => {
 });
 
 describe('replay.json — the technology catalog', () => {
+  test('every replay technology-id field shares the inclusive 0..511 schema', () => {
+    const decodeId = Schema.decodeUnknownEither(TechnologyId);
+    expect(Either.isRight(decodeId(0))).toBe(true);
+    expect(Either.isRight(decodeId(511))).toBe(true);
+    expect(Either.isLeft(decodeId(-1))).toBe(true);
+    expect(Either.isLeft(decodeId(512))).toBe(true);
+
+    expect(Either.isRight(decodeResearchState(researchStateWithTechId(511)))).toBe(true);
+    expect(Either.isLeft(decodeResearchState(researchStateWithTechId(512)))).toBe(true);
+  });
+
   test('requires/depth are optional under the same schema_version 1', () => {
     const modern = decodedValue(decodeTechnologyCatalog, readJson(CATALOG_MODERN));
     const legacy = decodedValue(decodeTechnologyCatalog, readJson(CATALOG_LEGACY));

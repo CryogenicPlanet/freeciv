@@ -59,8 +59,25 @@
 import { Option, Schema } from 'effect';
 import { GameId } from '../ids.ts';
 import { JsonObject } from '../json.ts';
-import { WireInt, WireNonNegativeInt, WireNumber } from '../numeric.ts';
+import { WireInt, WireNonNegativeInt } from '../numeric.ts';
 import { GATEWAY_PROBLEM_MESSAGES } from './problem.ts';
+import {
+  MAX_TECHNOLOGY_ID,
+  Technology,
+  TechnologyCatalog,
+  TechnologyId,
+  decodeTechnologyCatalog,
+  encodeTechnologyCatalog,
+} from './technology.ts';
+
+export {
+  MAX_TECHNOLOGY_ID,
+  Technology,
+  TechnologyCatalog,
+  TechnologyId,
+  decodeTechnologyCatalog,
+  encodeTechnologyCatalog,
+};
 import {
   decodeTolerant,
   encodeTolerant,
@@ -118,52 +135,6 @@ export const decodeReplayWarning: TolerantDecoder<ReplayWarning> = decodeToleran
 // ---------------------------------------------------------------------------
 
 /**
- * One technology in the ruleset catalog (`save_replay.py:322-366`).
- *
- * `requires` and `depth` are added only for the bundled `classic` ruleset
- * (`save_replay.py:355-364`); every other ruleset — and every catalog cached
- * before that code landed — omits both keys under the *same*
- * `schema_version: 1`.  Both shapes are in the corpus.
- */
-export const Technology = Schema.Struct({
-  id: WireNonNegativeInt,
-  rule_name: Schema.String,
-  name: Schema.String,
-  cost_base: WireNumber,
-  requires: Schema.optional(Schema.Array(WireNonNegativeInt)),
-  depth: Schema.optional(WireNonNegativeInt),
-}).annotations({ identifier: 'Technology' });
-/** One technology in the ruleset catalog. */
-export type Technology = typeof Technology.Type;
-
-/**
- * The technology catalog embedded in a replay page (`save_replay.py:334`,
- * `:365`).
- *
- * `schema_version` is `1` on every catalog ever written, but it is typed as an
- * open integer rather than `Schema.Literal(1)`: it is not a discriminator yet,
- * and a bump must not turn every consumer into a hard failure.
- */
-export const TechnologyCatalog = Schema.Struct({
-  schema_version: WireNonNegativeInt,
-  technologies: Schema.Array(Technology),
-}).annotations({ identifier: 'TechnologyCatalog' });
-/** The technology catalog embedded in a replay page. */
-export type TechnologyCatalog = typeof TechnologyCatalog.Type;
-
-/** Decode a {@link TechnologyCatalog} — also the on-disk `replay-catalog.json`. */
-export const decodeTechnologyCatalog: TolerantDecoder<TechnologyCatalog> = decodeTolerant(
-  TechnologyCatalog,
-  'TechnologyCatalog',
-);
-
-/** Re-encode a {@link TechnologyCatalog}, unknown fields included. */
-export const encodeTechnologyCatalog: TolerantEncoder<
-  TechnologyCatalog,
-  typeof TechnologyCatalog.Encoded
-> = encodeTolerant(TechnologyCatalog, 'TechnologyCatalog');
-
-/**
  * What a player is researching (`save_replay.py:749-754`).
  *
  * `tech_id` is `null` when the current research name is absent or one of the
@@ -171,7 +142,7 @@ export const encodeTechnologyCatalog: TolerantEncoder<
  * `0` and carries no information.
  */
 export const ResearchState = Schema.Struct({
-  tech_id: Schema.NullOr(WireNonNegativeInt),
+  tech_id: Schema.NullOr(TechnologyId),
   name: Schema.String,
   bulbs: WireInt,
   cost: WireInt,
@@ -233,10 +204,10 @@ export const ReplayPlayer = Schema.Struct({
   units: WireInt,
   gold: WireInt,
   culture: WireInt,
-  known_tech_ids: Schema.Array(WireNonNegativeInt),
+  known_tech_ids: Schema.Array(TechnologyId),
   known_tech_names: Schema.optional(Schema.Array(Schema.String)),
-  gained_tech_ids: Schema.Array(WireNonNegativeInt),
-  lost_tech_ids: Schema.Array(WireNonNegativeInt),
+  gained_tech_ids: Schema.Array(TechnologyId),
+  lost_tech_ids: Schema.Array(TechnologyId),
   research: ResearchState,
   future_techs: WireInt,
   team_no: Schema.optional(Schema.NullOr(WireInt)),

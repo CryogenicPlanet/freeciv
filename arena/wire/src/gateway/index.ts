@@ -262,6 +262,7 @@ export {
   ResearchState,
   Technology,
   TechnologyCatalog,
+  TechnologyId,
 } from './replay.ts';
 
 export {
