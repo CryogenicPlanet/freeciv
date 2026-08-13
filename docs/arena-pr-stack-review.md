@@ -10,21 +10,20 @@
 
 **Scope note:** The original review covered committed PR diffs only. Uncommitted PostgreSQL work was excluded and remains outside this document's update.
 
-## Fix status update (PR #10)
+## Final fix status
 
-The PR #10 follow-up is implemented in the parity-rig worktree:
+The full #7–#10 stack was repaired and restacked parent-first:
 
-- **Resolved:** the full parity boot gates now support both Linux and Darwin. `ARENA_REQUIRE_PARITY=1` makes an unsupported-platform skip fail.
-- **Resolved:** raw `/v1/games/A/../B/...` is an ordinary equality leg after the PR #9 Node raw-target fix; both gateways refuse it. The referred disposition and exclusion were removed.
-- **Resolved:** the redundant header/method hunt wrapper and the query hunt's historical `DIVERGENT_AT_MEASUREMENT` registry/meta-tests were removed. Unique fixed, waiver, traversal, and derive seeds remain, including waiver self-invalidation.
-- **Remeasured:** self-invalidation removed the now-equal duplicate-`Content-Length` and binary framing waivers; their request/frame seeds are ordinary parity assertions now. The invented-verb runtime waiver was updated from Bun's old closed connection to Node's measured bare `400`.
-- **Still tracked elsewhere:** findings not assigned to this PR #10 cleanup remain historical review findings below; this update does not claim that all PR #7–#9 concerns are closed.
+- **PR #7:** reduced to canonical JSON and strict, explicitly versioned gateway schemas. Speculative Agent/FNV surfaces, tolerant excess-field preservation, generated snapshots, hunts, and migration meta-tests were removed.
+- **PR #8:** OTLP mirror failure is distinguished from authoritative event loss; the deferred corpus `live` command was removed.
+- **PR #9:** Linux locking, listener/readiness ordering, typed startup and derivation transport failures, integer-preserving Python JSON, unbounded-by-default derivation, logical PPM scanning, raw request targets, and committed derivation fixtures are implemented.
+- **PR #10:** Linux/Darwin parity gates, raw dot-segment refusal, Python non-finite JSON parity, platform-aware waivers, and historical hunt cleanup are implemented.
 
-Verification results for this update are recorded at the end of the document.
+Verification results are recorded at the end of the document.
 
 ## Executive summary
 
-The stack has strong Effect fundamentals and a serious differential parity rig. The two PR #10 acceptance blockers identified by the original review—Darwin-only parity gates and the referred cross-game raw-path divergence—are now resolved. Remaining stack-wide release findings below retain their original severity unless explicitly marked resolved.
+The original release blockers and correctness findings are resolved unless a section explicitly says otherwise. The remaining medium concern is synchronous filesystem work in request handling; it is bounded and securely wrapped, but can still stall unrelated requests on a slow filesystem. The final wire package is gateway-focused and rejects unsupported versions and unknown fields.
 
 ## Release blockers
 
@@ -76,10 +75,10 @@ produces:
 
 The PR #9 Node server edge now reads `IncomingMessage.url`, preserving literal dot segments for dispatch instead of routing the adapter-normalized URL. The PR #10 query corpus treats the target as ordinary byte equality and asserts that both gateways refuse it; no referred branch, disposition, or traversal exclusion remains.
 
-### 3. TypeScript adds a fixed 120-second derivation timeout
+### 3. TypeScript adds a fixed 120-second derivation timeout — resolved
 
 **PR:** #9  
-**Severity:** High
+**Status:** Resolved
 
 - `arena/harness/src/gateway/services/derivation.ts:384-415`
 - `arena/harness/src/gateway/services/derivation.ts:610-624`
@@ -89,15 +88,12 @@ Replay, board, and event derivation subprocesses are killed after 120 seconds. P
 
 A valid large cold derivation can therefore return TypeScript `503` while Python eventually succeeds and populates the cache.
 
-**Required direction:**
+**Implemented direction:** omitted timeout now means no wall-clock limit, matching Python; callers may opt into an explicit timeout.
 
-- Default to no derivation timeout for Python parity.
-- If an operational timeout is desired, make it an explicit configuration option and document it as a behavior change rather than a parity default.
-
-### 4. Disk JSON can lose arbitrary-precision integers
+### 4. Disk JSON can lose arbitrary-precision integers — resolved
 
 **PR:** #9  
-**Severity:** High
+**Status:** Resolved
 
 - `arena/harness/src/gateway/services/runs.ts:287-305`
 - `arena/harness/src/gateway/services/runs.ts:384-460`
@@ -110,15 +106,12 @@ For example, `9007199254740993` can first become `9007199254740992`.
 
 The stack already contains `python-json.ts` to preserve Python's `int`/`float` distinction, but it is not used at every Python-authored disk boundary.
 
-**Required direction:**
+**Implemented direction:** Python-authored disk JSON and derivation output use `parsePythonJson`, preserving integer/float distinctions and integers beyond `2^53`; boundary tests cover the behavior.
 
-- Use the integer-preserving parser for manifest, report, victory, and all other Python-authored disk JSON.
-- Add values around `2^53` to disk-to-response parity tests.
-
-### 5. Readiness is removed before the listener closes
+### 5. Readiness is removed before the listener closes — resolved
 
 **PR:** #9  
-**Severity:** High
+**Status:** Resolved
 
 - `arena/harness/src/gateway/server.ts:455-483`
 - Python reference: `agent_eval/replay_gateway.py:2163-2170`
@@ -127,17 +120,12 @@ TypeScript scope finalization removes the ready file before closing the HTTP lis
 
 A launcher observing file removal can begin replacement while the old listener remains bound. TypeScript also suppresses owned-ready-file unlink failures, potentially reporting clean shutdown while leaving stale readiness.
 
-**Required direction:**
+**Implemented direction:** the listener has a child scope registered after ready resources, so LIFO finalization closes it before readiness removal and lock release.
 
-1. Stop accepting requests and close the listener.
-2. Remove the owned ready record.
-3. Release the ready lock.
-4. Surface cleanup failures without masking the original shutdown cause.
-
-### 6. A clean checkout skips real derivation parity
+### 6. A clean checkout skips real derivation parity — resolved
 
 **PRs:** #9 and #10  
-**Severity:** High
+**Status:** Resolved
 
 - `arena/harness/test/gateway/derivation.test.ts:470-490`
 - `arena/harness/test/gateway/derivation.test.ts:548-576`
@@ -155,36 +143,25 @@ Observed committed-tip test result:
 
 The skipped cases included byte parity against the real Python save loaders.
 
-**Required direction:**
-
-- Build a deterministic synthetic run directory around committed `.sav.gz` fixtures.
-- Require replay, board, and events differential tests in CI.
-- Treat parity-suite skips as failures in the required CI job.
+**Implemented direction:** `derivation.test.ts` builds a deterministic run around a committed save and requires replay, board, and events bridge parity in a clean checkout. `ARENA_REQUIRE_PARITY=1` prevents platform gating from silently skipping required parity.
 
 ## Additional correctness findings
 
-### 7. Competing technology-catalogue schemas disagree on valid IDs
+### 7. Competing technology-catalogue schemas disagree on valid IDs — resolved
 
 **PR:** #7  
-**Severity:** High
+**Status:** Resolved
 
 - `arena/wire/src/gateway/replay.ts:128-157`
 - `arena/wire/src/gateway/manifest.ts:687-715`
 - Python reference: `agent_eval/supervisor.py:424-434`
 
-Two exported schemas model effectively the same catalogue:
+The original stack exported two schemas for the same catalogue with different ID bounds. One `TechnologyCatalog` schema now owns the embedded and on-disk shape, with technology IDs bounded to `0..511`.
 
-- `Technology.id` accepts any non-negative integer.
-- `TechnologyEntry.id` enforces `0..511`.
-
-A caller using `decodeTechnologyCatalog` can accept `512`, while `decodeReplayCatalog` rejects it.
-
-**Required direction:** consolidate the types into one authoritative schema and reuse it for both embedded and on-disk catalogues.
-
-### 8. OTLP failure is falsely reported as a dropped event
+### 8. OTLP failure is falsely reported as a dropped event — resolved
 
 **PR:** #8  
-**Severity:** High
+**Status:** Resolved
 
 - `arena/telemetry/src/observability.ts:125-137`
 - `arena/telemetry/src/middleware.ts:122-152`
@@ -197,7 +174,7 @@ The authoritative NDJSON line is written before OTLP mirroring. If mirroring fai
 
 The event was not dropped; it was persisted locally and failed only to mirror.
 
-**Required direction:** distinguish emit/write loss from post-persistence export failure.
+**Implemented direction:** persistence and mirroring have distinct outcomes; OTLP failure no longer claims that the authoritative corpus event was dropped.
 
 ### 9. Synchronous request-path filesystem work can stall the gateway
 
@@ -214,10 +191,10 @@ A slow disk or archive read can stall unrelated health and proxy requests.
 
 **Required direction:** use asynchronous scoped filesystem effects or isolate blocking calls on an appropriate blocking executor.
 
-### 10. Derivation transport failures are silently degraded
+### 10. Derivation transport failures are silently degraded — resolved
 
 **PR:** #9  
-**Severity:** Medium
+**Status:** Resolved
 
 - `arena/harness/src/gateway/services/derivation.ts:477-492`
 - `arena/harness/src/gateway/services/derivation.ts:541-559`
@@ -231,12 +208,12 @@ Current behavior includes:
 
 A failed stdin write can leave the child deriving with incomplete input or waiting until timeout.
 
-**Required direction:** map each transport failure immediately to `DerivationUnavailable` and close stdin in a finalizer.
+**Implemented direction:** stdin, reader, and child-exit failures map to typed `DerivationUnavailable`; stdin and process cleanup are scoped.
 
-### 11. Startup ordering and bind-error reporting differ from Python
+### 11. Startup ordering and bind-error reporting differ from Python — resolved
 
 **PR:** #9  
-**Severity:** Medium
+**Status:** Resolved
 
 - `arena/harness/src/gateway/server.ts:421-475`
 - `arena/harness/src/gateway/main.ts:315-324`
@@ -244,12 +221,12 @@ A failed stdin write can leave the child deriving with incomplete input or waiti
 
 TypeScript binds before creating `cache_root`; Python creates the directory first. Bind failures can also become defects rendered with `Cause.pretty` instead of Python's uniform `error: …`, exit 2 contract.
 
-**Required direction:** validate/create the cache before binding and translate bind failures into a tagged startup error.
+**Implemented direction:** cache creation precedes binding and bind failures flow through the typed startup error/reporting contract.
 
-### 12. Upstream JSON rejects Python-accepted non-finite constants
+### 12. Upstream JSON rejects Python-accepted non-finite constants — resolved
 
 **PR:** #9  
-**Severity:** Medium
+**Status:** Resolved
 
 - `arena/harness/src/gateway/python-json.ts:59-65`, `:225-235`
 - `arena/harness/src/gateway/http/routes/games.ts:129-145`
@@ -259,24 +236,24 @@ TypeScript binds before creating `cache_root`; Python creates the directory firs
 
 An upstream games response containing `NaN` can therefore be Python `200` but TypeScript `502`.
 
-**Required direction:** either reproduce CPython constant handling or harden both implementations together and document the contract change.
+**Implemented direction:** the Python-compatible parser accepts `NaN` and infinities, and gateway rendering emits CPython-compatible spellings.
 
-### 13. PPM metadata parsing adds a 512 KiB cutoff
+### 13. PPM metadata parsing adds a 512 KiB cutoff — resolved
 
 **PR:** #9  
-**Severity:** Medium
+**Status:** Resolved
 
 - `arena/harness/src/gateway/http/routes/archive.ts:145-193`, `:234-243`
 - Python reference: `agent_eval/replay_gateway.py:906-925`
 
 TypeScript reads a 512 KiB prefix. Python reads at most 513 complete logical lines. A very long early line can hide valid metadata from TypeScript.
 
-**Required direction:** stream a bounded number of complete lines to match Python's rule.
+**Implemented direction:** the reader streams at most 513 complete logical lines, including coverage for a metadata row after a line larger than 512 KiB.
 
-### 14. The ready-lock descriptor leaks if `chmod` fails
+### 14. The ready-lock descriptor leaks if `chmod` fails — resolved
 
 **PR:** #9  
-**Severity:** Medium
+**Status:** Resolved
 
 - `arena/harness/src/gateway/services/ready-file.ts:383-399`
 - `arena/harness/src/gateway/services/ready-file.ts:449-455`
@@ -284,22 +261,14 @@ TypeScript reads a 512 KiB prefix. Python reads at most 513 complete logical lin
 
 `openLockFd` opens the descriptor and then performs `chmod` through `Effect.tap`. If `chmod` fails, the descriptor has not yet reached `acquireRelease` and is not closed.
 
-**Required direction:** bracket open plus chmod as one acquisition and close on every post-open failure.
+**Implemented direction:** a failed post-open `chmod` closes the descriptor before propagating the typed I/O error.
 
-### 15. Wire decoding is intentionally less strict than the Python client
+### 15. Wire decoding is intentionally less strict than the Python client — resolved
 
 **PR:** #7  
-**Severity:** Medium / contract decision
+**Status:** Resolved
 
-- `arena/wire/src/tolerant.ts:31-44`
-- `arena/wire/src/agent/health.ts:579-580`
-- Python reference: `play/client.py:2091-2099`
-
-Wire decoders generally preserve excess keys. Python `_exact` rejects them in many client envelopes; unknown `sidecar` keys are one concrete example.
-
-This may be a valid forward-compatibility policy, but it is not drop-in Python validation parity.
-
-**Required direction:** expose clearly named strict decoders for Python-client parity, or document tolerant decoding as an intentional protocol change.
+The speculative Agent protocol package and tolerant preservation layer were removed from this gateway stack. Current gateway decoders use `onExcessProperty: 'error'`, require their supported schema version, reject future versions, and encode only the current shape.
 
 ### 16. Core parity was Darwin-only and optional by default — resolved
 
@@ -346,8 +315,7 @@ Several files are too large:
 | File | Lines |
 |---|---:|
 | `arena/harness/src/gateway/archive.ts` | 1131 |
-| `arena/wire/src/gateway/games.ts` | 1020 |
-| `arena/wire/src/agent/health.ts` | 1003 |
+| `arena/wire/src/gateway/games.ts` | 995 |
 | `arena/harness/src/gateway/config.ts` | 993 |
 | `arena/harness/src/gateway/services/upstream.ts` | 893 |
 | `arena/harness/src/gateway/services/runs.ts` | 851 |
@@ -357,30 +325,17 @@ Suggested splits:
 
 - `config.ts`: Python numeric parsing, URL parsing, path resolution, config assembly
 - `archive.ts`: status/result/watch/frame/index projections
-- `health.ts`: sidecar, phase, recovery, envelope
 - `runs.ts`: secure filesystem primitives versus repository API
 
-Naming is otherwise generally strong. The clearest naming problem is the competing `TechnologyCatalog` and `ReplayCatalog` concepts.
+Naming is otherwise generally strong. The competing catalog types were consolidated into `TechnologyCatalog`.
 
 ### Lint signal
 
-Production-source lint results:
-
-- wire: 0 warnings
-- telemetry: 0 warnings
-- harness: 12 warnings
-
-The full harness suite reports 406 warnings, mostly from parity and spike tests using Promise/async and Node APIs. “Zero lint errors” is accurate, but the stack is not warning-clean Effect code.
+The final validation reports zero lint errors. Warnings remain, concentrated in parity/spike tests using Promise/async and Node APIs; “zero lint errors” does not mean warning-clean Effect code.
 
 ## Test assessment
 
-The final stack adds approximately 73,453 net lines. Test-to-source ratios:
-
-| Package | Test/source ratio |
-|---|---:|
-| wire | 1.49× |
-| telemetry | 0.95× |
-| harness | 2.49× |
+The wire cleanup deleted 21,714 lines from its earlier implementation and left a focused 216-test package. The full stack retains the high-value parity and lifecycle suites below.
 
 ### Retain
 
@@ -400,27 +355,17 @@ The final stack adds approximately 73,453 net lines. Test-to-source ratios:
 
 `hunt-header-method-fuzz.test.ts` was redundant with the matrix and has been deleted. `hunt-query-fuzz.test.ts` remains because it owns unique parser-boundary, traversal, derive, and waiver seeds, but its historical `DIVERGENT_AT_MEASUREMENT` registry and disposition meta-tests were removed.
 
-#### Duplicate native-schema fixture
+#### Duplicate native-schema fixture — resolved
 
-- `arena/wire/test/native-schema-fixture.ts`
-- `arena/harness/test/spikes/s2-native-schema-fixture.ts`
-
-They are about 3,400 lines each and differ only slightly. Keep one authoritative fixture.
+The wire copy was removed; only the harness spike fixture remains.
 
 #### Redundant telemetry exit matrices
 
 `middleware.test.ts` and `result-preserved.test.ts` both exercise success, failure, defect, and interruption across multiple backends. Keep the stronger result-preservation matrix and reduce the middleware suite to emission/outcome behavior.
 
-#### Migration-time meta-tests
+#### Migration-time meta-tests — wire cleanup complete
 
-Review whether these should remain after the Python migration ends:
-
-- `arena/wire/test/citations.test.ts`
-- `arena/wire/test/schema-shape.test.ts`
-- `arena/wire/test/parity-constants.test.ts`
-- `arena/harness/test/gateway/invariants.test.ts`
-
-The gateway invariant test provides lasting architectural value. Python line-number citation validation and very large schema snapshots are more likely to become maintenance burdens once Python is no longer co-maintained.
+Wire citation, schema-shape, parity-constant, barrel, snapshot, hunt, and fixture-coverage meta-suites were removed. The gateway invariant test remains because it provides lasting architectural value.
 
 ## Migration stragglers
 
@@ -434,12 +379,9 @@ The gateway invariant test provides lasting architectural value. Python line-num
 
 These explicitly describe themselves as interim and scheduled for deletion when native derivation lands.
 
-#### Deferred corpus command
+#### Deferred corpus command — resolved
 
-- `agent_eval/corpus_record.py:1963-1986`
-- parser registration around `agent_eval/corpus_record.py:2051`
-
-The `live` subcommand always exits with a deferral error. Implement it or remove it before presenting the CLI as final.
+The non-functional `live` subcommand and its parser registration were removed.
 
 #### Historical migration prose
 
@@ -464,25 +406,25 @@ The corpus recorder's monkeypatching of `v2_control.secrets` and `v2_control.tim
 
 | PR | Recommendation |
 |---|---|
-| #7 wire | Changes requested: consolidate technology schemas and decide strict-versus-tolerant client semantics. |
-| #8 telemetry/corpus | Changes requested: fix false dropped-event reporting and remove or hide the deferred `live` command. |
-| #9 gateway | Not ready as a replacement: portable Linux locking, derivation timeout, integer-preserving disk JSON, lifecycle ordering, and transport failure handling need resolution. |
-| #10 parity rig | **Follow-up complete:** Linux/Darwin gates enabled, cross-game raw-path parity restored, and historical hunt scaffolding trimmed without dropping unique seeds or waiver self-invalidation. |
+| #7 wire | **Ready:** gateway-focused, strict/versioned, consolidated technology schema, speculative protocol machinery removed. |
+| #8 telemetry/corpus | **Ready:** persistence/export semantics corrected and deferred CLI scaffolding removed. |
+| #9 gateway | **Ready with noted performance caveat:** parity/lifecycle/transport/Linux blockers resolved; synchronous request-path filesystem work remains a follow-up. |
+| #10 parity rig | **Ready:** Linux/Darwin gates enabled, raw-path parity restored, and historical hunt scaffolding trimmed without dropping unique seeds or waiver self-invalidation. |
 
 ## Original proposed fix order
 
 Approval was subsequently given for the scoped PR #10 follow-up. Items 1 and 6, plus the PR #10 hunt cleanup, are reflected in the status update above. The remaining order is retained as historical planning context.
 
 1. Portable Linux/Darwin ready-file locking and Linux CI. **Implemented.**
-2. Correct listener/readiness acquisition and release order.
-3. Mandatory clean-checkout derivation parity fixtures.
-4. Remove or make configurable the derivation timeout.
-5. Integer-preserving parsing at every Python-authored JSON boundary.
+2. Correct listener/readiness acquisition and release order. **Implemented.**
+3. Mandatory clean-checkout derivation parity fixtures. **Implemented.**
+4. Remove or make configurable the derivation timeout. **Implemented.**
+5. Integer-preserving parsing at every Python-authored JSON boundary. **Implemented.**
 6. Resolve raw-path/dot-segment routing behavior. **Implemented.**
-7. Type derivation transport failures.
-8. Fix telemetry export-versus-drop reporting.
-9. Resolve remaining medium parity differences.
-10. Consolidate schemas, large files, hunt tests, fixtures, and migration prose.
+7. Type derivation transport failures. **Implemented.**
+8. Fix telemetry export-versus-drop reporting. **Implemented.**
+9. Resolve remaining medium parity differences. **Implemented except the request-path synchronous-I/O performance follow-up.**
+10. Consolidate schemas, large files, hunt tests, fixtures, and migration prose. **Implemented for the reviewed stack scope.**
 
 ## Verification
 
@@ -496,14 +438,22 @@ On an archive of the then-committed stack tip, with workspace dependencies linke
 - harness tests: **2135 passed, 5 skipped**
 - lint: zero errors; 406 harness warnings
 
-### PR #10 follow-up on macOS
+### Final slim-stack verification
+
+macOS:
 
 - `bun run typecheck`: passed for wire, telemetry, and harness.
-- `bun run lint`: passed with **0 errors** (415 existing-style warnings).
-- `ARENA_REQUIRE_PARITY=1 bun test arena/harness/test/parity/hunt-query-fuzz.test.ts`: **265 passed, 0 failed**.
-- `ARENA_REQUIRE_PARITY=1 bun test arena/harness/test/parity arena/harness/test/gateway/smoke-live.test.ts`: **1307 passed, 0 failed**.
-- `ARENA_REQUIRE_PARITY=1 bun test arena/harness/test/gateway/server.test.ts arena/harness/test/gateway/ready-file.test.ts`: **91 passed, 0 failed**.
-- `python3 -B -W error::ResourceWarning -m unittest agent_eval.tests.test_local_stack -v`: **19 passed**.
-- `git diff --check`: passed.
+- `bun test arena/wire`: **243 passed, 0 failed** after the final `/result`, encode, barrel, version, state, and timing-contract coverage.
+- PR #9 harness suite: **931 passed, 0 failed**.
+- `ARENA_REQUIRE_PARITY=1 bun test` at PR #10: **2082 passed, 0 failed**.
+- Python local-stack tests: **19 passed**.
+- lint: **0 errors**; `git diff --check`: passed.
 
-Linux is enabled by the same platform gates and native ready-lock selection, but this follow-up verification was executed on macOS; Linux CI/runtime execution remains the cross-platform confirmation.
+Linux (`freeciv-port.exe.xyz`, Python 3.14):
+
+- workspace typecheck: passed.
+- wire suite before the final test-only matrix: **205 passed, 0 failed**.
+- `ARENA_REQUIRE_PARITY=1 bun test`: **2081 passed, 0 failed**.
+- Python local-stack tests: **19 passed**.
+
+The one-test platform count difference is expected from a Darwin-only non-parity spike; required parity itself runs on both supported platforms.
