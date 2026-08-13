@@ -93,23 +93,19 @@ build-viewer:
 
 # Install the browser replay viewer's pinned development dependencies.
 replay-install:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [[ ! -d agent_eval/viewer/node_modules ]]; then
-      npm --prefix agent_eval/viewer ci
-    fi
+    bun install --frozen-lockfile
 
 # Typecheck and build the committed browser replay viewer served by `just start`.
 replay-build: replay-install
-    npm --prefix agent_eval/viewer run build
+    bun run --cwd agent_eval/viewer build
 
 # Run only Vite on its legacy raw port (advanced UI development).
 replay-dev: replay-install
-    npm --prefix agent_eval/viewer run dev -- --host 127.0.0.1 --port 5173 --strictPort
+    bun run --cwd agent_eval/viewer dev -- --host 127.0.0.1 --port 5173 --strictPort
 
 # Run browser replay typechecks, unit tests, and the production build.
 replay-check: replay-install
-    npm --prefix agent_eval/viewer run check
+    bun run --cwd agent_eval/viewer check
 
 # Start the complete local stack. Ctrl-C stops only children from this invocation.
 start: build replay-build
@@ -436,13 +432,8 @@ replay game_id="":
     python3 -B -m agent_eval.local_stack replay "{{ game_id }}"
 # Install the offline video renderer's pinned dependencies.
 video-install:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cd agent_eval/video
-    if [[ ! -d node_modules ]]; then
-      npm ci
-    fi
-    npx remotion browser ensure
+    bun install --frozen-lockfile
+    bunx remotion browser ensure
 
 # Export one finished run and render it to an MP4. Reads the run read-only.
 # preset: "full" for the 1080p deliverable, "draft" for fast 720p iteration.
@@ -476,21 +467,21 @@ video game_id out="" preset="full": video-install
     cd "$repo/agent_eval/video"
     # Bash 3.2 treats an empty array as unset under `set -u`, so the full
     # preset's empty flag list needs the guarded expansion.
-    npx remotion render src/index.ts GameFilm "$output" \
+    bunx remotion render src/index.ts GameFilm "$output" \
       --props "{\"gameId\":\"{{ game_id }}\"}" \
       ${render_flags[@]+"${render_flags[@]}"}
     echo "wrote $output"
 
 # Typecheck the offline video renderer and run its unit tests.
 video-check: video-install
-    npm --prefix agent_eval/video run check
+    bun run --cwd agent_eval/video check
 
 # Open the video renderer's studio against an already-exported game.
 video-studio: video-install
     #!/usr/bin/env bash
     set -euo pipefail
     cd agent_eval/video
-    npx remotion studio src/index.ts
+    bunx remotion studio src/index.ts
 
 # Show current public game state.
 status game_id:

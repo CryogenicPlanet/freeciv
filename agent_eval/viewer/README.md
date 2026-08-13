@@ -5,9 +5,9 @@ application. The supervisor serves the committed `dist/` output, so production
 does not require Node.js.
 
 ```sh
-npm install
-npm run check
-npm run dev
+bun install
+bun run check
+bun run dev
 ```
 
 Vite emits route-relative `../viewer/` asset URLs. A shell at

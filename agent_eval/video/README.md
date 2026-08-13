@@ -140,7 +140,7 @@ Pass composition props to change the pacing or fidelity:
 
 ```bash
 cd agent_eval/video
-npx remotion render src/index.ts GameFilm out.mp4 \
+bunx remotion render src/index.ts GameFilm out.mp4 \
   --props '{"gameId":"game_...","framesPerTurn":6,"showCityLabels":false}'
 ```
 
