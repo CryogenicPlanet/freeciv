@@ -4,44 +4,44 @@ export interface GamePlace {
   place: number
   seat_id: string
   player_name: string
-  controller: 'agent' | 'native_classic_ai'
+  controller: string
   joined: boolean
-  controller_label?: string | null
-  controller_type?: string | null
-  model?: string | null
+  controller_label?: string | null | undefined
+  controller_type?: string | null | undefined
+  model?: string | null | undefined
   /** The server AI level driving this place; absent on older payloads. */
-  ai_difficulty?: string | null
+  ai_difficulty?: string | null | undefined
   player_color: string
 }
 
 export interface LeaderboardEntry {
   rank: number
   score: number
-  score_turn?: number | null
+  score_turn?: number | null | undefined
   place: number
   seat_id: string
   player_name: string
   player_color: string
   controller_label: string
   controller_type: string
-  model?: string | null
+  model?: string | null | undefined
 }
 
 export interface MatchVictory {
   code: string
   label: string
   winners: string[]
-  turn?: number | null
-  year?: number | null
+  turn?: number | null | undefined
+  year?: number | null | undefined
 }
 
 export interface MatchOutcome {
   status: string
   summary: string
-  leaders?: string[]
-  margin?: number | null
-  score_turn?: number | null
-  victory?: MatchVictory | null
+  leaders?: string[] | undefined
+  margin?: number | null | undefined
+  score_turn?: number | null | undefined
+  victory?: MatchVictory | null | undefined
 }
 
 export interface GameStatus {
@@ -51,23 +51,23 @@ export interface GameStatus {
   benchmark_valid: BenchmarkValidity
   mode: string
   /** Absent on runs recorded before the field existed; those are strategic-v1. */
-  control_protocol?: string | null
+  control_protocol?: string | null | undefined
   places: number
   max_agents: number
   joined_agents: number
   turns: number
   current_turn: number | null
   objective: string
-  timing_mode?: 'default' | 'blitz' | 'infinite' | 'custom' | null
-  action_timeout_s?: number | null
+  timing_mode?: string | null | undefined
+  action_timeout_s?: number | null | undefined
   error: string | null
   invalid_reasons: string[]
   resolved_places: GamePlace[]
   leaderboard: LeaderboardEntry[]
   outcome: MatchOutcome
-  replay_url?: string
-  created_at?: number | null
-  finished_at?: number | null
+  replay_url?: string | undefined
+  created_at?: number | null | undefined
+  finished_at?: number | null | undefined
 }
 
 export type GameSummary = Pick<GameStatus,
@@ -87,9 +87,9 @@ export type GameSummary = Pick<GameStatus,
   | 'timing_mode'
   | 'action_timeout_s'
 > & {
-  created_at?: number | null
-  finished_at?: number | null
-  watch_path?: string
+  created_at?: number | null | undefined
+  finished_at?: number | null | undefined
+  watch_path?: string | undefined
 }
 
 export interface GamesIndexResponse {
@@ -99,30 +99,30 @@ export interface GamesIndexResponse {
 
 export interface TurnTimelineEntry {
   turn: number
-  year?: number
-  responded_seats?: string[]
-  timed_out_seats?: string[]
-  resolved_at?: number
+  year?: number | null | undefined
+  responded_seats?: string[] | undefined
+  timed_out_seats?: string[] | undefined
+  resolved_at?: number | undefined
 }
 
 export interface MapPlayer {
   player_id: number
   player_name: string
   player_color: string
-  seat_id?: string | null
-  place?: number | null
-  controller_label?: string | null
-  controller_type?: string | null
-  nation?: string | null
-  scored?: boolean
+  seat_id?: string | null | undefined
+  place?: number | null | undefined
+  controller_label?: string | null | undefined
+  controller_type?: string | null | undefined
+  nation?: string | null | undefined
+  scored?: boolean | undefined
 }
 
 export interface ReplayFrame {
   index: number
-  turn?: number | null
+  turn?: number | null | undefined
   source_name: string
   png_url: string
-  map_players?: MapPlayer[]
+  map_players?: MapPlayer[] | undefined
 }
 
 export interface WatchResponse {
@@ -131,8 +131,8 @@ export interface WatchResponse {
   game: GameStatus
   timeline: TurnTimelineEntry[]
   frames: ReplayFrame[]
-  replay?: { url: string; available: boolean }
-  video?: { available: boolean; url: string; kind: string }
+  replay?: { url: string; available: boolean } | undefined
+  video?: { available: boolean; url: string; kind: string } | undefined
 }
 
 export interface Technology {
@@ -140,12 +140,12 @@ export interface Technology {
   rule_name: string
   name: string
   cost_base: number
-  requires?: number[]
-  depth?: number
+  requires?: number[] | undefined
+  depth?: number | undefined
 }
 
 export interface TechnologyCatalog {
-  schema_version?: number
+  schema_version?: number | undefined
   technologies: Technology[]
 }
 
@@ -158,22 +158,22 @@ export interface ResearchState {
 
 export interface ReplayPlayer {
   seat_id: string
-  place?: number | null
+  place?: number | null | undefined
   player_id: number
   player_name: string
-  player_color?: string | null
-  controller_label?: string | null
-  controller_type?: string | null
-  model?: string | null
+  player_color?: string | null | undefined
+  controller_label?: string | null | undefined
+  controller_type?: string | null | undefined
+  model?: string | null | undefined
   /** The server AI level driving this player; absent on older payloads. */
-  ai_difficulty?: string | null
+  ai_difficulty?: string | null | undefined
   nation: string
   government: string
   alive: boolean
   score: number
   cities: number
-  citizens?: number
-  population?: number
+  citizens?: number | undefined
+  population?: number | undefined
   units: number
   gold: number
   culture: number
@@ -182,19 +182,19 @@ export interface ReplayPlayer {
   lost_tech_ids: number[]
   research: ResearchState
   future_techs: number
-  scored?: boolean
+  scored?: boolean | undefined
 }
 
 export interface ReplaySnapshot {
-  schema_version?: number
-  game_id?: string
+  schema_version?: number | undefined
+  game_id?: string | undefined
   turn: number
   year: number
   players: ReplayPlayer[]
 }
 
 export interface ReplayWarning {
-  turn?: number | null
+  turn?: number | null | undefined
   message: string
 }
 
@@ -202,16 +202,22 @@ export interface ReplayResponse {
   schema_version: number
   game_id: string
   available: boolean
-  catalog?: TechnologyCatalog
+  catalog?: TechnologyCatalog | null | undefined
   snapshots: ReplaySnapshot[]
   next_after_turn: number
   has_more: boolean
-  complete?: boolean
-  replay_warnings?: ReplayWarning[]
-  warnings?: ReplayWarning[]
+  complete?: boolean | undefined
+  replay_warnings?: ReplayWarning[] | undefined
+  warnings?: ReplayWarning[] | undefined
 }
 
 /** One derived match event: what happened, on which turn, to whom. */
+export type JsonValue = boolean | JsonObject | JsonValue[] | null | number | string
+
+export interface JsonObject {
+  [key: string]: JsonValue
+}
+
 export interface GameEvent {
   turn: number
   kind: string
@@ -220,7 +226,7 @@ export interface GameEvent {
   actors: string[]
   /** 1-100. How much of the match's story this event carries. */
   weight: number
-  data: Record<string, unknown>
+  data: JsonObject
 }
 
 export interface GameEventsResponse {
@@ -235,8 +241,8 @@ export interface GameEventsResponse {
   /** The lightest weight that survived the response cap. */
   min_included_weight: number
   last_turn: number
-  complete?: boolean
-  event_warnings?: ReplayWarning[]
+  complete?: boolean | undefined
+  event_warnings?: ReplayWarning[] | undefined
 }
 
 export interface BoardTerrain {
@@ -275,14 +281,14 @@ export interface BoardUnitStack {
 export interface BoardPlayer {
   player_id: number
   player_name: string
-  player_color?: string | null
-  seat_id?: string | null
-  place?: number | null
-  controller_label?: string | null
-  controller_type?: string | null
-  model?: string | null
-  nation?: string | null
-  scored?: boolean
+  player_color?: string | null | undefined
+  seat_id?: string | null | undefined
+  place?: number | null | undefined
+  controller_label?: string | null | undefined
+  controller_type?: string | null | undefined
+  model?: string | null | undefined
+  nation?: string | null | undefined
+  scored?: boolean | undefined
 }
 
 export interface BoardResponse {

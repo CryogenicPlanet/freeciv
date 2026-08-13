@@ -1,3 +1,4 @@
+import React from 'react'
 import { Composition } from 'remotion'
 import { DEFAULT_FILM_TIMING, GameFilm, filmDurationInFrames, type FilmProps } from './GameFilm'
 import { loadMeta } from './dataset/load'

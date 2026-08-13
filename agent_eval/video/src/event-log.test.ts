@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   DENSITY_FLOOR, heaviestPerWindow, isMustShow, planCaptions, topHighlights, weightTier,
 } from './event-log'
-import type { GameEvent } from './dataset/schema'
+import type { GameEvent, JsonObject } from './dataset/schema'
 
 /**
  * `heaviestPerWindow`, `DENSITY_FLOOR` and `weightTier` are ports of the
@@ -12,7 +12,7 @@ import type { GameEvent } from './dataset/schema'
 
 function event(
   turn: number, kind: string, weight: number, summary = kind,
-  data: Record<string, unknown> = {},
+  data: JsonObject = {},
 ): GameEvent {
   return { turn, kind, summary, actors: ['place-1'], weight, data }
 }

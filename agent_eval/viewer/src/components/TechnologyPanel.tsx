@@ -1,3 +1,4 @@
+import React from 'react'
 import type { ReplayPlayer, ReplaySnapshot, Technology } from '../types'
 import { competitorLabel, technologyState } from '../view-model'
 import { ColorMark } from './ColorMark'
@@ -8,7 +9,7 @@ const RESEARCH_META = 'block text-muted text-[9px] leading-[1.4] font-readout up
 
 interface TechnologyPanelProps {
   catalog: Technology[]
-  player?: ReplayPlayer
+  player: ReplayPlayer | undefined
   scoredPlayers: ReplayPlayer[]
   selectedSeat: string
   setSelectedSeat: (seat: string) => void
@@ -32,7 +33,8 @@ export function TechnologyPanel({
     return (current?.gained_tech_ids ?? []).map((id) => ({ turn: snapshot.turn, id }))
   })
   const techById = new Map(catalog.map((technology) => [technology.id, technology]))
-  const depths = [...new Set(catalog.map((technology) => technology.depth ?? 0))].sort((a, b) => a - b)
+  const depths = [...new Set(catalog.map((technology) => technology.depth ?? 0))]
+    .toSorted((a, b) => a - b)
 
   return (
     <section className="panel technology-panel" aria-labelledby="technology-title">

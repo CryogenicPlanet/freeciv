@@ -117,13 +117,23 @@ export function buildBoardTiles(board: BoardResponse): BoardTile[] {
   const result: BoardTile[] = []
   for (let y = 0; y < board.height; y += 1) {
     const terrainRow = board.terrain_rows[y]
+    const altitudeRow = board.altitude_rows[y]
+    const ownerRow = board.owner_rows[y]
+    if (terrainRow === undefined || altitudeRow === undefined || ownerRow === undefined) {
+      throw new Error('Missing semantic board row')
+    }
     if (terrainRow.length !== board.width) throw new Error('Invalid semantic terrain row')
-    const altitudes = decodeAltitudeRow(board.altitude_rows[y], board.width)
-    const owners = decodeOwnerRow(board.owner_rows[y], board.width)
+    const altitudes = decodeAltitudeRow(altitudeRow, board.width)
+    const owners = decodeOwnerRow(ownerRow, board.width)
     for (let x = 0; x < board.width; x += 1) {
-      const terrainCode = terrainRow[x]
+      const terrainCode = terrainRow.charAt(x)
       const terrainName = terrainNames.get(terrainCode)
       if (!terrainName) throw new Error('Unknown semantic terrain code')
+      const altitude = altitudes[x]
+      const ownerId = owners[x]
+      if (altitude === undefined || ownerId === undefined) {
+        throw new Error('Incomplete semantic board row')
+      }
       const position = nativeTilePosition(x, y, board.width)
       result.push({
         index: y * board.width + x,
@@ -133,8 +143,8 @@ export function buildBoardTiles(board: BoardResponse): BoardTile[] {
         worldZ: position.z,
         terrainCode,
         terrainName,
-        altitude: altitudes[x],
-        ownerId: owners[x],
+        altitude,
+        ownerId,
         extraIds: decodeExtraIds(board, x, y),
       })
     }
@@ -171,7 +181,7 @@ export function ownershipBoundaryEdges(
     for (let x = 0; x < board.width; x += 1) {
       const tileIndex = y * board.width + x
       const ownerId = owners[tileIndex]
-      if (ownerId === null) continue
+      if (ownerId === null || ownerId === undefined) continue
       isoHexNeighborCoordinates(x, y).forEach((neighbor, direction) => {
         const neighborX = wrappedCoordinate(neighbor.x, board.width, wrapX)
         const neighborY = wrappedCoordinate(neighbor.z, board.height, wrapY)
@@ -179,6 +189,7 @@ export function ownershipBoundaryEdges(
           ? null
           : neighborY * board.width + neighborX
         const neighborOwnerId = neighborIndex === null ? null : owners[neighborIndex]
+        if (neighborOwnerId === undefined) throw new Error('Invalid territory neighbor')
         if (neighborOwnerId === ownerId) return
         // A shared edge between two empires is emitted once. Edges against
         // unowned space remain owned by the bordering faction.

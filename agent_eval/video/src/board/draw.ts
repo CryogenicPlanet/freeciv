@@ -11,7 +11,7 @@ import type { TurnState } from '../dataset/film'
 import type { DatasetMeta } from '../dataset/schema'
 import {
   HEX_CIRCUMRADIUS, hexPath, isoHexNeighborCoordinates, tileCenter,
-  type BoardLayout, type FitTransform,
+  type BoardLayout, type FitTransform, type Point,
 } from '../dataset/geometry'
 import { SHELL, mixColors, terrainColor, withAlpha } from '../theme'
 
@@ -42,11 +42,6 @@ export function buildPalette(
     railBit: meta.infrastructureBits['railroad'] ?? 0,
     roadBit: meta.infrastructureBits['road'] ?? 0,
   }
-}
-
-interface Point {
-  x: number
-  y: number
 }
 
 function tracePath(context: CanvasRenderingContext2D, points: readonly Point[]): void {
@@ -101,8 +96,8 @@ export function drawBoard(
   context.setTransform(fit.scale, 0, 0, fit.scale, fit.offsetX, fit.offsetY)
   context.lineJoin = 'round'
 
-  const terrainBatches = new Map<string, Point[][]>()
-  const territoryBatches = new Map<string, Point[][]>()
+  const terrainBatches = new Map<string, Array<readonly Point[]>>()
+  const territoryBatches = new Map<string, Array<readonly Point[]>>()
   const railTiles: Point[] = []
   const roadTiles: Point[] = []
 
@@ -121,8 +116,8 @@ export function drawBoard(
         : terrainColor(name)
       const hex = hexPath(center.x, center.y, radius, layout.rotation)
       const batch = terrainBatches.get(fill)
-      if (batch) batch.push(hex as Point[])
-      else terrainBatches.set(fill, [hex as Point[]])
+      if (batch) batch.push(hex)
+      else terrainBatches.set(fill, [hex])
 
       const owner = turn.owners[y * layout.width + x] ?? -1
       const isWater = /ocean|lake/i.test(name)
@@ -133,8 +128,8 @@ export function drawBoard(
         const inner = hexPath(center.x, center.y, radius * 0.97, layout.rotation)
         const key = owner >= 0 ? tint : 'unowned'
         const territory = territoryBatches.get(key)
-        if (territory) territory.push(inner as Point[])
-        else territoryBatches.set(key, [inner as Point[]])
+        if (territory) territory.push(inner)
+        else territoryBatches.set(key, [inner])
       }
       if (palette.railBit !== 0 && (infrastructure & palette.railBit) !== 0) {
         railTiles.push(center)

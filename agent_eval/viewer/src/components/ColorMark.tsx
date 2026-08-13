@@ -1,8 +1,9 @@
+import React from 'react'
 import { displayPlayerColor } from '../display-color'
 import { useDisplayPalette } from '../display-palette'
 
 interface ColorMarkProps {
-  color?: string | null
+  color: string | null | undefined
   label: string
   size?: 'sm' | 'md' | 'lg'
 }

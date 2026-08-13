@@ -9,10 +9,13 @@ export type ViewerRoute =
 export function parseWatchRoute(pathname: string): RouteContext | null {
   const match = pathname.match(/^(.*)\/watch\/([^/]+)\/?$/)
   if (!match) return null
+  const prefix = match[1]
+  const encodedGameId = match[2]
+  if (prefix === undefined || encodedGameId === undefined) return null
   try {
-    const gameId = decodeURIComponent(match[2])
+    const gameId = decodeURIComponent(encodedGameId)
     if (!/^[A-Za-z0-9_-]{20,80}$/.test(gameId)) return null
-    return { prefix: match[1].replace(/\/$/, ''), gameId }
+    return { prefix: prefix.replace(/\/$/, ''), gameId }
   } catch {
     return null
   }
@@ -20,7 +23,7 @@ export function parseWatchRoute(pathname: string): RouteContext | null {
 
 export function apiUrl(route: RouteContext, path: string): string {
   const suffix = path.startsWith('/') ? path : `/${path}`
-  return `${route.prefix}${suffix}` || '/'
+  return `${route.prefix}${suffix}`
 }
 
 export function resolveViewerRoute(pathname: string): ViewerRoute {
@@ -38,11 +41,11 @@ export function resolveViewerRoute(pathname: string): ViewerRoute {
 
 export function arenaApiUrl(route: ArenaRouteContext, path: string): string {
   const suffix = path.startsWith('/') ? path : `/${path}`
-  return `${route.prefix}${suffix}` || '/'
+  return `${route.prefix}${suffix}`
 }
 
 export function watchUrl(prefix: string, gameId: string): string {
-  return `${prefix}/watch/${encodeURIComponent(gameId)}` || '/'
+  return `${prefix}/watch/${encodeURIComponent(gameId)}`
 }
 
 export function frameImageUrl(route: RouteContext, frame: ReplayFrame): string {

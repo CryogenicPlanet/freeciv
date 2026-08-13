@@ -1,3 +1,4 @@
+import React from 'react'
 import type { Film, PlayerTrack, TurnState } from '../dataset/film'
 import { sampleTrack } from '../dataset/film'
 import { controllerDisplayName, nationDisplayName } from '../faction-label'
@@ -241,7 +242,7 @@ export function ScorePanel({
   film, turn, turnIndex, progress, width,
 }: ScorePanelProps) {
   const scoreOf = (track: PlayerTrack): number => track.scores[turnIndex] ?? 0
-  const byScore = [...film.seatTracks].sort((left, right) => scoreOf(right) - scoreOf(left))
+  const byScore = film.seatTracks.toSorted((left, right) => scoreOf(right) - scoreOf(left))
   /*
    * Rank is always the standing; the row *order* is not.
    *

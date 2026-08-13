@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import React, { useMemo } from 'react'
 import { Easing, interpolate, useCurrentFrame } from 'remotion'
 import type { Film, PlayerTrack } from '../dataset/film'
 import { buildBoardLayout } from '../dataset/geometry'
@@ -33,6 +33,7 @@ const MAX_HIGHLIGHTS = 7
 const CHARTS_WIDTH = STAGE_WIDTH - PANEL_WIDTH - CHART_GAP
 const CHART_WIDTH = Math.floor((CHARTS_WIDTH - 4) / 3)
 const LAST_CHART_WIDTH = CHARTS_WIDTH - 4 - 2 * CHART_WIDTH
+const CUBIC_OUT = Easing.out((value: number): number => Easing.cubic(value))
 
 /**
  * How the match ended, in the archive's own words.
@@ -195,7 +196,7 @@ export function Outro({ film, superSample }: OutroProps) {
   const settle = interpolate(frame, [0, OUTRO_SETTLE_FRAMES], [0, 1], {
     extrapolateLeft: 'clamp',
     extrapolateRight: 'clamp',
-    easing: Easing.out(Easing.cubic),
+    easing: CUBIC_OUT,
   })
   const boardWidth = Math.round(
     interpolate(settle, [0, 1], [MATCH_BOARD_WIDTH, OUTRO_BOARD_WIDTH]),
@@ -203,7 +204,7 @@ export function Outro({ film, superSample }: OutroProps) {
   const arrive = interpolate(frame, [8, OUTRO_SETTLE_FRAMES + 8], [0, 1], {
     extrapolateLeft: 'clamp',
     extrapolateRight: 'clamp',
-    easing: Easing.out(Easing.cubic),
+    easing: CUBIC_OUT,
   })
   const boardHeight = useMemo(() => {
     const layout = buildBoardLayout(film.meta.width, film.meta.height)
@@ -218,7 +219,7 @@ export function Outro({ film, superSample }: OutroProps) {
   const highlights = topHighlights(film.events.events, MAX_HIGHLIGHTS)
   const lastIndex = film.turns.length - 1
   const lastTurn = film.turns[lastIndex]
-  const ranked = [...film.seatTracks].sort(
+  const ranked = film.seatTracks.toSorted(
     (left, right) => right.finalScore - left.finalScore,
   )
   const series = (pick: (track: PlayerTrack) => readonly number[]): ChartSeries[] =>

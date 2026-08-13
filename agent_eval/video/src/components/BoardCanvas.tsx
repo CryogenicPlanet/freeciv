@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react'
+import React, { useEffect, useMemo, useRef } from 'react'
 import { buildPalette, drawBoard } from '../board/draw'
 import type { TurnState } from '../dataset/film'
 import { buildBoardLayout, fitBoard } from '../dataset/geometry'

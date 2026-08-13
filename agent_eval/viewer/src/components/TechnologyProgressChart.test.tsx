@@ -1,5 +1,7 @@
+import React from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
+import { requiredValue } from '../test-support'
 import type { ReplayPlayer, ReplaySnapshot, Technology } from '../types'
 import {
   buildTechnologyProgressSeries,
@@ -49,6 +51,10 @@ function snapshot(turn: number, players: ReplayPlayer[]): ReplaySnapshot {
   return { turn, year: -4000 + turn * 50, players }
 }
 
+function firstSeries(model: ReturnType<typeof buildTechnologyProgressSeries>) {
+  return requiredValue(model.series[0], 'first technology progress series')
+}
+
 const snapshots = [
   snapshot(3, [
     player('agent', 1, [1], { lost_tech_ids: [2], future_techs: 2 }),
@@ -84,12 +90,12 @@ describe('technology progression model', () => {
       'pi-gpt-5.6-sol: Romans',
       'Romans (CPU)',
     ])
-    expect(model.series[0].values).toEqual([
+    expect(firstSeries(model).values).toEqual([
       { turn: 1, knownClassicTechnologies: 1, futureTechs: 0 },
       { turn: 2, knownClassicTechnologies: 2, futureTechs: 0 },
       { turn: 3, knownClassicTechnologies: 2, futureTechs: 2 },
     ])
-    expect(model.series[0]).toMatchObject({
+    expect(firstSeries(model)).toMatchObject({
       selected: { turn: 2, knownClassicTechnologies: 2 },
       latest: { turn: 3, knownClassicTechnologies: 2, futureTechs: 2 },
       acquiredInObservedWindow: 1,
@@ -99,12 +105,15 @@ describe('technology progression model', () => {
   })
 
   it('deduplicates the catalog denominator and uses state at or before the selected turn', () => {
-    const duplicateCatalog = [...catalog, { ...catalog[0] }]
+    const duplicateCatalog = [
+      ...catalog,
+      { ...requiredValue(catalog[0], 'first catalog technology') },
+    ]
     const model = buildTechnologyProgressSeries(snapshots, duplicateCatalog, 1.5)
 
     expect(model.catalogTotal).toBe(3)
     expect(model.selectedTurn).toBe(1)
-    expect(model.series[0].selected?.turn).toBe(1)
+    expect(firstSeries(model).selected?.turn).toBe(1)
   })
 
   it('qualifies multiple native controllers by nation', () => {
@@ -127,9 +136,9 @@ describe('technology progression model', () => {
       snapshot(5, [player('agent', 1, [1, 2])]),
     ], catalog)
 
-    expect(selectTechnologyProgressTurn(base, 1).series[0].selected).toBeNull()
-    expect(selectTechnologyProgressTurn(base, 4).series[0].selected?.turn).toBe(2)
-    expect(selectTechnologyProgressTurn(base, 99).series[0].selected?.turn).toBe(5)
+    expect(firstSeries(selectTechnologyProgressTurn(base, 1)).selected).toBeNull()
+    expect(firstSeries(selectTechnologyProgressTurn(base, 4)).selected?.turn).toBe(2)
+    expect(firstSeries(selectTechnologyProgressTurn(base, 99)).selected?.turn).toBe(5)
   })
 
   it('marks an absent recorded player color explicitly instead of calling gray exact', () => {
@@ -137,7 +146,7 @@ describe('technology progression model', () => {
       snapshot(1, [player('agent', 1, [1], { player_color: null })]),
     ], catalog)
 
-    expect(model.series[0].color).toBeNull()
+    expect(firstSeries(model).color).toBeNull()
     const markup = renderToStaticMarkup(
       <TechnologyProgressChart catalog={catalog} snapshots={[
         snapshot(1, [player('agent', 1, [1], { player_color: null })]),

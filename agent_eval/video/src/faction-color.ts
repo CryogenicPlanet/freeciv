@@ -158,7 +158,7 @@ export function planFactionColors(players: readonly PlayerEntry[]): FactionColor
   const clearsTaken = (candidate: string): boolean =>
     taken.every((used) => colorDistance(candidate, used) >= FACTION_CLEARANCE)
 
-  for (const player of [...players].sort((a, b) => a.playerId - b.playerId)) {
+  for (const player of players.toSorted((a, b) => a.playerId - b.playerId)) {
     const original = player.color
     // A pinned colour wins outright: it is a contract with the viewer, not a
     // preference, so it is never displaced by a clearance check.

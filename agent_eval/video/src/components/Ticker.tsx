@@ -1,3 +1,4 @@
+import React from 'react'
 import type { Film, TurnState } from '../dataset/film'
 import { nationDisplayName } from '../faction-label'
 import { formatCount, formatYear } from '../format'

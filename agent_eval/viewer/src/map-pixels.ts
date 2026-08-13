@@ -1,20 +1,21 @@
 const NEAR_BLACK_LIMIT = 12
 
-function clampChannel(value: number) {
+function clampChannel(value: number): number {
   return Math.max(0, Math.min(255, Math.round(value)))
 }
 
-function colorKey(red: number, green: number, blue: number) {
+function colorKey(red: number, green: number, blue: number): number {
   return (red << 16) | (green << 8) | blue
 }
 
-function parseHexColor(value: string) {
+function parseHexColor(value: string): number | null {
   const match = value.trim().match(/^#([0-9a-f]{6})$/i)
-  if (!match) return null
-  return Number.parseInt(match[1], 16)
+  const channels = match?.[1]
+  if (channels === undefined) return null
+  return Number.parseInt(channels, 16)
 }
 
-function enhancedChannels(red: number, green: number, blue: number) {
+function enhancedChannels(red: number, green: number, blue: number): [number, number, number] {
   if (blue > red * 1.15 && blue > green * 1.08) {
     return [
       clampChannel(8 + red * .62 + green * .04),
@@ -67,6 +68,9 @@ export function transformAtlasPixels(
     const red = result[offset]
     const green = result[offset + 1]
     const blue = result[offset + 2]
+    if (red === undefined || green === undefined || blue === undefined) {
+      throw new Error('Incomplete RGBA pixel')
+    }
 
     if (protectedKeys.has(colorKey(red, green, blue))) continue
 

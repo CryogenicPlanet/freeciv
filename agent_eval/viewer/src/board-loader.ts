@@ -30,7 +30,7 @@ export class LruCache<T> {
     this.values.delete(key)
     this.values.set(key, value)
     while (this.values.size > this.capacity) {
-      const oldest = this.values.keys().next().value as string | undefined
+      const oldest = this.values.keys().next().value
       if (oldest === undefined) break
       this.values.delete(oldest)
     }
@@ -49,6 +49,6 @@ export function priorAvailableTurns(
   if (!Number.isInteger(limit) || limit < 1) return []
   return [...new Set(turns)]
     .filter((turn) => Number.isInteger(turn) && turn > 0 && turn < selectedTurn)
-    .sort((left, right) => right - left)
+    .toSorted((left, right) => right - left)
     .slice(0, limit)
 }

@@ -15,7 +15,7 @@
  * from the surface is a hairline edge, and that is not decoration: see below.
  */
 
-import type { CSSProperties, ReactElement } from 'react'
+import React, { type CSSProperties, type ReactElement } from 'react'
 import { staticFile } from 'remotion'
 import FLAG_ASSETS from './dataset/flag-assets.json'
 import NATION_FLAGS from './dataset/nation-flags.json'
@@ -96,30 +96,29 @@ export function NationFlag({
   if (nation === null || nation === undefined) return null
   const slug = flagSlugForNation(nation)
   if (slug === null || !STAGED.has(slug)) return null
+  const imageStyle: CSSProperties = {
+    display: 'block',
+    flex: 'none',
+    width: size,
+    height: Math.round(size / FLAG_ASPECT),
+    // `cover` rather than `contain`: every flag is already 3:2, and on the
+    // day one is not, a hair of crop reads better than page-coloured bars
+    // sitting inside the hairline pretending to be part of the flag.
+    objectFit: 'cover',
+  }
+  if (outlined) {
+    imageStyle.outline = '1px solid color-mix(in srgb, currentColor 22%, transparent)'
+    imageStyle.outlineOffset = '-1px'
+    imageStyle.boxShadow = '0 1px 2px color-mix(in srgb, currentColor 8%, transparent)'
+  }
+  Object.assign(imageStyle, style)
   return (
     <img
       alt={title ?? `${nation.trim()} flag`}
       className={className}
       height={Math.round(size / FLAG_ASPECT)}
       src={staticFile(`flags/${slug}.svg`)}
-      style={{
-        display: 'block',
-        flex: 'none',
-        width: size,
-        height: Math.round(size / FLAG_ASPECT),
-        // `cover` rather than `contain`: every flag is already 3:2, and on the
-        // day one is not, a hair of crop reads better than page-coloured bars
-        // sitting inside the hairline pretending to be part of the flag.
-        objectFit: 'cover',
-        ...(outlined
-          ? {
-            outline: '1px solid color-mix(in srgb, currentColor 22%, transparent)',
-            outlineOffset: '-1px',
-            boxShadow: '0 1px 2px color-mix(in srgb, currentColor 8%, transparent)',
-          }
-          : {}),
-        ...style,
-      }}
+      style={imageStyle}
       width={size}
     />
   )

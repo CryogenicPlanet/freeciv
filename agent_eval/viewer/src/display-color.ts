@@ -190,7 +190,7 @@ function paletteKey(factions: readonly DisplayFaction[]): string {
  * record the same color, the lower player id decides what that color paints as.
  */
 export function buildDisplayPalette(factions: readonly DisplayFaction[]): DisplayPalette {
-  const ordered = [...factions].sort((left, right) => left.playerId - right.playerId)
+  const ordered = factions.toSorted((left, right) => left.playerId - right.playerId)
   const key = paletteKey(ordered)
   const cached = paletteCache.get(key)
   if (cached) return cached

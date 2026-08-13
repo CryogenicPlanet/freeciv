@@ -1,3 +1,4 @@
+import React from 'react'
 import { agentFirstBy, isAgentController } from '../agent-order'
 import { displayPlayerColor, type DisplayPalette } from '../display-color'
 import { useDisplayPalette } from '../display-palette'

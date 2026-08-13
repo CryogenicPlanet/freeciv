@@ -1,5 +1,5 @@
 import { useCurrentFrame, useVideoConfig } from 'remotion'
-import { useMemo } from 'react'
+import React, { useMemo } from 'react'
 import { SHELL } from '../theme'
 
 /**
@@ -40,20 +40,23 @@ const EDGE_HIGH = 0.5
 const THRESHOLD = 0.59
 const SPREAD = 0.8
 
+function bayerQuadrant(x: number, y: number): number {
+  return y * 3 + x * 2 - x * y * 4
+}
+
 /**
  * The 8x8 Bayer matrix built by the recurrence the source uses, not a textbook
  * table: this nesting puts the coarsest term last, and substituting a
  * conventionally-ordered matrix visibly changes the grain.
  */
 function buildBayer8(): Float64Array {
-  const quad = (x: number, y: number): number => y * 3 + x * 2 - x * y * 4
   const table = new Float64Array(64)
   for (let y = 0; y < 8; y += 1) {
     for (let x = 0; x < 8; x += 1) {
       table[y * 8 + x] = (
-        quad(x % 2, y % 2) * 16
-        + quad(Math.floor((x % 4) / 2), Math.floor((y % 4) / 2)) * 4
-        + quad(Math.floor(x / 4), Math.floor(y / 4))
+        bayerQuadrant(x % 2, y % 2) * 16
+        + bayerQuadrant(Math.floor((x % 4) / 2), Math.floor((y % 4) / 2)) * 4
+        + bayerQuadrant(Math.floor(x / 4), Math.floor(y / 4))
       ) / 64
     }
   }

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type MutableRefObject } from 'react'
+import React, { useEffect, useRef, useState, type MutableRefObject } from 'react'
 import * as THREE from 'three'
 import { MapControls } from 'three/addons/controls/MapControls.js'
 import {
@@ -46,7 +46,7 @@ interface ThreeBoardProps {
 
 interface BoardLayer {
   group: THREE.Group
-  shapeSignature: string
+  boardSignature: string
   topByTile: number[]
   /**
    * Footprint of the tiles alone, in world space, after the group's rotation.
@@ -209,7 +209,7 @@ function buildBoardLayer(
     if (tile.ownerId === null || !ownerColor(board, tile.ownerId, palette)) {
       if (mode === 'political') {
         unownedMatrices.push(instanceMatrix(
-          tile.worldX, topByTile[tile.index] + 0.014, tile.worldZ,
+          tile.worldX, (topByTile[tile.index] ?? 0) + 0.014, tile.worldZ,
           1, 1, 1, Math.PI / 6,
         ))
       }
@@ -217,7 +217,7 @@ function buildBoardLayer(
     }
     const matrices = territoryByPlayer.get(tile.ownerId) ?? []
     matrices.push(instanceMatrix(
-      tile.worldX, topByTile[tile.index] + 0.014, tile.worldZ,
+      tile.worldX, (topByTile[tile.index] ?? 0) + 0.014, tile.worldZ,
       1, 1, 1, Math.PI / 6,
     ))
     territoryByPlayer.set(tile.ownerId, matrices)
@@ -263,7 +263,7 @@ function buildBoardLayer(
     const matrices = boundaryByColor.get(color) ?? []
     matrices.push(instanceMatrix(
       tile.worldX + normalX * 0.545,
-      topByTile[tile.index] + 0.05,
+      (topByTile[tile.index] ?? 0) + 0.05,
       tile.worldZ + normalZ * 0.545,
       1, 1, 1,
       Math.atan2(normalZ, normalX) + Math.PI / 2,
@@ -288,7 +288,7 @@ function buildBoardLayer(
   for (const tile of tiles) {
     const names = tile.extraIds.map((id) => extraNames.get(id) ?? '')
     const rotation = ((tile.x + tile.y) % 3) * Math.PI / 3
-    const y = topByTile[tile.index] + 0.035
+    const y = (topByTile[tile.index] ?? 0) + 0.035
     if (names.includes('Road')) roadMatrices.push(instanceMatrix(tile.worldX, y, tile.worldZ, 1, 1, 1, rotation))
     if (names.includes('Railroad')) railMatrices.push(instanceMatrix(tile.worldX, y + 0.012, tile.worldZ, 1, 1, 1, rotation))
     if (names.includes('River')) riverMatrices.push(instanceMatrix(tile.worldX, y + 0.018, tile.worldZ, 1, 1, 1, rotation + Math.PI / 3))
@@ -392,7 +392,7 @@ function buildBoardLayer(
 
   return {
     group,
-    shapeSignature: `${board.width}x${board.height}:${board.topology}:${board.wrap}`,
+    boardSignature: `${board.width}x${board.height}:${board.topology}:${board.wrap}`,
     topByTile,
     footprint,
   }
@@ -405,8 +405,8 @@ function disposeLayer(layer: BoardLayer | null): void {
     if (object instanceof THREE.Mesh) object.geometry.dispose()
     const materials = Array.isArray(object.material) ? object.material : [object.material]
     materials.forEach((material) => {
-      const map = (material as THREE.SpriteMaterial).map
-      if (map) map.dispose()
+      const map = 'map' in material ? material.map : null
+      if (map instanceof THREE.Texture) map.dispose()
       material.dispose()
     })
   })
@@ -423,13 +423,13 @@ export function ThreeBoard({ actionsRef, alt, board, mode, onCommit, onFailure, 
 
   useEffect(() => {
     const container = containerRef.current
-    if (!container) return
+    if (!container) return undefined
     let renderer: THREE.WebGLRenderer
     try {
       renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true, powerPreference: 'high-performance' })
     } catch {
       onFailure()
-      return
+      return undefined
     }
     renderer.outputColorSpace = THREE.SRGBColorSpace
     renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1))
@@ -532,7 +532,7 @@ export function ThreeBoard({ actionsRef, alt, board, mode, onCommit, onFailure, 
 
   useEffect(() => {
     const runtime = runtimeRef.current
-    if (!ready || !runtime) return
+    if (!ready || !runtime) return undefined
     const generation = ++sceneGeneration.current
     let frame = 0
     let buildTimer = 0
@@ -558,7 +558,7 @@ export function ThreeBoard({ actionsRef, alt, board, mode, onCommit, onFailure, 
           runtime.scene.add(built.group)
           runtime.current = built
           if (previous) runtime.scene.remove(previous.group)
-          if (!previous || previous.shapeSignature !== built.shapeSignature) runtime.fit()
+          if (!previous || previous.boardSignature !== built.boardSignature) runtime.fit()
           else runtime.render()
           if (previous) disposeLayer(previous)
           onCommit(board)

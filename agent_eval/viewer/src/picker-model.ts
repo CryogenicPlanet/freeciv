@@ -79,7 +79,7 @@ export function placeLabel(place: GamePlace): string {
 }
 
 export function sortedGames(games: GameSummary[]): GameSummary[] {
-  return [...games].sort((a, b) => {
+  return games.toSorted((a, b) => {
     const active = Number(ACTIVE_STATES.has(b.state)) - Number(ACTIVE_STATES.has(a.state))
     if (active) return active
     return (b.created_at ?? 0) - (a.created_at ?? 0)
@@ -98,7 +98,7 @@ export function timingModeLabel(
 ): string | null {
   if (!game.timing_mode) return null
   if (game.timing_mode === 'infinite') return 'Infinite · no deadline'
-  if (typeof game.action_timeout_s !== 'number' || !Number.isFinite(game.action_timeout_s)) return null
+  if (game.action_timeout_s == null || !Number.isFinite(game.action_timeout_s)) return null
   const label = game.timing_mode === 'blitz'
     ? 'Blitz'
     : game.timing_mode === 'custom' ? 'Custom' : 'Default'

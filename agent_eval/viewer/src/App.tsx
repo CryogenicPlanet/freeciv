@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { agentFirst } from './agent-order'
 import { fetchEvents, fetchWatch, fetchWatchWithOptionalReplay } from './api'
 import { ArenaPicker } from './components/ArenaPicker'
@@ -21,6 +21,7 @@ import type {
   GamePlace,
   ReplayPlayer,
   ReplaySnapshot,
+  ReplayWarning,
   RouteContext,
   TechnologyCatalog,
   WatchResponse,
@@ -53,7 +54,7 @@ const CLAMPED_LINE_RAIL = 'block min-w-0 overflow-hidden text-ellipsis whitespac
 function mergeSnapshots(current: ReplaySnapshot[], incoming: ReplaySnapshot[]) {
   const merged = new Map(current.map((snapshot) => [snapshot.turn, snapshot]))
   for (const snapshot of incoming) merged.set(snapshot.turn, snapshot)
-  return [...merged.values()].sort((a, b) => a.turn - b.turn)
+  return [...merged.values()].toSorted((a, b) => a.turn - b.turn)
 }
 
 function stateLabel(state: string) {
@@ -115,7 +116,7 @@ function MatchViewer({ route }: { route: RouteContext }) {
   const [watch, setWatch] = useState<WatchResponse | null>(null)
   const [snapshots, setSnapshots] = useState<ReplaySnapshot[]>([])
   const [catalog, setCatalog] = useState<TechnologyCatalog>({ technologies: [] })
-  const [warnings, setWarnings] = useState<{ turn?: number | null; message: string }[]>([])
+  const [warnings, setWarnings] = useState<ReplayWarning[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [basicTelemetry, setBasicTelemetry] = useState(false)
@@ -138,7 +139,7 @@ function MatchViewer({ route }: { route: RouteContext }) {
         const load = await fetchWatchWithOptionalReplay(route, 0, controller.signal)
         setWatch(load.watch)
         if (load.replay) {
-          setSnapshots(load.replay.snapshots.sort((a, b) => a.turn - b.turn))
+          setSnapshots(load.replay.snapshots.toSorted((a, b) => a.turn - b.turn))
           if (load.replay.catalog) setCatalog(load.replay.catalog)
           setWarnings(load.replay.warnings)
         }
@@ -160,7 +161,7 @@ function MatchViewer({ route }: { route: RouteContext }) {
   }, [route])
 
   useEffect(() => {
-    if (loading) return
+    if (loading) return undefined
     const controller = new AbortController()
     const timer = window.setInterval(async () => {
       try {
@@ -174,9 +175,10 @@ function MatchViewer({ route }: { route: RouteContext }) {
         )
         setWatch(load.watch)
         if (load.replay) {
-          setSnapshots((current) => mergeSnapshots(current, load.replay!.snapshots))
-          if (load.replay.catalog) setCatalog(load.replay.catalog)
-          setWarnings(load.replay.warnings)
+          const replay = load.replay
+          setSnapshots((current) => mergeSnapshots(current, replay.snapshots))
+          if (replay.catalog) setCatalog(replay.catalog)
+          setWarnings(replay.warnings)
         }
         setBasicTelemetry(load.replayUnavailable)
         nextReplayProbeAt.current = load.replayUnavailable
@@ -208,7 +210,7 @@ function MatchViewer({ route }: { route: RouteContext }) {
   }, [lastTurn, live])
 
   useEffect(() => {
-    if (!playing || availableTurns.length < 2) return
+    if (!playing || availableTurns.length < 2) return undefined
     const timer = window.setInterval(() => {
       setSelectedTurn((current) => {
         const next = availableTurns.find((turn) => turn > current)
@@ -307,14 +309,16 @@ function MatchViewer({ route }: { route: RouteContext }) {
       place,
       score: historicalComparison ? telemetry?.score : authoritative?.score ?? telemetry?.score,
     }
-  }).sort((a, b) => (b.score ?? Number.NEGATIVE_INFINITY) - (a.score ?? Number.NEGATIVE_INFINITY))
+  }).toSorted(
+    (a, b) => (b.score ?? Number.NEGATIVE_INFINITY) - (a.score ?? Number.NEGATIVE_INFINITY),
+  )
 
   function chooseTurn(turn: number) {
     setSelectedTurn(turn)
     setLive(turn === lastTurn)
   }
 
-  const previousTurn = [...availableTurns].reverse().find((turn) => turn < selectedTurn)
+  const previousTurn = availableTurns.toReversed().find((turn) => turn < selectedTurn)
   const nextTurn = availableTurns.find((turn) => turn > selectedTurn)
 
   function stepReplay(turn: number | undefined) {
@@ -514,7 +518,7 @@ function MatchViewer({ route }: { route: RouteContext }) {
                 </div>
                 <div className="mt-[14px] pt-3 border-t border-t-[var(--color-line)]">
                   <small className="block mb-[7px] text-[var(--color-muted)] font-bold text-[7px] leading-none font-readout tracking-[.1em] uppercase">Acquisition history</small>
-                  <div className="flex flex-wrap gap-[5px]">{acquisitions.length ? acquisitions.slice(-4).reverse().map((acquisition, index) => <span className="py-[5px] px-[7px] border border-line text-muted bg-[var(--color-page)] text-[8px]" key={`${acquisition.turn}-${acquisition.name}-${index}`}><b className="mr-[5px] text-[var(--color-muted)] font-medium text-[7px] leading-none font-readout">T{acquisition.turn}</b>{acquisition.name}</span>) : <em className="text-[var(--color-muted)] text-[9px] not-italic">No new technology recorded yet</em>}</div>
+                  <div className="flex flex-wrap gap-[5px]">{acquisitions.length ? acquisitions.slice(-4).toReversed().map((acquisition, index) => <span className="py-[5px] px-[7px] border border-line text-muted bg-[var(--color-page)] text-[8px]" key={`${acquisition.turn}-${acquisition.name}-${index}`}><b className="mr-[5px] text-[var(--color-muted)] font-medium text-[7px] leading-none font-readout">T{acquisition.turn}</b>{acquisition.name}</span>) : <em className="text-[var(--color-muted)] text-[9px] not-italic">No new technology recorded yet</em>}</div>
                 </div>
               </article>
             )
@@ -595,7 +599,7 @@ function MatchViewer({ route }: { route: RouteContext }) {
           </>
         ) : (
           <div className="event-stream">
-            {watch.timeline.slice(-12).reverse().map((event) => (
+            {watch.timeline.slice(-12).toReversed().map((event) => (
               <article key={event.turn}>
                 <b>T{event.turn}</b>
                 <span>{event.year ?? '—'}</span>

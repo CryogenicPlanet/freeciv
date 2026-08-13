@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import React, { useMemo } from 'react'
 import { interpolate } from 'remotion'
 import type { Film } from '../dataset/film'
 import type { GameEvent } from '../dataset/schema'

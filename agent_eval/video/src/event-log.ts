@@ -12,7 +12,7 @@
 import type { GameEvent } from './dataset/schema'
 
 /** Short chips; unknown kinds render their raw name. Mirrors the viewer. */
-const EVENT_KIND_LABELS: Readonly<Record<string, string>> = {
+const EVENT_KIND_LABELS = {
   alliance_formed: 'Alliance',
   armistice_agreed: 'Armistice',
   barbarian_uprising: 'Uprising',
@@ -40,10 +40,12 @@ const EVENT_KIND_LABELS: Readonly<Record<string, string>> = {
   wonder_captured: 'Wonder taken',
   wonder_completed: 'Wonder',
   wonder_destroyed: 'Wonder lost',
-}
+} satisfies Readonly<Record<string, string>>
+
+const EVENT_KIND_LABEL_BY_KIND = new Map<string, string>(Object.entries(EVENT_KIND_LABELS))
 
 export function eventKindLabel(kind: string): string {
-  return EVENT_KIND_LABELS[kind] ?? kind.replaceAll('_', ' ')
+  return EVENT_KIND_LABEL_BY_KIND.get(kind) ?? kind.replaceAll('_', ' ')
 }
 
 /** Weight floors, on the extractor's 1-100 scale. Mirrors the viewer. */
@@ -72,7 +74,7 @@ export function heaviestPerWindow(
     const held = best.get(window)
     if (!held || event.weight > held.weight) best.set(window, event)
   }
-  return [...best.values()].sort((left, right) => left.turn - right.turn)
+  return [...best.values()].toSorted((left, right) => left.turn - right.turn)
 }
 
 /** Kinds that are always a beat of the story, whatever else shares their turn. */
@@ -162,7 +164,7 @@ export function planCaptions(
   // folded into a "+N more" chip: the beat still plays, just a moment late.
   const slots = new Map<number, { event: GameEvent; sourceWindow: number }>()
   const placed = new Set<GameEvent>()
-  for (const event of [...mustShow].sort((a, b) => a.turn - b.turn || b.weight - a.weight)) {
+  for (const event of mustShow.toSorted((a, b) => a.turn - b.turn || b.weight - a.weight)) {
     let window = windowOf(event.turn)
     while (slots.has(window)) window += 1
     slots.set(window, { event, sourceWindow: windowOf(event.turn) })
@@ -184,7 +186,7 @@ export function planCaptions(
   )
   const unshown = eligible.filter((event) => !placed.has(event))
 
-  const ordered = [...slots.entries()].sort(([left], [right]) => left - right)
+  const ordered = [...slots.entries()].toSorted(([left], [right]) => left - right)
   const captions = ordered.map(([window, held], index): Caption => {
     const sameWindow = unshown.filter(
       (event) => windowOf(event.turn) === held.sourceWindow,
@@ -224,8 +226,8 @@ export function topHighlights(
   events: readonly GameEvent[], limit: number, perKind = 2,
 ): GameEvent[] {
   const wanted = Math.max(0, limit)
-  const ranked = [...events]
-    .sort((left, right) => right.weight - left.weight || left.turn - right.turn)
+  const ranked = events
+    .toSorted((left, right) => right.weight - left.weight || left.turn - right.turn)
   const chosen: GameEvent[] = []
   const used = new Map<string, number>()
   for (const event of ranked) {
@@ -240,5 +242,5 @@ export function topHighlights(
     if (chosen.length >= wanted) break
     if (!chosen.includes(event)) chosen.push(event)
   }
-  return chosen.sort((left, right) => left.turn - right.turn)
+  return chosen.toSorted((left, right) => left.turn - right.turn)
 }

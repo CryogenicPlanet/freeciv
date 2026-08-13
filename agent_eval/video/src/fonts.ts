@@ -23,7 +23,7 @@ const FACES = [
 ] as const
 
 function load(): void {
-  if (typeof document === 'undefined' || typeof FontFace === 'undefined') return
+  if (!('document' in globalThis) || !('FontFace' in globalThis)) return
   const handle = delayRender('Loading arena typefaces')
   const settle = (): void => {
     continueRender(handle)

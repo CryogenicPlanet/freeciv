@@ -1,7 +1,7 @@
 import type { GameEvent, GamePlace, ReplayPlayer } from './types'
 
 /** Short chips for the log's right rail; unknown kinds render their raw name. */
-const EVENT_KIND_LABELS: Readonly<Record<string, string>> = {
+const EVENT_KIND_LABELS = new Map(Object.entries({
   alliance_formed: 'Alliance',
   armistice_agreed: 'Armistice',
   barbarian_uprising: 'Uprising',
@@ -29,10 +29,10 @@ const EVENT_KIND_LABELS: Readonly<Record<string, string>> = {
   wonder_captured: 'Wonder taken',
   wonder_completed: 'Wonder',
   wonder_destroyed: 'Wonder lost',
-}
+}))
 
 export function eventKindLabel(kind: string): string {
-  return EVENT_KIND_LABELS[kind] ?? kind.replaceAll('_', ' ')
+  return EVENT_KIND_LABELS.get(kind) ?? kind.replaceAll('_', ' ')
 }
 
 /**
@@ -125,19 +125,19 @@ export type EventDensity = 'all' | 'key' | 'major'
  * first contact, and score markers, and keeps every capture, razing, wonder,
  * pact, elimination and spaceship beat.
  */
-export const DENSITY_FLOOR: Readonly<Record<EventDensity, number>> = {
+export const DENSITY_FLOOR = {
   all: 0,
   key: 30,
   major: 60,
-}
+} satisfies Readonly<Record<EventDensity, number>>
 
 export const DENSITY_ORDER: readonly EventDensity[] = ['all', 'key', 'major']
 
-export const DENSITY_LABEL: Readonly<Record<EventDensity, string>> = {
+export const DENSITY_LABEL = {
   all: 'Everything',
   key: 'Key moments',
   major: 'Major',
-}
+} satisfies Readonly<Record<EventDensity, string>>
 
 export function eventsAtDensity(
   events: readonly GameEvent[], density: EventDensity,
@@ -171,12 +171,12 @@ export function heaviestPerWindow(
     const held = best.get(window)
     if (!held || event.weight > held.weight) best.set(window, event)
   }
-  return [...best.values()].sort((left, right) => left.turn - right.turn)
+  return [...best.values()].toSorted((left, right) => left.turn - right.turn)
 }
 
 export function omittedSummary(omitted: Readonly<Record<string, number>>): string {
   const parts = Object.entries(omitted)
-    .sort(([left], [right]) => left.localeCompare(right))
+    .toSorted(([left], [right]) => left.localeCompare(right))
     .map(([kind, count]) => `${count} ${eventKindLabel(kind).toLowerCase()}`)
   return parts.join(', ')
 }

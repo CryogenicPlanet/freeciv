@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react'
+import React, { type FormEvent, useEffect, useMemo, useState } from 'react'
 import { agentFirst } from '../agent-order'
 import { fetchGames } from '../api'
 import {
