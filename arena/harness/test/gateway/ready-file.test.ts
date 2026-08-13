@@ -140,7 +140,7 @@ const LOCK_VARIABLE = 'READY_LOCK_PATH';
 
 const childEnvironment = (
   variables: Readonly<Record<string, string>>,
-): Record<string, string | undefined> => ({ ...process.env, ...variables });
+): NodeJS.ProcessEnv => ({ ...process.env, ...variables });
 
 const pythonRun = (
   source: string,

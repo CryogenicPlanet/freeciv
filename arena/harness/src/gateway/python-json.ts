@@ -4,7 +4,7 @@
  */
 
 import type { CanonRecord, CanonValue } from '@arena/wire';
-import { Data, Either } from 'effect';
+import { Predicate, Data, Either } from 'effect';
 
 /**
  * The text was not JSON, or was JSON this reader will not produce a
@@ -98,8 +98,11 @@ export const rewriteLiterals = (text: string): string =>
  * every value string — so the final arm is unreachable padding that keeps the
  * function total rather than partial.
  */
-const reviveMarked = (_key: string, value: unknown): unknown => {
-  if (typeof value !== 'string' || !value.startsWith(MARKER)) return value;
+const reviveMarked = <Value>(
+  _key: string,
+  value: Value,
+): Value | bigint | number | string => {
+  if (!Predicate.isString(value) || !value.startsWith(MARKER)) return value;
   const kind = value.charAt(MARKER.length);
   const rest = value.slice(MARKER.length + 1);
   return kind === MARK_INT
@@ -123,8 +126,8 @@ const reviveMarked = (_key: string, value: unknown): unknown => {
  * no `bigint` member, so it refuses exactly the documents this reader exists
  * to produce.
  */
-export const isCanonRecord = (value: unknown): value is CanonRecord =>
-  typeof value === 'object' && value !== null && !Array.isArray(value) && isCanonValue(value);
+export const isCanonRecord = <Value>(value: Value): value is Value & CanonRecord =>
+  Predicate.isRecord(value) && isCanonValue(value);
 
 /**
  * Every runtime shape {@link CanonValue} admits.
@@ -135,21 +138,18 @@ export const isCanonRecord = (value: unknown): value is CanonRecord =>
  * Recursion depth is the document's, which `JSON.parse` has already bounded by
  * failing on anything deeper than its own parser can hold.
  */
-export const isCanonValue = (value: unknown): value is CanonValue => {
-  if (value === null) return true;
-  switch (typeof value) {
-    case 'boolean':
-    case 'bigint':
-    case 'number':
-    case 'string':
-      return true;
-    case 'object':
-      return Array.isArray(value)
-        ? value.every(isCanonValue)
-        : Object.values(value).every(isCanonValue);
-    default:
-      return false;
+export const isCanonValue = <Value>(value: Value): value is Value & CanonValue => {
+  if (
+    value === null ||
+    Predicate.isBoolean(value) ||
+    Predicate.isBigInt(value) ||
+    Predicate.isNumber(value) ||
+    Predicate.isString(value)
+  ) {
+    return true;
   }
+  if (Array.isArray(value)) return value.every(isCanonValue);
+  return Predicate.isRecord(value) && Object.values(value).every(isCanonValue);
 };
 
 // ---------------------------------------------------------------------------
@@ -157,6 +157,7 @@ export const isCanonValue = (value: unknown): value is CanonValue => {
 // ---------------------------------------------------------------------------
 
 const NOT_CANON = 'the document contains a value with no canonical spelling';
+const INVALID_CANON = Symbol('invalid canonical JSON');
 
 const failure = (cause: unknown): PythonJsonError =>
   new PythonJsonError({
@@ -174,7 +175,10 @@ const failure = (cause: unknown): PythonJsonError =>
 export const parsePythonJson = (text: string): Either.Either<CanonValue, PythonJsonError> =>
   Either.flatMap(
     Either.try({
-      try: (): unknown => JSON.parse(rewriteLiterals(text), reviveMarked) as unknown,
+      try: (): CanonValue | typeof INVALID_CANON => {
+        const parsed: unknown = JSON.parse(rewriteLiterals(text), reviveMarked);
+        return isCanonValue(parsed) ? parsed : INVALID_CANON;
+      },
       catch: failure,
     }),
     (value) =>

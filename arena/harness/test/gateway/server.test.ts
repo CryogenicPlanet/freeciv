@@ -13,7 +13,7 @@ import {
 import { HelpDoc, ValidationError } from '@effect/cli';
 import { Headers } from '@effect/platform';
 import { NodeContext, NodeHttpServer } from '@effect/platform-node';
-import { Cause, Console, Data, Effect, Either, Exit, FiberId, Layer, Option, Ref } from 'effect';
+import { Predicate, Cause, Console, Data, Effect, Either, Exit, FiberId, Layer, Option, Ref } from 'effect';
 import { mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -277,9 +277,9 @@ interface ReadyProbe {
 /** Read one string field out of a JSON object text without an unchecked cast. */
 const stringField = (text: string, key: string): string => {
   const value: unknown = JSON.parse(text);
-  if (typeof value !== 'object' || value === null) return '';
+  if (!Predicate.isRecord(value) && !Array.isArray(value)) return '';
   const found = Object.entries(value).find(([name]) => name === key);
-  return typeof found?.[1] === 'string' ? found[1] : '';
+  return Predicate.isString(found?.[1]) ? found[1] : '';
 };
 
 /**
@@ -440,7 +440,7 @@ describe('startup: the ready record is published only after serve() attaches the
         Effect.gen(function* () {
           const port = payload['port'];
           yield* Effect.addFinalizer(() =>
-            typeof port === 'bigint'
+            Predicate.isBigInt(port)
               ? Effect.flatMap(probeConnect(Number(port)), (state) =>
                   Effect.sync(() => observed.push(`ready-cleanup:${state}`)),
                 )
@@ -861,7 +861,8 @@ describe('telemetry: exactly one wide event per request, refusals included', () 
    * sealed fields next to `event`, `eventId` and `durationMs` — so a reader
    * looks the annotations up by their own key and not under a `fields` object.
    */
-  const field = (event: Readonly<Record<string, unknown>>, key: string): unknown => event[key];
+  const field = <Value>(event: Readonly<Record<string, Value>>, key: string): Value | undefined =>
+    event[key];
 
   test('a served request, a refused one and an unmapped verb each produce one event', async () => {
     const events = await withGateway(

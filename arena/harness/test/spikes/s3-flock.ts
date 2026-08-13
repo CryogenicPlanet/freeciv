@@ -154,7 +154,7 @@ export const LOCK_PATH_VARIABLE = 'S3_LOCK_PATH';
 
 const childEnvironment = (
   path: string,
-): Record<string, string | undefined> => ({
+): NodeJS.ProcessEnv => ({
   ...process.env,
   [LOCK_PATH_VARIABLE]: path,
 });

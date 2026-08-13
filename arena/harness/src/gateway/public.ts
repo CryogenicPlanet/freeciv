@@ -3,7 +3,7 @@
  * truthiness, ordering, and `int`/`float` behavior; unknown/private fields must never pass through.
  */
 
-import { Option } from 'effect';
+import { Predicate, Option } from 'effect';
 import {
   type CanonValue,
   compareCodePoints,
@@ -75,11 +75,21 @@ export type Canonical<A> =
             ? { readonly [K in keyof A]: Canonical<Exclude<A[K], undefined>> }
             : A;
 
-export type Untrusted = { readonly [key: string]: unknown };
+export type UntrustedValue =
+  | bigint
+  | boolean
+  | number
+  | string
+  | null
+  | undefined
+  | Untrusted
+  | readonly UntrustedValue[];
+
+export type Untrusted = { readonly [key: string]: UntrustedValue };
 
 /** `isinstance(value, Mapping)` — a JSON object, never an array. */
-export const isUntrusted = (value: unknown): value is Untrusted =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
+export const isUntrusted = <Value>(value: Value): value is Value & Untrusted =>
+  Predicate.isRecord(value);
 
 /**
  * `value.get(key)` — `undefined` when the value is not a mapping or the key is
@@ -89,7 +99,7 @@ export const isUntrusted = (value: unknown): value is Untrusted =>
  * inherited function on any object literal, and a manifest key named
  * `constructor` or `toString` is a value whoever wrote the manifest controls.
  */
-export const untrustedField = (value: unknown, key: string): unknown =>
+export const untrustedField = <Value>(value: Value, key: string): UntrustedValue =>
   isUntrusted(value) && Object.hasOwn(value, key) ? value[key] : undefined;
 
 /**
@@ -101,7 +111,11 @@ export const untrustedField = (value: unknown, key: string): unknown =>
  * while an absent one does not: `dict.get` distinguishes the two and `??` does
  * not.
  */
-export const untrustedFieldOr = (value: unknown, key: string, fallbackKey: string): unknown =>
+export const untrustedFieldOr = <Value>(
+  value: Value,
+  key: string,
+  fallbackKey: string,
+): UntrustedValue =>
   isUntrusted(value) && Object.hasOwn(value, key) ? value[key] : untrustedField(value, fallbackKey);
 
 // ---------------------------------------------------------------------------
@@ -167,8 +181,12 @@ export const isPythonSpace = (character: string): boolean => PYTHON_SPACE_RE.tes
  * control characters, `str.strip()`-ed, truncated to `limit` **code points**,
  * and replaced by `fallback` when nothing is left.
  */
-export const publicText = (value: unknown, fallback: string, limit = PUBLIC_TEXT_LIMIT): string => {
-  if (typeof value !== 'string') return fallback;
+export const publicText = <Value>(
+  value: Value,
+  fallback: string,
+  limit = PUBLIC_TEXT_LIMIT,
+): string => {
+  if (!Predicate.isString(value)) return fallback;
   const rendered = pythonStrip(withoutControls(value));
   const truncated = [...rendered].slice(0, limit).join('');
   return truncated === '' ? fallback : truncated;
@@ -190,9 +208,9 @@ const maxBigInt = (left: bigint, right: bigint): bigint => (left > right ? left 
  * `bigint`.  `JSON.parse` cannot produce one, so this widens nothing CPython
  * would have seen.
  */
-export const publicInt = (value: unknown, fallback = 0n, minimum = 0n): bigint => {
-  if (typeof value === 'bigint') return maxBigInt(minimum, value);
-  if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value)) {
+export const publicInt = <Value>(value: Value, fallback = 0n, minimum = 0n): bigint => {
+  if (Predicate.isBigInt(value)) return maxBigInt(minimum, value);
+  if (!Predicate.isNumber(value) || !Number.isFinite(value) || !Number.isInteger(value)) {
     return fallback;
   }
   return maxBigInt(minimum, BigInt(value));
@@ -205,9 +223,9 @@ export const publicInt = (value: unknown, fallback = 0n, minimum = 0n): bigint =
  * way `repr(float)` does: `publicNumber(180)` is `180.0` on the wire, never
  * `180`.
  */
-export const publicNumber = (value: unknown, fallback = 0): number => {
-  if (typeof value === 'bigint') return Number(value);
-  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+export const publicNumber = <Value>(value: Value, fallback = 0): number => {
+  if (Predicate.isBigInt(value)) return Number(value);
+  return Predicate.isNumber(value) && Number.isFinite(value) ? value : fallback;
 };
 
 // ---------------------------------------------------------------------------
@@ -223,8 +241,8 @@ export const publicNumber = (value: unknown, fallback = 0): number => {
  * `boolean`, and neither is a `bigint`, so `isinstance(weight, int) and not
  * isinstance(weight, bool)` needs no second clause here.
  */
-const isEventWeight = (value: unknown): value is bigint =>
-  typeof value === 'bigint' &&
+const isEventWeight = <Value>(value: Value): value is Value & bigint =>
+  Predicate.isBigInt(value) &&
   value >= BigInt(Gateway.GAME_EVENT_MIN_WEIGHT) &&
   value <= BigInt(Gateway.GAME_EVENT_MAX_WEIGHT);
 
@@ -243,15 +261,17 @@ const isEventWeight = (value: unknown): value is bigint =>
  * instead of guessing at a `number`.  `data` keeps its own integer spelling
  * for the same reason — it is relayed, not rebuilt.
  */
-export const publicEvent = (value: unknown): Option.Option<Canonical<Gateway.GameEvent>> => {
+export const publicEvent = <Value>(
+  value: Value,
+): Option.Option<Canonical<Gateway.GameEvent>> => {
   if (!isUntrusted(value)) return Option.none();
   const turn = untrustedField(value, 'turn');
   const kind = untrustedField(value, 'kind');
   const summary = untrustedField(value, 'summary');
   const weight = untrustedField(value, 'weight');
-  if (typeof turn !== 'bigint' || turn < 0n) return Option.none();
-  if (typeof kind !== 'string' || kind === '') return Option.none();
-  if (typeof summary !== 'string' || summary === '') return Option.none();
+  if (!Predicate.isBigInt(turn) || turn < 0n) return Option.none();
+  if (!Predicate.isString(kind) || kind === '') return Option.none();
+  if (!Predicate.isString(summary) || summary === '') return Option.none();
   if (!isEventWeight(weight)) return Option.none();
   const actors = untrustedField(value, 'actors');
   const data = untrustedField(value, 'data');
@@ -261,7 +281,7 @@ export const publicEvent = (value: unknown): Option.Option<Canonical<Gateway.Gam
     summary: publicText(summary, '', Gateway.GAME_EVENT_SUMMARY_MAX_LENGTH),
     weight,
     actors: (Array.isArray(actors) ? actors : [])
-      .filter((actor): actor is string => typeof actor === 'string')
+      .filter((actor): actor is string => Predicate.isString(actor))
       .map((actor) => publicText(actor, '', Gateway.GAME_EVENT_ACTOR_MAX_LENGTH))
       .slice(0, Gateway.GAME_EVENT_ACTORS_MAX),
     data: isCanonRecord(data) ? data : {},
@@ -278,7 +298,7 @@ export type PublicCounts = { readonly [kind: string]: bigint };
  * Two kinds that truncate to the same 40 characters collapse into one entry,
  * last writer wins, exactly as the Python dict comprehension does.
  */
-export const publicCounts = (value: unknown): PublicCounts =>
+export const publicCounts = <Value>(value: Value): PublicCounts =>
   isUntrusted(value)
     ? Object.fromEntries(
         Object.entries(value).map(([kind, count]) => [
@@ -289,16 +309,18 @@ export const publicCounts = (value: unknown): PublicCounts =>
     : {};
 
 /** `event_warnings` (`:429-439`): `{turn, message}`, message-bearing rows only. */
-const publicWarnings = (value: unknown): readonly Canonical<Gateway.ReplayWarning>[] =>
+const publicWarnings = <Value>(
+  value: Value,
+): readonly Canonical<Gateway.ReplayWarning>[] =>
   (Array.isArray(value) ? value : [])
-    .filter((row) => typeof untrustedField(row, 'message') === 'string')
+    .filter((row) => Predicate.isString(untrustedField(row, 'message')))
     .slice(0, Gateway.GAME_EVENT_WARNINGS_MAX)
     .map((row) => {
       const turn = untrustedField(row, 'turn');
       // `isinstance(row["turn"], int) and not isinstance(..., bool)` (`:431`):
       // a `bigint` and nothing else.
       return {
-        turn: typeof turn === 'bigint' ? turn : null,
+        turn: Predicate.isBigInt(turn) ? turn : null,
         message: publicText(
           untrustedField(row, 'message'),
           '',
@@ -320,8 +342,8 @@ const publicWarnings = (value: unknown): readonly Canonical<Gateway.ReplayWarnin
  * - `min_included_weight` is the minimum over the surviving rows, falling back
  *   to the loader's value only when nothing survived (`:423-426`).
  */
-export const publicEvents = (
-  value: unknown,
+export const publicEvents = <Value>(
+  value: Value,
   gameId: GameId,
 ): Canonical<Gateway.GameEventsResponse> => {
   const rows = untrustedField(value, 'events');
@@ -393,10 +415,10 @@ const TIMING_MODE_FIXED_TIMEOUT: ReadonlyMap<string, number> = new Map([
  * constant this function hardcodes, which is why most `full-control-v2` runs
  * (600 s under a `default` label) publish neither key.
  */
-export const publicTiming = (config: unknown): PublicTiming | NoKeys => {
+export const publicTiming = <Config>(config: Config): PublicTiming | NoKeys => {
   const mode = untrustedField(config, 'timing_mode');
   const timeout = untrustedField(config, 'action_timeout_s');
-  if (typeof mode !== 'string' || !Gateway.isTimingMode(mode)) return {};
+  if (!Predicate.isString(mode) || !Gateway.isTimingMode(mode)) return {};
   if (mode === 'infinite') {
     // `config.get("action_timeout_s")` is `None` for a *missing* key as much
     // as for an explicit `null`, and `infinite` publishes on both — the
@@ -405,7 +427,7 @@ export const publicTiming = (config: unknown): PublicTiming | NoKeys => {
       ? { timing_mode: mode, action_timeout_s: null }
       : {};
   }
-  if (typeof timeout !== 'number' || !Number.isFinite(timeout) || timeout <= 0) return {};
+  if (!Predicate.isNumber(timeout) || !Number.isFinite(timeout) || timeout <= 0) return {};
   const fixed = TIMING_MODE_FIXED_TIMEOUT.get(mode);
   if (fixed !== undefined && timeout !== fixed) return {};
   return { timing_mode: mode, action_timeout_s: timeout };
@@ -419,16 +441,16 @@ export const publicTiming = (config: unknown): PublicTiming | NoKeys => {
  * viewer then renders an unqualified match instead of claiming a protocol the
  * run may not have used.
  */
-export const publicControlProtocol = (
-  config: unknown,
-  manifest: unknown,
+export const publicControlProtocol = <Config, Manifest>(
+  config: Config,
+  manifest: Manifest,
 ): PublicControlProtocol | NoKeys => {
   const found = [
     untrustedField(config, 'control_protocol'),
     untrustedField(manifest, 'control_protocol'),
   ].find(
     (candidate): candidate is ControlProtocol =>
-      typeof candidate === 'string' && isControlProtocol(candidate),
+      Predicate.isString(candidate) && isControlProtocol(candidate),
   );
   return found === undefined ? {} : { control_protocol: found };
 };
@@ -441,8 +463,8 @@ export const publicControlProtocol = (
  * a status row always carries the key (possibly `null`), while a place carries
  * it only when it resolved.  See {@link publicPlaces}.
  */
-export const publicAiDifficulty = (level: unknown): Gateway.AiDifficulty | null =>
-  typeof level === 'string' && Gateway.isAiDifficulty(level) ? level : null;
+export const publicAiDifficulty = <Level>(level: Level): Gateway.AiDifficulty | null =>
+  Predicate.isString(level) && Gateway.isAiDifficulty(level) ? level : null;
 
 // ---------------------------------------------------------------------------
 // _public_places
@@ -469,7 +491,7 @@ type PlaceExtras = { readonly [key: string]: string };
  * test below, so the key is omitted rather than rendered — which is why this
  * answers `unknown` rather than `string`.
  */
-const orDefault = (value: unknown, fallback: string): unknown => {
+const orDefault = (value: UntrustedValue, fallback: string): UntrustedValue => {
   if (value === undefined || value === null || value === '' || value === false || value === 0) {
     return fallback;
   }
@@ -486,8 +508,8 @@ const orDefault = (value: unknown, fallback: string): unknown => {
  * one, so a label of `"\x01"` passes the test and then publishes `""` —
  * present and blank, which no other path produces.
  */
-const namedText = (key: string, value: unknown, limit: number): PlaceExtras =>
-  typeof value === 'string' && pythonStrip(value) !== ''
+const namedText = <Value>(key: string, value: Value, limit: number): PlaceExtras =>
+  Predicate.isString(value) && pythonStrip(value) !== ''
     ? { [key]: publicText(value, '', limit) }
     : {};
 
@@ -513,9 +535,9 @@ const namedText = (key: string, value: unknown, limit: number): PlaceExtras =>
  * as Python compares `str`; `<` on JavaScript strings compares UTF-16 units
  * and disagrees above U+FFFF.
  */
-export const publicPlaces = (
-  value: unknown,
-  manifest?: unknown,
+export const publicPlaces = <Value, Manifest>(
+  value: Value,
+  manifest?: Manifest,
 ): readonly Canonical<Gateway.GamePlace>[] => {
   const config = untrustedField(manifest, 'config');
   const gameDifficulty = publicAiDifficulty(untrustedField(config, 'difficulty'));
@@ -549,26 +571,26 @@ export const publicPlaces = (
         : joined &&
             (rawModel === undefined || rawModel === null) &&
             isUntrusted(metadata) &&
-            typeof metadataModel === 'string'
+            Predicate.isString(metadataModel)
           ? metadataModel
           : rawModel;
       const difficulty = native
         ? (publicAiDifficulty(untrustedField(raw, 'ai_difficulty')) ?? gameDifficulty)
         : null;
-      return [
-        {
-          place,
-          seat_id: seatId,
-          player_name: playerName,
-          player_color: publicText(untrustedField(raw, 'player_color'), '', PLACE_COLOR_LIMIT),
-          controller,
-          joined,
-          ...(difficulty === null ? {} : { ai_difficulty: difficulty }),
-          ...namedText('controller_label', label, PLACE_LABEL_LIMIT),
-          ...namedText('controller_type', controllerType, PLACE_TYPE_LIMIT),
-          ...namedText('model', model, PLACE_MODEL_LIMIT),
-        },
-      ];
+      const publicPlace = {
+        place,
+        seat_id: seatId,
+        player_name: playerName,
+        player_color: publicText(untrustedField(raw, 'player_color'), '', PLACE_COLOR_LIMIT),
+        controller,
+        joined,
+        ...namedText('controller_label', label, PLACE_LABEL_LIMIT),
+        ...namedText('controller_type', controllerType, PLACE_TYPE_LIMIT),
+        ...namedText('model', model, PLACE_MODEL_LIMIT),
+      };
+      return difficulty === null
+        ? [publicPlace]
+        : [{ ...publicPlace, ai_difficulty: difficulty }];
     },
   );
   return rows.toSorted((left, right) =>

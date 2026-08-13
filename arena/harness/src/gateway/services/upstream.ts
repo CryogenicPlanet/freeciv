@@ -271,7 +271,13 @@ export const upstreamUrl = (serviceUrl: string, request: UpstreamRequest): strin
  * byte parity: a negotiated `gzip` would hand us a body the upstream did not
  * write and a `Content-Length` that does not describe it.
  */
-export const upstreamRequestHeaders = (accept: string): Record<string, string> => ({
+export interface UpstreamRequestHeaders {
+  readonly [key: string]: string;
+  readonly Accept: string;
+  readonly 'Accept-Encoding': string;
+}
+
+export const upstreamRequestHeaders = (accept: string): UpstreamRequestHeaders => ({
   Accept: accept,
   'Accept-Encoding': 'identity',
 });

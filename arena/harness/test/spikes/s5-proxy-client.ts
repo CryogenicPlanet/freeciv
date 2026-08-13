@@ -156,9 +156,14 @@ export interface CappedCollector {
   readonly text: () => string;
 }
 
+interface CappedCollectorState {
+  parts: ReadonlyArray<Uint8Array>;
+  retained: number;
+}
+
 /** Retains at most `capBytes` of what flows past — for error bodies. */
 export const cappedCollector = (capBytes: number): CappedCollector => {
-  const state: { parts: ReadonlyArray<Uint8Array>; retained: number } = {
+  const state: CappedCollectorState = {
     parts: [],
     retained: 0,
   };

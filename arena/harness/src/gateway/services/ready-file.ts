@@ -20,7 +20,7 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
-import { Context, Data, Effect, Either, Layer, Option, type Scope } from 'effect';
+import { Predicate, Context, Data, Effect, Either, Layer, Option, type Scope } from 'effect';
 import { parsePythonJsonObject } from '../python-json.ts';
 import {
   CANON_ASCII,
@@ -141,7 +141,15 @@ const prettyText = (
   value: CanonValue,
   depth: number,
 ): Either.Either<string, CanonError> => {
-  if (value === null || typeof value !== 'object') return canonicalText(value, CANON_ASCII);
+  if (
+    value === null ||
+    Predicate.isBoolean(value) ||
+    Predicate.isBigInt(value) ||
+    Predicate.isNumber(value) ||
+    Predicate.isString(value)
+  ) {
+    return canonicalText(value, CANON_ASCII);
+  }
   const inner = indentAt(depth + 1);
   const outer = indentAt(depth);
   if (isRecord(value)) {
@@ -530,11 +538,14 @@ const propertyOf = (value: CanonRecord, key: string): CanonValue | undefined => 
  * `bigint`, so identity on its own would never match on `pid` — and a guard
  * that never matches turns "clean up after yourself" into "never clean up".
  */
-const sameJsonValue = (expected: CanonValue | undefined, actual: unknown): boolean => {
+const sameJsonValue = <Actual>(
+  expected: CanonValue | undefined,
+  actual: Actual,
+): boolean => {
   if (expected === undefined) return actual === undefined;
-  if (typeof expected === 'bigint') {
+  if (Predicate.isBigInt(expected)) {
     return actual === expected ||
-      (typeof actual === 'number' && Number.isInteger(actual) && BigInt(actual) === expected);
+      (Predicate.isNumber(actual) && Number.isInteger(actual) && BigInt(actual) === expected);
   }
   return expected === actual;
 };

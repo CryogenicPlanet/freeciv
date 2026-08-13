@@ -6,6 +6,7 @@
  */
 import { describe, expect, test } from 'bun:test';
 import { Command } from '@effect/cli';
+import { Predicate } from 'effect';
 import { HARNESS_PACKAGE, stack } from 'src/index';
 
 describe('@arena/harness scaffold', () => {
@@ -22,6 +23,6 @@ describe('@arena/harness scaffold', () => {
   });
 
   test('@effect/cli resolves', () => {
-    expect(typeof Command.make(HARNESS_PACKAGE)).toBe('object');
+    expect(Predicate.isObject(Command.make(HARNESS_PACKAGE))).toBe(true);
   });
 });

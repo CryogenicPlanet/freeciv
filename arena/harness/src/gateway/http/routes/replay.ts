@@ -13,8 +13,8 @@ import {
   isTerminalRunState,
   type JsonValue,
 } from '@arena/wire';
-import { HttpServerResponse } from '@effect/platform';
-import { Effect, Either, Option } from 'effect';
+import { type HttpServerResponse } from '@effect/platform';
+import { Predicate, Effect, Either, Option } from 'effect';
 import { manifestState } from '../../archive.ts';
 import { isUpstreamFallbackStatus } from '../../constants.ts';
 import {
@@ -28,6 +28,7 @@ import {
   UpstreamHttpError,
 } from '../../errors.ts';
 import { publicPlaces, untrustedField } from '../../public.ts';
+import { isCanonRecord } from '../../python-json.ts';
 import {
   type DerivationError,
   type DerivationOperation,
@@ -245,18 +246,18 @@ export const toLoaderInteger = (value: bigint): number =>
 // ---------------------------------------------------------------------------
 
 /** `except FileNotFoundError` (`:1712`, `:1784`, `:1866`) — one 404 per loader. */
-const DERIVATION_NOT_FOUND: { readonly [K in DerivationOperation]: NotFoundProblem } = {
+const DERIVATION_NOT_FOUND = {
   replay: 'replayArtifactsNotFound',
   board: 'boardSnapshotNotFound',
   events: 'eventArtifactsNotFound',
-};
+} satisfies { readonly [K in DerivationOperation]: NotFoundProblem };
 
 /** `except (OSError, UnicodeError, JSONDecodeError, ValueError)` — one 503 per loader. */
-const DERIVATION_UNAVAILABLE: { readonly [K in DerivationOperation]: ArchiveUnavailableProblem } = {
+const DERIVATION_UNAVAILABLE = {
   replay: 'replayTelemetryUnavailable',
   board: 'boardSnapshotUnavailable',
   events: 'eventsUnavailable',
-};
+} satisfies { readonly [K in DerivationOperation]: ArchiveUnavailableProblem };
 
 /**
  * A derivation failure as the taxonomy.
@@ -314,16 +315,20 @@ export const relayUpstreamJson = (
  * a manifest claiming a seat beyond 2**53 loses precision, and nothing else
  * can.
  */
-export const canonToJson = (value: CanonValue): JsonValue =>
-  typeof value === 'bigint'
-    ? Number(value)
-    : Array.isArray(value)
-      ? value.map(canonToJson)
-      : typeof value === 'object' && value !== null
-        ? Object.fromEntries(
-            Object.entries(value).map(([key, entry]) => [key, canonToJson(entry)]),
-          )
-        : value;
+export const canonToJson = (value: CanonValue): JsonValue => {
+  if (Predicate.isBigInt(value)) return Number(value);
+  if (Array.isArray(value)) return value.map(canonToJson);
+  if (isCanonRecord(value)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, canonToJson(entry)]),
+    );
+  }
+  if (value === null) return null;
+  if (Predicate.isBoolean(value) || Predicate.isNumber(value) || Predicate.isString(value)) {
+    return value;
+  }
+  return null;
+};
 
 /**
  * `_public_places(manifest.get("resolved_places"), manifest)` (`:1699`,

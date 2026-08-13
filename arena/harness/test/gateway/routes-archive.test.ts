@@ -1,6 +1,6 @@
 /** Archive route fallback, relay, streaming, local-file security, and exact body coverage. */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { Gateway } from '@arena/wire';
+import { Gateway, isJsonObject, type JsonObject } from '@arena/wire';
 import { HttpServerResponse } from '@effect/platform';
 import { Effect, Either, Exit, Layer, Scope } from 'effect';
 import {
@@ -31,11 +31,11 @@ import {
   archiveRouteOptions,
   type ArchiveRouteOptions,
 } from 'src/gateway/http/routes/archive';
-import { layer as runsLayer, RunsRepository } from 'src/gateway/services/runs';
+import { layer as runsLayer, type RunsRepository } from 'src/gateway/services/runs';
 import {
   layerLive as upstreamLayer,
   UpstreamBodyError,
-  UpstreamClient,
+  type UpstreamClient,
   UpstreamJsonTooLarge,
   UpstreamOffline,
   UpstreamRedirect,
@@ -108,15 +108,15 @@ const FRAME_SEVEN = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x
 const VIDEO_BYTES = encoder.encode('archive-video');
 const SECRET = '{"owner_token":"must-not-leak"}';
 
-const readFixture = (kind: string, name: string): Record<string, unknown> => {
+const readFixture = (kind: string, name: string): JsonObject => {
   const parsed: unknown = JSON.parse(readFileSync(join(FIXTURES, kind, `${name}.json`), 'utf8'));
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+  if (!isJsonObject(parsed)) {
     throw new Error(`fixture ${kind}/${name}.json is not a JSON object`);
   }
   return { ...parsed };
 };
 
-const writeJson = (path: string, value: unknown): void => {
+const writeJson = <Value>(path: string, value: Value): void => {
   writeFileSync(path, `${JSON.stringify(value)}\n`, 'utf8');
 };
 
@@ -138,14 +138,12 @@ const writeRun = (root: string, spec: RunSpec): void => {
   });
   const report = readFixture('report', spec.report);
   const manifest = report['manifest'];
+  const reportManifest = isJsonObject(manifest)
+    ? { ...manifest, game_id: spec.id }
+    : { game_id: spec.id };
   writeJson(join(directory, 'report.json'), {
     ...report,
-    manifest: {
-      ...(typeof manifest === 'object' && manifest !== null && !Array.isArray(manifest)
-        ? manifest
-        : {}),
-      game_id: spec.id,
-    },
+    manifest: reportManifest,
   });
   writeFileSync(join(directory, 'auth.json'), SECRET, 'utf8');
   if (spec.frames !== undefined) {
@@ -291,8 +289,7 @@ const runOracle = (
   if (result.exitCode !== 0) {
     throw new Error(`oracle failed: ${result.stderr.toString()}`);
   }
-  // The one assertion in this file: a subprocess's stdout is untyped by
-  // construction, and this is the boundary where it becomes typed.
+  // SAFETY: the subprocess is the fixed oracle above and its stdout contract is OracleResult.
   return JSON.parse(result.stdout.toString()) as OracleResult;
 };
 
@@ -329,13 +326,21 @@ interface Stub {
   readonly stop: () => void;
 }
 
+interface StubState {
+  mode: UpstreamMode;
+  produced: number;
+  cancels: number;
+  targets: string[];
+  accepts: string[];
+}
+
 const startStub = (): Stub => {
-  const state = {
-    mode: 'not-found' as UpstreamMode,
+  const state: StubState = {
+    mode: 'not-found',
     produced: 0,
     cancels: 0,
-    targets: [] as string[],
-    accepts: [] as string[],
+    targets: [],
+    accepts: [],
   };
 
   const counted = (chunk: Uint8Array, count: number, delayMs: number): ReadableStream<Uint8Array> => {
@@ -365,7 +370,7 @@ const startStub = (): Stub => {
   // Deliberately not canonical: byte parity means these exact bytes.
   const jsonBody = encoder.encode('{"zeta":1,  "alpha":[2,3] ,"png_url":"http://up/x.png"}');
 
-  const answers: { readonly [M in UpstreamMode]: () => Response } = {
+  const answers = {
     'binary-stream': () =>
       new Response(counted(frameChunk, STREAM_CHUNKS, 3), {
         headers: { 'content-type': 'image/png' },
@@ -411,7 +416,7 @@ const startStub = (): Stub => {
         status: 502,
         headers: { 'content-type': 'text/HTML; charset=utf-8', 'x-portless': '1' },
       }),
-  };
+  } satisfies { readonly [M in UpstreamMode]: () => Response };
 
   const server = Bun.serve({
     port: 0,
@@ -449,7 +454,12 @@ const startStub = (): Stub => {
 // The rig
 // ---------------------------------------------------------------------------
 
-const fixture: { root: string | null; stub: Stub | null } = { root: null, stub: null };
+interface ArchiveRouteFixture {
+  root: string | null;
+  stub: Stub | null;
+}
+
+const fixture: ArchiveRouteFixture = { root: null, stub: null };
 
 const runsRoot = (): string => {
   const root = fixture.root;
@@ -559,7 +569,12 @@ const serve = async (
   };
 };
 
-const problemOf = (name: Gateway.GatewayProblemName): { status: number; body: string } => {
+interface ExpectedProblem {
+  readonly status: number;
+  readonly body: string;
+}
+
+const problemOf = (name: Gateway.GatewayProblemName): ExpectedProblem => {
   const message = Gateway.GATEWAY_PROBLEM_MESSAGES[name];
   return {
     status: Gateway.GATEWAY_PROBLEM_STATUS[message],

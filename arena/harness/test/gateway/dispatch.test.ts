@@ -55,7 +55,13 @@ const refusalOf = (
     : { tag: problem._tag, message: problem.message, status: problem.status };
 };
 
-const badRequest = (message: string): { tag: string; message: string; status: number } => ({
+interface BadRequestView {
+  readonly tag: string;
+  readonly message: string;
+  readonly status: number;
+}
+
+const badRequest = (message: string): BadRequestView => ({
   tag: 'BadRequest',
   message,
   status: 400,

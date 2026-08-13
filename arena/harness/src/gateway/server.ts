@@ -5,7 +5,7 @@
  * and lock.
  */
 
-import { annotate, Observability, withWideEvent } from '@arena/telemetry';
+import { annotate, type Observability, withWideEvent } from '@arena/telemetry';
 import { Gateway } from '@arena/wire';
 import { FileSystem, type Headers, HttpServerRequest, HttpServerResponse } from '@effect/platform';
 import type { PlatformError } from '@effect/platform/Error';
@@ -30,10 +30,10 @@ import {
   makeGatewayIdentity,
 } from './http/routes/health.ts';
 import { replayRoute } from './http/routes/replay.ts';
-import { ReplayDerivation } from './services/derivation.ts';
+import { type ReplayDerivation } from './services/derivation.ts';
 import { ReadyFile, type ReadyFileError, type ReadyPublication } from './services/ready-file.ts';
-import { RunsRepository } from './services/runs.ts';
-import { parsePythonInt, UpstreamClient } from './services/upstream.ts';
+import { type RunsRepository } from './services/runs.ts';
+import { parsePythonInt, type UpstreamClient } from './services/upstream.ts';
 
 // ---------------------------------------------------------------------------
 // The stdlib error page — pre-router, HTML, no security headers
@@ -264,10 +264,14 @@ export const UNSUPPORTED_METHOD_ROUTE = 'UnsupportedMethod';
  * is recorded whole because it is the only way to tell which archive a 404 was
  * about, and it is already public — it is what the client typed.
  */
-const requestFields = (
-  method: string,
-  target: RequestTarget,
-): Readonly<Record<string, unknown>> => ({
+interface RequestFields {
+  readonly [key: string]: string | boolean;
+  readonly 'http.method': string;
+  readonly 'http.path': string;
+  readonly 'http.query': boolean;
+}
+
+const requestFields = (method: string, target: RequestTarget): RequestFields => ({
   'http.method': method,
   'http.path': target.path,
   'http.query': target.query !== '',

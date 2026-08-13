@@ -265,13 +265,7 @@ const videoAvailable = (
  * the frame listing, and `watch` needs the video probe on top — which is why
  * this is an `Effect` and not a `switch` over a record of constants.
  */
-const ARCHIVE_JSON_VALUES: {
-  readonly [V in ArchiveJsonView]: (
-    archive: TerminalArchive,
-    options: ArchiveRouteOptions,
-    runs: RunsRepositoryApi,
-  ) => Effect.Effect<CanonValue, GatewayError>;
-} = {
+const ARCHIVE_JSON_VALUES = {
   status: (archive, options) =>
     Effect.succeed(archiveStatus(archive, options.base, options.absoluteWatch)),
   result: (archive, options) =>
@@ -289,6 +283,12 @@ const ARCHIVE_JSON_VALUES: {
         archiveWatch(archive, options.base, frames, video, options.absoluteWatch),
       ),
     ),
+} satisfies {
+  readonly [V in ArchiveJsonView]: (
+    archive: TerminalArchive,
+    options: ArchiveRouteOptions,
+    runs: RunsRepositoryApi,
+  ) => Effect.Effect<CanonValue, GatewayError>;
 };
 
 /** The disk arm of `_archive_json_route` (`:1912-1933`), shared by 404/405 and offline. */
@@ -444,14 +444,21 @@ const proxiedBinaryResponse = (
   owned: OwnedBinary,
 ): HttpServerResponse.HttpServerResponse => {
   const contentLength = proxiedContentLength(owned.response);
-  return withSecurityHeaders(
-    HttpServerResponse.stream(Stream.ensuring(owned.response.stream, owned.close), {
-      status: owned.response.status,
-      contentType: proxiedContentType(owned.response),
-      ...(Option.isSome(contentLength) ? { contentLength: contentLength.value } : {}),
-      headers: proxiedHeaders(owned.response),
-    }),
-  );
+  const responseOptions = {
+    status: owned.response.status,
+    contentType: proxiedContentType(owned.response),
+    headers: proxiedHeaders(owned.response),
+  };
+  const response = Option.isSome(contentLength)
+    ? HttpServerResponse.stream(Stream.ensuring(owned.response.stream, owned.close), {
+        ...responseOptions,
+        contentLength: contentLength.value,
+      })
+    : HttpServerResponse.stream(
+        Stream.ensuring(owned.response.stream, owned.close),
+        responseOptions,
+      );
+  return withSecurityHeaders(response);
 };
 
 /** `index=None` is `latest.png`; `video=True` has no index at all (`:2022-2033`). */

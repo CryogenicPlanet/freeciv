@@ -3,7 +3,7 @@
  * Keep Python's tolerant missing-data rules and its `int`/`float` distinction (`bigint`/`number`).
  */
 
-import { Either, Option } from 'effect';
+import { Predicate, Either, Option } from 'effect';
 import {
   type CanonValue,
   compareCodePoints,
@@ -26,6 +26,7 @@ import {
   publicTiming,
   pythonStrip,
   type Untrusted,
+  type UntrustedValue,
   untrustedField,
   untrustedFieldOr,
 } from './public.ts';
@@ -63,7 +64,7 @@ export interface ArchiveView {
 const SCHEMA_VERSION = 1n;
 
 /** Sanitized manifest state, preserving unfamiliar non-empty strings like Python. */
-export const manifestState = (manifest: unknown): string =>
+export const manifestState = <Manifest>(manifest: Manifest): string =>
   publicText(untrustedFieldOr(manifest, 'state', 'status'), 'unknown', 32);
 
 // ---------------------------------------------------------------------------
@@ -87,7 +88,7 @@ const REASON_SECRET_WORDS = ['token', 'password', 'credential', 'secret'] as con
  * considered (`:606`) — the cap is on the input, not the output — and the
  * dedupe runs after the substitution.
  */
-export const archiveReasons = (value: unknown): readonly string[] => {
+export const archiveReasons = <Value>(value: Value): readonly string[] => {
   const rows = (Array.isArray(value) ? value : []).slice(0, REASONS_MAX).flatMap((raw) => {
     const reason = publicText(raw, '', REASON_LIMIT);
     if (reason === '') return [];
@@ -143,8 +144,8 @@ interface UnrankedEntry {
  * list that is exactly "the 1-based position of the first row with this
  * score", which is what the running `previous_score`/`rank` pair computes.
  */
-export const archiveLeaderboard = (
-  report: unknown,
+export const archiveLeaderboard = <Report>(
+  report: Report,
   places: readonly Canonical<Gateway.GamePlace>[],
 ): readonly Canonical<Gateway.LeaderboardEntry>[] => {
   const score = untrustedField(report, 'score');
@@ -202,10 +203,12 @@ export const archiveLeaderboard = (
  * `bigint` and integral floats remain `number`; no post-parse numeric guess is
  * permitted here because it would collapse a disk literal such as `753.0`.
  */
-const relayedJson = (value: unknown): CanonValue => {
-  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
-  if (typeof value === 'bigint') return value;
-  if (typeof value === 'number') return value;
+const relayedJson = (value: UntrustedValue): CanonValue => {
+  if (value === null) return value;
+  if (Predicate.isString(value)) return value;
+  if (Predicate.isBoolean(value)) return value;
+  if (Predicate.isBigInt(value)) return value;
+  if (Predicate.isNumber(value)) return value;
   if (Array.isArray(value)) return value.map(relayedJson);
   if (isUntrusted(value)) {
     return Object.fromEntries(
@@ -233,7 +236,7 @@ export const archiveVictory = (
   const value = Option.getOrUndefined(record);
   if (!isUntrusted(value)) return Option.none();
   const code = value['victory'];
-  if (typeof code !== 'string' || code === '') return Option.none();
+  if (!Predicate.isString(code) || code === '') return Option.none();
   const winners = value['winners'];
   const turn = value['turn'];
   const year = value['year'];
@@ -241,7 +244,7 @@ export const archiveVictory = (
     code,
     label: Gateway.victoryLabel(code),
     winners: (Array.isArray(winners) ? winners : []).filter(
-      (name): name is string => typeof name === 'string',
+      (name): name is string => Predicate.isString(name),
     ),
     // Always present, `null` when the record had no such key: Python builds
     // the payload with `record.get("turn")` (`:704`), which puts `None` on
@@ -417,7 +420,7 @@ export const archiveUrls = (
 };
 
 /** `config` if it is a dict, else `{}` (`:830`, `:1068`). */
-const archiveConfig = (manifest: Untrusted): unknown => {
+const archiveConfig = (manifest: Untrusted): Untrusted => {
   const config = untrustedField(manifest, 'config');
   return isUntrusted(config) ? config : {};
 };
@@ -874,11 +877,11 @@ const DISK_ROW_SUMMARIES = {
 export const diskGameRow = (manifest: Untrusted): Option.Option<Canonical<Gateway.GameRow>> => {
   const gameId = untrustedField(manifest, 'game_id');
   const config = untrustedField(manifest, 'config');
-  if (typeof gameId !== 'string' || !isGameId(gameId)) return Option.none();
+  if (!Predicate.isString(gameId) || !isGameId(gameId)) return Option.none();
   if (!isUntrusted(config)) return Option.none();
   const state = manifestState(manifest);
   const rawValidity = untrustedField(manifest, 'benchmark_valid');
-  const validity = typeof rawValidity === 'boolean' ? rawValidity : null;
+  const validity = Predicate.isBoolean(rawValidity) ? rawValidity : null;
   const status = isTerminalRunState(state)
     ? validity === true
       ? 'complete'
@@ -967,11 +970,11 @@ export const asInterrupted = (
  * well-formed id, contributes nothing to the set *and is still relayed* inside
  * `games` by the caller.
  */
-export const liveGameIds = (upstreamRows: unknown): ReadonlySet<string> =>
+export const liveGameIds = <UpstreamRows>(upstreamRows: UpstreamRows): ReadonlySet<string> =>
   new Set(
     (Array.isArray(upstreamRows) ? upstreamRows : []).flatMap((row) => {
       const gameId = untrustedField(row, 'game_id');
-      return typeof gameId === 'string' && isGameId(gameId) ? [gameId] : [];
+      return Predicate.isString(gameId) && isGameId(gameId) ? [gameId] : [];
     }),
   );
 

@@ -1,16 +1,16 @@
 /** Gateway CLI composition and scoped startup/teardown. */
 
 import {
-  Observability,
+  type Observability,
   ObservabilityLive,
   ObservabilityNoop,
   telemetryConfigLayer,
 } from '@arena/telemetry';
-import { CliApp, Command, ValidationError } from '@effect/cli';
+import { type CliApp, Command, ValidationError } from '@effect/cli';
 import type { FileSystem } from '@effect/platform';
 import type { Teardown } from '@effect/platform/Runtime';
 import { NodeContext, NodeRuntime } from '@effect/platform-node';
-import { Cause, Console, Effect, Exit, Layer, Option } from 'effect';
+import { Predicate, Cause, Console, Effect, Exit, Layer, Option } from 'effect';
 import {
   GATEWAY_CLI_ERROR_EXIT_CODE,
   GATEWAY_CLI_NAME,
@@ -19,10 +19,10 @@ import {
 } from './cli.ts';
 import { GatewayConfig, type GatewayConfigError, gatewayConfigLayer } from './config.ts';
 import { type GatewayServeError, runGatewayForever } from './server.ts';
-import { ReplayDerivation, ReplayDerivationPython } from './services/derivation.ts';
-import { ReadyFile, layer as readyFileLayer, stdoutSink } from './services/ready-file.ts';
-import { RunsRepository, layer as runsRepositoryLayer } from './services/runs.ts';
-import { UpstreamClient, layerLive as upstreamClientLayer } from './services/upstream.ts';
+import { type ReplayDerivation, ReplayDerivationPython } from './services/derivation.ts';
+import { type ReadyFile, layer as readyFileLayer, stdoutSink } from './services/ready-file.ts';
+import { type RunsRepository, layer as runsRepositoryLayer } from './services/runs.ts';
+import { type UpstreamClient, layerLive as upstreamClientLayer } from './services/upstream.ts';
 
 // ---------------------------------------------------------------------------
 // Telemetry
@@ -203,8 +203,8 @@ export const runGatewayCli: (
  * `error: [object Object]` under the usage block `@effect/cli` already wrote.
  * (Observed, before this line existed.)
  */
-export const isValidationError: (error: unknown) => boolean =
-  ValidationError.isValidationError;
+export const isValidationError = <Cause>(cause: Cause): boolean =>
+  ValidationError.isValidationError(cause);
 
 /**
  * An error's public text, falling back to whatever it can say about itself.
@@ -223,18 +223,18 @@ export const isValidationError: (error: unknown) => boolean =
  *    not help anyone anyway.
  * 3. Anything else is rendered as-is.
  */
-export const describeStartupError = (error: unknown): string => {
-  if (error instanceof Error && error.message !== '') return error.message;
-  if (typeof error !== 'object' || error === null) return String(error);
-  const detail = Object.entries(error)
+export const describeStartupError = <Cause>(cause: Cause): string => {
+  if (cause instanceof Error && cause.message !== '') return cause.message;
+  if (!Predicate.isRecord(cause) && !Array.isArray(cause)) return String(cause);
+  const detail = Object.entries(cause)
     .flatMap(([key, value]: readonly [string, unknown]): ReadonlyArray<string> =>
       key !== '_tag' &&
-      (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean')
+      (Predicate.isString(value) || Predicate.isNumber(value) || Predicate.isBoolean(value))
         ? [`${key}=${String(value)}`]
         : [],
     )
     .join(' ');
-  const label = errorLabel(error);
+  const label = errorLabel(cause);
   return detail === '' ? label : `${label}: ${detail}`;
 };
 
@@ -246,8 +246,8 @@ export const describeStartupError = (error: unknown): string => {
  * for a plain object that is `[object Object]`, and the type-aware lint is
  * right to refuse it.
  */
-const errorLabel = (error: object): string =>
-  '_tag' in error && typeof error._tag === 'string'
+const errorLabel = <ErrorValue extends object>(error: ErrorValue): string =>
+  '_tag' in error && Predicate.isString(error._tag)
     ? error._tag
     : error instanceof Error
       ? error.name

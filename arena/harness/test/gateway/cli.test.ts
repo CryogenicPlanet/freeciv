@@ -1,7 +1,7 @@
 /** CLI/config behavior and Python-compatibility coverage. */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { CliConfig, CommandDescriptor, HelpDoc } from '@effect/cli';
-import { FileSystem } from '@effect/platform';
+import { type FileSystem } from '@effect/platform';
 import { NodeFileSystem, NodePath, NodeTerminal } from '@effect/platform-node';
 import { Gateway } from '@arena/wire';
 import { Effect, Either, Layer, Option } from 'effect';
@@ -152,7 +152,7 @@ const askOracle = async (job: OracleJob): Promise<OracleAnswer> => {
     child.exited,
   ]);
   expect({ code, stderr }).toEqual({ code: 0, stderr: '' });
-  // The shape is fixed by ORACLE_SOURCE above; a drift surfaces as a failed compare.
+  // SAFETY: ORACLE_SOURCE is fixed above and always emits the OracleAnswer contract.
   // oxlint-disable-next-line no-unsafe-type-assertion
   return JSON.parse(stdout) as OracleAnswer;
 };
@@ -161,10 +161,13 @@ const askOracle = async (job: OracleJob): Promise<OracleAnswer> => {
 // Comparing an `Either` to an oracle outcome
 // ---------------------------------------------------------------------------
 
+/** Preserve a value while retaining its inferred domain type. */
+const identity = <Value>(value: Value): Value => value;
+
 /** Render an `Either` the way the oracle renders a Python call. */
-const asOutcome = <A>(
+const asOutcome = <A, Rendered>(
   result: Either.Either<A, GatewayConfigError>,
-  render: (value: A) => unknown = (value) => value,
+  render: (value: A) => Rendered,
 ): OracleOutcome =>
   Either.match(result, {
     onLeft: (error) => ({ ok: false, error: error.message }),
@@ -439,10 +442,18 @@ const baseInput = (
 
 // ---------------------------------------------------------------------------
 
+interface OracleAnswerState {
+  value?: OracleAnswer;
+}
+
+interface ConfigSpecsState {
+  value: readonly GatewayConfigInput[];
+}
+
 describe('the Python differential', () => {
   const fixture = { created: '', real: '' };
-  const answer: { value?: OracleAnswer } = {};
-  const specs: { value: readonly GatewayConfigInput[] } = { value: [] };
+  const answer: OracleAnswerState = {};
+  const specs: ConfigSpecsState = { value: [] };
 
   beforeAll(async () => {
     fixture.created = await mkdtemp(join(tmpdir(), 'arena-gateway-config-'));
@@ -519,13 +530,13 @@ describe('the Python differential', () => {
   };
 
   test('_normalize_service_url agrees on every corpus URL', () => {
-    expect(keyed(SERVICE_URLS, SERVICE_URLS.map((u) => tidy(asOutcome(normalizeServiceUrl(u)))))).toEqual(
+    expect(keyed(SERVICE_URLS, SERVICE_URLS.map((u) => tidy(asOutcome(normalizeServiceUrl(u), identity))))).toEqual(
       keyed(SERVICE_URLS, oracle().normalize.map(tidy)),
     );
   });
 
   test('_loopback_host agrees on every corpus host', () => {
-    expect(keyed(LOOPBACK_HOSTS, LOOPBACK_HOSTS.map((h) => tidy(asOutcome(loopbackHost(h)))))).toEqual(
+    expect(keyed(LOOPBACK_HOSTS, LOOPBACK_HOSTS.map((h) => tidy(asOutcome(loopbackHost(h), identity))))).toEqual(
       keyed(LOOPBACK_HOSTS, oracle().loopback.map(tidy)),
     );
   });
@@ -568,7 +579,7 @@ describe('the Python differential', () => {
     const environment = { cwd: fixture.real, home: Option.some('/home/nobody') };
     const actual = await runFs(
       Effect.forEach(RESOLVE_PATHS, (path) =>
-        Effect.map(Effect.either(resolvePath(path, environment)), (result) => tidy(asOutcome(result))),
+        Effect.map(Effect.either(resolvePath(path, environment)), (result) => tidy(asOutcome(result, identity))),
       ),
     );
     expect(keyed(RESOLVE_PATHS, actual)).toEqual(keyed(RESOLVE_PATHS, oracle().resolve.map(tidy)));

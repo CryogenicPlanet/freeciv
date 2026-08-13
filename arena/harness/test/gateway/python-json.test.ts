@@ -1,7 +1,7 @@
 /** Python-number JSON parsing and canonical round-trip coverage. */
 import { describe, expect, test } from 'bun:test';
 import { CANON_UTF8, canonicalText } from '@arena/wire';
-import { Either } from 'effect';
+import { Either, Predicate } from 'effect';
 import {
   isCanonValue,
   parsePythonJson,
@@ -135,9 +135,9 @@ describe('refusals', () => {
     // The rewrite is only allowed to preserve refusal, never to create
     // acceptance: whatever `JSON.parse` said about the original it must still
     // say about the rewritten text.
-    const rawAccepted = Either.isRight(Either.try(() => JSON.parse(text) as unknown));
+    const rawAccepted = Either.isRight(Either.try(() => JSON.parse(text)));
     const rewrittenAccepted = Either.isRight(
-      Either.try(() => JSON.parse(rewriteLiterals(text)) as unknown),
+      Either.try(() => JSON.parse(rewriteLiterals(text))),
     );
     expect({ text, rawAccepted, rewrittenAccepted }).toEqual({
       text,
@@ -159,9 +159,9 @@ describe('the reader itself', () => {
       parsePythonJsonObject('{"i":7,"f":7.0,"e":7e0,"neg":-7}'),
       (error) => new Error(error.message),
     );
-    expect(typeof value['i']).toBe('bigint');
-    expect(typeof value['f']).toBe('number');
-    expect(typeof value['e']).toBe('number');
+    expect(Predicate.isBigInt(value['i'])).toBe(true);
+    expect(Predicate.isNumber(value['f'])).toBe(true);
+    expect(Predicate.isNumber(value['e'])).toBe(true);
     expect(value['i']).toBe(7n);
     expect(value['neg']).toBe(-7n);
   });

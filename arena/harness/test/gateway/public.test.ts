@@ -76,7 +76,7 @@ const canonical = (value: CanonValue): string =>
   Either.getOrThrowWith(canonicalText(value, CANON_UTF8), (error) => new Error(String(error)));
 
 /** Run the driver and return CPython's canonical answer. */
-const oracle = (program: string, op: string, args: unknown): string => {
+const oracle = <Args>(program: string, op: string, args: Args): string => {
   const result = Bun.spawnSync(['python3', '-c', program], {
     cwd: REPO_ROOT,
     stdin: Buffer.from(JSON.stringify({ op, args }), 'utf-8'),
@@ -98,16 +98,19 @@ const oracle = (program: string, op: string, args: unknown): string => {
  * — writing `12n` by hand in every fixture would say the same thing and would
  * stop saying it the moment someone added a case.
  */
-const asPython = (value: unknown): CanonValue =>
+const asPython = <Value>(value: Value): CanonValue =>
   Either.getOrThrowWith(
     parsePythonJson(JSON.stringify(value)),
     (error) => new Error(`fixture is not JSON: ${error.message}`),
   );
 
-const publicEvent = (value: unknown): ReturnType<typeof publicEventOfCanon> =>
+const publicEvent = <Value>(value: Value): ReturnType<typeof publicEventOfCanon> =>
   publicEventOfCanon(asPython(value));
 
-const publicEvents = (value: unknown, gameId: GameId): ReturnType<typeof publicEventsOfCanon> =>
+const publicEvents = <Value>(
+  value: Value,
+  gameId: GameId,
+): ReturnType<typeof publicEventsOfCanon> =>
   publicEventsOfCanon(asPython(value), gameId);
 
 /** True when the oracle can run at all; the differential suites skip if not. */
@@ -498,7 +501,7 @@ describe('publicPlaces', () => {
 // ---------------------------------------------------------------------------
 
 describe.if(PYTHON_AVAILABLE)('differential: _public_* in CPython', () => {
-  const check = (op: string, args: unknown, ours: CanonValue): void => {
+  const check = <Args>(op: string, args: Args, ours: CanonValue): void => {
     expect(canonical(ours)).toBe(oracle(PUBLIC_DRIVER, op, args));
   };
 

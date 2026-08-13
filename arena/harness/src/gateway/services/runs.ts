@@ -3,7 +3,7 @@
  * where Python skips it, replay tails preserve Python line splitting and integer spelling, and
  * terminal projections remain shared with `archive.ts` for the database backend.
  */
-import { Array as Arr, Context, Data, Effect, Either, Layer, Option, type Scope } from 'effect';
+import { Predicate, Array as Arr, Context, Data, Effect, Either, Layer, Option, type Scope } from 'effect';
 import {
   closeSync,
   fstatSync,
@@ -23,6 +23,7 @@ import {
   type CanonRecord,
   type CanonValue,
   type FrameIndex,
+  type JsonValue,
   type WireDecodeError,
 } from '@arena/wire';
 import {
@@ -96,14 +97,14 @@ export const REPLAY_JSONL_FILE = 'replay.jsonl';
 export const VICTORY_FILE = 'victory.json';
 
 /** The two `_read_archive_json` labels, and the pair of failures each names. */
-const ARCHIVE_JSON_PROBLEMS: {
+const ARCHIVE_JSON_PROBLEMS = {
+  'game manifest': { missing: 'manifestNotFound', unusable: 'manifestUnavailable' },
+  'game report': { missing: 'reportNotFound', unusable: 'reportUnavailable' },
+} satisfies {
   readonly [L in Gateway.ArchiveJsonLabel]: {
     readonly missing: NotFoundProblem;
     readonly unusable: ArchiveUnavailableProblem;
   };
-} = {
-  'game manifest': { missing: 'manifestNotFound', unusable: 'manifestUnavailable' },
-  'game report': { missing: 'reportNotFound', unusable: 'reportUnavailable' },
 };
 
 // ---------------------------------------------------------------------------
@@ -225,16 +226,20 @@ const asJsonObject = (value: CanonValue): Option.Option<CanonRecord> =>
   isCanonRecord(value) ? Option.some(value) : Option.none();
 
 /** A Python-aware document converted only for a strict wire-schema decode. */
-const canonToJson = (value: CanonValue): unknown =>
-  typeof value === 'bigint'
-    ? Number(value)
-    : Array.isArray(value)
-      ? value.map(canonToJson)
-      : typeof value === 'object' && value !== null
-        ? Object.fromEntries(
-            Object.entries(value).map(([key, item]) => [key, canonToJson(item)]),
-          )
-        : value;
+const canonToJson = (value: CanonValue): JsonValue => {
+  if (Predicate.isBigInt(value)) return Number(value);
+  if (Array.isArray(value)) return value.map(canonToJson);
+  if (isCanonRecord(value)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, canonToJson(item)]),
+    );
+  }
+  if (value === null) return null;
+  if (Predicate.isBoolean(value) || Predicate.isNumber(value) || Predicate.isString(value)) {
+    return value;
+  }
+  return null;
+};
 
 /** `Path.read_text` — follows symlinks, no size ceiling, closes either way. */
 const readWholeFile = (path: string): Either.Either<Uint8Array, FsFailure> =>
@@ -510,7 +515,7 @@ const makeLastReplayTurn =
               // exactly as it is there — which drops the run from the index
               // rather than publishing a row Python hides.
               const turn = untrustedField(parsed.value, 'turn');
-              return typeof turn === 'bigint' && turn > 0n
+              return Predicate.isBigInt(turn) && turn > 0n
                 ? Option.some(turn)
                 : Option.none<bigint>();
             }),
@@ -634,7 +639,7 @@ const makeDiskRowsWithInterrupted =
  * from an upstream row would have done anyway.
  */
 const createdAt = (row: Canonical<Gateway.GameRow>): number =>
-  typeof row.created_at === 'number' ? row.created_at : 0;
+  Predicate.isNumber(row.created_at) ? row.created_at : 0;
 
 /**
  * `_disk_games_index`'s ordering (`:1274`): `(created_at, game_id)`

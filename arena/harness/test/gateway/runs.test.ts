@@ -1,6 +1,6 @@
 /** Filesystem repository behavior and CPython differential coverage. */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { Effect, Either, Option } from 'effect';
+import { Predicate, Effect, Either, Option } from 'effect';
 import {
   canonicalText,
   CANON_UTF8,
@@ -69,7 +69,7 @@ const readFixture = (kind: string, name: string): JsonObject => {
   return document.right;
 };
 
-const writeJson = (path: string, value: unknown): void => {
+const writeJson = <Value>(path: string, value: Value): void => {
   writeFileSync(path, `${JSON.stringify(value)}\n`, 'utf8');
 };
 
@@ -93,12 +93,12 @@ const writeRun = (root: string, spec: RunSpec): void => {
   if (spec.report !== undefined) {
     const report = readFixture('report', spec.report);
     const manifest = report['manifest'];
+    const reportManifest = isJsonObject(manifest)
+      ? { ...manifest, game_id: spec.reportGameId ?? spec.id }
+      : { game_id: spec.reportGameId ?? spec.id };
     writeJson(join(directory, 'report.json'), {
       ...report,
-      manifest: {
-        ...(isJsonObject(manifest) ? manifest : {}),
-        game_id: spec.reportGameId ?? spec.id,
-      },
+      manifest: reportManifest,
     });
   }
   if (spec.replay !== undefined) {
@@ -348,8 +348,7 @@ const runOracle = (
   if (result.exitCode !== 0) {
     throw new Error(`oracle failed: ${result.stderr.toString()}`);
   }
-  // The one assertion in this file: a subprocess's stdout is `any` by
-  // construction, and this is the boundary where it becomes typed.
+  // SAFETY: the subprocess is the fixed oracle above and its stdout contract is OracleResult.
   return JSON.parse(result.stdout.toString()) as OracleResult;
 };
 
@@ -360,20 +359,16 @@ const runOracle = (
  * the wire — and anything this port should never produce becomes a poison
  * string so a differential fails loudly instead of comparing equal.
  */
-const toCanon = (value: unknown): CanonValue => {
-  if (
-    value === null ||
-    typeof value === 'boolean' ||
-    typeof value === 'string' ||
-    typeof value === 'number' ||
-    typeof value === 'bigint'
-  ) {
-    return value;
-  }
+const toCanon = <Value>(value: Value): CanonValue => {
+  if (value === null) return null;
+  if (Predicate.isBoolean(value)) return value;
+  if (Predicate.isString(value)) return value;
+  if (Predicate.isNumber(value)) return value;
+  if (Predicate.isBigInt(value)) return value;
   if (Array.isArray(value)) {
     return value.map(toCanon);
   }
-  if (typeof value === 'object') {
+  if (Predicate.isRecord(value)) {
     return Object.fromEntries(
       Object.entries(value)
         .filter(([, entry]) => entry !== undefined)
@@ -383,7 +378,7 @@ const toCanon = (value: unknown): CanonValue => {
   return '<not a JSON value>';
 };
 
-const canonical = (value: unknown): string =>
+const canonical = <Value>(value: Value): string =>
   Either.getOrElse(
     canonicalText(toCanon(value), CANON_UTF8),
     (error) => `<canon error: ${String(error)}>`,
@@ -391,10 +386,19 @@ const canonical = (value: unknown): string =>
 
 const run = <A, E>(effect: Effect.Effect<A, E>): A => Effect.runSync(effect);
 
-const failure = <A>(effect: Effect.Effect<A, { readonly message: string; readonly status: number }>): {
+interface FailureResult {
   readonly status: number;
   readonly message: string;
-} => {
+}
+
+interface RunsTestState {
+  root: string;
+  repo: RunsRepositoryApi;
+}
+
+const failure = <A>(
+  effect: Effect.Effect<A, { readonly message: string; readonly status: number }>,
+): FailureResult => {
   const result = Effect.runSync(Effect.either(effect));
   if (Either.isRight(result)) {
     return { status: 200, message: 'ok' };
@@ -405,7 +409,7 @@ const failure = <A>(effect: Effect.Effect<A, { readonly message: string; readonl
 // ---------------------------------------------------------------------------
 
 describe('RunsRepository', () => {
-  const state: { root: string; repo: RunsRepositoryApi } = {
+  const state: RunsTestState = {
     root: '',
     repo: makeRunsRepository('/nonexistent'),
   };
@@ -752,7 +756,7 @@ describe('RunsRepository', () => {
       const rows = run(state.repo.diskRowsWithInterrupted(new Set()));
       const orphan = rows.find((row) => row.game_id === RUNNING);
       const expected =
-        typeof manifestTurn === 'number' && manifestTurn > 44 ? BigInt(manifestTurn) : 44n;
+        Predicate.isNumber(manifestTurn) && manifestTurn > 44 ? BigInt(manifestTurn) : 44n;
       expect(orphan?.current_turn).toBe(expected);
       expect(orphan?.outcome.summary).toBe(
         `Interrupted at turn ${String(expected)} without a terminal result; the replay is available.`,
