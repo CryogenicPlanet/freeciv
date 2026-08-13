@@ -5,22 +5,8 @@
     {
       "idx": 0,
       "version": "7",
-      "when": 1786567018246,
-      "tag": "0000_arena_schema",
-      "breakpoints": true
-    },
-    {
-      "idx": 1,
-      "version": "7",
-      "when": 1786567018430,
-      "tag": "0001_storage_external",
-      "breakpoints": true
-    },
-    {
-      "idx": 2,
-      "version": "7",
-      "when": 1786582321618,
-      "tag": "0002_byte_size_bigint_and_prunable_sweeps",
+      "when": 1786593687273,
+      "tag": "0000_arena_v2",
       "breakpoints": true
     }
   ]
