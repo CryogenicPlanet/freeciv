@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { agentFirst, isAgentController, isNativeController } from './agent-order'
 import { configuredPlaceFactions, mapFactions, matchHeaderLabel } from './view-model'
 import { mockReplay, mockWatch } from './mock'
+import { requiredValue } from './test-support'
 import type { GamePlace } from './types'
 
 function place(overrides: Partial<GamePlace> & Pick<GamePlace, 'place'>): GamePlace {
@@ -32,6 +33,14 @@ function nativePlace(number: number): GamePlace {
 }
 
 const seats = (places: GamePlace[]) => places.map((entry) => entry.seat_id)
+const configuredAgent = requiredValue(
+  mockWatch.game.resolved_places[0], 'configured agent place',
+)
+const configuredNative = requiredValue(
+  mockWatch.game.resolved_places[1], 'configured native place',
+)
+const firstFrame = requiredValue(mockWatch.frames[0], 'first watch frame')
+const latestSnapshot = requiredValue(mockReplay.snapshots[2], 'latest replay snapshot')
 
 describe('agent-first ordering', () => {
   it('names a native controller from any of the fields that carry one', () => {
@@ -85,8 +94,8 @@ describe('agent-first ordering', () => {
 describe('agent-first ordering across the viewer', () => {
   /** The mock roster with the native dealt the first seat. */
   const nativeSeatedFirst: GamePlace[] = [
-    { ...mockWatch.game.resolved_places[1], place: 1, seat_id: 'place-1' },
-    { ...mockWatch.game.resolved_places[0], place: 2, seat_id: 'place-2' },
+    { ...configuredNative, place: 1, seat_id: 'place-1' },
+    { ...configuredAgent, place: 2, seat_id: 'place-2' },
   ]
 
   it('titles the page with the model even when the AI holds seat one', () => {
@@ -103,7 +112,7 @@ describe('agent-first ordering across the viewer', () => {
 
   it('opens the resolved map key on the agent and keeps dynamics last', () => {
     const frame = {
-      ...mockWatch.frames[0],
+      ...firstFrame,
       map_players: [
         { player_id: 1, player_name: 'NativePlace2', player_color: '#F38400' },
         { player_id: 2, player_name: 'Blackbeard', player_color: '#FF1493' },
@@ -111,7 +120,7 @@ describe('agent-first ordering across the viewer', () => {
       ],
     }
     const factions = mapFactions(
-      frame, mockReplay.snapshots[2], mockWatch.game.resolved_places,
+      frame, latestSnapshot, mockWatch.game.resolved_places,
     )
     expect(factions.map((faction) => faction.player_name))
       .toEqual(['AgentPlace1', 'NativePlace2', 'Blackbeard'])

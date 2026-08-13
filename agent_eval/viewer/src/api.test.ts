@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { fetchBoard, fetchEvents, fetchGames, fetchWatchWithOptionalReplay } from './api'
 import { mockWatch } from './mock'
+import { requiredValue } from './test-support'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -9,7 +10,7 @@ afterEach(() => {
 describe('arena game index', () => {
   it('loads the same-origin public index under a proxy prefix', async () => {
     const payload = { schema_version: 1, games: [] }
-    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(payload), {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify(payload), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     }))
@@ -17,8 +18,17 @@ describe('arena game index', () => {
 
     await expect(fetchGames({ prefix: '/freeciv' })).resolves.toEqual(payload)
     expect(fetchMock).toHaveBeenCalledWith('/freeciv/v1/games', {
-      cache: 'no-store', signal: undefined,
+      cache: 'no-store',
     })
+  })
+
+  it('rejects malformed successful payloads at the JSON boundary', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(new Response(
+      JSON.stringify({ schema_version: 1, games: [{ state: 'running' }] }),
+      { status: 200 },
+    )))
+
+    await expect(fetchGames({ prefix: '' })).rejects.toThrow('game_id')
   })
 
   it('surfaces an index error while the picker can retain manual entry', async () => {
@@ -33,8 +43,25 @@ describe('arena game index', () => {
 
 describe('semantic board endpoint', () => {
   it('loads exactly one selected turn through the same-origin prefix', async () => {
-    const payload = { schema_version: 1, game_id: 'game_abcdefghijklmnop', turn: 42 }
-    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(payload), { status: 200 }))
+    const payload = {
+      schema_version: 1,
+      game_id: 'game_abcdefghijklmnop',
+      turn: 42,
+      width: 1,
+      height: 1,
+      topology: 'ISO|HEX',
+      wrap: '',
+      terrain_catalog: [{ code: 'g', name: 'Grassland' }],
+      terrain_rows: ['g'],
+      altitude_rows: ['0'],
+      owner_rows: ['-:1'],
+      extras_catalog: [],
+      extra_layers: [],
+      cities: [],
+      unit_stacks: [],
+      players: [],
+    }
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify(payload), { status: 200 }))
     vi.stubGlobal('fetch', fetchMock)
 
     await expect(fetchBoard({
@@ -42,7 +69,7 @@ describe('semantic board endpoint', () => {
     }, 42)).resolves.toEqual(payload)
     expect(fetchMock).toHaveBeenCalledWith(
       '/freeciv/v1/games/game_abcdefghijklmnop/board.json?turn=42',
-      { cache: 'no-store', signal: undefined },
+      { cache: 'no-store' },
     )
   })
 })
@@ -61,7 +88,7 @@ describe('derived game event log endpoint', () => {
       min_included_weight: 0,
       last_turn: 0,
     }
-    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(payload), { status: 200 }))
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify(payload), { status: 200 }))
     vi.stubGlobal('fetch', fetchMock)
 
     await expect(fetchEvents({
@@ -69,7 +96,7 @@ describe('derived game event log endpoint', () => {
     })).resolves.toEqual(payload)
     expect(fetchMock).toHaveBeenCalledWith(
       '/freeciv/v1/games/game_abcdefghijklmnop/events.json',
-      { cache: 'no-store', signal: undefined },
+      { cache: 'no-store' },
     )
   })
 
@@ -89,8 +116,8 @@ describe('legacy watch compatibility', () => {
       ...mockWatch,
       frames: mockWatch.frames.map(({ turn: _turn, ...frame }) => frame),
     }
-    vi.stubGlobal('fetch', vi.fn().mockImplementation((input: string) => {
-      if (String(input).includes('/watch.json')) {
+    vi.stubGlobal('fetch', vi.fn<(input: string) => Promise<Response>>().mockImplementation((input) => {
+      if (input.includes('/watch.json')) {
         return Promise.resolve(new Response(JSON.stringify(legacyWatch), { status: 200 }))
       }
       return Promise.resolve(new Response(
@@ -103,7 +130,7 @@ describe('legacy watch compatibility', () => {
       { prefix: '', gameId: mockWatch.game.game_id }, 0,
     )
     expect(load.watch.game.game_id).toBe(mockWatch.game.game_id)
-    expect(load.watch.frames[0].turn).toBe(3)
+    expect(requiredValue(load.watch.frames[0], 'loaded watch frame').turn).toBe(3)
     expect(load.replay).toBeNull()
     expect(load.replayError).toBe('not found')
     expect(load.replayUnavailable).toBe(true)

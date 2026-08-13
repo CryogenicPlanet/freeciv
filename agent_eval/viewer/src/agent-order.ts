@@ -15,13 +15,14 @@
  */
 
 import { NATIVE_AI_LABEL, displayControllerLabel } from './faction-label'
+import { sortedCopy } from './ordered'
 
 /** The controller fields every side-shaped payload carries some subset of. */
 export interface ControllerSource {
   /** Only configured places carry this; it is the authoritative answer. */
-  controller?: string | null
-  controller_label?: string | null
-  controller_type?: string | null
+  controller?: string | null | undefined
+  controller_label?: string | null | undefined
+  controller_type?: string | null | undefined
 }
 
 /** True when Freeciv itself drives this side rather than a model harness. */
@@ -55,7 +56,8 @@ export function agentFirstBy<T>(
   sides: readonly T[],
   isAgent: (side: T) => boolean,
 ): T[] {
-  return [...sides].sort(
+  return sortedCopy(
+    sides,
     (left, right) => Number(isAgent(right)) - Number(isAgent(left)),
   )
 }

@@ -1,4 +1,5 @@
-import { useMemo } from 'react'
+import React, { useMemo } from 'react'
+import { sortedCopy } from '../ordered'
 import type { ReplayPlayer, ReplaySnapshot, Technology } from '../types'
 import { agentFirstBy, isAgentController } from '../agent-order'
 import { displayPlayerColor } from '../display-color'
@@ -32,14 +33,25 @@ export type TechnologyProgressStatus =
   | 'snapshots-unavailable'
   | 'controllers-unavailable'
 
-export interface TechnologyProgressModel {
-  status: TechnologyProgressStatus
+interface TechnologyProgressModelBase {
   catalogTotal: number
-  selectedTurn: number | null
-  minTurn: number | null
-  maxTurn: number | null
   series: TechnologyProgressSeries[]
 }
+
+export type TechnologyProgressModel = TechnologyProgressModelBase & (
+  | {
+    status: 'ready'
+    selectedTurn: number
+    minTurn: number
+    maxTurn: number
+  }
+  | {
+    status: Exclude<TechnologyProgressStatus, 'ready'>
+    selectedTurn: null
+    minTurn: null
+    maxTurn: null
+  }
+)
 
 export interface TechnologyProgressChartProps {
   catalog?: readonly Technology[] | null
@@ -62,14 +74,16 @@ function pointAtOrBefore(
   let selectedIndex = -1
   while (low <= high) {
     const middle = Math.floor((low + high) / 2)
-    if (values[middle].turn <= turn) {
+    const point = values[middle]
+    if (point === undefined) throw new Error('Technology series search exceeded its bounds')
+    if (point.turn <= turn) {
       selectedIndex = middle
       low = middle + 1
     } else {
       high = middle - 1
     }
   }
-  return selectedIndex < 0 ? null : values[selectedIndex]
+  return selectedIndex < 0 ? null : values[selectedIndex] ?? null
 }
 
 export function selectTechnologyProgressTurn(
@@ -77,9 +91,9 @@ export function selectTechnologyProgressTurn(
   selectedTurn?: number | null,
 ): TechnologyProgressModel {
   if (model.status !== 'ready') return model
-  const normalizedSelectedTurn = typeof selectedTurn === 'number' && Number.isFinite(selectedTurn)
+  const normalizedSelectedTurn = selectedTurn != null && Number.isFinite(selectedTurn)
     ? Math.trunc(selectedTurn)
-    : model.maxTurn!
+    : model.maxTurn
   return {
     ...model,
     selectedTurn: normalizedSelectedTurn,
@@ -114,7 +128,7 @@ export function buildTechnologyProgressSeries(
     }
   }
 
-  const orderedSnapshots = [...snapshots].sort((left, right) => left.turn - right.turn)
+  const orderedSnapshots = sortedCopy(snapshots, (left, right) => left.turn - right.turn)
   if (!orderedSnapshots.length) {
     return {
       status: 'snapshots-unavailable',
@@ -175,9 +189,15 @@ export function buildTechnologyProgressSeries(
   const series = agentFirstBy(
     [...builders.entries()], ([, builder]) => isAgentController(builder.player),
   ).map(([seatId, builder]) => {
-    const values = [...builder.valuesByTurn.values()].sort((left, right) => left.turn - right.turn)
+    const values = sortedCopy(
+      [...builder.valuesByTurn.values()],
+      (left, right) => left.turn - right.turn,
+    )
     const first = values[0]
-    const latest = values.at(-1)!
+    const latest = values.at(-1)
+    if (first === undefined || latest === undefined) {
+      throw new Error('A technology series has no observed turns')
+    }
     const observedTurnSpan = latest.turn - first.turn
     const acquiredInObservedWindow = (
       latest.knownClassicTechnologies - first.knownClassicTechnologies
@@ -200,7 +220,7 @@ export function buildTechnologyProgressSeries(
   return selectTechnologyProgressTurn({
     status: 'ready',
     catalogTotal: catalogIds.size,
-    selectedTurn: null,
+    selectedTurn: maxTurn,
     minTurn,
     maxTurn,
     series,
@@ -328,13 +348,13 @@ export function TechnologyProgressChart({
             <text fill="currentColor" fontSize="10" textAnchor="end" x={CHART.right} y="238">
               Turn {model.maxTurn}
             </text>
-            {model.selectedTurn != null && model.selectedTurn >= model.minTurn! && model.selectedTurn <= model.maxTurn! ? (
+            {model.selectedTurn >= model.minTurn && model.selectedTurn <= model.maxTurn ? (
               <line
                 className="technology-selected-turn"
                 stroke="currentColor"
                 strokeDasharray="2 5"
-                x1={xPosition(model.selectedTurn, model.minTurn!, model.maxTurn!)}
-                x2={xPosition(model.selectedTurn, model.minTurn!, model.maxTurn!)}
+                x1={xPosition(model.selectedTurn, model.minTurn, model.maxTurn)}
+                x2={xPosition(model.selectedTurn, model.minTurn, model.maxTurn)}
                 y1={CHART.top}
                 y2={CHART.bottom}
               />
@@ -343,13 +363,10 @@ export function TechnologyProgressChart({
               const paint = displayPlayerColor(item.color, palette) ?? 'var(--color-muted)'
               return (
                 <g key={item.key}>
-                  <title>
-                    {item.label}: {item.latest.knownClassicTechnologies} of {model.catalogTotal}
-                    {' '}classic technologies at turn {item.latest.turn}
-                  </title>
+                  <title>{`${item.label}: ${item.latest.knownClassicTechnologies} of ${model.catalogTotal} classic technologies at turn ${item.latest.turn}`}</title>
                   <polyline
                     fill="none"
-                    points={polylinePoints(item.values, model.minTurn!, model.maxTurn!, model.catalogTotal)}
+                    points={polylinePoints(item.values, model.minTurn, model.maxTurn, model.catalogTotal)}
                     stroke={paint}
                     strokeLinecap="square"
                     strokeLinejoin="miter"
@@ -360,12 +377,12 @@ export function TechnologyProgressChart({
                     fill={paint}
                     height={6}
                     width={6}
-                    x={xPosition(item.latest.turn, model.minTurn!, model.maxTurn!) - 3}
+                    x={xPosition(item.latest.turn, model.minTurn, model.maxTurn) - 3}
                     y={yPosition(item.latest.knownClassicTechnologies, model.catalogTotal) - 3}
                   />
                   {item.selected ? (
                     <circle
-                      cx={xPosition(item.selected.turn, model.minTurn!, model.maxTurn!)}
+                      cx={xPosition(item.selected.turn, model.minTurn, model.maxTurn)}
                       cy={yPosition(item.selected.knownClassicTechnologies, model.catalogTotal)}
                       fill={paint}
                       r="5"

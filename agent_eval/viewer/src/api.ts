@@ -1,11 +1,20 @@
+import type { ZodType } from 'zod'
+import {
+  BOARD_RESPONSE_SCHEMA,
+  ERROR_PAYLOAD_SCHEMA,
+  GAME_EVENTS_RESPONSE_SCHEMA,
+  GAMES_INDEX_RESPONSE_SCHEMA,
+  REPLAY_RESPONSE_SCHEMA,
+  WATCH_RESPONSE_SCHEMA,
+} from './api-schema'
 import { apiUrl, arenaApiUrl } from './route'
 import type {
   ArenaRouteContext,
   BoardResponse,
   GameEventsResponse,
   GamesIndexResponse,
-  ReplayResponse,
   ReplaySnapshot,
+  ReplayWarning,
   RouteContext,
   TechnologyCatalog,
   WatchResponse,
@@ -18,34 +27,43 @@ export class HTTPError extends Error {
   }
 }
 
-async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
-  const response = await fetch(url, { cache: 'no-store', signal })
+async function fetchJson<T>(
+  url: string,
+  schema: ZodType<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  const request: RequestInit = { cache: 'no-store' }
+  if (signal) request.signal = signal
+  const response = await fetch(url, request)
   if (!response.ok) {
     let detail = `${response.status} ${response.statusText}`
     try {
-      const payload = (await response.json()) as { error?: string }
-      if (payload.error) detail = payload.error
+      const payload = ERROR_PAYLOAD_SCHEMA.safeParse(await response.json())
+      if (payload.success) detail = payload.data.error
     } catch {
       // Keep the stable HTTP status when a proxy returns non-JSON.
     }
     throw new HTTPError(response.status, detail)
   }
-  return (await response.json()) as T
+  return schema.parse(await response.json())
 }
 
 export function fetchGames(
   route: ArenaRouteContext,
   signal?: AbortSignal,
 ): Promise<GamesIndexResponse> {
-  return fetchJson<GamesIndexResponse>(arenaApiUrl(route, '/v1/games'), signal)
+  return fetchJson(
+    arenaApiUrl(route, '/v1/games'), GAMES_INDEX_RESPONSE_SCHEMA, signal,
+  )
 }
 
 export function fetchWatch(
   route: RouteContext,
   signal?: AbortSignal,
 ): Promise<WatchResponse> {
-  return fetchJson<WatchResponse>(
+  return fetchJson(
     apiUrl(route, `/v1/games/${encodeURIComponent(route.gameId)}/watch.json`),
+    WATCH_RESPONSE_SCHEMA,
     signal,
   ).then((payload) => ({
     ...payload,
@@ -60,8 +78,9 @@ export function fetchEvents(
   route: RouteContext,
   signal?: AbortSignal,
 ): Promise<GameEventsResponse> {
-  return fetchJson<GameEventsResponse>(
+  return fetchJson(
     apiUrl(route, `/v1/games/${encodeURIComponent(route.gameId)}/events.json`),
+    GAME_EVENTS_RESPONSE_SCHEMA,
     signal,
   )
 }
@@ -72,27 +91,32 @@ export function fetchBoard(
   signal?: AbortSignal,
 ): Promise<BoardResponse> {
   const query = new URLSearchParams({ turn: String(Math.max(0, Math.trunc(turn))) })
-  return fetchJson<BoardResponse>(
+  return fetchJson(
     apiUrl(
       route,
       `/v1/games/${encodeURIComponent(route.gameId)}/board.json?${query}`,
     ),
+    BOARD_RESPONSE_SCHEMA,
     signal,
   )
 }
 
-export function legacyFrameTurn(frame: { turn?: number | null; source_name: string }): number | null {
-  if (typeof frame.turn === 'number' && Number.isFinite(frame.turn) && frame.turn >= 0) {
+export function legacyFrameTurn(frame: {
+  turn?: number | null | undefined
+  source_name: string
+}): number | null {
+  if (frame.turn != null && Number.isFinite(frame.turn) && frame.turn >= 0) {
     return Math.trunc(frame.turn)
   }
   const match = frame.source_name.match(/^turn-(\d+)(?:-|\.|$)/)
-  return match ? Number(match[1]) : null
+  const encodedTurn = match?.[1]
+  return encodedTurn === undefined ? null : Number(encodedTurn)
 }
 
 export interface ReplayBatch {
   snapshots: ReplaySnapshot[]
-  catalog?: TechnologyCatalog
-  warnings: { turn?: number | null; message: string }[]
+  catalog: TechnologyCatalog | undefined
+  warnings: ReplayWarning[]
   available: boolean
   complete: boolean
 }
@@ -103,7 +127,7 @@ export async function fetchReplaySince(
   signal?: AbortSignal,
 ): Promise<ReplayBatch> {
   const snapshots: ReplaySnapshot[] = []
-  const warnings: { turn?: number | null; message: string }[] = []
+  const warnings: ReplayWarning[] = []
   let catalog: TechnologyCatalog | undefined
   let cursor = afterTurn
   let available = false
@@ -114,11 +138,12 @@ export async function fetchReplaySince(
       after_turn: String(cursor),
       limit: '250',
     })
-    const payload = await fetchJson<ReplayResponse>(
+    const payload = await fetchJson(
       apiUrl(
         route,
         `/v1/games/${encodeURIComponent(route.gameId)}/replay.json?${query}`,
       ),
+      REPLAY_RESPONSE_SCHEMA,
       signal,
     )
     available ||= payload.available

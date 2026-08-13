@@ -25,7 +25,7 @@
     "verbatimModuleSyntax": true,
     "isolatedModules": true,
     "noEmit": true,
-    "jsx": "react-jsx",
+    "jsx": "react",
     "types": ["vite/client", "vitest/globals"]
   },
   "include": ["src", "vite.config.ts"]

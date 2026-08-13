@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import React, { type ReactNode } from 'react'
 
 export const MAP_REGION_ID = 'strategic-map-region'
 

@@ -7,6 +7,7 @@ import type {
   ReplaySnapshot,
   Technology,
 } from './types'
+import { sortedCopy } from './ordered'
 import { placeLabel } from './picker-model'
 import { agentFirst, agentFirstBy, isNativeController } from './agent-order'
 import {
@@ -83,8 +84,10 @@ export function frameAtOrBefore(
 ): ReplayFrame | undefined {
   let selected: ReplayFrame | undefined
   for (const frame of frames) {
-    if (typeof frame.turn === 'number' && frame.turn <= turn) selected = frame
-    if (typeof frame.turn === 'number' && frame.turn > turn) break
+    if (frame.turn != null && Number.isFinite(frame.turn) && frame.turn <= turn) {
+      selected = frame
+    }
+    if (frame.turn != null && Number.isFinite(frame.turn) && frame.turn > turn) break
   }
   return selected
 }
@@ -96,7 +99,9 @@ export function maxKnownTechnologyDepth(
   if (!player.known_tech_ids.length || !technologies.length) return null
   const known = new Set(player.known_tech_ids)
   const depths = technologies.flatMap((technology) => (
-    known.has(technology.id) && typeof technology.depth === 'number'
+    known.has(technology.id)
+      && technology.depth != null
+      && Number.isFinite(technology.depth)
       ? [technology.depth]
       : []
   ))
@@ -129,14 +134,14 @@ export function configuredPlaceFactions(places: GamePlace[]): MapFaction[] {
     player_color: place.player_color,
     seat_id: place.seat_id,
     place: place.place,
-    controller_label: place.controller_label,
-    controller_type: place.controller_type,
+    controller_label: place.controller_label ?? null,
+    controller_type: place.controller_type ?? null,
     scored: true,
     display_label: factionDisplayLabel({
       controller_label: placeLabel(place),
-      controller_type: place.controller === 'native_classic_ai' ? 'native' : place.controller_type,
+      controller_type: place.controller === 'native_classic_ai' ? 'native' : place.controller_type ?? null,
       player_name: place.player_name,
-      ai_difficulty: place.ai_difficulty,
+      ai_difficulty: place.ai_difficulty ?? null,
     }),
     detail: place.controller === 'native_classic_ai'
       ? `${place.player_name} · native controller`
@@ -149,8 +154,10 @@ export function matchDurationLabel(
   game: Pick<GameStatus, 'created_at' | 'finished_at'>,
   nowMs: number = Date.now(),
 ): string | null {
-  if (typeof game.created_at !== 'number') return null
-  const end = typeof game.finished_at === 'number' ? game.finished_at : nowMs / 1000
+  if (game.created_at == null || !Number.isFinite(game.created_at)) return null
+  const end = game.finished_at != null && Number.isFinite(game.finished_at)
+    ? game.finished_at
+    : nowMs / 1000
   const total = Math.max(0, Math.round(end - game.created_at))
   const days = Math.floor(total / 86_400)
   const hours = Math.floor((total % 86_400) / 3_600)
@@ -183,11 +190,11 @@ export function mapFactions(
       player_name: player.player_name,
       player_color: player.player_color,
       seat_id: player.seat_id,
-      place: player.place,
-      controller_label: player.controller_label,
-      controller_type: player.controller_type,
+      place: player.place ?? null,
+      controller_label: player.controller_label ?? null,
+      controller_type: player.controller_type ?? null,
       nation: player.nation,
-      scored: player.scored,
+      scored: player.scored ?? false,
     }] : [],
   )
   if (!sourcePlayers.length) return []
@@ -225,23 +232,23 @@ export function mapFactions(
         : mapPlayer.controller_type ?? replayPlayer?.controller_type
       return {
         agent: !isNativeController({
-          controller_label: label, controller_type: controllerType,
+          controller_label: label, controller_type: controllerType ?? null,
         }),
         faction: {
           ...mapPlayer,
           display_label: factionDisplayLabel({
             controller_label: label,
-            controller_type: controllerType,
-            nation: mapPlayer.nation ?? replayPlayer?.nation,
+            controller_type: controllerType ?? null,
+            nation: mapPlayer.nation ?? replayPlayer?.nation ?? null,
             player_name: place?.player_name ?? mapPlayer.player_name,
-            ai_difficulty: place?.ai_difficulty ?? replayPlayer?.ai_difficulty,
+            ai_difficulty: place?.ai_difficulty ?? replayPlayer?.ai_difficulty ?? null,
           }),
           detail: `${place?.player_name ?? mapPlayer.player_name}${replayPlayer?.nation ? ` · ${replayPlayer.nation}` : ''}`,
           dynamic: false,
         },
       }
     }
-    const nation = mapPlayer.nation || replayPlayer?.nation
+    const nation = mapPlayer.nation || replayPlayer?.nation || null
     return {
       agent: false,
       faction: {
@@ -279,8 +286,10 @@ export function turnsAvailable(
   snapshots: ReplaySnapshot[],
   frames: ReplayFrame[],
 ): number[] {
-  return [...new Set([
+  return sortedCopy([...new Set([
     ...snapshots.map((snapshot) => snapshot.turn),
-    ...frames.flatMap((frame) => typeof frame.turn === 'number' ? [frame.turn] : []),
-  ])].sort((a, b) => a - b)
+    ...frames.flatMap((frame) => (
+      frame.turn == null || !Number.isFinite(frame.turn) ? [] : [frame.turn]
+    )),
+  ])], (a, b) => a - b)
 }

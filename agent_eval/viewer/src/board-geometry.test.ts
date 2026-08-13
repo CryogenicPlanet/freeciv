@@ -66,7 +66,12 @@ describe('semantic board geometry', () => {
     const edges = ownershipBoundaryEdges(board)
     const sharedOwnedEdge = edges.filter((edge) => edge.neighborOwnerId !== null)
     expect(sharedOwnedEdge.length).toBeGreaterThan(0)
-    expect(new Set(sharedOwnedEdge.map((edge) => [edge.tileIndex, edge.neighborIndex].sort().join(':'))).size).toBe(sharedOwnedEdge.length)
+    expect(new Set(sharedOwnedEdge.map((edge) => {
+      if (edge.neighborIndex === null) throw new Error('Owned boundary has no neighbor')
+      return edge.tileIndex < edge.neighborIndex
+        ? `${edge.tileIndex}:${edge.neighborIndex}`
+        : `${edge.neighborIndex}:${edge.tileIndex}`
+    })).size).toBe(sharedOwnedEdge.length)
     expect(edges.some((edge) => edge.tileIndex === 0 && edge.neighborIndex === 1)).toBe(false)
     expect(isoHexNeighborCoordinates(4, 5)).toEqual([
       { x: 5, z: 4 }, { x: 5, z: 6 }, { x: 4, z: 7 },

@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { mockReplay, mockWatch } from './mock'
+import { requiredValue } from './test-support'
+import type { GamePlace } from './types'
 import {
   controlProtocolLabel,
   gamePrimaryResult,
@@ -30,6 +32,22 @@ import {
   technologyState,
 } from './view-model'
 
+const firstFrame = requiredValue(mockWatch.frames[0], 'first watch frame')
+const configuredAgent = requiredValue(
+  mockWatch.game.resolved_places[0], 'configured agent place',
+)
+const configuredNative = requiredValue(
+  mockWatch.game.resolved_places[1], 'configured native place',
+)
+const firstSnapshot = requiredValue(mockReplay.snapshots[0], 'first replay snapshot')
+const latestSnapshot = requiredValue(mockReplay.snapshots[2], 'latest replay snapshot')
+const firstReplayPlayer = requiredValue(firstSnapshot.players[0], 'first replay player')
+const latestAgent = requiredValue(latestSnapshot.players[0], 'latest agent player')
+const latestDynamic = requiredValue(latestSnapshot.players[2], 'latest dynamic player')
+const replayCatalog = requiredValue(mockReplay.catalog, 'replay technology catalog')
+const alphabet = requiredValue(replayCatalog.technologies[0], 'Alphabet technology')
+const writing = requiredValue(replayCatalog.technologies[1], 'Writing technology')
+
 describe('watch route parsing', () => {
   it('routes the arena picker at root and reverse-proxy prefixes', () => {
     expect(resolveViewerRoute('/')).toEqual({
@@ -51,8 +69,9 @@ describe('watch route parsing', () => {
     expect(prefixed).toEqual({
       gameId: 'game_abcdefghijklmnopqrstuvwx', prefix: '/freeciv',
     })
-    expect(apiUrl(prefixed!, '/v1/games/test')).toBe('/freeciv/v1/games/test')
-    expect(frameImageUrl(prefixed!, mockWatch.frames[0])).toBe(
+    const route = requiredValue(prefixed, 'prefixed watch route')
+    expect(apiUrl(route, '/v1/games/test')).toBe('/freeciv/v1/games/test')
+    expect(frameImageUrl(route, firstFrame)).toBe(
       '/freeciv/v1/games/game_abcdefghijklmnopqrstuvwx/frames/0.png',
     )
     expect(resolveViewerRoute('/watch/game_abcdefghijklmnopqrstuvwx')).toEqual({
@@ -69,7 +88,7 @@ describe('watch route parsing', () => {
   it('validates manual IDs and builds prefix-safe watch paths', () => {
     const gameId = normalizeGameId('  game_abcdefghijklmnopqrstuvwx  ')
     expect(gameId).toBe('game_abcdefghijklmnopqrstuvwx')
-    expect(watchUrl('/freeciv', gameId!)).toBe(
+    expect(watchUrl('/freeciv', requiredValue(gameId, 'normalized game id'))).toBe(
       '/freeciv/watch/game_abcdefghijklmnopqrstuvwx',
     )
     expect(normalizeGameId('not a game id')).toBeNull()
@@ -85,7 +104,7 @@ describe('watch route parsing', () => {
 
   it('uses truthful joined-aware labels for open lobby seats', () => {
     expect(placeLabel({
-      ...mockWatch.game.resolved_places[0],
+      ...configuredAgent,
       joined: false,
       controller_label: null,
       model: null,
@@ -166,18 +185,18 @@ describe('replay view model', () => {
         player_color: '#F38400', controller: 'agent', joined: true,
         controller_label: 'claude-fable-5', controller_type: 'external',
         model: 'fable-5' },
-    ] as typeof mockWatch.game.resolved_places
+    ] satisfies GamePlace[]
     const snapshot = {
       turn: 10, year: -3000,
       players: [
-        { ...mockReplay.snapshots[0].players[0], player_id: 0,
+        { ...firstReplayPlayer, player_id: 0,
           seat_id: 'place-1', player_name: 'Elizabeth', nation: 'English' },
-        { ...mockReplay.snapshots[0].players[0], player_id: 1,
+        { ...firstReplayPlayer, player_id: 1,
           seat_id: 'place-2', player_name: 'Isabella', nation: 'Spanish' },
       ],
     }
     const frame = {
-      ...mockWatch.frames[0],
+      ...firstFrame,
       map_players: [
         { player_id: 0, player_name: 'Elizabeth', player_color: '#0067A5' },
         { player_id: 1, player_name: 'Isabella', player_color: '#F38400' },
@@ -192,7 +211,7 @@ describe('replay view model', () => {
 
   it('keeps dynamic map factions distinct from scored competitors', () => {
     const factions = mapFactions(
-      mockWatch.frames[0], mockReplay.snapshots[2], mockWatch.game.resolved_places,
+      firstFrame, latestSnapshot, mockWatch.game.resolved_places,
     )
     expect(factions.map((faction) => faction.display_label)).toEqual([
       'codex-gpt-5.6-sol: Danish', 'Romans (CPU)', 'Freeciv dynamic: Pirate',
@@ -221,9 +240,9 @@ describe('replay view model', () => {
   })
 
   it('summarizes duplicate native seats in the match header', () => {
-    const native = mockWatch.game.resolved_places[1]
+    const native = configuredNative
     expect(matchHeaderLabel([
-      mockWatch.game.resolved_places[0],
+      configuredAgent,
       native,
       { ...native, place: 3, seat_id: 'place-3', player_name: 'NativePlace3' },
     ])).toBe('codex-gpt-5.6-sol  vs  CPU ×2')
@@ -232,7 +251,8 @@ describe('replay view model', () => {
   it('names the difficulty in the header and the place label', () => {
     // The header and the place label used to hardcode the AI's name; they now
     // read it from `faction-label`, so a recorded level reaches both.
-    const [agent, native] = mockWatch.game.resolved_places
+    const agent = configuredAgent
+    const native = configuredNative
     const deity = { ...native, ai_difficulty: 'cheating' }
     expect(matchHeaderLabel([agent, deity]))
       .toBe('codex-gpt-5.6-sol  vs  CPU: Deity')
@@ -243,8 +263,9 @@ describe('replay view model', () => {
     // An unnamed level, and a payload with none at all, stay unqualified.
     expect(placeLabel({ ...native, ai_difficulty: 'normal' })).toBe('CPU')
     expect(placeLabel(native)).toBe('CPU')
-    expect(configuredPlaceFactions([deity])[0].display_label)
-      .toBe('NativePlace2 (CPU: Deity)')
+    expect(requiredValue(
+      configuredPlaceFactions([deity])[0], 'configured deity faction',
+    ).display_label).toBe('NativePlace2 (CPU: Deity)')
   })
 
   it('builds the legacy map key from scored roster identities and colors', () => {
@@ -259,13 +280,17 @@ describe('replay view model', () => {
   })
 
   it('builds an exact-color faction key from replay data for legacy frames', () => {
-    const legacyFrame = { ...mockWatch.frames[0], map_players: undefined }
+    const legacyFrame = {
+      index: firstFrame.index,
+      source_name: firstFrame.source_name,
+      png_url: firstFrame.png_url,
+    }
     const snapshot = {
-      ...mockReplay.snapshots[2],
+      ...latestSnapshot,
       players: [
-        ...mockReplay.snapshots[2].players,
+        ...latestSnapshot.players,
         {
-          ...mockReplay.snapshots[2].players[2],
+          ...latestDynamic,
           seat_id: 'dynamic-player-3', player_id: 3,
           player_name: 'Goldfinger', player_color: '#FFD700', nation: 'Barbarian',
         },
@@ -286,13 +311,13 @@ describe('replay view model', () => {
   })
 
   it('normalizes citizen population and technology states', () => {
-    const player = mockReplay.snapshots[2].players[0]
+    const player = latestAgent
     expect(playerMetric(player, 'citizens')).toBe(6)
-    expect(technologyState(mockReplay.catalog!.technologies[0], player)).toBe('known')
-    expect(technologyState(mockReplay.catalog!.technologies[1], player)).toBe('current')
+    expect(technologyState(alphabet, player)).toBe('known')
+    expect(technologyState(writing, player)).toBe('current')
     expect(maxKnownTechnologyDepth(player, [])).toBeNull()
     expect(maxKnownTechnologyDepth(
-      { ...player, known_tech_ids: [] }, mockReplay.catalog!.technologies,
+      { ...player, known_tech_ids: [] }, replayCatalog.technologies,
     )).toBeNull()
   })
 

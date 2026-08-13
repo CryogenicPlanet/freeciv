@@ -8,7 +8,7 @@ function routeAwareAssetBases(): Plugin {
     enforce: 'post',
     generateBundle(_options, bundle) {
       const index = bundle['index.html']
-      if (!index || index.type !== 'asset' || typeof index.source !== 'string') {
+      if (!index || index.type !== 'asset' || index.source instanceof Uint8Array) {
         throw new Error('Vite did not emit the replay viewer index')
       }
       if (!index.source.includes('./assets/')) {

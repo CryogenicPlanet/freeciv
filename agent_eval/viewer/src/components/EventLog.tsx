@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import {
   activeEventIndex,
   DENSITY_LABEL,
@@ -19,21 +19,21 @@ const PAST_ROW = 'border-l-transparent'
 const UPCOMING_ROW = 'border-l-transparent opacity-45'
 
 /** Weight is the hierarchy: a bigger moment reads bigger. */
-const TIER_ROW: Readonly<Record<WeightTier, string>> = {
+const TIER_ROW = {
   major: 'py-2.5 px-3',
   notable: 'py-2 px-3',
   routine: 'py-1.5 px-3',
-}
-const TIER_TEXT: Readonly<Record<WeightTier, string>> = {
+} satisfies Readonly<Record<WeightTier, string>>
+const TIER_TEXT = {
   major: 'text-[var(--color-ink)] text-[12px] font-semibold',
   notable: 'text-[var(--color-ink)] text-[11px]',
   routine: 'text-[var(--color-ink-2)] text-[10px]',
-}
-const TIER_DOT: Readonly<Record<WeightTier, string>> = {
+} satisfies Readonly<Record<WeightTier, string>>
+const TIER_DOT = {
   major: 'w-2.5 h-2.5',
   notable: 'w-[7px] h-[7px]',
   routine: 'w-[5px] h-[5px]',
-}
+} satisfies Readonly<Record<WeightTier, string>>
 
 const DENSITY_BUTTON = 'py-1.5 px-2.5 border border-[var(--color-line)] text-[8px] leading-none font-readout font-extrabold tracking-[.12em] uppercase cursor-pointer focus-visible:outline-2 focus-visible:outline-[var(--color-ink)] focus-visible:outline-offset-2'
 const DENSITY_ON = 'text-[var(--color-ink)] bg-[var(--color-panel-3)] border-[var(--color-line-2)]'

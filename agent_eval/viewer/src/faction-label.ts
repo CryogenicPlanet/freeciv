@@ -1,10 +1,10 @@
 export interface FactionLabelSource {
-  controller_label?: string | null
-  controller_type?: string | null
-  nation?: string | null
+  controller_label?: string | null | undefined
+  controller_type?: string | null | undefined
+  nation?: string | null | undefined
   player_name: string
   /** The freeciv server AI level, when the payload carries one. */
-  ai_difficulty?: string | null
+  ai_difficulty?: string | null | undefined
 }
 
 /** The native opponent's base display name. The wire still says
@@ -23,14 +23,14 @@ export const NATIVE_AI_LABEL = 'CPU'
  * Levels outside this table render as a plain "CPU": naming a difficulty we
  * have not deliberately translated is worse than naming none.
  */
-const DIFFICULTY_NAMES: Readonly<Record<string, string>> = {
-  hard: 'Hard',
-  cheating: 'Deity',
-}
+const DIFFICULTY_NAMES = new Map([
+  ['hard', 'Hard'],
+  ['cheating', 'Deity'],
+])
 
 /** "CPU", or "CPU: Deity" when the difficulty is one we name. */
 export function nativeAiLabel(difficulty?: string | null): string {
-  const name = DIFFICULTY_NAMES[difficulty?.trim().toLowerCase() ?? '']
+  const name = DIFFICULTY_NAMES.get(difficulty?.trim().toLowerCase() ?? '')
   return name ? `${NATIVE_AI_LABEL}: ${name}` : NATIVE_AI_LABEL
 }
 

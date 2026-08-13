@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import React, { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { fetchBoard } from '../api'
 import { LatestRequestGate, LruCache, priorAvailableTurns } from '../board-loader'
 import type { BoardResponse, RouteContext } from '../types'
@@ -14,8 +14,8 @@ type LoadStatus = 'idle' | 'loading' | 'ready' | 'unavailable'
 interface StrategicMapProps {
   alt: string
   availableTurns: readonly number[]
-  rawSourceName?: string
-  rawSrc?: string
+  rawSourceName: string | undefined
+  rawSrc: string | undefined
   route: RouteContext
   turn: number
 }
@@ -30,7 +30,7 @@ function neighboringTurns(turns: readonly number[], turn: number): number[] {
   const index = turns.indexOf(turn)
   if (index < 0) return []
   return [turns[index - 1], turns[index + 1]].filter(
-    (candidate): candidate is number => typeof candidate === 'number',
+    (candidate): candidate is number => candidate !== undefined,
   )
 }
 
@@ -95,7 +95,7 @@ export function StrategicMap({
       setCommittedBoard(cached)
       setStatus('ready')
       setLoadError(null)
-      return
+      return undefined
     }
     const controller = new AbortController()
     setStatus('loading')
@@ -149,7 +149,7 @@ export function StrategicMap({
   }, [availableTurns, key, route, turn])
 
   useEffect(() => {
-    if (status !== 'ready') return
+    if (status !== 'ready') return undefined
     const timer = window.setTimeout(() => {
       for (const candidate of neighboringTurns(availableTurns, turn)) {
         const candidateKey = cacheKey(route, candidate)

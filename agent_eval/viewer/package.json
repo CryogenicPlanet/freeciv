@@ -14,7 +14,8 @@
   "dependencies": {
     "react": "19.2.8",
     "react-dom": "19.2.8",
-    "three": "0.185.1"
+    "three": "0.185.1",
+    "zod": "4.4.3"
   },
   "devDependencies": {
     "@freeciv/oxlint-config": "workspace:*",
@@ -24,6 +25,7 @@
     "@types/three": "0.185.3",
     "@vitejs/plugin-react": "6.0.5",
     "oxlint": "1.77.0",
+    "oxlint-tsgolint": "7.0.2001",
     "tailwindcss": "4.3.3",
     "typescript": "7.0.2",
     "vite": "8.2.0",
