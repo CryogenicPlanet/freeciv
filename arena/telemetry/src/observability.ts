@@ -29,7 +29,7 @@
  */
 
 import { Context, Effect, Layer, Option, Ref } from 'effect';
-import { TelemetryConfig, type TelemetryConfigShape } from './config.ts';
+import { TelemetryConfig, type ResolvedTelemetryConfig } from './config.ts';
 import {
   emitWideEvent,
   type EvlogWideEvent,
@@ -100,7 +100,7 @@ export class TelemetryCapture extends Context.Tag('@arena/telemetry/TelemetryCap
  */
 const mirror = (
   event: EvlogWideEvent,
-  config: TelemetryConfigShape,
+  config: ResolvedTelemetryConfig,
 ): Effect.Effect<void, TelemetryExportError> =>
   Option.match(config.otlpEndpoint, {
     onNone: () => Effect.void,

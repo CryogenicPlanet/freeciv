@@ -35,8 +35,9 @@
  * @module
  */
 
-import { Option } from 'effect';
-import { createError, EvlogError } from 'evlog';
+import { Option, Predicate } from 'effect';
+import { createError, EvlogError, type ErrorOptions } from 'evlog';
+import type { TelemetryFields } from './wide-event.ts';
 
 /** What went wrong underneath, and what the reader should do about it. */
 export interface Remedy {
@@ -55,7 +56,9 @@ export interface Remedy {
  * from `arena/wire/src/canon.ts` and `arena/wire/src/codec.ts`; the
  * `Telemetry*` entries are this package's own, from `./evlog-adapter.ts`.
  */
-export const REMEDIES: Readonly<Record<string, Remedy>> = {
+const defineRemedies = (remedies: Readonly<Record<string, Remedy>>) => remedies;
+
+export const REMEDIES = defineRemedies({
   // --- @arena/wire: decoding and encoding -----------------------------------
   WireDecodeError: {
     why: 'A value crossing the wire boundary did not match its schema — the producer and this consumer disagree about the shape.',
@@ -107,7 +110,7 @@ export const REMEDIES: Readonly<Record<string, Remedy>> = {
     why: 'The failure value could not be described: reading its tag, its message or its fields threw, which means one of its property getters is hostile or its prototype is.',
     fix: 'Find the code that constructed the failure value and make it a plain tagged error. A value that cannot be read cannot be recorded, and this note is standing in for it.',
   },
-};
+});
 
 /** The tag {@link REMEDIES} registers for a failure value that could not be read at all. */
 export const UNREADABLE_FAILURE_TAG = 'UnreadableFailure';
@@ -134,11 +137,11 @@ export const isRegisteredTag = (tag: string): boolean => Object.hasOwn(REMEDIES,
  * job is describing other people's failure values has no business asserting
  * anything about their shape.
  */
-const isTagged = (value: unknown): value is { readonly _tag: string } =>
-  typeof value === 'object' &&
-  value !== null &&
-  '_tag' in value &&
-  typeof value._tag === 'string';
+const isTagged = <A>(value: A): value is A & { readonly _tag: string } =>
+  Predicate.isObject(value) &&
+  !Predicate.isFunction(value) &&
+  Predicate.hasProperty(value, '_tag') &&
+  Predicate.isString(value._tag);
 
 /**
  * The tag of a failure value.
@@ -148,15 +151,15 @@ const isTagged = (value: unknown): value is { readonly _tag: string } =>
  * it has to one.  Anything else has no tag, and {@link describeTag} says so
  * rather than inventing one.
  */
-export const tagOf = (error: unknown): Option.Option<string> => {
-  if (isTagged(error)) return Option.some(error._tag);
-  if (error instanceof Error && error.name !== '') return Option.some(error.name);
+export const tagOf = (cause: unknown): Option.Option<string> => {
+  if (isTagged(cause)) return Option.some(cause._tag);
+  if (cause instanceof Error && cause.name !== '') return Option.some(cause.name);
   return Option.none();
 };
 
 /** The tag of a failure value, or `'Untagged'` when it has none. */
-export const describeTag = (error: unknown): string =>
-  Option.getOrElse(tagOf(error), () => 'Untagged');
+export const describeTag = (cause: unknown): string =>
+  Option.getOrElse(tagOf(cause), () => 'Untagged');
 
 /**
  * The message of a failure value.
@@ -165,19 +168,22 @@ export const describeTag = (error: unknown): string =>
  * value; `String(value)` is a poor description of an object literal, so the
  * shape is named explicitly instead of leaving `[object Object]` in the corpus.
  */
-export const describeMessage = (error: unknown): string => {
+export const describeMessage = (cause: unknown): string => {
   // A `Data.TaggedError` is an `Error` whose `message` is `''` unless the
   // author happened to name a field `message` — its information lives in its
   // fields, not in a sentence. Falling back to the tag keeps `message` from
   // being the empty string on most of this codebase's failures; the fields
   // themselves are carried separately, by `errorFields` below.
-  if (error instanceof Error) return error.message === '' ? describeTag(error) : error.message;
-  if (typeof error === 'string') return error;
-  if (typeof error === 'number' || typeof error === 'boolean' || typeof error === 'bigint') {
-    return String(error);
+  if (cause instanceof Error) return cause.message === '' ? describeTag(cause) : cause.message;
+  if (Predicate.isString(cause)) return cause;
+  if (Predicate.isNumber(cause) || Predicate.isBoolean(cause) || Predicate.isBigInt(cause)) {
+    return String(cause);
   }
-  if (typeof error === 'symbol') return error.toString();
-  return `non-Error failure of type ${error === null ? 'null' : typeof error}`;
+  if (Predicate.isSymbol(cause)) return cause.toString();
+  if (cause === null) return 'non-Error failure of type null';
+  if (Predicate.isUndefined(cause)) return 'non-Error failure of type undefined';
+  if (Predicate.isFunction(cause)) return 'non-Error failure of type function';
+  return 'non-Error failure of type object';
 };
 
 /**
@@ -193,12 +199,15 @@ export const describeMessage = (error: unknown): string => {
  * asymmetry: a decoder's expected-vs-actual belongs in the corpus and belongs
  * nowhere near a response body.
  */
-export const errorFields = (error: unknown): Readonly<Record<string, unknown>> => {
-  if (typeof error !== 'object' || error === null) return {};
+export const errorFields = (cause: unknown): TelemetryFields => {
+  if (!Predicate.isObject(cause) || Predicate.isFunction(cause)) return {};
   return Object.fromEntries(
-    Object.keys(error)
+    Object.keys(cause)
       .filter((key) => key !== '_tag')
-      .map((key): readonly [string, unknown] => [key, Reflect.get(error, key)]),
+      .map((key): readonly [string, unknown] => [
+        key,
+        Predicate.hasProperty(cause, key) ? cause[key] : undefined,
+      ]),
   );
 };
 
@@ -215,10 +224,12 @@ export const errorFields = (error: unknown): Readonly<Record<string, unknown>> =
  * `'cause' in error` rather than `Object.hasOwn`: a wrapper class that puts its
  * cause on the prototype is still carrying a cause.
  */
-export const causeOf = (error: unknown): Option.Option<unknown> =>
-  typeof error === 'object' && error !== null && 'cause' in error
-    ? Option.some(Reflect.get(error, 'cause'))
-    : Option.none();
+export const causeOf = (cause: unknown): Option.Option<unknown> =>
+  Predicate.isFunction(cause)
+    ? Option.none()
+    : Predicate.hasProperty(cause, 'cause')
+      ? Option.some(cause.cause)
+      : Option.none();
 
 /**
  * A one-line description of a failure that is not merely its own tag.
@@ -233,16 +244,16 @@ export const causeOf = (error: unknown): Option.Option<unknown> =>
  * Reads properties of `error`, so it is total only for readable values; call it
  * inside the fence.  @see {@link toEvlogError}.
  */
-export const describeDetail = (error: unknown): string =>
-  describeMessage(error) !== describeTag(error)
-    ? describeMessage(error)
-    : Option.match(causeOf(error), {
-        onSome: (cause) => describeMessage(cause),
+export const describeDetail = (cause: unknown): string =>
+  describeMessage(cause) !== describeTag(cause)
+    ? describeMessage(cause)
+    : Option.match(causeOf(cause), {
+        onSome: (wrapped) => describeMessage(wrapped),
         onNone: () => {
-          const keys = Object.keys(errorFields(error));
+          const keys = Object.keys(errorFields(cause));
           return keys.length === 0
-            ? describeMessage(error)
-            : `${describeMessage(error)}; fields: ${keys.join(', ')}`;
+            ? describeMessage(cause)
+            : `${describeMessage(cause)}; fields: ${keys.join(', ')}`;
         },
       });
 
@@ -257,17 +268,17 @@ export const describeDetail = (error: unknown): string =>
  * `JSON.stringify` here can throw (a cycle, a `BigInt`); that is the fence's
  * problem and not this function's.
  */
-export const renderValue = (value: unknown): string => {
-  if (typeof value === 'string') return value;
-  if (value === null) return 'null';
-  if (value === undefined) return 'undefined';
-  if (value instanceof Error) return `${describeTag(value)}: ${describeMessage(value)}`;
-  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
-    return String(value);
+export const renderValue = (cause: unknown): string => {
+  if (Predicate.isString(cause)) return cause;
+  if (cause === null) return 'null';
+  if (Predicate.isUndefined(cause)) return 'undefined';
+  if (cause instanceof Error) return `${describeTag(cause)}: ${describeMessage(cause)}`;
+  if (Predicate.isNumber(cause) || Predicate.isBoolean(cause) || Predicate.isBigInt(cause)) {
+    return String(cause);
   }
-  if (typeof value === 'symbol') return value.toString();
-  if (typeof value === 'function') return `function ${value.name}`;
-  return JSON.stringify(value) ?? 'undefined';
+  if (Predicate.isSymbol(cause)) return cause.toString();
+  if (Predicate.isFunction(cause)) return `function ${cause.name}`;
+  return JSON.stringify(cause) ?? 'undefined';
 };
 
 /**
@@ -283,23 +294,26 @@ export const renderValue = (value: unknown): string => {
  * author chose, and overwriting that with a table lookup keyed on
  * `'EvlogError'` would be strictly worse information.
  */
-export const toEvlogError = (error: unknown): EvlogError => {
-  if (EvlogError.isEvlogError(error)) return error;
-  const tag = describeTag(error);
+export const toEvlogError = (cause: unknown): EvlogError => {
+  if (EvlogError.isEvlogError(cause)) return cause;
+  const tag = describeTag(cause);
   const remedy = remedyFor(tag);
-  const fields = errorFields(error);
-  return createError({
-    message: describeMessage(error),
+  const fields = errorFields(cause);
+  const internal: NonNullable<ErrorOptions['internal']> = {
+    tag,
+    // Says plainly whether the `why`/`fix` above were written by a person or
+    // generated by the fallback. A reader should not have to guess.
+    registeredRemedy: isRegisteredTag(tag),
+  };
+  if (Object.keys(fields).length > 0) internal['fields'] = fields;
+
+  const options: ErrorOptions = {
+    message: describeMessage(cause),
     code: tag,
     why: remedy.why,
     fix: remedy.fix,
-    internal: {
-      tag,
-      // Says plainly whether the `why`/`fix` above were written by a person or
-      // generated by the fallback. A reader should not have to guess.
-      registeredRemedy: isRegisteredTag(tag),
-      ...(Object.keys(fields).length > 0 ? { fields } : {}),
-    },
-    ...(error instanceof Error ? { cause: error } : {}),
-  });
+    internal,
+  };
+  if (cause instanceof Error) options.cause = cause;
+  return createError(options);
 };

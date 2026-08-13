@@ -46,7 +46,7 @@ import { Context, Layer, Option } from 'effect';
  *
  * @see {@link TelemetryConfigInput} for the shape callers write.
  */
-export interface TelemetryConfigShape {
+export interface ResolvedTelemetryConfig {
   /**
    * `service` on every wide event, stamped from this value onto every event
    * this layer records.  Dashboards facet on this, so it should name the
@@ -128,7 +128,7 @@ export interface TelemetryConfigInput {
 }
 
 /** Normalize the ergonomic input shape into the `Option`-typed resolved shape. */
-export const makeTelemetryConfig = (input: TelemetryConfigInput): TelemetryConfigShape => ({
+export const makeTelemetryConfig = (input: TelemetryConfigInput): ResolvedTelemetryConfig => ({
   service: input.service,
   environment: input.environment,
   ndjsonDir: input.ndjsonDir,
@@ -147,8 +147,11 @@ export const makeTelemetryConfig = (input: TelemetryConfigInput): TelemetryConfi
  */
 export class TelemetryConfig extends Context.Tag('@arena/telemetry/TelemetryConfig')<
   TelemetryConfig,
-  TelemetryConfigShape
+  ResolvedTelemetryConfig
 >() {}
+
+/** Backward-compatible name for the resolved configuration contract. */
+export type { ResolvedTelemetryConfig as 'TelemetryConfigShape' };
 
 /** A `Layer` providing {@link TelemetryConfig} from a literal configuration. */
 export const telemetryConfigLayer = (input: TelemetryConfigInput): Layer.Layer<TelemetryConfig> =>

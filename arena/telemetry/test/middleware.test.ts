@@ -17,7 +17,13 @@
 // oxlint-disable effecttsgo/strict-effect-provide
 import { describe, expect, test } from 'bun:test';
 import { Data, Deferred, Effect, Exit, Fiber, Layer, Option, TestClock, TestContext } from 'effect';
-import { annotate, annotateError, TelemetryCapture, withWideEvent } from 'src/index';
+import {
+  annotate,
+  annotateError,
+  type EvlogWideEvent,
+  TelemetryCapture,
+  withWideEvent,
+} from 'src/index';
 import { captureLayer, takeEvents } from 'test/support';
 
 class TurnRefused extends Data.TaggedError('TurnRefused')<{
@@ -25,7 +31,7 @@ class TurnRefused extends Data.TaggedError('TurnRefused')<{
 }> {}
 
 /** Run `self` under a fresh capture layer and return the events it produced. */
-const eventsOf = <A, E>(self: Effect.Effect<A, E>): Promise<ReadonlyArray<Record<string, unknown>>> =>
+const eventsOf = <A, E>(self: Effect.Effect<A, E>): Promise<ReadonlyArray<EvlogWideEvent>> =>
   Effect.exit(withWideEvent(self, 'unit.work'))
     .pipe(
       Effect.zipRight(takeEvents),
@@ -34,9 +40,9 @@ const eventsOf = <A, E>(self: Effect.Effect<A, E>): Promise<ReadonlyArray<Record
       Effect.runPromise,
     );
 
-const only = (events: ReadonlyArray<Record<string, unknown>>): Record<string, unknown> => {
+const only = (events: ReadonlyArray<EvlogWideEvent>): EvlogWideEvent => {
   expect(events).toHaveLength(1);
-  return events[0] ?? {};
+  return events[0]!;
 };
 
 describe('withWideEvent seals exactly once', () => {

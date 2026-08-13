@@ -39,7 +39,7 @@
  */
 
 import { Clock, Effect, FiberRef, Option, Random, Ref } from 'effect';
-import type { EvlogError } from 'evlog';
+import type { EvlogError, WideEvent as EvlogWideEvent } from 'evlog';
 import { readTelemetryFields, toEvlogErrorSafely } from './evlog-adapter.ts';
 
 /**
@@ -51,7 +51,10 @@ import { readTelemetryFields, toEvlogErrorSafely } from './evlog-adapter.ts';
  * put here becomes a `TelemetryEmitError` naming this `annotate` call, instead
  * of a defect in whoever was annotating.
  */
-export type TelemetryFields = Readonly<Record<string, unknown>>;
+/** A value accepted by evlog's owned wide-event field contract. */
+type TelemetryFieldValue = EvlogWideEvent[string];
+
+export type TelemetryFields = Readonly<Record<string, TelemetryFieldValue>>;
 
 /** An open wide event: annotate it until something seals it. */
 export interface WideEvent {
@@ -183,12 +186,12 @@ export const annotateOn = (event: WideEvent, fields: TelemetryFields): Effect.Ef
  *
  * No-ops on a sealed event.
  */
-export const annotateErrorOn = (event: WideEvent, error: unknown): Effect.Effect<void> =>
+export const annotateErrorOn = (event: WideEvent, cause: unknown): Effect.Effect<void> =>
   Ref.get(event.sealed).pipe(
     Effect.flatMap((sealed) =>
       sealed
         ? Effect.void
-        : toEvlogErrorSafely(error).pipe(
+        : toEvlogErrorSafely(cause).pipe(
             Effect.flatMap((mapped) => Ref.set(event.error, Option.some(mapped))),
           ),
     ),
@@ -212,12 +215,12 @@ export const annotate = (fields: TelemetryFields): Effect.Effect<void> =>
   );
 
 /** Record `error` as the failure of the current event; no-op when there is none. */
-export const annotateError = (error: unknown): Effect.Effect<void> =>
+export const annotateError = (cause: unknown): Effect.Effect<void> =>
   currentEvent.pipe(
     Effect.flatMap(
       Option.match({
         onNone: () => Effect.void,
-        onSome: (event) => annotateErrorOn(event, error),
+        onSome: (event) => annotateErrorOn(event, cause),
       }),
     ),
   );

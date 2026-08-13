@@ -45,7 +45,7 @@ const ROOT = join(tmpdir(), `arena-telemetry-hostile-${String(process.pid)}`);
 afterAll(() => rm(ROOT, { recursive: true, force: true }));
 
 /** An object whose own enumerable getter throws when anything copies it. */
-const withThrowingGetter = (): Record<string, unknown> => ({
+const withThrowingGetter = () => ({
   safe: 1,
   get boom(): never {
     throw new TypeError('this getter refuses');
@@ -53,7 +53,7 @@ const withThrowingGetter = (): Record<string, unknown> => ({
 });
 
 /** A failure value that resists every attempt to describe it. */
-const hostileFailure = (): unknown => ({
+const hostileFailure = () => ({
   get _tag(): never {
     throw new TypeError('no tag for you');
   },

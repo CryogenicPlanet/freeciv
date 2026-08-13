@@ -24,9 +24,21 @@ import { afterAll, describe, expect, test } from 'bun:test';
 import { mkdir, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Cause, Deferred, Effect, Exit, Fiber, Layer, Logger, Option, TestContext } from 'effect';
+import {
+  Cause,
+  Deferred,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Logger,
+  Option,
+  Predicate,
+  TestContext,
+} from 'effect';
 import {
   annotate,
+  type EvlogWideEvent,
   exportWideEvents,
   Observability,
   ObservabilityLive,
@@ -51,22 +63,17 @@ const runDir = async (name: string): Promise<string> => {
 
 afterAll(() => rm(ROOT, { recursive: true, force: true }));
 
-/** An arbitrary object as a plain record, without asserting anything about it. */
-const asRecord = (value: unknown): Record<string, unknown> => {
-  if (typeof value !== 'object' || value === null) return {};
-  return Object.fromEntries(
-    Object.keys(value).map((key): readonly [string, unknown] => [key, Reflect.get(value, key)]),
-  );
-};
+/** Decode one corpus line written by evlog. */
+const parseCorpusEvent = (line: string): EvlogWideEvent => JSON.parse(line);
 
 /** Every JSON object on every line of the corpus in `dir`, oldest first. */
-const readCorpus = async (dir: string): Promise<ReadonlyArray<Record<string, unknown>>> => {
+const readCorpus = async (dir: string): Promise<ReadonlyArray<EvlogWideEvent>> => {
   const names = (await readdir(dir)).filter((name) => name.endsWith('.jsonl')).toSorted();
   const files = await Promise.all(names.map((name) => readFile(join(dir, name), 'utf8')));
   return files
     .flatMap((text) => text.split('\n'))
     .filter((line) => line.trim() !== '')
-    .map((line): Record<string, unknown> => asRecord(JSON.parse(line)));
+    .map(parseCorpusEvent);
 };
 
 /**
@@ -76,7 +83,7 @@ const readCorpus = async (dir: string): Promise<ReadonlyArray<Record<string, unk
  */
 const VOLATILE: ReadonlyArray<string> = ['timestamp', 'eventId'];
 
-const stable = (event: Record<string, unknown> | undefined): Record<string, unknown> =>
+const stable = (event: EvlogWideEvent | undefined): Partial<EvlogWideEvent> =>
   Object.fromEntries(
     Object.entries(event ?? {}).filter(([key]) => !VOLATILE.includes(key)),
   );
@@ -110,7 +117,7 @@ describe('ObservabilityLive', () => {
     expect(corpus.map((event) => event['event'])).toEqual(['turn.play', 'turn.play', 'turn.play']);
     // Whole lines, not fragments: `writeBatchToFs` appends one `appendFile` per
     // call, and two of those interleaving would leave a line no reader can parse.
-    expect(corpus.every((event) => typeof event['eventId'] === 'string')).toBe(true);
+    expect(corpus.every((event) => Predicate.isString(event['eventId']))).toBe(true);
     expect(corpus[0]).toMatchObject({
       service: 'arena-telemetry-suite',
       environment: 'test',
@@ -123,7 +130,7 @@ describe('ObservabilityLive', () => {
     });
     // No drain, no `waitUntil`, no exit race: the write is awaited by the
     // effect that produced it, so the file is complete the moment it returns.
-    expect(typeof corpus[0]?.['timestamp']).toBe('string');
+    expect(Predicate.isString(corpus[0]?.['timestamp'])).toBe(true);
   });
 
   test('writes the lines in the order the events sealed', async () => {

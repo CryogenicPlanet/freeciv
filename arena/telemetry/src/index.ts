@@ -66,7 +66,7 @@ export {
   makeTelemetryConfig,
   TelemetryConfig,
   type TelemetryConfigInput,
-  type TelemetryConfigShape,
+  type ResolvedTelemetryConfig as 'TelemetryConfigShape',
   telemetryConfigLayer,
 } from './config.ts';
 

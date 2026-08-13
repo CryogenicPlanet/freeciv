@@ -39,6 +39,7 @@ import { Effect, Layer, Option } from 'effect';
 import { initLogger } from 'evlog';
 import {
   annotate,
+  type EvlogWideEvent,
   initializeEvlog,
   makeTelemetryConfig,
   ObservabilityLive,
@@ -58,24 +59,17 @@ const runDir = async (name: string): Promise<string> => {
   return dir;
 };
 
+/** Decode one corpus line written by evlog. */
+const parseCorpusEvent = (line: string): EvlogWideEvent => JSON.parse(line);
+
 /** Every JSON object written into `dir`, oldest first. */
-const readCorpus = async (dir: string): Promise<ReadonlyArray<Record<string, unknown>>> => {
+const readCorpus = async (dir: string): Promise<ReadonlyArray<EvlogWideEvent>> => {
   const names = (await readdir(dir)).filter((name) => name.endsWith('.jsonl')).toSorted();
   const files = await Promise.all(names.map((name) => readFile(join(dir, name), 'utf8')));
   return files
     .flatMap((text) => text.split('\n'))
     .filter((line) => line.trim() !== '')
-    .map((line): Record<string, unknown> => {
-      const parsed: unknown = JSON.parse(line);
-      return typeof parsed === 'object' && parsed !== null
-        ? Object.fromEntries(
-            Object.keys(parsed).map((key): readonly [string, unknown] => [
-              key,
-              Reflect.get(parsed, key),
-            ]),
-          )
-        : {};
-    });
+    .map(parseCorpusEvent);
 };
 
 /** The environment variables `evlog`'s `detectEnvironment()` reads. */
@@ -145,7 +139,7 @@ describe('the environment cannot reach the event', () => {
     'timestamp',
   ];
 
-  const record = async (config: TelemetryConfigInput): Promise<Record<string, unknown>> => {
+  const record = async (config: TelemetryConfigInput): Promise<EvlogWideEvent> => {
     await Effect.runPromise(
       annotate({ turn: 1 }).pipe(
         withWideEvent('probe.work'),
@@ -154,7 +148,7 @@ describe('the environment cannot reach the event', () => {
     );
     const corpus = await readCorpus(config.ndjsonDir);
     expect(corpus).toHaveLength(1);
-    return corpus[0] ?? {};
+    return corpus[0]!;
   };
 
   test('APP_VERSION, GITHUB_SHA and AWS_REGION do not appear on an event', async () => {

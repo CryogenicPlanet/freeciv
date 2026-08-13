@@ -75,7 +75,7 @@ import type { AuditableLogger, EvlogError, WideEvent as EvlogWideEvent } from 'e
 import { createError, createLogger, initLogger } from 'evlog';
 import { writeBatchToFs } from 'evlog/fs';
 import { sendBatchToOTLP } from 'evlog/otlp';
-import type { TelemetryConfigShape } from './config.ts';
+import type { ResolvedTelemetryConfig } from './config.ts';
 import {
   causeOf,
   describeDetail,
@@ -177,7 +177,7 @@ export type TelemetryError =
  *   warning telling us to configure the drain we deliberately did not configure.
  */
 export const initializeEvlog = (
-  config: TelemetryConfigShape,
+  config: ResolvedTelemetryConfig,
 ): Effect.Effect<void, TelemetryInitError> =>
   Effect.try({
     try: () =>
@@ -241,7 +241,7 @@ export const sealWideEvent = (
  * over the corpus depends on. `durationMs` is set explicitly because
  * `createLogger` — unlike the request loggers — stamps no duration of its own.
  */
-const toEvlogContext = (sealed: SealedWideEvent): Record<string, unknown> => ({
+const toEvlogContext = (sealed: SealedWideEvent) => ({
   ...sealed.fields,
   event: sealed.name,
   eventId: sealed.id,
@@ -341,7 +341,7 @@ const optionalField = (
 const stampIdentity = (
   event: EvlogWideEvent,
   durationMs: number,
-  config: TelemetryConfigShape,
+  config: ResolvedTelemetryConfig,
 ): EvlogWideEvent => ({
   ...Object.fromEntries(
     Object.entries(event).filter(([key]) => !OPTIONAL_IDENTITY.includes(key)),
@@ -387,7 +387,7 @@ const proveSerializable = (event: EvlogWideEvent): EvlogWideEvent => {
  */
 export const emitWideEvent = (
   sealed: SealedWideEvent,
-  config: TelemetryConfigShape,
+  config: ResolvedTelemetryConfig,
 ): Effect.Effect<Option.Option<EvlogWideEvent>, TelemetryEmitError> =>
   Effect.try({
     try: () => {
@@ -430,7 +430,7 @@ export const exportWideEvents = (
   serviceName: string,
 ): Effect.Effect<void, TelemetryExportError> =>
   Effect.tryPromise({
-    try: () => sendBatchToOTLP([...events], { endpoint, serviceName, recordShape: 'compact' }),
+    try: () => sendBatchToOTLP([...events], { endpoint, serviceName, 'recordShape': 'compact' }),
     catch: (cause) => new TelemetryExportError({ endpoint, events: events.length, cause }),
   });
 
@@ -487,7 +487,7 @@ export const readTelemetryFields = (fields: TelemetryFields): Effect.Effect<Tele
         Effect.flatMap((keys) =>
           Effect.forEach(keys, (key) =>
             fenced(
-              (): readonly [string, unknown] => [key, Reflect.get(fields, key)],
+              (): readonly [string, unknown] => [key, fields[key]],
               (cause): readonly [string, unknown] => [key, unreadable(cause)],
             ),
           ),
@@ -505,12 +505,12 @@ export const readTelemetryFields = (fields: TelemetryFields): Effect.Effect<Tele
  * records that honestly, under a tag {@link REMEDIES} has an entry for, rather
  * than dropping the error channel of the event on the floor.
  */
-export const toEvlogErrorSafely = (error: unknown): Effect.Effect<EvlogError> =>
+export const toEvlogErrorSafely = (cause: unknown): Effect.Effect<EvlogError> =>
   fenced(
-    () => toEvlogError(error),
-    (cause) =>
+    () => toEvlogError(cause),
+    (thrown) =>
       createError({
-        message: unreadable(cause),
+        message: unreadable(thrown),
         code: UNREADABLE_FAILURE_TAG,
         why: remedyFor(UNREADABLE_FAILURE_TAG).why,
         fix: remedyFor(UNREADABLE_FAILURE_TAG).fix,
