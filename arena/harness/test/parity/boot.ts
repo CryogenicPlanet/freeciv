@@ -124,39 +124,20 @@ export const LIVE_STACK_RECORDS_DIR: string = join(LIVE_STACK_DIR, 'local-stack'
 // ---------------------------------------------------------------------------
 
 /**
- * The two darwin facts every file in this directory depends on: `flock` through
- * `bun:ffi` against `libSystem.B.dylib`, and a `python3` that owns
- * `agent_eval`.
- *
- * A partial matrix would report a parity result the platform cannot support, so
- * the gate is right — but a gate that *vanishes* is indistinguishable from a
- * gate that passed.  Demonstrated in a scratch file: a `describe.if(false)`
- * suite reports `0 pass / 1 skip / 0 fail` and exits 0, naming nothing that did
- * not run.  On a Linux box the whole 711-leg matrix would contribute zero
- * assertions and the run would be green.
+ * Ready-file locking has native bindings for Darwin and Linux. A different
+ * platform cannot boot the complete pair and must not report partial parity.
  */
-export const PARITY_PLATFORM_SUPPORTED: boolean = process.platform === 'darwin';
+export const PARITY_PLATFORM_SUPPORTED: boolean =
+  process.platform === 'darwin' || process.platform === 'linux';
 
-/**
- * `ARENA_REQUIRE_PARITY=1` makes a skipped rig a **failure**.
- *
- * The same switch `test/gateway/smoke-live.test.ts:855` reads, and for the same
- * reason: a job that means to *depend* on the parity claim can ask for an error
- * instead of a warning.
- */
-export const PARITY_REQUIRED: boolean = process.env['ARENA_REQUIRE_PARITY'] !== undefined;
+/** `ARENA_REQUIRE_PARITY=1` turns every unsupported-platform skip into failure. */
+export const PARITY_REQUIRED: boolean = process.env['ARENA_REQUIRE_PARITY'] === '1';
 
-/**
- * The loud banner a skipped rig prints, naming exactly what did not run.
- *
- * Returned as a value rather than printed here so the `console.warn` — the one
- * call that has to reach a terminal, since a `bun:test` process has no Logger —
- * stays at the single call site in each test file.
- */
+/** The loud banner a skipped rig prints, naming exactly what did not run. */
 export const paritySkipWarning = (rig: string, whatDidNotRun: string): string =>
-  `\n!! ${rig} DID NOT RUN: platform is ${process.platform}, not darwin.\n` +
+  `\n!! ${rig} DID NOT RUN: platform ${process.platform} is unsupported; expected linux or darwin.\n` +
   `!! ${whatDidNotRun} contributed ZERO assertions to this run.\n` +
-  '!! Set ARENA_REQUIRE_PARITY=1 to make this a failure instead of a warning.\n';
+  '!! ARENA_REQUIRE_PARITY=1 forbids this platform skip.\n';
 
 // ---------------------------------------------------------------------------
 // Upstream fixtures for a gateway that must find no upstream

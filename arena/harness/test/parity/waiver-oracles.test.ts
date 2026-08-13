@@ -1,15 +1,11 @@
 /**
- * The waiver list's **second** oracle.
+ * Independent duplicate-`Content-Length` parser oracles.
  *
- * `waivers.ts` makes a three-part claim about each accepted divergence — Python
- * still does X, Bun still does Y, and X ≠ Y — and `diff.test.ts` checks all
- * three on every run.  That is enough to *police* a waiver and not enough to
- * *justify* one, because the rig that consumes the entry is then the only thing
- * that has ever measured it.  Six of the seven entries name a source outside
- * this directory (`test/gateway/smoke-live.test.ts`, `test/gateway/server.test.ts`);
- * `duplicate-content-length` named `diff.test.ts` itself, and nothing anywhere
- * asserted the joined-`Content-Length` behavior at all — `dispatch.test.ts:484`
- * covers only the *unparseable* value, never `0, 0`.
+ * This file originally corroborated a matrix waiver. The Node server edge now
+ * delivers the same effective first value as CPython, so the matrix leg agrees
+ * and the self-invalidated waiver has been removed. These parser probes remain
+ * useful evidence that bare Bun and CPython still expose repeated fields
+ * differently below the gateway adapter.
  *
  * This file is that missing source, and it deliberately uses **neither
  * gateway**: three measurements, three different oracles, no parity rig.
@@ -27,8 +23,8 @@
  *    `"0, 0"` because Python's `int()` refuses it.  So the `400` is not a port
  *    defect that a waiver excuses; it is the right answer to a different input.
  *
- * Together those three say exactly what the waiver claims: same request, two
- * parsers, two different values delivered to two identical decision procedures.
+ * Together these probes explain the old divergence without continuing to waive
+ * the now-equal gateway behavior.
  *
  * No `describe.if` here.  These oracles need Bun and `python3` and nothing else,
  * so the corroboration exists on every platform the suite runs on — including
@@ -44,7 +40,7 @@ import { PYTHON_BIN } from './boot.ts';
 import { bodySignal } from '../../src/gateway/server.ts';
 import { waiverFor } from './waivers.ts';
 
-/** The leg whose waiver this file exists to corroborate. */
+/** The matrix leg that is now ordinary parity. */
 const LEG = 'duplicate-content-length';
 
 /**
@@ -106,17 +102,9 @@ const askCPythonParser = (): string => {
   return probe.stdout.toString().trim();
 };
 
-describe('the duplicate-Content-Length waiver, corroborated outside the parity rig', () => {
-  test('the waiver still exists and still claims what this file measures', () => {
-    const waiver = waiverFor('matrix', LEG);
-    expect(waiver?.aspects.toSorted()).toEqual(['body', 'reason', 'status']);
-    // The measured signatures the matrix pins: a served `/health` against our
-    // own 400.  Named here so this file fails too if the entry is reworded into
-    // a different claim.
-    expect([waiver?.python.startsWith('200 '), waiver?.typescript.startsWith('400 ')]).toEqual([
-      true,
-      true,
-    ]);
+describe('duplicate Content-Length parser behavior outside the parity rig', () => {
+  test('the self-invalidated matrix waiver was removed', () => {
+    expect(waiverFor('matrix', LEG)).toBeUndefined();
   });
 
   test("Bun joins the two fields into `0, 0` before any handler exists", async () => {
@@ -134,10 +122,9 @@ describe('the duplicate-Content-Length waiver, corroborated outside the parity r
     expect(askCPythonParser()).toBe("'0' 2");
   });
 
-  test("the gateway's 400 is the correct answer to the value Bun delivers", () => {
-    // `int("0, 0")` raises in Python, so `_reject_body` would answer exactly
-    // this if it were ever handed the joined value.  The divergence is in what
-    // the two runtimes deliver, not in what either gateway decides.
+  test('bodySignal still maps both possible parser values correctly', () => {
+    // The Node gateway receives the first value for this raw request now, while
+    // a bare Bun server still exposes the joined value measured above.
     expect(bodySignal(Headers.fromInput({ 'content-length': '0, 0' }))).toBe(
       'invalid-content-length',
     );

@@ -41,14 +41,9 @@
  *
  * Every entry names the rig that replays and polices it ({@link WaiverArena}):
  *
- * - **`matrix`** — `diff.test.ts`, which replays the leg in all nine upstream
- *   scenarios.  Most matrix entries target `/health` or fail before routing
- *   (`/health` never contacts the upstream, `dispatch.ts:504`), so they are
- *   scenario-independent and say nothing about the upstream fixture.  The one
- *   exception is `binary-disk-fallback-chunked`, which is *only* reachable when
- *   the archive is read from disk and therefore carries an explicit
- *   {@link ParityWaiver.scenarios} list; in the other four scenarios the same
- *   legs are compared in full, with no exemption at all.
+ * - **`matrix`** — `diff.test.ts`, which replays each leg in all nine upstream
+ *   scenarios. Current matrix waivers target `/health` or fail before routing,
+ *   so they are scenario-independent and say nothing about the upstream fixture.
  * - **`query-fuzz`** — `hunt-query-fuzz.test.ts`, whose legs are request
  *   targets rather than routes.  Four entries live there because the behavior
  *   they name is a property of a *byte sequence in the request line*, which the
@@ -68,8 +63,8 @@
  * the socket (`content-length`, `chunked`, `until-close`).  Exactly one entry
  * needs it, and needs it twice over: a PNG served from disk has the same
  * status, phrase, type and non-empty body on both sides, so without the
- * framing field the waiver would look dead the moment it was written, and the
- * divergence it exists for would be unobservable.
+ * framing field a framing-only waiver would look dead the moment it was written.
+ * No current waiver needs that extension.
  *
  * @module
  */
@@ -157,18 +152,7 @@ export interface ParityWaiver {
 const JSON_UTF8 = 'application/json; charset=utf-8';
 const STDLIB_HTML = 'text/html;charset=utf-8';
 
-/** The five scenarios in which the archive is read from disk rather than relayed. */
-const DISK_FALLBACK_SCENARIOS: ReadonlyArray<string> = [
-  'upstream-down',
-  'stub-not-found-404',
-  'stub-method-405',
-  'stub-portless',
-  'stub-hang',
-];
-
-/**
- * Twelve entries.  Adding a thirteenth requires a measurement, not an argument.
- */
+/** Ten entries. Adding another requires a measurement, not an argument. */
 export const PARITY_WAIVERS: ReadonlyArray<ParityWaiver> = [
   {
     id: 'bad-content-length',
@@ -182,41 +166,34 @@ export const PARITY_WAIVERS: ReadonlyArray<ParityWaiver> = [
     python: `400 | "Bad Request" | ${JSON_UTF8} | body:nonempty`,
     typescript: '400 | "Bad Request" | - | body:empty',
   },
-  {
-    id: 'transfer-encoding-identity',
-    arena: 'matrix',
-    legs: ['transfer-encoding-identity'],
-    aspects: ['headers', 'body'],
-    reason:
-      '`Transfer-Encoding: identity` is a legal field value CPython treats as "a body is present" (`:1394` → `GET request bodies are not accepted`); Bun rejects the framing outright. `Transfer-Encoding: chunked` does reach the handler and matches, which is what makes this a parser boundary and not a routing difference.',
-    measuredIn:
-      'test/gateway/smoke-live.test.ts "a Transfer-Encoding on a GET is likewise answered by Bun"',
-    python: `400 | "Bad Request" | ${JSON_UTF8} | body:nonempty`,
-    typescript: '400 | "Bad Request" | - | body:empty',
-  },
-  {
-    id: 'duplicate-content-length',
-    arena: 'matrix',
-    legs: ['duplicate-content-length'],
-    aspects: ['status', 'reason', 'body'],
-    reason:
-      'Two `Content-Length: 0` fields, and the two runtimes disagree about what a repeated framing header *is*. CPython reads it through `email.message.Message.get`, which returns the **first** occurrence, so `_reject_body` sees `int("0") == 0`, concludes there is no body, and serves `/health` with a `200`. Bun hands the handler a `Headers` object that has **joined** them into `0, 0`; the port\'s Python-`int` parse refuses that and answers its own `400 invalid Content-Length` — which is the correct answer to the value it was given, and unreachable from the port, because the two fields no longer exist separately by the time any code owned here can look. The **headers** match (both are the gateway\'s own JSON problem shape); only the status, the reason and the body differ. It is also why the parity client treats a joined `Content-Length` as non-numeric (`wire-client.ts` `framedLength`).',
-    measuredIn:
-      'test/parity/waiver-oracles.test.ts — three measurements, none of them this rig: a bare `Bun.serve` is handed `"0, 0"` (so the two fields are gone before any Effect runs), `http.client.parse_headers` returns `\'0\'` out of two occurrences in the same `python3` that owns `agent_eval`, and `server.ts#bodySignal` maps `"0, 0"` to `invalid-content-length`. The signatures below are from a matrix run, which pins the pair in all nine scenarios every time.',
-    python: `200 | "OK" | ${JSON_UTF8} | body:nonempty`,
-    typescript: `400 | "Bad Request" | ${JSON_UTF8} | body:nonempty`,
-  },
+  ...(process.platform === 'darwin'
+    ? [{
+        id: 'transfer-encoding-identity',
+        arena: 'matrix' as const,
+        legs: ['transfer-encoding-identity'],
+        aspects: ['headers', 'body'] as const,
+        reason:
+          '`Transfer-Encoding: identity` is rejected by Node before the handler on Darwin. CPython treats it as a present GET body. Linux delivers it to the handler and needs no waiver.',
+        measuredIn:
+          'test/gateway/smoke-live.test.ts "Transfer-Encoding is either parser-rejected or handled, but never served"',
+        python: `400 | "Bad Request" | ${JSON_UTF8} | body:nonempty`,
+        typescript: '400 | "Bad Request" | - | body:empty',
+      }]
+    : []),
   {
     id: 'space-in-request-target',
     arena: 'matrix',
     legs: ['space-in-request-target'],
     aspects: ['status', 'reason', 'headers', 'body'],
     reason:
-      "`GET /v1/games?a= b HTTP/1.1` — CPython's `parse_request` cannot split three tokens out of four and sends the stdlib `400` page naming the whole line; Bun reads the trailing `b HTTP/1.1` as the protocol version and refuses *that* with a `505`. Neither request ever reaches a router.",
+      "`GET /v1/games?a= b HTTP/1.1` — CPython's `parse_request` cannot split three tokens out of four and sends the stdlib `400` page naming the whole line. Node rejects it before routing too, but Darwin reports `505` while Linux reports `400`; both are bare parser responses.",
     measuredIn:
-      'test/gateway/smoke-live.test.ts "a space in the request target: CPython 400-HTML, Bun 505"',
+      'test/gateway/smoke-live.test.ts "a space in the request target is platform-policed"',
     python: `400 | "Bad request syntax ('GET /v1/games?a= b HTTP/1.1')" | ${STDLIB_HTML} | body:nonempty`,
-    typescript: '505 | "HTTP Version Not Supported" | - | body:empty',
+    typescript:
+      process.platform === 'darwin'
+        ? '505 | "HTTP Version Not Supported" | - | body:empty'
+        : '400 | "Bad Request" | - | body:empty',
   },
   {
     id: 'invented-verb',
@@ -224,11 +201,11 @@ export const PARITY_WAIVERS: ReadonlyArray<ParityWaiver> = [
     legs: ['invented-verb'],
     aspects: ['status', 'reason', 'headers', 'body'],
     reason:
-      "CPython answers any unmapped verb with `501 Unsupported method ('FROB')` and the stdlib HTML page. Bun's parser accepts only known methods and drops the connection with **no response bytes at all**, so there is nothing for the port to answer with. Recorded rather than commented so a future Bun that starts delivering `FROB` fails this list.",
+      "CPython answers an unmapped verb with `501 Unsupported method ('FROB')` and the stdlib HTML page. Node's parser rejects the same request with a bare `400` before the gateway handler runs.",
     measuredIn:
-      'test/gateway/server.test.ts "an invented verb never reaches us at all — Bun closes the connection"',
+      'test/gateway/server.test.ts "an invented verb never reaches us at all — Node\'s parser writes 400"',
     python: `501 | "Unsupported method ('FROB')" | ${STDLIB_HTML} | body:nonempty`,
-    typescript: 'ClosedWithoutResponse',
+    typescript: '400 | "Bad Request" | - | body:empty',
   },
   {
     id: 'trace-501',
@@ -253,24 +230,6 @@ export const PARITY_WAIVERS: ReadonlyArray<ParityWaiver> = [
       'test/gateway/smoke-live.test.ts "HEAD: headers match including Content-Length; the adapter strips the body"',
     python: `405 | "Method Not Allowed" | ${JSON_UTF8} | body:nonempty`,
     typescript: 'Truncated',
-  },
-  {
-    id: 'binary-disk-fallback-chunked',
-    arena: 'matrix',
-    legs: ['frame-zero', 'frame-last', 'frame-latest', 'frame-unpaired-archive'],
-    scenarios: DISK_FALLBACK_SCENARIOS,
-    aspects: ['headers'],
-    headers: ['content-length'],
-    framing: true,
-    reason:
-      // The dossier, consolidated here from `OPEN_FINDINGS` and from
-      // `archive.ts#sendLocalFile`, because this is now the one place that
-      // decides it.
-      'A PNG served from the **disk archive** goes out `Transfer-Encoding: chunked` with no `Content-Length`; CPython sends `Content-Length: st_size` and no chunking. The bytes are byte-identical, `Range` is ignored by both (`200`, never a `206`), and every other compared header matches — only the framing differs. Cause, measured: Bun drops a `Content-Length` from any `Response` whose body is a `ReadableStream` that does not resolve synchronously, which every Effect `Stream` is. Four candidate bodies were built and measured, and each is worse than the divergence: `Bun.file(path)` (a `Blob`) keeps the length but makes **Bun** answer `Range` itself — `Range: bytes=0-9` gets a `206 Partial Content` with `Content-Range` where CPython ignores the header and sends the whole `200`, on `video.mp4`, the one route a browser seeks in on every scrub; `Bun.file(fd)` keeps the length but does not take ownership of the descriptor, so leaving it open leaks one per request (**209 open after 200 requests, measured**) and closing it at scope exit truncates the body (also measured); a `ReadableStream` with `type: "direct"` is still chunked; a `Uint8Array` keeps the length and buffers an 18 MiB video per request. This is therefore a **decision**, not a defect being tolerated: a framing divergence with byte-identical bodies is strictly better than a `200`-versus-`206` status divergence on the video route. It closes when Bun can stream a body of known length, or when the port stops going through `Response` — and this entry dies with it, because the four legs would then match.',
-    measuredIn:
-      'test/gateway/routes-archive.test.ts (the `contentLength` on the response *value*), and the matrix itself: the four legs below, in the five scenarios that read the archive from disk. The `206` and the descriptor-leak numbers were measured against a standalone `Bun.serve` in the same Bun version, not inferred.',
-    python: '200 | "OK" | image/png | body:nonempty | framing:content-length',
-    typescript: '200 | "OK" | image/png | body:nonempty | framing:chunked',
   },
   {
     id: 'query-raw-bytes-utf8-vs-latin1',

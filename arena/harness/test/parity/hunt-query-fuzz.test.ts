@@ -31,36 +31,20 @@
  *   autosaves, so the derivation subprocess runs and the loaders' integer width
  *   is observable in the body.
  *
- * ## Agreements are pinned here, and so are four measured disagreements
+ * ## Agreements and runtime-boundary waivers are pinned here
  *
- * Most of this file is agreement: every leg without a waiver agreed byte for
- * byte on both sides, in every phase it appears in, and is a regression pin
- * from here on.
+ * Every leg without a waiver agrees byte for byte on both sides. The four
+ * runtime-boundary disagreements remain `waivers.ts` entries with measured
+ * signatures, and each fails if either side moves or the implementations begin
+ * to agree. A waiver nobody can observe is a waiver nobody can police.
  *
- * The hunt that produced the table found divergences too, and
- * {@link DIVERGENT_AT_MEASUREMENT} carries every one of them with a
- * disposition, so this table cannot be mistaken for a complete enumeration of
- * the fuzz space.  Four of those rows are now `waivers.ts` entries whose legs
- * live in the `disk` phase below ({@link BOUNDARY_LEGS}): each is replayed on
- * both sides like any other leg, and instead of asserting equality it asserts
- * the **measured signature pair**, failing if either side moves *or* if the two
- * ever agree.  A waiver nobody can observe is a waiver nobody can police.
+ * ## The traversal corpus
  *
- * ## The traversal corpus, and the one row referred upward
- *
- * Bun normalizes `..`, `%2e%2e` and `\\` in the request target before dispatch;
- * `urlsplit` does not.  {@link TRAVERSAL_LEGS} replays the escape-shaped
- * targets that matter — up and out of `/v1/games`, into `/health`, into
- * `/etc/passwd`, through an encoded separator, through the archive's frame
- * path — and both gateways answer **404** to every one of them.  The test *no
- * traversal-shaped target is served by either gateway* asserts that directly,
- * because "no traversal reaches a route it does not name" is a security claim
- * and not a parity one.
- *
- * One target is the exception, it is **not waived**, and it is the reason this
- * section exists: `/v1/games/A/../B/board.json?turn=1` is a `400` on CPython
- * and a **`200` serving game B's board** here.  See
- * {@link CROSS_GAME_DOT_SEGMENT}.
+ * {@link TRAVERSAL_LEGS} replays escape-shaped and normalization-sensitive
+ * targets, including raw cross-game `A/../B`. Node now preserves the raw request
+ * target at the server edge, so that cross-game case is ordinary byte parity:
+ * both gateways refuse it. Backslash and self-dot cases retain their narrower
+ * traversal-safety assertion because their refusal bodies differ.
  *
  * Every process this file spawns binds `--port 0` under a private `mkdtemp`,
  * and the stub binds `127.0.0.1:0`; nothing here can reach a running stack.
@@ -102,129 +86,6 @@ const SHORT_GAME_ID = 'tooshort';
 const VIEWER_PUBLIC_URL = 'http://viewer.parity.invalid';
 
 // ---------------------------------------------------------------------------
-// What was measured to diverge, and is therefore absent from the table
-// ---------------------------------------------------------------------------
-
-/**
- * The rows this hunt removed, with the target that produced each one **and what
- * was done about it**.
- *
- * Kept as data rather than as prose so a future run can re-measure them
- * directly, and so "we found twelve divergences" cannot decay into a sentence
- * nobody can check.  Every row carries a `disposition`, and the three values
- * are the only three there are — note that `open` is not among them, because
- * nothing measured here is still an unclosed defect:
- *
- * - **`fixed`** — the TypeScript gateway was wrong and was changed.  The leg is
- *   no longer a divergence and is now an ordinary *agreement* seed in the table
- *   below, which is the ratchet: the fix cannot silently regress.
- * - **`waived`** — neither gateway decides it.  Bun's parser or its URL layer,
- *   or CPython's own request-line splitter, or the Unicode table a runtime
- *   ships, answers before any code either port owns can see the request.  Each
- *   of these is now a `waivers.ts` entry with a leg in the `disk` phase below
- *   and a measured signature pair, and each fails if the divergence disappears.
- * - **`referred`** — measured, reproducible, and **not** disposed of here.  Bun
- *   resolves dot segments in the request target before dispatch, and one shape
- *   of that reaches a *different resource* than the target names, which is a
- *   security question rather than a parity one.  Recorded, not waived, and
- *   raised with whoever owns the decision.
- */
-export const DIVERGENT_AT_MEASUREMENT: ReadonlyArray<{
-  readonly target: string;
-  readonly python: string;
-  readonly typescript: string;
-  readonly disposition: 'fixed' | 'waived' | 'referred';
-  /** What closed it, what polices it now, or what is waiting on a decision. */
-  readonly note: string;
-}> = [
-  {
-    target: `/v1/games/${ABSENT_GAME_ID}/replay.json?after_turn=%C2%855`,
-    python: '200 — int() strips U+0085 (NEL), so after_turn=5 goes upstream',
-    typescript: '400 after_turn and limit must be integers — String.trim() does not strip U+0085',
-    disposition: 'fixed',
-    note: "`parsePythonInt` strips int()'s whitespace set, enumerated against CPython over every code point; pinned as `after-nel-prefix`",
-  },
-  {
-    target: `/v1/games/${ABSENT_GAME_ID}/replay.json?after_turn=%EF%BB%BF5`,
-    python: '400 — int() does not strip U+FEFF',
-    typescript: '200 — String.trim() does, so after_turn=5 goes upstream',
-    disposition: 'fixed',
-    note: "two causes, not one: `String.trim()` strips U+FEFF where `int()` does not, *and* `pythonUnquote`'s `TextDecoder` removed a leading BOM outright because `ignoreBOM` defaults to `false` — `bytes.decode('utf-8', 'replace')` keeps it. Both are fixed; pinned as `after-bom-prefix` and `turn-bom-prefix`",
-  },
-  {
-    target: `/v1/games/${ABSENT_GAME_ID}/replay.json?after_turn=${'9'.repeat(4301)}`,
-    python: '400 — sys.int_info.default_max_str_digits is 4300; int() raises past it',
-    typescript: '200 — a bigint has no digit cap, and a 4377-byte query is forwarded upstream',
-    disposition: 'fixed',
-    note: '`parsePythonInt` refuses more than 4300 digit characters, measured at both edges; pinned as `after-4301-digits`',
-  },
-  {
-    target: `/v1/games/${ABSENT_GAME_ID}/board.json?turn=%C2%855`,
-    python: '200 — the same NEL asymmetry on the board route',
-    typescript: '400 turn must be an integer',
-    disposition: 'fixed',
-    note: 'one parser, two routes; pinned as `turn-nel-prefix`',
-  },
-  {
-    target: `/v1/games/${VALID_GAME_ID}/replay.json?after_turn=9007199254740993`,
-    python: '200 with "next_after_turn":9007199254740993',
-    typescript: '200 with "next_after_turn":9007199254740991 — toLoaderInteger saturated',
-    disposition: 'fixed',
-    note: "`services/derivation.ts`'s two loader input types take `bigint`, and `toLoaderInteger` is deleted rather than fixed — there is no seam left to saturate at. Pinned twice: as `derive-replay-after-2-53-plus-1` below, where the derived body is compared byte for byte, and as `diff.test.ts`'s `replay-after-turn-2-53-plus-1`, now an ordinary leg",
-  },
-  {
-    target: `/v1/games/${ABSENT_GAME_ID}/board.json?turn=<raw bytes D9 A1>`,
-    python: '400 turn must be an integer — self.path is latin-1, so the bytes are not a digit',
-    typescript:
-      '404 game not found — Bun re-decodes the raw bytes as UTF-8 (U+0661), so turn=1 parsed and the request went on',
-    disposition: 'waived',
-    note: '`waivers.ts#query-raw-bytes-utf8-vs-latin1`, leg `disk-boundary-raw-arabic-indic-digit`. The two runtimes decode the request target with different codecs before either gateway is called; a raw byte that is invalid UTF-8 reaches us as U+FFFD, so the original is not even recoverable',
-  },
-  {
-    target: `/v1/games/${ABSENT_GAME_ID}/board.json\\?turn=1`,
-    python: '400 this viewer route does not accept query parameters — "\\" is not a separator',
-    typescript: '404 game not found — the URL layer turns "\\" into "/", so board.json routes',
-    disposition: 'referred',
-    note: 'WHATWG URL normalization inside the adapter: the path we are handed is already rewritten, and `urlsplit` does no such thing. Safe on this target — the rewritten path names the same game — and pinned by `disk-traversal-backslash-separator`, but it is the same mechanism as the row below and is referred with it rather than waived separately',
-  },
-  {
-    target: `/v1/games/${ABSENT_GAME_ID}/x/../board.json?turn=1`,
-    python: '400 this viewer route does not accept query parameters — urlsplit keeps dot segments',
-    typescript: '404 game not found — the URL layer resolves them, so board.json routes',
-    disposition: 'referred',
-    note: 'the same rewrite, for dot segments. Self-cancelling here, so the resolved path still names the game the target names — but see the next row, which is the same mechanism reaching a resource the target does not name',
-  },
-  {
-    target: `/v1/games/${ABSENT_GAME_ID}/../${VALID_GAME_ID}/board.json?turn=1`,
-    python: '400 this viewer route does not accept query parameters',
-    typescript: `200 serving ${VALID_GAME_ID}'s board — the dot segment is resolved before dispatch`,
-    disposition: 'referred',
-    note: '**NOT WAIVED.** A traversal-shaped target that answers 2xx from a route it does not name is a security question, not a parity one, so it is recorded and raised rather than excused. What it is not: an escape from the runs root or a reach into a route with different exposure — every game under `/v1/games` is equally public and unauthenticated, the id still has to satisfy `GAME_ID_RE`, and the whole traversal corpus (`TRAVERSAL_LEGS`) 404s on both sides, `/health`, `/etc/passwd` and the frame path included. What it is: the TypeScript gateway serving a *different* document than the request line names, where CPython refuses. Pinned as `CROSS_GAME_DOT_SEGMENT` so it cannot change silently',
-  },
-  {
-    target: `/v1/games/${ABSENT_GAME_ID}/replay.json?after_turn=0&limit=250&pad=<16 KiB>`,
-    python: '400 replay query accepts one after_turn and one limit',
-    typescript: '431 with an empty body — Bun refuses a request line past ~16 KiB',
-    disposition: 'waived',
-    note: "`waivers.ts#request-line-length-cap`, leg `disk-boundary-request-line-16k`. Bun's parser answers it itself; CPython's cap is 64 KiB, so the same target reaches do_GET there",
-  },
-  {
-    target: `/v1/games/${ABSENT_GAME_ID}/board.json?turn=<raw byte 85>5`,
-    python: '400 Bad request syntax as stdlib HTML — str.split() treats U+0085 as whitespace',
-    typescript: '400 turn must be an integer as JSON — same status, different body',
-    disposition: 'waived',
-    note: '`waivers.ts#cpython-request-line-nel-split`, leg `disk-boundary-cpython-nel-split`. CPython\'s own request-line splitter, before do_GET: the mirror image of a Bun-parser waiver, and unreachable from either gateway',
-  },
-  {
-    target: `/v1/games/${ABSENT_GAME_ID}/board.json?turn=%F0%91%B7%A05`,
-    python: '400 turn must be an integer — U+11DE0 is unassigned in CPython 3.14.6\'s UCD',
-    typescript: "404 game not found — U+11DE0 is \\p{Nd} in Bun's, so turn=5 parsed",
-    disposition: 'waived',
-    note: '`waivers.ts#query-ucd-skew-11de0`, legs `disk-boundary-ucd-skew-11de0` and `-11de9`. Found by the 2 228 224-code-point differential behind `services/upstream.ts#digitRunOffset`, which agrees with CPython everywhere but this ten-code-point block; it closes when the interpreter\'s table catches up',
-  },
-];
-
-// ---------------------------------------------------------------------------
 // The table
 // ---------------------------------------------------------------------------
 
@@ -242,14 +103,12 @@ interface FuzzLeg {
    * - `status` — the two bodies legitimately differ (the identity payload).
    * - `traversal-safety` — the two sides refuse a traversal-shaped target with
    *   *different* refusals; what is asserted is that both refuse, and that
-   *   neither serves a 2xx.  See {@link TRAVERSAL_LEGS}.
-   * - `referred` — the measured pair of a divergence that is neither fixed nor
-   *   waived.  Exactly one leg, and its test spells the pair out.
+   *   neither serves a 2xx. See {@link TRAVERSAL_LEGS}.
    *
    * A leg named by a `waivers.ts` entry needs none of these: the waiver itself
    * says what to assert.
    */
-  readonly compare?: 'status' | 'traversal-safety' | 'referred';
+  readonly compare?: 'status' | 'traversal-safety';
 }
 
 interface QuerySeed {
@@ -671,7 +530,7 @@ const TRAVERSAL_LEGS: ReadonlyArray<Omit<FuzzLeg, 'phase'>> = [
   {
     name: 'disk-traversal-backslash-separator',
     target: `/v1/games/${ABSENT_GAME_ID}/board.json\\?turn=1`,
-    why: 'a backslash where the ? should be — recorded as referred, and safe: 404 here',
+    why: 'a backslash where the ? should be; both sides refuse it',
     compare: 'traversal-safety',
   },
   {
@@ -698,34 +557,12 @@ const TRAVERSAL_LEGS: ReadonlyArray<Omit<FuzzLeg, 'phase'>> = [
     why: 'a single dot segment after the route, which normalizes to the route itself',
     compare: 'traversal-safety',
   },
+  {
+    name: 'disk-traversal-cross-game-dot-segment',
+    target: `/v1/games/${ABSENT_GAME_ID}/../${VALID_GAME_ID}/board.json?turn=1`,
+    why: 'the raw A/../B target stays raw and both gateways refuse it byte-for-byte',
+  },
 ];
-
-/**
- * The one traversal shape that reaches a document the request line does not
- * name — **referred, not waived**.
- *
- * `/v1/games/A/../B/board.json?turn=1`: CPython answers `400 this viewer route
- * does not accept query parameters`, because `urlsplit` keeps the dot segment
- * and the literal path matches no viewer route.  Bun resolves it before
- * dispatch, so the TypeScript gateway serves **game B's board** with a `200`.
- *
- * It is pinned rather than waived because the waiver rule stops at "neither
- * gateway decides it", and this one has a consequence the rule does not cover:
- * a 2xx from a route the target does not name.  What bounds it — measured, not
- * assumed — is that every game under `/v1/games` is equally public and
- * unauthenticated, that the resolved id still has to satisfy `GAME_ID_RE`, and
- * that every leg in {@link TRAVERSAL_LEGS} 404s on both sides, so nothing
- * escapes the route family or the runs root.  The decision of whether to
- * normalize before dispatch belongs to whoever owns the port's routing
- * contract; this pin makes sure the behavior cannot change without a test
- * saying so.
- */
-const CROSS_GAME_DOT_SEGMENT: Omit<FuzzLeg, 'phase'> = {
-  name: 'disk-traversal-cross-game-dot-segment',
-  target: `/v1/games/${ABSENT_GAME_ID}/../${VALID_GAME_ID}/board.json?turn=1`,
-  why: 'REFERRED: 400 on CPython, 200 serving another game here',
-  compare: 'referred',
-};
 
 /** Every leg, in replay order. */
 export const QUERY_FUZZ_LEGS: ReadonlyArray<FuzzLeg> = [
@@ -733,7 +570,6 @@ export const QUERY_FUZZ_LEGS: ReadonlyArray<FuzzLeg> = [
   ...proxyPhaseLegs('disk'),
   ...BOUNDARY_LEGS.map((leg): FuzzLeg => ({ ...leg, phase: 'disk' })),
   ...TRAVERSAL_LEGS.map((leg): FuzzLeg => ({ ...leg, phase: 'disk' })),
-  { ...CROSS_GAME_DOT_SEGMENT, phase: 'disk' },
   ...DERIVE_LEGS.map((leg): FuzzLeg => ({ ...leg, phase: 'derive' })),
 ];
 
@@ -925,22 +761,6 @@ describe('query-fuzz parity', () => {
             }).toEqual({ leg: leg.name, refusals: ['refused', 'refused'] });
             return;
           }
-          if (leg.compare === 'referred') {
-            expect({
-              python: { status: result.python.status, body: result.python.body },
-              typescript: {
-                status: result.typescript.status,
-                servesAnotherGame: result.typescript.body.includes('altitude_rows'),
-              },
-            }).toEqual({
-              python: {
-                status: 400,
-                body: '{"error":"this viewer route does not accept query parameters"}',
-              },
-              typescript: { status: 200, servesAnotherGame: true },
-            });
-            return;
-          }
           expect(comparable(leg, result.typescript)).toEqual(comparable(leg, result.python));
         });
       });
@@ -977,46 +797,6 @@ describe('query-fuzz parity', () => {
     expect(refusalsThatProxied).toEqual([]);
   });
 
-  test('the measured divergences are recorded, not silently dropped', () => {
-    expect(DIVERGENT_AT_MEASUREMENT.length).toBeGreaterThan(0);
-    expect(
-      DIVERGENT_AT_MEASUREMENT.filter((finding) => finding.python === finding.typescript),
-    ).toEqual([]);
-  });
-
-  test('every recorded divergence carries a disposition and a reason', () => {
-    // The point of the field: "found ten divergences" is a claim, "four fixed,
-    // one pinned as a finding, five at a runtime boundary" is a report.
-    expect(
-      DIVERGENT_AT_MEASUREMENT.filter((finding) => finding.note.trim() === '').map(
-        (finding) => finding.target,
-      ),
-    ).toEqual([]);
-    const byDisposition = DIVERGENT_AT_MEASUREMENT.reduce<Record<string, number>>(
-      (counts, finding) => ({
-        ...counts,
-        [finding.disposition]: (counts[finding.disposition] ?? 0) + 1,
-      }),
-      {},
-    );
-    expect(byDisposition).toEqual({ fixed: 5, waived: 4, referred: 3 });
-  });
-
-  test('every fixed divergence is now pinned as an agreement leg', () => {
-    // A fix with no leg is a fix that can regress silently.  Each of the five
-    // targets below appears in the table above under a name of its own.
-    const pinned = [
-      'after-nel-prefix',
-      'after-bom-prefix',
-      'after-4301-digits',
-      'turn-nel-prefix',
-      'after-2-53-plus-1',
-    ];
-    expect(
-      pinned.filter((suffix) => !QUERY_FUZZ_LEGS.some((leg) => leg.name.endsWith(suffix))),
-    ).toEqual([]);
-  });
-
   test('every waived divergence has a leg in this file that exercises it', () => {
     // The other half of the same rule: a waiver with no leg is a paragraph.
     const legs = new Set(QUERY_FUZZ_LEGS.map((leg) => leg.name));
@@ -1034,22 +814,11 @@ describe('query-fuzz parity', () => {
     ).toEqual([]);
   });
 
-  /**
-   * The security promise, stated once for the whole corpus rather than leg by
-   * leg: a traversal-shaped target is refused on **both** sides, and the
-   * TypeScript side never answers 2xx to one.
-   *
-   * The single exception is the referred leg, which is exactly why it is
-   * referred; it is excluded by name so this test cannot be quietly widened to
-   * cover it.
-   */
+  /** Every traversal-shaped target, including raw A/../B, is refused by both sides. */
   test('no traversal-shaped target is served by either gateway', () => {
     const report = reportFor('disk');
     const served = QUERY_FUZZ_LEGS.filter(
-      (leg) =>
-        leg.phase === 'disk' &&
-        leg.name.startsWith('disk-traversal-') &&
-        leg.name !== CROSS_GAME_DOT_SEGMENT.name,
+      (leg) => leg.phase === 'disk' && leg.name.startsWith('disk-traversal-'),
     ).flatMap((leg) => {
       const result = report.results.get(leg.name);
       if (result === undefined) return [`${leg.name}/did-not-run`];

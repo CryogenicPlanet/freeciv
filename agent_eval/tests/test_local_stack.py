@@ -2,6 +2,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from argparse import Namespace
@@ -242,8 +243,9 @@ class ReplayCommandTests(unittest.TestCase):
         self.assertEqual(
             run.call_args_list[0].args[0], ["portless", "get", "freeciv"],
         )
+        opener = "open" if sys.platform == "darwin" else "xdg-open"
         run.assert_called_with(
-            ["open", f"https://freeciv.localhost/watch/{game_id}"],
+            [opener, f"https://freeciv.localhost/watch/{game_id}"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
@@ -271,8 +273,9 @@ class ReplayCommandTests(unittest.TestCase):
             "agent_eval.local_stack.subprocess.run", side_effect=fake_run,
         ) as run:
             self.assertEqual(replay(Namespace(game_id=game_id, no_open=False)), 0)
+        opener = "open" if sys.platform == "darwin" else "xdg-open"
         self.assertEqual(
-            run.call_args_list[-1].args[0], ["open", f"{base}/watch/{game_id}"],
+            run.call_args_list[-1].args[0], [opener, f"{base}/watch/{game_id}"],
         )
 
     def test_replay_failure_tells_user_to_start_stack(self):

@@ -23,16 +23,10 @@
  *
  * ## What this file pins, and what it does not
  *
- * **Only agreement.**  Every assertion below was measured green against both
- * gateways; a divergence found by the same hunt belongs in the hunt's report
- * and in the file that owns the ratchet, not here.  One such divergence is
- * live and is the reason {@link BINARY_ROUTE_ASPECTS} exists: a PNG served from
- * the **disk archive** goes out `Transfer-Encoding: chunked` with no
- * `Content-Length` on the TypeScript side
- * (`waivers.ts#binary-disk-fallback-chunked`, policed by the matrix in the five
- * scenarios that read the archive from disk).  The *bytes* agree, so the binary
- * legs here pin status, reason and body and leave the framing headers to the
- * entry that owns them.
+ * **Only agreement.** Every assertion below was measured green against both
+ * gateways; a divergence found by the same hunt belongs in the file that owns
+ * the ratchet. Binary routes now include `Content-Length` in that agreement
+ * after the Node server edge closed the former framing waiver.
  *
  * ## The fixture tree is copied, never used in place
  *
@@ -87,8 +81,8 @@ import { VALID_GAME_ID } from './fixtures/request-cases.ts';
 import { makeStub, type StubHandle } from './stub-supervisor.ts';
 import { bodyLatin1, isWireResponse, wireRequest, type WireOutcome } from './wire-client.ts';
 
-/** `flock` through `bun:ffi` and the `python3` that owns `agent_eval`. */
-const DARWIN = PARITY_PLATFORM_SUPPORTED;
+/** Linux and Darwin have the native locking support needed by the full rig. */
+const PLATFORM_SUPPORTED = PARITY_PLATFORM_SUPPORTED;
 
 /**
  * Unconditional, and the only test this file registers outside the gated
@@ -101,7 +95,7 @@ const DARWIN = PARITY_PLATFORM_SUPPORTED;
  * them.
  */
 test('the state and cache fuzz is not silently skipped', () => {
-  if (!DARWIN) {
+  if (!PLATFORM_SUPPORTED) {
     // oxlint-disable-next-line effecttsgo/global-console -- a skipped oracle has
     // to reach a terminal; there is no Logger in a bun:test process.
     console.warn(
@@ -111,7 +105,10 @@ test('the state and cache fuzz is not silently skipped', () => {
       ),
     );
   }
-  expect({ platform: process.platform, ranTheFuzz: DARWIN || !PARITY_REQUIRED }).toEqual({
+  expect({
+    platform: process.platform,
+    ranTheFuzz: PLATFORM_SUPPORTED || !PARITY_REQUIRED,
+  }).toEqual({
     platform: process.platform,
     ranTheFuzz: true,
   });
@@ -145,17 +142,8 @@ const COMPARED_HEADERS: ReadonlyArray<string> = [
   'content-length',
 ];
 
-/**
- * The binary legs compare everything *except* the framing headers.
- *
- * Not a weakening: `waivers.ts#binary-disk-fallback-chunked` owns that
- * divergence, and the matrix asserts both sides' framing there — including that
- * the two still differ.  Pinning it here too would duplicate a claim this file
- * did not measure, and pinning the *current* framing would freeze it.
- */
-const BINARY_ROUTE_ASPECTS: ReadonlyArray<string> = COMPARED_HEADERS.filter(
-  (name) => name !== 'content-length',
-);
+/** Binary legs now compare the full matrix header set, framing included. */
+const BINARY_ROUTE_ASPECTS: ReadonlyArray<string> = COMPARED_HEADERS;
 
 const digest = (text: string): string =>
   createHash('sha256').update(Buffer.from(text, 'latin1')).digest('hex').slice(0, 16);
@@ -569,7 +557,7 @@ const mainRoutes = (): ReadonlyArray<readonly [string, string]> => [
 ];
 
 beforeAll(async () => {
-  if (!DARWIN) return;
+  if (!PLATFORM_SUPPORTED) return;
   const scratch = mkdtempSync(join(tmpdir(), 'arena-hunt-state-'));
   state.scratches = [scratch];
   const runsRoot = cloneFixtures(join(scratch, 'runs'));
@@ -1009,7 +997,7 @@ afterAll(async () => {
 // The pins
 // ---------------------------------------------------------------------------
 
-describe.if(DARWIN)('state and cache fuzz', () => {
+describe.if(PLATFORM_SUPPORTED)('state and cache fuzz', () => {
   describe('a warm answer is the cold answer', () => {
     DERIVATION_ROUTES.forEach((route) => {
       test(`${route.name} — cold, warm, warm again and re-cold are one body on both sides`, () => {

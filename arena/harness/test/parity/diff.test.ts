@@ -33,7 +33,7 @@
  * | Aspect | Rule |
  * |---|---|
  * | outcome | a response, or the same failure tag on both sides — a closed connection is a comparison subject, not an error |
- * | answered at all | **both** sides must produce a response, in every scenario, except the two waived silences.  Without this the row above would score a mutual timeout as parity |
+ * | answered at all | **both** sides must produce a response, in every scenario, except the one waived `HEAD` truncation. Without this the row above would score a mutual timeout as parity |
  * | status | equal |
  * | reason phrase | equal.  Included because it is the *only* observable of the discarded-`statusText` waiver; without it that waiver could never be policed |
  * | headers | {@link COMPARED_HEADERS}, case-insensitively, values exact |
@@ -54,14 +54,10 @@
  *    never reaches an archive document.  That is a *configuration* choice
  *    rather than a comparison weakening: the flag is byte-identical in both
  *    argvs, and `argvParity` asserts it.
- * 2. **`waivers.ts`** lists the divergences either runtime's HTTP layer imposes
- *    below any code the port owns — eight of them reach this file, seven
- *    scenario-independent and one (`binary-disk-fallback-chunked`) scoped to
- *    the five scenarios that read the archive from disk, waiving one header
- *    name and nothing else.  Each waived leg still asserts the TypeScript
- *    side's *actual* behavior, in every scenario the entry claims; a waiver
- *    that stops being needed fails the suite, and one that exempts anything
- *    outside its own scenarios fails it too.
+ * 2. **`waivers.ts`** lists the six scenario-independent divergences imposed by
+ *    a runtime's HTTP layer below code the port owns. Each waived leg still
+ *    asserts the TypeScript side's actual behavior; a waiver that stops being
+ *    needed fails the suite.
  *
  * Anything else that diverges is a bug, and this file reports it as one.
  *
@@ -92,8 +88,8 @@
  *
  * ## The platform gate is announced
  *
- * Everything below runs under `describe.if(DARWIN)`, and the *first* test in
- * the file is unconditional and says so when it does not run.
+ * Everything below runs on Linux and Darwin. The *first* test is unconditional
+ * and reports an unsupported-platform skip.
  *
  * @module
  */
@@ -138,17 +134,8 @@ import {
 } from './waivers.ts';
 import { bodyLatin1, isWireResponse, type WireOutcome, wireRequest } from './wire-client.ts';
 
-/**
- * `flock` through `bun:ffi`, and the `python3` that owns `agent_eval`, are
- * darwin facts in this checkout.  The tag is on the whole file because a
- * partial matrix would report a parity result the platform cannot support.
- *
- * The skip is **announced** — see the unconditional test right below, which is
- * the only thing this file registers outside a gated `describe` and therefore
- * the only thing standing between "the matrix passed" and "the matrix was never
- * built".
- */
-const DARWIN = PARITY_PLATFORM_SUPPORTED;
+/** Linux and Darwin have the native locking support needed by the full rig. */
+const PLATFORM_SUPPORTED = PARITY_PLATFORM_SUPPORTED;
 
 /**
  * Unconditional, and deliberately the first test in the file.
@@ -160,7 +147,7 @@ const DARWIN = PARITY_PLATFORM_SUPPORTED;
  * against CPython, and exits 0.
  */
 test('the diff matrix is not silently skipped', () => {
-  if (!DARWIN) {
+  if (!PLATFORM_SUPPORTED) {
     // oxlint-disable-next-line effecttsgo/global-console -- a skipped oracle has
     // to reach a terminal; there is no Logger in a bun:test process.
     console.warn(
@@ -170,7 +157,10 @@ test('the diff matrix is not silently skipped', () => {
       ),
     );
   }
-  expect({ platform: process.platform, ranTheMatrix: DARWIN || !PARITY_REQUIRED }).toEqual({
+  expect({
+    platform: process.platform,
+    ranTheMatrix: PLATFORM_SUPPORTED || !PARITY_REQUIRED,
+  }).toEqual({
     platform: process.platform,
     ranTheMatrix: true,
   });
@@ -311,7 +301,7 @@ const ROUTE_LEGS: ReadonlyArray<MatrixLeg> = [
   get(
     'replay-after-turn-2-53-plus-1',
     `/v1/games/${VALID_GAME_ID}/replay.json?after_turn=9007199254740993`,
-    'a turn no double spells, echoed back as next_after_turn — the open finding the query fuzz measured',
+    'a turn no double spells, echoed back as next_after_turn — the fixed query-fuzz seed',
   ),
   get('replay-cold', `/v1/games/${VALID_GAME_ID}/replay.json?limit=5`, 'the first request after freshCaches: pays for the derivation subprocess'),
   get('replay-warm', `/v1/games/${VALID_GAME_ID}/replay.json?limit=5`, 'the same request again: reads what the cold leg wrote, and must be byte-identical to it'),
@@ -354,7 +344,7 @@ const ROUTE_LEGS: ReadonlyArray<MatrixLeg> = [
     bodyRule: 'bytes',
   },
   { name: 'trace-501', method: 'TRACE', target: '/health', why: 'an unmapped-but-known verb: the stdlib 501 page, and the reason phrase waiver', bodyRule: 'bytes' },
-  { name: 'invented-verb', method: 'FROB', target: '/health', why: 'a verb no parser knows: CPython answers 501, Bun closes the connection', bodyRule: 'bytes' },
+  { name: 'invented-verb', method: 'FROB', target: '/health', why: 'a verb no parser knows: CPython answers 501, Node answers 400', bodyRule: 'bytes' },
   // --- request bodies -----------------------------------------------------
   {
     name: 'get-with-body',
@@ -402,7 +392,7 @@ const ROUTE_LEGS: ReadonlyArray<MatrixLeg> = [
     name: 'duplicate-content-length',
     method: 'GET',
     target: '/health',
-    why: 'WAIVED: CPython reads the first occurrence and serves; Bun refuses the framing',
+    why: 'both Node and CPython now deliver the first occurrence and serve identically',
     headers: [
       ['Content-Length', '0'],
       ['Content-Length', '0'],
@@ -777,16 +767,10 @@ const divergences = (leg: MatrixLeg, sides: Sided<WireOutcome>): ReadonlyArray<D
 /**
  * The divergences a waiver does not excuse — what a leg's test asserts is empty.
  *
- * An `outcome` divergence (one side never produced a response at all) is
- * excused only by a waiver that also waives `status`, which is true of exactly
- * the two legs where Bun answers with silence: the invented verb and the
- * body-visible `HEAD`.
- *
- * `scenario` and the divergence's `detail` are both load-bearing rather than
- * decorative: one waiver is scoped to the five scenarios that read the archive
- * from disk, and it waives a single *header name* out of the compared set, so a
- * leg that starts diverging on a second header — or in a sixth scenario — is an
- * ordinary failure.
+ * An `outcome` divergence (one side never produced a complete response) is
+ * excused only by a waiver that also waives `status`; currently that is only
+ * the body-visible `HEAD` truncation. `scenario` remains part of the lookup so
+ * a future narrowly scoped waiver cannot exempt any other scenario.
  */
 const unwaived = (
   scenario: string,
@@ -852,14 +836,10 @@ const unwaived = (
  *    input types, and `toLoaderInteger` deleted rather than fixed — there is now
  *    no seam to saturate at.  The leg is an ordinary comparison from here on,
  *    and the derived body echoes the digits CPython echoes.
- * 4. **`binary-disk-fallback-chunked`** — the one that did *not* close in the
- *    gateway.  Its obvious fix was built, measured, and rejected: the body type
- *    that keeps `Content-Length` also makes Bun answer `Range` with a `206`
- *    where CPython ignores the header and sends a `200`, and trading a framing
- *    divergence for a status divergence on the video route is not a fix.  It
- *    moved to `waivers.ts` with the whole measurement table, and it is policed
- *    there exactly as tightly: four legs, five scenarios, the bytes still
- *    compared byte-for-byte, and the entry dies the moment the two sides agree.
+ * 4. **`binary-disk-fallback-chunked`** — originally accepted as a framing
+ *    waiver. The later Node server edge preserves the known length while still
+ *    streaming, so all four frame legs now compare normally and the
+ *    self-invalidated waiver was removed.
  */
 
 // ---------------------------------------------------------------------------
@@ -927,8 +907,8 @@ const renderReport = (reports: ReadonlyMap<string, ScenarioReport>): ReadonlyArr
  * comparison subject — but that reading is only safe if something else insists
  * a leg answered in the first place.  Nothing did: a mutual timeout in any of
  * the seven healthy scenarios would have compared no status, no header and no
- * byte, and passed.  `hunt-header-method-fuzz.test.ts:456` already refuses a
- * non-response the strong way; this is the matrix doing the same.
+ * byte, and passed. This matrix therefore refuses a non-response explicitly
+ * rather than accepting matching absence as parity.
  *
  * A leg the scenario never ran at all is reported here too, rather than being
  * silently absent from the list.
@@ -952,12 +932,10 @@ const MATRIX_WAIVERS: ReadonlyArray<ParityWaiver> = waiversIn('matrix');
 /**
  * The silences the rig accepts, derived rather than restated.
  *
- * A waiver whose measured signature for a side is an outcome *tag* rather than
- * a status line is a waiver that says "this side answers nothing": Bun's
- * `ClosedWithoutResponse` on an invented verb, and the `Truncated` read of an
- * adapter-stripped `HEAD` body.  Reading it off `waivers.ts`
- * ({@link waiverExpectsNoResponse}) means the exempt set cannot drift from the
- * waiver list, and that deleting a waiver deletes its exemption.
+ * A waiver whose measured signature is an outcome tag says that side produced
+ * no complete response. Currently this is the `Truncated` read of an
+ * adapter-stripped `HEAD` body. Reading it off `waivers.ts`
+ * ({@link waiverExpectsNoResponse}) keeps the exemption derived from the list.
  */
 const WAIVED_SILENCES: ReadonlyArray<string> = MATRIX_WAIVERS.flatMap((waiver) =>
   SIDES.flatMap((side) =>
@@ -966,7 +944,7 @@ const WAIVED_SILENCES: ReadonlyArray<string> = MATRIX_WAIVERS.flatMap((waiver) =
 ).toSorted();
 
 beforeAll(async () => {
-  if (!DARWIN) return;
+  if (!PLATFORM_SUPPORTED) return;
   const stubs = STUB_MODES.map((mode) => makeStub(mode));
   const scenarios: ReadonlyArray<ScenarioSpec> = [
     UPSTREAM_DOWN,
@@ -1027,7 +1005,7 @@ const SCENARIO_NAMES: ReadonlyArray<string> = [
   ...(LIVE_SCENARIO === null ? [] : [LIVE_SCENARIO.name]),
 ];
 
-describe.if(DARWIN)('the diff matrix', () => {
+describe.if(PLATFORM_SUPPORTED)('the diff matrix', () => {
   SCENARIO_NAMES.forEach((scenario) => {
     describe(scenario, () => {
       test('both gateways were given the same flags, modulo the two slot-scoped ones', () => {
@@ -1104,7 +1082,7 @@ const waivedScenarios = (waiver: ParityWaiver): ReadonlyArray<string> =>
     ? SCENARIO_NAMES
     : SCENARIO_NAMES.filter((scenario) => waiver.scenarios?.includes(scenario) === true);
 
-describe.if(DARWIN)('waivers', () => {
+describe.if(PLATFORM_SUPPORTED)('waivers', () => {
   test('every matrix waiver names legs that exist', () => {
     const unknown = MATRIX_WAIVERS.flatMap((waiver) =>
       waiver.legs.filter((leg) => MATRIX_LEGS.every((candidate) => candidate.name !== leg)),
@@ -1210,7 +1188,7 @@ describe.if(DARWIN)('waivers', () => {
  * scenario is what keeps the fixture honest — and it is the only assertion in
  * this file that is about one implementation rather than about the pair.
  */
-describe.if(DARWIN)('the request-case table still describes CPython', () => {
+describe.if(PLATFORM_SUPPORTED)('the request-case table still describes CPython', () => {
   CASE_LEGS.forEach((leg) => {
     test(leg.name, () => {
       const expectation = leg.expected;

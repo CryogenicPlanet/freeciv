@@ -359,7 +359,7 @@ const transportRequest = (places: DerivationRequest['places'] = []): DerivationR
   operation: 'board',
   gameId: GAME_ID,
   places,
-  turn: 1,
+  turn: 1n,
 });
 
 const transportOptions = (python: string, timeout?: Duration.DurationInput) => {
