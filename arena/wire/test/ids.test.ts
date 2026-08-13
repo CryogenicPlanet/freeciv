@@ -212,9 +212,8 @@ const AGENT_EVAL = `${import.meta.dir}/../../../agent_eval`;
  *
  * **Ungated on purpose.**  A missing `agent_eval/` used to make these tests
  * *skip*, so a checkout without the Python side reported the whole parity story
- * green while checking nothing.  This throws at module load instead, which is
- * the standard `test/canon.test.ts` and `test/fnv1a64.test.ts` already set for
- * the python3 oracle: a missing authority fails, it does not disappear.
+ * green while checking nothing. This throws at module load instead, matching
+ * the canonical-JSON oracle: a missing authority fails, it does not disappear.
  */
 const readPythonSource = (path: string): Promise<string> => Bun.file(path).text();
 

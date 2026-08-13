@@ -1,7 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
-import { Either } from 'effect';
+import { Either, ParseResult, Schema } from 'effect';
+import { decodeWire, encodeWire } from 'src/codec';
 import { decodeWatchResponse } from 'src/gateway/archive';
 import {
   decodeGamesIndexResponse,
@@ -66,6 +67,18 @@ const validCorpus = [
   [decodeWatchResponse, 'live/supervisor-watch.json'],
 ] as const;
 
+const versionedCases = [
+  ['identity', decodeGatewayIdentity, 'live/gateway-health.json'],
+  ['games index', decodeGamesIndexResponse, 'live/gateway-games-index.json'],
+  ['game status', decodeGameStatus, 'live/supervisor-status-running.json'],
+  ['manifest', decodeManifest, 'runs/manifest/running-v2-multiplayer.json'],
+  ['watch', decodeWatchResponse, 'live/gateway-watch-terminal.json'],
+  ['replay', decodeReplayResponse, 'live/gateway-replay-terminal-limit5.json'],
+  ['board', decodeBoardResponse, 'live/gateway-board-turn1.json'],
+  ['events', decodeGameEventsResponse, 'live/gateway-events.json'],
+  ['technology catalog', decodeTechnologyCatalog, 'runs/replay-catalog/tech-tree-with-depth-and-requires.json'],
+] as const;
+
 const invalidCorpus = [
   ...[
     'manifest-current-turn-fractional.json',
@@ -107,7 +120,21 @@ describe('current gateway schemas', () => {
     expect(accepts(decode(read(path)))).toBe(false);
   });
 
-  test('nested unknown fields and future versions are rejected with paths', () => {
+  test.each(versionedCases)('%s requires the current integer schema version', (_name, decoder, path) => {
+    const decode = decoder as (input: unknown) => Either.Either<unknown, unknown>;
+    const value = read(path) as Record<string, unknown>;
+    const { schema_version: _schemaVersion, ...missing } = value;
+    for (const candidate of [
+      missing,
+      { ...value, schema_version: '1' },
+      { ...value, schema_version: 0 },
+      { ...value, schema_version: 2 },
+    ]) {
+      expect(accepts(decode(candidate))).toBe(false);
+    }
+  });
+
+  test('nested unknown fields are rejected with their path', () => {
     const manifest = read('runs/manifest/running-v2-multiplayer.json') as Record<string, unknown>;
     const config = manifest['config'] as Record<string, unknown>;
     const nested = decodeManifest({ ...manifest, config: { ...config, future_field: true } });
@@ -115,11 +142,47 @@ describe('current gateway schemas', () => {
     if (Either.isLeft(nested)) {
       expect(nested.left.issues.some((issue) => issue.path.join('.') === 'config.future_field')).toBe(true);
     }
-    expect(accepts(decodeManifest({ ...manifest, schema_version: 2 }))).toBe(false);
   });
 
   test('problem bodies are exact', () => {
     expect(accepts(decodeGatewayProblem({ error: 'not found' }))).toBe(true);
     expect(accepts(decodeGatewayProblem({ error: 'not found', code: 'future' }))).toBe(false);
+  });
+});
+
+describe('strict codec errors', () => {
+  const Packet = Schema.Struct({ mode: Schema.Literal('v1') });
+  const FailingEncodePacket = Schema.transformOrFail(
+    Schema.Struct({ mode: Schema.String }),
+    Packet,
+    {
+      strict: true,
+      decode: () => ParseResult.succeed({ mode: 'v1' as const }),
+      encode: (value, _options, ast) =>
+        ParseResult.fail(new ParseResult.Type(ast, value, 'test encode failure')),
+    },
+  );
+  const decodePacket = decodeWire(Packet, 'Packet');
+  const encodePacket = encodeWire(Packet, 'Packet');
+  const encodeFailingPacket = encodeWire(FailingEncodePacket, 'FailingEncodePacket');
+
+  test('decode errors retain the schema name and excess-field path', () => {
+    const result = decodePacket({ mode: 'v1', future: true });
+    expect(Either.isLeft(result)).toBe(true);
+    if (Either.isLeft(result)) {
+      expect(result.left.schemaName).toBe('Packet');
+      expect(result.left.issues.some((issue) => issue.path.join('.') === 'future')).toBe(true);
+    }
+  });
+
+  test('encoding emits the current shape and returns typed failures', () => {
+    expect(encodePacket({ mode: 'v1' })).toEqual(Either.right({ mode: 'v1' }));
+    const result = encodeFailingPacket({ mode: 'v1' });
+    expect(Either.isLeft(result)).toBe(true);
+    if (Either.isLeft(result)) {
+      expect(result.left._tag).toBe('WireEncodeError');
+      expect(result.left.schemaName).toBe('FailingEncodePacket');
+      expect(result.left.message).toContain('test encode failure');
+    }
   });
 });

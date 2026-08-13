@@ -12,11 +12,9 @@
  * independently and identically.  One home, so a future protocol cannot be
  * added to one copy and not the other.
  *
- * What is *not* consolidated here, deliberately: `src/agent/protocol.ts`
- * re-states `full-control-v2` as `ControlProtocolV2`, a one-element literal.
- * That is not a duplicate of {@link ControlProtocol} — it is the narrower claim
- * that a v2 envelope header may carry only that one value, and widening it to
- * this schema would let a `strategic-v1` envelope decode as a v2 one.
+ * Agent-envelope schemas are intentionally outside this gateway package; add
+ * their narrower protocol literal alongside a concrete consumer rather than
+ * widening this gateway vocabulary speculatively.
  */
 import { Schema } from 'effect';
 
@@ -32,9 +30,8 @@ export const STRATEGIC_V1 = 'strategic-v1';
  * The gateway *omits* the key entirely for anything outside this set
  * (`replay_gateway.py:475`) rather than passing the unknown value through, so
  * a decoder that sees one is looking at a payload the gateway did not write.
- * Where a producer other than the gateway may send an unrecognized value,
- * `src/gateway/manifest.ts` keeps it under the `UnrecognizedControlProtocol`
- * brand instead of dropping it.
+ * On-disk current-version manifests use the same closed set and reject an
+ * unrecognized value during decoding.
  */
 export const CONTROL_PROTOCOLS = [STRATEGIC_V1, FULL_CONTROL_V2] as const;
 

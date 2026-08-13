@@ -2,17 +2,11 @@
  * Barrel for the replay gateway's read-only payloads.
  *
  * These are the documents `agent_eval/replay_gateway.py` serves and the four
- * on-disk files it serves them from — the half of the protocol a *spectator*
- * sees.  The other half, the packets an agent exchanges with the supervisor,
- * is `../agent/index.ts`; the two share `../canon.ts`, `../json.ts`,
- * `../numeric.ts`, `../codec.ts` and the vocabularies in `../ids.ts` and
- * `../control-protocol.ts`, and nothing else.
+ * on-disk files it serves them from — the protocol a spectator sees.
  *
  * Reached as `Gateway` from the package barrel: `Wire.Gateway.decodeManifest`.
- * The namespace is not decoration — `Manifest`, `GameStatus` and `TimingMode`
- * are only unambiguous next to the word `Gateway`, since the agent half names
- * some of the same concepts differently and one of them (`WireInt`) the same
- * way with a different meaning.  See `../numeric.ts`.
+ * The namespace keeps these route and archive contracts distinct from the
+ * package's generic canonical-JSON and identifier helpers.
  *
  * Names are listed rather than `export *`-ed so that the public surface is a
  * written artifact: adding a module export does not silently widen the

@@ -37,10 +37,10 @@
  * document order and asserts float-spelled ⟺ decoded `number`,
  * int-spelled ⟺ decoded `bigint`.
  *
- * Three residual gaps are unrecoverable from parsed JSON and are documented
- * where they occur rather than papered over: {@link WireNumber} on
- * `mean_latency_ms` (see {@link SeatStats}), on `cost_base`, and the Lua
- * writer's float-spelled technology ids (see {@link TechnologyEntry}).
+ * The residual int/float gaps are unrecoverable from parsed JSON and use
+ * {@link WireNumber}: `mean_latency_ms` (see {@link SeatStats}) and catalog
+ * `cost_base`. Technology ids are integral and bounded by
+ * {@link MAX_TECHNOLOGY_ID} in the shared catalog schema.
  *
  * ## Optionality
  *

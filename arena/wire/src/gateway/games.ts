@@ -67,9 +67,8 @@ import {
 
 /**
  * `"schema_version": 1` — hardcoded by every gateway-built payload
- * (`:836`, `:1096`, `:1049`, `:1305`).  It has never been bumped and is not
- * yet a discriminator, but it is always present, so requiring it keeps a
- * non-gateway document from decoding as one.
+ * (`:836`, `:1096`, `:1049`, `:1305`). Version 1 is the only supported
+ * current shape: missing, malformed, older, and future versions are rejected.
  */
 export const SchemaVersion1 = WireInt.pipe(
   Schema.filter((value) => value === 1n, {
