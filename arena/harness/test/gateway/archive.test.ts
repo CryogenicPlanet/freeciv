@@ -64,6 +64,7 @@ import {
   terminalArchiveView,
 } from '../../src/gateway/archive.ts';
 import { type Canonical, isUntrusted, publicPlaces, type Untrusted } from '../../src/gateway/public.ts';
+import { parsePythonJson } from '../../src/gateway/python-json.ts';
 
 // ---------------------------------------------------------------------------
 // The oracle
@@ -210,7 +211,7 @@ const frameIndex = (value: number): FrameIndex =>
   Either.getOrThrowWith(decodeFrameIndex(value), (error) => new Error(String(error)));
 
 const parseJson = (text: string): Option.Option<unknown> =>
-  Option.getRight(Either.try(() => JSON.parse(text) as unknown));
+  Option.getRight(parsePythonJson(text));
 
 // ---------------------------------------------------------------------------
 // The corpus
@@ -494,9 +495,9 @@ describe('archiveVictory', () => {
     expect(odd.winners).toEqual(['w']);
   });
 
-  it('restores the int spelling a relayed turn was read with', () => {
+  it('preserves the int spelling the disk reader supplied', () => {
     const victory = Option.getOrThrow(
-      archiveVictory(Option.some({ victory: 'turn_limit', turn: 753, year: 1.5 })),
+      archiveVictory(parseJson('{"victory":"turn_limit","turn":753,"year":1.5}')),
     );
     expect(victory.turn).toBe(753n);
     expect(victory.year).toBe(1.5);

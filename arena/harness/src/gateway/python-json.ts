@@ -56,13 +56,13 @@
  * is typed `any`, and this module contains no assertion the compiler is asked
  * to take on trust.
  *
- * ## What it deliberately does not accept
- *
- * `NaN`, `Infinity` and `-Infinity`, which CPython's `json.loads` *does*
- * accept.  Refusing them preserves the behaviour the port already had (they
- * arrive as a parse failure), and the canonical writer refuses them anyway
- * under `allow_nan=False` — a document carrying one has no byte-parity answer
- * on either side of the seam.
+ * Python's three non-standard numeric tokens (`NaN`, `Infinity` and
+ * `-Infinity`) are accepted too.  They remain JavaScript numbers so the public
+ * projections can apply the same finite-number checks as Python. If one is
+ * relayed unchanged, `@arena/wire` still refuses it under its repository-wide
+ * `allow_nan=False` contract, whereas this Python gateway's default
+ * `json.dumps` would emit the non-standard token. Widening that wire contract
+ * is intentionally outside this parser and remains the one non-finite gap.
  *
  * @module
  */
@@ -102,6 +102,9 @@ const MARK_INT = 'i';
 /** `\u0000s` — the rest of the string is the value the document actually had. */
 const MARK_STRING = 's';
 
+/** `\u0000f` — the rest is one of CPython JSON's non-finite float tokens. */
+const MARK_NONFINITE = 'f';
+
 // ---------------------------------------------------------------------------
 // The rewrite
 // ---------------------------------------------------------------------------
@@ -117,7 +120,7 @@ const MARK_STRING = 's';
  * can only leave a malformed document malformed.
  */
 const JSON_TOKEN_RE =
-  /"(?:[^"\\]|\\[\s\S])*"[ \t\n\r]*:|"(?:[^"\\]|\\[\s\S])*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/g;
+  /"(?:[^"\\]|\\[\s\S])*"[ \t\n\r]*:|"(?:[^"\\]|\\[\s\S])*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|-?Infinity|NaN/g;
 
 /** True for a numeric literal CPython's scanner hands to `parse_float`. */
 const isFloatLiteral = (token: string): boolean =>
@@ -131,7 +134,11 @@ const rewriteToken = (token: string): string => {
       ? token
       : `"${MARKER_ESCAPE}${MARK_STRING}${token.slice(1)}`;
   }
-  return isFloatLiteral(token) ? token : `"${MARKER_ESCAPE}${MARK_INT}${token}"`;
+  return token === 'NaN' || token === 'Infinity' || token === '-Infinity'
+    ? `"${MARKER_ESCAPE}${MARK_NONFINITE}${token}"`
+    : isFloatLiteral(token)
+      ? token
+      : `"${MARKER_ESCAPE}${MARK_INT}${token}"`;
 };
 
 /**
@@ -159,7 +166,13 @@ const reviveMarked = (_key: string, value: unknown): unknown => {
   if (typeof value !== 'string' || !value.startsWith(MARKER)) return value;
   const kind = value.charAt(MARKER.length);
   const rest = value.slice(MARKER.length + 1);
-  return kind === MARK_INT ? BigInt(rest) : kind === MARK_STRING ? rest : value;
+  return kind === MARK_INT
+    ? BigInt(rest)
+    : kind === MARK_STRING
+      ? rest
+      : kind === MARK_NONFINITE
+        ? Number(rest)
+        : value;
 };
 
 // ---------------------------------------------------------------------------

@@ -381,7 +381,7 @@ export interface PythonDerivationOptions {
   readonly cacheRoot: string;
   /** Defaults to `python3`. */
   readonly python?: string;
-  /** Wall-clock budget for one derivation. Defaults to 120 seconds. */
+  /** Optional wall-clock budget. Omitted means no timeout, matching Python. */
   readonly timeout?: Duration.DurationInput;
   /** Cap on the JSON the bridge may return. Defaults to 64 MiB. */
   readonly maxOutputBytes?: number;
@@ -399,7 +399,6 @@ export const DERIVE_EXIT = {
 } as const;
 
 const DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
-const DEFAULT_TIMEOUT: Duration.DurationInput = '120 seconds';
 const STDERR_CAP_BYTES = 8 * 1024;
 
 /** The child's argv, in a fixed order so a recording test can assert on it. */
@@ -466,7 +465,9 @@ interface Collected {
 const collectCapped = (
   stream: ReadableStream<Uint8Array>,
   capBytes: number,
-): Effect.Effect<Collected> =>
+  request: DerivationRequest,
+  channel: 'stdout' | 'stderr',
+): Effect.Effect<Collected, DerivationUnavailable> =>
   Effect.acquireUseRelease(
     Effect.sync(() => stream.getReader()),
     (reader) =>
@@ -474,10 +475,15 @@ const collectCapped = (
         while: (state) => !state.done && !state.truncated,
         body: (state) =>
           Effect.map(
-            Effect.orElseSucceed(
-              Effect.tryPromise(() => reader.read()),
-              () => ({ done: true, value: undefined }) as const,
-            ),
+            Effect.tryPromise({
+              try: () => reader.read(),
+              catch: (cause) =>
+                new DerivationUnavailable({
+                  operation: request.operation,
+                  gameId: request.gameId,
+                  detail: `${channel} read failed: ${String(cause)}`,
+                }),
+            }),
             (result): CollectState =>
               result.done || result.value === undefined
                 ? { ...state, done: true }
@@ -536,27 +542,49 @@ const spawnBridge = (
         (spawned) => Effect.ignore(Effect.try(() => spawned.kill())),
       );
 
-      // `resolved_places` travels on stdin, not in argv: it is the loaders'
-      // third positional argument and can be arbitrarily large.
-      yield* Effect.ignore(
-        Effect.tryPromise(async () => {
-          await Promise.resolve(child.stdin.write(JSON.stringify(request.places)));
-          await child.stdin.end();
-        }),
+      // `resolved_places` travels on stdin, not in argv. The sink is finalized
+      // on success, transport failure and interruption so the child can never
+      // remain parked waiting for EOF.
+      yield* Effect.acquireUseRelease(
+        Effect.succeed(child.stdin),
+        (stdin) =>
+          Effect.tryPromise({
+            try: async () => {
+              await Promise.resolve(stdin.write(JSON.stringify(request.places)));
+              await Promise.resolve(stdin.end());
+            },
+            catch: (cause) =>
+              new DerivationUnavailable({
+                operation: request.operation,
+                gameId: request.gameId,
+                detail: `stdin write failed: ${String(cause)}`,
+              }),
+          }),
+        (stdin) => Effect.ignore(Effect.tryPromise(() => Promise.resolve(stdin.end()))),
       );
 
       const [stdout, stderr] = yield* Effect.all(
         [
-          collectCapped(child.stdout, options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES),
-          collectCapped(child.stderr, STDERR_CAP_BYTES),
+          collectCapped(
+            child.stdout,
+            options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES,
+            request,
+            'stdout',
+          ),
+          collectCapped(child.stderr, STDERR_CAP_BYTES, request, 'stderr'),
         ],
         { concurrency: 2 },
       );
 
-      const exitCode = yield* Effect.orElseSucceed(
-        Effect.tryPromise(() => child.exited),
-        () => -1,
-      );
+      const exitCode = yield* Effect.tryPromise({
+        try: () => child.exited,
+        catch: (cause) =>
+          new DerivationUnavailable({
+            operation: request.operation,
+            gameId: request.gameId,
+            detail: `wait failed: ${String(cause)}`,
+          }),
+      });
 
       return { exitCode, stdout, stderr };
     }),
@@ -609,19 +637,24 @@ const parseBridgeOutput = (
 /** The runner behind {@link ReplayDerivationPython}, exposed for tests. */
 export const pythonDerivationRunner =
   (options: PythonDerivationOptions): DerivationRunner =>
-  (request) =>
-    spawnBridge(options, request).pipe(
+  (request) => {
+    const derive = spawnBridge(options, request).pipe(
       Effect.flatMap((outcome) => parseBridgeOutput(request, outcome)),
-      Effect.timeoutFail({
-        duration: Duration.decode(options.timeout ?? DEFAULT_TIMEOUT),
-        onTimeout: () =>
-          new DerivationUnavailable({
-            operation: request.operation,
-            gameId: request.gameId,
-            detail: 'derivation timed out',
-          }),
-      }),
     );
+    return options.timeout === undefined
+      ? derive
+      : derive.pipe(
+          Effect.timeoutFail({
+            duration: Duration.decode(options.timeout),
+            onTimeout: () =>
+              new DerivationUnavailable({
+                operation: request.operation,
+                gameId: request.gameId,
+                detail: 'derivation timed out',
+              }),
+          }),
+        );
+  };
 
 /**
  * The interim layer: each derivation is one `python3 -m

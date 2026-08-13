@@ -65,7 +65,6 @@ import {
   type GameId,
   isJsonObject,
   isTerminalRunState,
-  type JsonObject,
   type JsonValue,
 } from '@arena/wire';
 import { HttpServerResponse } from '@effect/platform';
@@ -391,7 +390,7 @@ export const canonToJson = (value: CanonValue): JsonValue =>
  * a digest of exactly these rows, so handing the loader the raw manifest rows
  * would silently split the cache the Python gateway shares.
  */
-export const derivationPlaces = (manifest: JsonObject): ResolvedPlaces =>
+export const derivationPlaces = (manifest: CanonRecord): ResolvedPlaces =>
   publicPlaces(untrustedField(manifest, 'resolved_places'), manifest).flatMap((place) => {
     const json = canonToJson(place);
     // Total: `publicPlaces` returns records and `canonToJson` preserves shape,
@@ -407,7 +406,7 @@ export const derivationPlaces = (manifest: JsonObject): ResolvedPlaces =>
 /** What the manifest contributes to a loader call. */
 export interface DerivationContext {
   /** `_read_manifest`'s raw document. */
-  readonly manifest: JsonObject;
+  readonly manifest: CanonRecord;
   /** `_public_places(...)`, already projected. */
   readonly places: ResolvedPlaces;
   /**

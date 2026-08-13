@@ -21,7 +21,16 @@
  * `afterAll`.
  */
 import { afterAll, describe, expect, test } from 'bun:test';
-import { mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs';
+import {
+  chmodSync,
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { CANON_UTF8, canonicalBytes } from '@arena/wire';
@@ -42,6 +51,7 @@ import {
   derivationRequestKey,
   derivationTurnCacheName,
   layerFromRunner,
+  pythonDerivationRunner,
   ReplayDerivation,
   ReplayDerivationFixture,
   ReplayDerivationPython,
@@ -53,7 +63,6 @@ import {
 // ---------------------------------------------------------------------------
 
 const REPO_ROOT = resolve(import.meta.dir, '../../../..');
-const RUNS_ROOT = join(REPO_ROOT, '.agent-eval', 'runs');
 
 /**
  * Throwaway cache roots, owned by this file and removed in `afterAll`.  Kept
@@ -450,10 +459,93 @@ describe('unavailable layer', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Python process transport
+// ---------------------------------------------------------------------------
+
+const transportRequest = (places: DerivationRequest['places'] = []): DerivationRequest => ({
+  operation: 'board',
+  gameId: GAME_ID,
+  places,
+  turn: 1,
+});
+
+const transportOptions = (python: string, timeout?: Duration.DurationInput) => ({
+  repoRoot: REPO_ROOT,
+  runsRoot: '/runs',
+  cacheRoot: '/cache',
+  python,
+  ...(timeout === undefined ? {} : { timeout }),
+});
+
+const executableFixture = (source: string): string => {
+  const directory = scratchDirectory('transport');
+  const path = join(directory, 'python-fixture');
+  writeFileSync(path, `#!/usr/bin/env python3\n${source}\n`, 'utf8');
+  chmodSync(path, 0o700);
+  return path;
+};
+
+describe('python bridge transport failures stay typed', () => {
+  test('spawn failure is DerivationUnavailable, never a defect', async () => {
+    const failure = await Effect.runPromise(
+      Effect.flip(
+        pythonDerivationRunner(transportOptions('/definitely/missing/arena-python'))(
+          transportRequest(),
+        ),
+      ),
+    );
+    expect(failure).toBeInstanceOf(DerivationUnavailable);
+    expect(failure.detail).toContain('spawn failed');
+  });
+
+  test('a closed child stdin is DerivationUnavailable, never a defect', async () => {
+    const python = executableFixture('import os, time\nos.close(0)\ntime.sleep(0.2)');
+    const padding = 'x'.repeat(1024);
+    const places = Array.from({ length: 20_000 }, (_, place) => ({ place, padding }));
+    const failure = await Effect.runPromise(
+      Effect.flip(
+        pythonDerivationRunner(transportOptions(python, '5 seconds'))(
+          transportRequest(places),
+        ),
+      ),
+    );
+    expect(failure).toBeInstanceOf(DerivationUnavailable);
+    expect(failure.detail).toContain('stdin write failed');
+  });
+
+  test('timeout is opt-in: omitted waits, configured timeout fails with a typed value', async () => {
+    const python = executableFixture(
+      'import sys, time\nsys.stdin.buffer.read()\ntime.sleep(0.08)\nsys.stdout.write("{}")',
+    );
+    const withoutTimeout = pythonDerivationRunner(transportOptions(python))(transportRequest());
+    expect(await Effect.runPromise(withoutTimeout)).toEqual({});
+
+    const failure = await Effect.runPromise(
+      Effect.flip(
+        pythonDerivationRunner(transportOptions(python, '10 millis'))(transportRequest()),
+      ),
+    );
+    expect(failure).toBeInstanceOf(DerivationUnavailable);
+    expect(failure.detail).toBe('derivation timed out');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // The Python bridge, against a real run directory
 // ---------------------------------------------------------------------------
 
-const SAVE_NAME_RE = /^turn-(\d{4,})-.*\.sav(\.gz|\.bz2|\.xz|\.zst)?$/;
+const FIXTURE_GAME_ID = 'game_mEUltpqtzauPGfjI9IlhWJ5x';
+const FIXTURE_TURN = 52;
+const FIXTURE_SAVE = join(
+  REPO_ROOT,
+  'agent_eval',
+  'tests',
+  'fixtures',
+  'incidents',
+  FIXTURE_GAME_ID,
+  'saves',
+  'turn-0052-auto.sav.gz',
+);
 
 interface RunFixture {
   readonly gameId: string;
@@ -461,33 +553,20 @@ interface RunFixture {
 }
 
 /**
- * The smallest run on this machine that has savegames — smallest so the smoke
- * test stays fast, and chosen by scanning rather than by hard-coded id so the
- * suite is not pinned to one developer's `.agent-eval`.
+ * Build the smallest real run from a committed save. The bridge differential
+ * must run in a clean checkout rather than depending on a developer's ignored
+ * `.agent-eval/runs` directory.
  */
-const discoverRun = (): RunFixture | undefined => {
-  const candidates = readdirSync(RUNS_ROOT, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .flatMap((entry) => {
-      const saves = join(RUNS_ROOT, entry.name, 'saves');
-      const names = statSync(saves, { throwIfNoEntry: false })?.isDirectory() === true
-        ? readdirSync(saves)
-        : [];
-      const turns = names.flatMap((name) => {
-        const match = SAVE_NAME_RE.exec(name);
-        return match?.[1] === undefined ? [] : [Number(match[1])];
-      });
-      return turns.length === 0
-        ? []
-        : [{ gameId: entry.name, turn: Math.min(...turns), count: turns.length }];
-    })
-    .toSorted((left, right) => left.count - right.count || left.gameId.localeCompare(right.gameId));
-  const chosen = candidates[0];
-  return chosen === undefined ? undefined : { gameId: chosen.gameId, turn: chosen.turn };
+const makeCommittedRun = (): { readonly fixture: RunFixture; readonly runsRoot: string } => {
+  const runsRoot = scratchDirectory('committed-run');
+  const saves = join(runsRoot, FIXTURE_GAME_ID, 'saves');
+  mkdirSync(saves, { recursive: true });
+  copyFileSync(FIXTURE_SAVE, join(saves, 'turn-0052-auto.sav.gz'));
+  return { fixture: { gameId: FIXTURE_GAME_ID, turn: FIXTURE_TURN }, runsRoot };
 };
 
-const runsRootExists = statSync(RUNS_ROOT, { throwIfNoEntry: false })?.isDirectory() === true;
-const RUN = runsRootExists ? discoverRun() : undefined;
+const COMMITTED_RUN = makeCommittedRun();
+const RUN: RunFixture = COMMITTED_RUN.fixture;
 
 const DIRECT_PY = [
   'import json, os, sys',
@@ -525,7 +604,7 @@ const directDerivation = (request: DirectRequest): Uint8Array<ArrayBuffer> => {
     env: {
       ...process.env,
       DERIVE_OP: request.operation,
-      DERIVE_RUNS: RUNS_ROOT,
+      DERIVE_RUNS: COMMITTED_RUN.runsRoot,
       DERIVE_GAME: request.gameId,
       DERIVE_CACHE: request.cacheRoot,
       DERIVE_PLACES: '[]',
@@ -545,39 +624,15 @@ const directDerivation = (request: DirectRequest): Uint8Array<ArrayBuffer> => {
   return Uint8Array.from(child.stdout);
 };
 
-/**
- * Set `ARENA_REQUIRE_PARITY=1` to make a skipped bridge differential a
- * **failure** rather than a silent pass.
- *
- * `discoverRun()` scans `<repo>/.agent-eval/runs/*&#47;saves` for a real
- * `turn-NNNN-*.sav*`, and a fresh clone has none — so on a clean checkout the
- * whole `python bridge` block, which is this file's only evidence that the
- * bridge is *faithful*, disappears while `bun test` still prints `N pass, 0
- * fail`.  The degraded case is otherwise indistinguishable from the healthy
- * one, so it is announced.
- */
-const REQUIRE_PARITY = process.env['ARENA_REQUIRE_PARITY'] !== undefined;
-
-test('the python bridge differential is not silently skipped', () => {
-  if (RUN === undefined) {
-    // oxlint-disable-next-line effecttsgo/global-console -- a skipped oracle has
-    // to reach a terminal; there is no Logger in a bun:test process.
-    console.warn(
-      `\n!! python bridge differential DID NOT RUN: no savegame under ${RUNS_ROOT}.\n` +
-        '!! The claim "the bridge is faithful" contributed ZERO assertions to this run.\n' +
-        '!! Set ARENA_REQUIRE_PARITY=1 to make this a failure.\n',
-    );
-  }
-  expect({ ranBridgeDifferential: RUN !== undefined || !REQUIRE_PARITY }).toEqual({
-    ranBridgeDifferential: true,
-  });
+test('the committed bridge fixture is present', () => {
+  expect(statSync(FIXTURE_SAVE).isFile()).toBe(true);
 });
 
-describe.skipIf(RUN === undefined)('python bridge', () => {
-  const run: RunFixture = RUN ?? { gameId: GAME_ID, turn: 1 };
+describe('python bridge', () => {
+  const run: RunFixture = RUN;
 
   test('argv is exactly the bridge CLI surface', () => {
-    const options = { repoRoot: REPO_ROOT, runsRoot: RUNS_ROOT, cacheRoot: '/cache' };
+    const options = { repoRoot: REPO_ROOT, runsRoot: COMMITTED_RUN.runsRoot, cacheRoot: '/cache' };
     expect(
       derivationArgv(options, {
         operation: 'replay',
@@ -594,7 +649,7 @@ describe.skipIf(RUN === undefined)('python bridge', () => {
       '--op',
       'replay',
       '--runs-root',
-      RUNS_ROOT,
+      COMMITTED_RUN.runsRoot,
       '--game-id',
       run.gameId,
       '--cache-root',
@@ -622,7 +677,7 @@ describe.skipIf(RUN === undefined)('python bridge', () => {
       '--op',
       'board',
       '--runs-root',
-      RUNS_ROOT,
+      COMMITTED_RUN.runsRoot,
       '--game-id',
       run.gameId,
       '--cache-root',
@@ -642,7 +697,7 @@ describe.skipIf(RUN === undefined)('python bridge', () => {
         { operation: 'board', gameId: run.gameId, turn: run.turn, cacheRoot: cliCache },
         { operation: 'events', gameId: run.gameId, turn: run.turn, cacheRoot: cliCache },
       ];
-      const options = { repoRoot: REPO_ROOT, runsRoot: RUNS_ROOT, cacheRoot: cliCache };
+      const options = { repoRoot: REPO_ROOT, runsRoot: COMMITTED_RUN.runsRoot, cacheRoot: cliCache };
       await Promise.all(
         requests.map(async (request) => {
           const argv = derivationArgv(
@@ -699,7 +754,7 @@ describe.skipIf(RUN === undefined)('python bridge', () => {
       const oracleCache = scratchDirectory('oracle');
       const layer = ReplayDerivationPython({
         repoRoot: REPO_ROOT,
-        runsRoot: RUNS_ROOT,
+        runsRoot: COMMITTED_RUN.runsRoot,
         cacheRoot: serviceCache,
         timeout: '90 seconds',
       });
@@ -754,7 +809,7 @@ describe.skipIf(RUN === undefined)('python bridge', () => {
     async () => {
       const layer = ReplayDerivationPython({
         repoRoot: REPO_ROOT,
-        runsRoot: RUNS_ROOT,
+        runsRoot: COMMITTED_RUN.runsRoot,
         cacheRoot: scratchDirectory('missing'),
         timeout: '90 seconds',
       });
@@ -781,7 +836,7 @@ describe.skipIf(RUN === undefined)('python bridge', () => {
     async () => {
       const layer = ReplayDerivationPython({
         repoRoot: REPO_ROOT,
-        runsRoot: RUNS_ROOT,
+        runsRoot: COMMITTED_RUN.runsRoot,
         cacheRoot: scratchDirectory('rejected'),
         timeout: '90 seconds',
       });

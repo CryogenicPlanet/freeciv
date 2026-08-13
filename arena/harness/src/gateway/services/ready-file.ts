@@ -44,15 +44,15 @@
  * ## What the port adds
  *
  * `flock(2)` is not in Bun's `node:fs`, so it comes through `bun:ffi` against
- * `libSystem.B.dylib` with `__error()` for `errno` — the arrangement spike S3
- * proved interoperates with `fcntl.flock` in both directions
- * (`test/spikes/s3-flock.ts`).  The lock descriptor additionally carries
- * `O_CLOEXEC`, which the Python does not set: a `flock` lives on the open file
- * description, so an inherited descriptor in a spawned freeciv process would
- * keep the lock alive past this process's death.  `O_CLOEXEC` is spelled out
- * as a literal because `node:fs`'s `constants.O_CLOEXEC` reads back
- * `undefined` under Bun on darwin, and `undefined` in a `|` chain contributes
- * a silent `0`.
+ * the host libc: `libSystem.B.dylib` / `__error()` on Darwin and
+ * `libc.so.6` / `__errno_location()` on Linux.  Both paths interoperate with
+ * Python's `fcntl.flock`; only the errno accessor and the platform constants
+ * differ.  The lock descriptor additionally carries `O_CLOEXEC`, which the
+ * Python does not set: a `flock` lives on the open file description, so an
+ * inherited descriptor in a spawned freeciv process would keep the lock alive
+ * past this process's death.  `O_CLOEXEC` is spelled out per platform because
+ * `node:fs`'s `constants.O_CLOEXEC` reads back `undefined` under Bun, and
+ * `undefined` in a `|` chain contributes a silent `0`.
  *
  * @module
  */
@@ -74,6 +74,7 @@ import {
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { Context, Data, Effect, Either, Layer, Option, type Scope } from 'effect';
+import { parsePythonJsonObject } from '../python-json.ts';
 import {
   CANON_ASCII,
   CANON_UTF8,
@@ -99,15 +100,15 @@ export const LOCK_EX = 2;
 export const LOCK_NB = 4;
 export const LOCK_UN = 8;
 
-/** darwin `EAGAIN === EWOULDBLOCK === 35` — what Python raises as `BlockingIOError`. */
-export const EWOULDBLOCK = 35;
+/** `EAGAIN === EWOULDBLOCK`: 35 on Darwin, 11 on Linux. */
+export const EWOULDBLOCK = process.platform === 'linux' ? 11 : 35;
 
 /**
- * darwin `O_CLOEXEC`.  Written out because `node:fs`'s `constants` does not
- * carry it under Bun: it reads back `undefined`, which would contribute `0` to
- * the flag word instead of failing.
+ * `O_CLOEXEC`: `0x01000000` on Darwin and `0x00080000` on Linux.  Written out
+ * because `node:fs`'s `constants` does not carry it under Bun: it reads back
+ * `undefined`, which would contribute `0` to the flag word instead of failing.
  */
-export const O_CLOEXEC = 0x0100_0000;
+export const O_CLOEXEC = process.platform === 'linux' ? 0x0008_0000 : 0x0100_0000;
 
 /** Reported when libc will not say where `errno` lives. */
 const UNKNOWN_ERRNO = -1;
@@ -307,21 +308,38 @@ interface FlockOutcome {
 
 const loadLibc: Effect.Effect<Libc, ReadyLockUnavailable> = Effect.try({
   try: (): Libc => {
-    const library = dlopen('libSystem.B.dylib', {
-      flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
-      // `errno` is a macro over a per-thread location; libc exposes it as `__error()`.
-      __error: { args: [], returns: FFIType.ptr },
-    });
-    return {
-      flock: (fd, operation) => library.symbols.flock(fd, operation),
-      currentErrno: () => {
-        const location = library.symbols.__error();
-        return location === null ? UNKNOWN_ERRNO : read.i32(location, 0);
-      },
-    };
+    if (process.platform === 'darwin') {
+      const library = dlopen('libSystem.B.dylib', {
+        flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+        // `errno` is a macro over a per-thread location on Darwin.
+        __error: { args: [], returns: FFIType.ptr },
+      });
+      return {
+        flock: (fd, operation) => library.symbols.flock(fd, operation),
+        currentErrno: () => {
+          const location = library.symbols.__error();
+          return location === null ? UNKNOWN_ERRNO : read.i32(location, 0);
+        },
+      };
+    }
+    if (process.platform === 'linux') {
+      const library = dlopen('libc.so.6', {
+        flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+        // glibc's thread-local errno accessor. Bun's supported Linux builds use glibc.
+        __errno_location: { args: [], returns: FFIType.ptr },
+      });
+      return {
+        flock: (fd, operation) => library.symbols.flock(fd, operation),
+        currentErrno: () => {
+          const location = library.symbols.__errno_location();
+          return location === null ? UNKNOWN_ERRNO : read.i32(location, 0);
+        },
+      };
+    }
+    throw new Error(`ready-file locking is unsupported on ${process.platform}`);
   },
   catch: (cause) =>
-    new ReadyLockUnavailable({ reason: 'dlopen(libSystem.B.dylib) failed', cause }),
+    new ReadyLockUnavailable({ reason: `loading libc flock on ${process.platform} failed`, cause }),
 });
 
 /**
@@ -380,9 +398,12 @@ const closeQuietly = (fd: number): Effect.Effect<void> =>
  * `chmod` on `:249` — the mode argument only applies when the file is created,
  * and the lock file outlives individual runs, so the mode is forced every time.
  */
-const openLockFd = (lockPath: string): Effect.Effect<number, ReadyFileIoError> =>
-  Effect.tap(
-    Effect.try({
+export const openLockFd = (
+  lockPath: string,
+  chmod: (path: string, mode: number) => void = chmodSync,
+): Effect.Effect<number, ReadyFileIoError> =>
+  Effect.gen(function* () {
+    const fd = yield* Effect.try({
       try: () =>
         openSync(
           lockPath,
@@ -390,13 +411,13 @@ const openLockFd = (lockPath: string): Effect.Effect<number, ReadyFileIoError> =
           READY_FILE_MODE,
         ),
       catch: (cause) => new ReadyFileIoError({ operation: 'open', path: lockPath, cause }),
-    }),
-    () =>
-      Effect.try({
-        try: () => chmodSync(lockPath, READY_FILE_MODE),
-        catch: (cause) => new ReadyFileIoError({ operation: 'chmod', path: lockPath, cause }),
-      }),
-  );
+    });
+    yield* Effect.try({
+      try: () => chmod(lockPath, READY_FILE_MODE),
+      catch: (cause) => new ReadyFileIoError({ operation: 'chmod', path: lockPath, cause }),
+    }).pipe(Effect.onError(() => closeQuietly(fd)));
+    return fd;
+  });
 
 /**
  * `EWOULDBLOCK` is the contended case and nothing else is: `EBADF` or `EINVAL`
@@ -553,17 +574,8 @@ const writePrivateJson = (
 // The guarded unlink
 // ---------------------------------------------------------------------------
 
-/** `isinstance(value, dict)` over a `JSON.parse` result — arrays are not dicts. */
-const isJsonObject = (value: unknown): value is object =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
-
-/**
- * `dict.get(key)`.  `Reflect.get` rather than an index signature assertion:
- * the value came off the disk, and claiming a shape for it is exactly the kind
- * of unchecked narrowing that would make the pid guard pass on a record it
- * never read.
- */
-const propertyOf = (value: object, key: string): unknown => Reflect.get(value, key);
+/** `dict.get(key)` over the integer-preserving parsed record. */
+const propertyOf = (value: CanonRecord, key: string): CanonValue | undefined => value[key];
 
 /**
  * Does the value read back out of the file mean the same thing as the value we
@@ -574,7 +586,8 @@ const propertyOf = (value: object, key: string): unknown => Reflect.get(value, k
 const sameJsonValue = (expected: CanonValue | undefined, actual: unknown): boolean => {
   if (expected === undefined) return actual === undefined;
   if (typeof expected === 'bigint') {
-    return typeof actual === 'number' && Number.isInteger(actual) && BigInt(actual) === expected;
+    return actual === expected ||
+      (typeof actual === 'number' && Number.isInteger(actual) && BigInt(actual) === expected);
   }
   return expected === actual;
 };
@@ -599,16 +612,16 @@ const removeOwnedReadyFile = (
 ): Effect.Effect<void> =>
   Effect.ignore(
     Effect.flatMap(
-      // A schema would only re-describe `unknown` here: the guard's whole
-      // contract is CPython's "any decode failure means not mine", which is
-      // the `Effect.try` boundary, not the shape of what came back.
-      Effect.try(() => JSON.parse(decodeUtf8Strict(readFileSync(path))) as unknown),
-      (record) =>
-        isJsonObject(record) &&
-        sameJsonValue(identity, propertyOf(record, 'identity')) &&
-        sameJsonValue(pid, propertyOf(record, 'pid'))
-          ? Effect.ignore(Effect.try(() => unlinkSync(path)))
-          : Effect.void,
+      Effect.try(() => decodeUtf8Strict(readFileSync(path))),
+      (text) =>
+        Either.match(parsePythonJsonObject(text), {
+          onLeft: () => Effect.void,
+          onRight: (record) =>
+            sameJsonValue(identity, propertyOf(record, 'identity')) &&
+            sameJsonValue(pid, propertyOf(record, 'pid'))
+              ? Effect.ignore(Effect.try(() => unlinkSync(path)))
+              : Effect.void,
+        }),
     ),
   );
 
@@ -657,9 +670,9 @@ export interface ReadyFileService {
    * `payload` must already carry the *bound* port: `identity_payload` reads
    * `server.server_address` after the socket is listening (`:1302`), so a
    * `--port 0` gateway publishes the port the kernel handed out and never `0`.
-   * Per spike law the caller must also have finished `serve()` before calling
-   * this — a Bun socket 404s from library code until it returns, so a record
-   * published earlier would advertise a URL that is not yet answering.
+   * The caller must also have finished `serve()` before calling this: Node
+   * binds before installing the request listener, so an earlier record would
+   * advertise a URL that accepts connections but does not yet answer.
    */
   readonly publish: (
     payload: CanonRecord,

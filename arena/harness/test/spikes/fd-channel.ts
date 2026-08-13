@@ -20,7 +20,7 @@ const AF_UNIX = 1;
 /** `SOCK_STREAM` — 1 on both darwin and linux. */
 const SOCK_STREAM = 1;
 
-const libc = dlopen(`libc.${suffix}`, {
+const libc = dlopen(process.platform === 'linux' ? 'libc.so.6' : `libc.${suffix}`, {
   socketpair: {
     args: [FFIType.int, FFIType.int, FFIType.int, FFIType.ptr],
     returns: FFIType.int,

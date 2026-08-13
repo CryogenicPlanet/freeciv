@@ -14,7 +14,7 @@
 import { describe, expect, test } from 'bun:test';
 import { Data, Effect, type Scope } from 'effect';
 import { FileSystem } from '@effect/platform';
-import { BunFileSystem } from '@effect/platform-bun';
+import { NodeFileSystem } from '@effect/platform-node';
 import { mkdtempSync, rmSync, rmdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -65,14 +65,14 @@ const run = <A, E>(effect: Effect.Effect<A, E, Scope.Scope>): Promise<A> =>
 const HOLD_FOREVER_JS = [
   'import { FFIType, dlopen } from "bun:ffi";',
   'import { openSync } from "node:fs";',
-  'const libc = dlopen("libSystem.B.dylib", { flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 } });',
+  'const libc = dlopen(process.platform === "linux" ? "libc.so.6" : "libSystem.B.dylib", { flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 } });',
   `const fd = openSync(process.env["${LOCK_PATH_VARIABLE}"], "a+");`,
   'process.stdout.write(String(libc.symbols.flock(fd, 2 | 4)) + "\\n");',
   'await new Promise(() => {});',
 ].join('\n');
 
 describe('S3: flock interop between Bun and Python', () => {
-  test('bun:ffi can bind flock out of libSystem', () => {
+  test('bun:ffi can bind flock out of the host libc', () => {
     expect(ffiAvailable()).toBe(true);
   });
 
@@ -171,7 +171,7 @@ describe('S3: flock interop between Bun and Python', () => {
         expect((yield* flock(file.fd, LOCK_EX | LOCK_NB)).returnCode).toBe(0);
         expect(yield* pythonAttempt(path)).toBe(`BLOCKED ${EWOULDBLOCK}`);
         expect((yield* flock(file.fd, LOCK_UN)).returnCode).toBe(0);
-      }).pipe(Effect.provide(BunFileSystem.layer)),
+      }).pipe(Effect.provide(NodeFileSystem.layer)),
     ));
 
   test('a crashed Bun holder frees the lock, exactly as the monitor comment promises', () =>
@@ -182,7 +182,7 @@ describe('S3: flock interop between Bun and Python', () => {
         // A child Bun process takes the lock and is killed without unlocking.
         const child = yield* Effect.acquireRelease(
           Effect.sync(() =>
-            Bun.spawn(['bun', '-e', HOLD_FOREVER_JS], {
+            Bun.spawn([process.execPath, '-e', HOLD_FOREVER_JS], {
               stdout: 'pipe',
               stderr: 'pipe',
               env: { ...process.env, [LOCK_PATH_VARIABLE]: path },

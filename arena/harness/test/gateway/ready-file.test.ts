@@ -38,6 +38,7 @@ import { dirname, join } from 'node:path';
 import { CANON_UTF8, type CanonRecord, canonicalText } from '@arena/wire';
 import {
   EWOULDBLOCK,
+  O_CLOEXEC,
   READY_FILE_MODE,
   READY_LOCK_SUFFIX,
   ReadyFile,
@@ -48,6 +49,7 @@ import {
   type ReadyPublication,
   layer,
   lockSupported,
+  openLockFd,
   readyFileText,
   readyLineText,
   resolveReadyPath,
@@ -506,10 +508,30 @@ describe('ready file: differential against agent_eval.replay_gateway', () => {
 });
 
 describe('ready file: the lock, both directions', () => {
-  test('bun:ffi bound flock out of libSystem', async () => {
-    // An `Effect`, not a module constant: the `dlopen` used to run at import
-    // time through the only `Effect.runSync` in `src/gateway/**`.
+  test('bun:ffi binds the host libc with platform errno and CLOEXEC constants', async () => {
+    // An `Effect`, not a module constant: `dlopen` must not run at import time.
     expect(await Effect.runPromise(lockSupported)).toBe(true);
+    expect(EWOULDBLOCK).toBe(process.platform === 'linux' ? 11 : 35);
+    expect(O_CLOEXEC).toBe(process.platform === 'linux' ? 0x0008_0000 : 0x0100_0000);
+  });
+
+  test('a chmod failure closes the just-opened lock descriptor', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'ready-file-fd-'));
+    const path = join(directory, 'gateway.json.lock');
+    const descriptors = (): number => readdirSync('/dev/fd').length;
+    const before = descriptors();
+    for (let attempt = 0; attempt < 128; attempt += 1) {
+      const failure = await Effect.runPromise(
+        Effect.flip(
+          openLockFd(path, () => {
+            throw new Error('injected chmod failure');
+          }),
+        ),
+      );
+      expect(failure).toMatchObject({ _tag: 'ReadyFileIoError', operation: 'chmod', path });
+    }
+    expect(descriptors()).toBeLessThanOrEqual(before + 1);
+    rmSync(directory, { recursive: true, force: true });
   });
 
   test('a python3 holder blocks the publisher, and the incumbent record survives', () =>
@@ -547,7 +569,7 @@ describe('ready file: the lock, both directions', () => {
       }),
     ));
 
-  test('while the publisher holds it, python3 fcntl.flock reports BlockingIOError(35)', () =>
+  test(`while held, Python reports BlockingIOError(errno=${String(EWOULDBLOCK)})`, () =>
     run(
       Effect.gen(function* () {
         const directory = yield* scratchDirectory;
@@ -633,12 +655,44 @@ describe('ready file: the guarded unlink', () => {
           fileText({ identity: OUR_IDENTITY, pid: OUR_PID, extra: 'rewritten' }),
         );
 
+        const hugePid = 9_007_199_254_740_993n;
+        const hugeOwned = yield* Effect.scoped(
+          Effect.as(
+            publishInScope(
+              join(directory, 'huge-owned.json'),
+              identityPayload({ pid: hugePid }),
+              captured.sink,
+            ),
+            join(directory, 'huge-owned.json'),
+          ),
+        );
+        const hugeForeign = yield* Effect.scoped(
+          Effect.as(
+            Effect.zipRight(
+              publishInScope(
+                join(directory, 'huge-foreign.json'),
+                identityPayload({ pid: hugePid }),
+                captured.sink,
+              ),
+              Effect.sync(() =>
+                writeFileSync(
+                  join(directory, 'huge-foreign.json'),
+                  fileText({ identity: OUR_IDENTITY, pid: hugePid + 1n }),
+                ),
+              ),
+            ),
+            join(directory, 'huge-foreign.json'),
+          ),
+        );
+
         expect(existsSync(foreignPid)).toBe(true);
         expect(existsSync(foreignIdentity)).toBe(true);
         expect(existsSync(noGuardFields)).toBe(true);
         expect(textOf(unparseable)).toBe('{not json');
-        // Both guard fields still match, so this one really is ours to delete.
+        // Both guard fields still match, including beyond Number.MAX_SAFE_INTEGER.
         expect(existsSync(stillOurs)).toBe(false);
+        expect(existsSync(hugeOwned)).toBe(false);
+        expect(existsSync(hugeForeign)).toBe(true);
       }),
     ));
 });

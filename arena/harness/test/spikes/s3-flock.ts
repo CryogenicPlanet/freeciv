@@ -20,8 +20,8 @@ export const LOCK_EX = 2;
 export const LOCK_NB = 4;
 export const LOCK_UN = 8;
 
-/** darwin `EAGAIN === EWOULDBLOCK === 35`; this is what Python raises as `BlockingIOError`. */
-export const EWOULDBLOCK = 35;
+/** `EAGAIN === EWOULDBLOCK`: 35 on Darwin, 11 on Linux. */
+export const EWOULDBLOCK = process.platform === 'linux' ? 11 : 35;
 
 /** Reported when libc will not tell us where `errno` lives. */
 export const UNKNOWN_ERRNO = -1;
@@ -31,7 +31,7 @@ export const UNKNOWN_ERRNO = -1;
  * not carry it under Bun — it reads back `undefined`, which would silently
  * contribute 0 to the flag word instead of failing.
  */
-export const O_CLOEXEC = 0x0100_0000;
+export const O_CLOEXEC = process.platform === 'linux' ? 0x0008_0000 : 0x0100_0000;
 
 /** The mode `play/client.py` insists on before it will trust a lock file. */
 export const LOCK_FILE_MODE = 0o600;
@@ -60,23 +60,33 @@ interface Libc {
 
 const loadLibc: Effect.Effect<Libc, FfiUnavailable> = Effect.try({
   try: (): Libc => {
+    if (process.platform === 'linux') {
+      const library = dlopen('libc.so.6', {
+        flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+        __errno_location: { args: [], returns: FFIType.ptr },
+      });
+      return {
+        flock: (fd, operation) => library.symbols.flock(fd, operation),
+        currentErrno: () => {
+          const location = library.symbols.__errno_location();
+          return location === null ? UNKNOWN_ERRNO : read.i32(location, 0);
+        },
+      };
+    }
     const library = dlopen('libSystem.B.dylib', {
       flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
-      // `errno` is a macro over a per-thread location; libc exposes it as `__error()`.
       __error: { args: [], returns: FFIType.ptr },
     });
     return {
       flock: (fd, operation) => library.symbols.flock(fd, operation),
       currentErrno: () => {
         const location = library.symbols.__error();
-        // A null `__error()` cannot happen on a live libc, but the binding is
-        // typed `Pointer | null`, and guessing an errno would be worse.
         return location === null ? UNKNOWN_ERRNO : read.i32(location, 0);
       },
     };
   },
   catch: (cause) =>
-    new FfiUnavailable({ reason: 'dlopen(libSystem.B.dylib) failed', cause }),
+    new FfiUnavailable({ reason: `loading libc flock on ${process.platform} failed`, cause }),
 });
 
 /**

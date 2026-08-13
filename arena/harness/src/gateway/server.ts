@@ -1,5 +1,5 @@
 /**
- * The socket edge: everything between a Bun `Request` and the one response
+ * The socket edge: everything between a Node request and the one response
  * site, plus the startup order the ready file depends on.
  *
  * This module is the assembly, not the behavior.  Dispatch is a pure function
@@ -9,7 +9,7 @@
  * here — is the four things only the edge can do:
  *
  * 1. **Recover the request line Python saw.**  `BaseHTTPRequestHandler` hands
- *    `do_GET` a `urlsplit(self.path)`; Bun hands us an absolute URL.  The
+ *    `do_GET` a `urlsplit(self.path)`; Node preserves the raw request target. The
  *    fragment must be dropped, the query must be the *raw* string (`''` means
  *    no query, so a bare trailing `?` is no query), and the path must **never**
  *    be percent-decoded — `%2F` staying literal is the only reason
@@ -17,7 +17,7 @@
  *    D5).
  * 2. **Classify the entity body from headers alone.**  `_reject_body`
  *    (`:1384-1396`) never reads the socket, and it could not here anyway: spike
- *    S4 proved Bun discards a GET entity-body outright (`request.body === null`)
+ *    the adapter does not expose a GET entity body (`request.body === null`)
  *    while still delivering `Content-Length`/`Transfer-Encoding`.  Detection
  *    yes, payload no — which is exactly what the Python needs.
  * 3. **Answer the verbs `do_GET` never sees.**  A verb with no `do_<VERB>` is
@@ -30,33 +30,21 @@
  *    `DEFAULT_ERROR_MESSAGE_FORMAT`; the JSON 405 belongs to the six *mapped*
  *    verbs and comes out of `dispatch` like every other refusal.
  *
- * ## Bun has pre-handler rejections of its own, and they are not Python's
+ * ## Node has pre-handler behavior of its own, and it is not Python's
  *
- * `http.server` rejects a malformed request line before `do_GET`; Bun rejects a
- * malformed *message* before our `fetch` handler, and it draws the line in a
- * different place.  Measured against this very app (`test/gateway/server.test.ts`):
- *
- * | Request | Python | Bun |
- * |---|---|---|
- * | `TRACE` / `CONNECT` | `501 …` HTML | reaches us → {@link unsupportedMethod} |
- * | an invented verb (`FOO`) | `501 …` HTML | connection closed, **no response** |
- * | `Content-Length: abc` \| `5_0` | `400 invalid Content-Length` (ours) | `400 Bad Request` (Bun's, bodiless) |
- * | `Transfer-Encoding: identity` | `400 GET request bodies…` (ours) | `400 Bad Request` (Bun's) |
- * | `Transfer-Encoding: chunked` | `400 GET request bodies…` | reaches us → same 400 |
- * | a space in the target | `400 Bad request syntax` HTML | `505 HTTP Version Not Supported` |
- * | two `Content-Length: 0` | accepted (`.get` takes the first) | joined to `"0, 0"` → our 400 |
+ * Measured against this app (`test/gateway/server.test.ts`): `TRACE` reaches
+ * {@link unsupportedMethod}; `CONNECT` is diverted to Node's unhandled tunnel
+ * event; an invented verb gets Node's parser-level bodiless 400; malformed
+ * `Content-Length` is also a parser-level 400; and `Transfer-Encoding: identity`
+ * reaches `_reject_body` and gets the gateway JSON 400, matching Python.
  *
  * None of these are fixable at this layer — the bytes never reach Effect code —
  * so they are written down instead, and {@link bodySignal} keeps the *decision*
  * testable as a pure function even where the socket will not deliver the input.
- * 4. **Publish the ready record last.**  Spike S4's headline finding:
- *    `BunHttpServer.make` calls `Bun.serve` immediately, with a built-in
- *    `404 not found` handler, so the port is bound and *answering* before
- *    `serve(app)` attaches ours.  The ready file therefore goes out **after**
- *    `serve()` returns, never merely after the address is readable, or a client
- *    that reads the record and connects instantly is told 404 by code that is
- *    not ours.  `test/gateway/server.test.ts` pins this from the client side:
- *    the ready sink itself performs the request.
+ * 4. **Publish the ready record last.** `NodeHttpServer.make` binds before
+ *    `serve(app)` installs the request listener. A client in that interval can
+ *    connect but receives no response, so the ready file is published only
+ *    after `serve()` returns. The ready sink itself probes `/health`.
  *
  * Every bare `:NNN` citation is `agent_eval/replay_gateway.py`.
  *
@@ -65,11 +53,8 @@
  * - **It builds no error body.**  The 501 above is the stdlib's, produced
  *   before routing exists; everything downstream of {@link dispatch} fails with
  *   a `../errors.ts` value and {@link respondGateway} renders it.
- * - **It passes no `routes` option to `BunHttpServer.make`.**  Bun's router
- *   would answer before our handler and take the method contract with it
- *   (spike law).
- * - **It does not special-case HEAD.**  `dispatch` answers 405 with the GET
- *   body computed in full; the Bun adapter strips the body and keeps
+ * - **It does not special-case HEAD.** `dispatch` answers 405 with the GET
+ *   body computed in full; the Node adapter strips the body and keeps
  *   `Content-Length`, which is what Python's HEAD does on the wire (§7.2, §15).
  *
  * @module
@@ -79,9 +64,11 @@ import { annotate, Observability, withWideEvent } from '@arena/telemetry';
 import { Gateway } from '@arena/wire';
 import { FileSystem, type Headers, HttpServerRequest, HttpServerResponse } from '@effect/platform';
 import type { PlatformError } from '@effect/platform/Error';
-import { BunHttpServer } from '@effect/platform-bun';
-import { Effect, Either, Match, Option, type Scope } from 'effect';
-import { GatewayConfig, pythonRepr } from './config.ts';
+import type { ServeError } from '@effect/platform/HttpServerError';
+import { NodeHttpServer, NodeHttpServerRequest } from '@effect/platform-node';
+import { Effect, Either, Exit, Match, Option, Scope } from 'effect';
+import { createServer } from 'node:http';
+import { GatewayConfig, pythonRepr, urlsplit } from './config.ts';
 import { isGatewayMethod } from './constants.ts';
 import type { GatewayError } from './errors.ts';
 import { dispatch, type RequestBodySignal, type RouteDecision } from './http/dispatch.ts';
@@ -171,17 +158,17 @@ export const unsupportedMethodMessage = (method: string): string =>
  * because it never reaches `_send_headers` (`:1335`), so a port that adds its
  * security pair "for consistency" diverges on the first `TRACE`.
  *
- * Two things are stated here that Bun then overrules, measured rather than
+ * Two things are stated here that Node then overrules, measured rather than
  * assumed (see the test):
  *
  * - **`statusText`.**  Python's reason phrase is the message —
- *   `HTTP/1.0 501 Unsupported method ('TRACE')`.  Bun writes the *canonical*
+ *   `HTTP/1.0 501 Unsupported method ('TRACE')`. Node writes the *canonical*
  *   phrase for the status whatever the `Response` carries, so the wire says
  *   `501 Not Implemented`.  It is set anyway because it is the correct value
  *   and the only place a reader would look for it; the divergence is the
  *   server's, not this function's.
  * - **`Connection: close`.**  The stdlib states it because HTTP/1.0 closes
- *   every response; Bun owns its own connection management.  The header is
+ *   every response; Node owns its own connection management. The header is
  *   ours, the socket is not.
  */
 export const unsupportedMethod = (method: string): HttpServerResponse.HttpServerResponse => {
@@ -207,7 +194,7 @@ export interface RequestTarget {
 }
 
 /**
- * Split what the Bun adapter hands us the way `urlsplit` splits `self.path`.
+ * Split Node's raw request target the way `urlsplit` splits `self.path`.
  *
  * The adapter has already removed the scheme and authority (its `removeHost`),
  * which is `urlsplit`'s "absolute-form targets are accepted, `netloc` ignored"
@@ -216,6 +203,14 @@ export interface RequestTarget {
  * query at all, exactly as `urlsplit` reports it.
  */
 export const splitTarget = (target: string): RequestTarget => {
+  // Node preserves IncomingMessage.url exactly, including absolute-form
+  // targets. `urlsplit(self.path)` ignores their scheme and authority before
+  // the Python handler routes. Do not use `URL`: it would normalize raw dot
+  // segments before dispatch can reject them.
+  const absolute = urlsplit(target);
+  if (Option.isSome(absolute) && absolute.value.scheme !== '') {
+    return { path: absolute.value.path, query: absolute.value.query };
+  }
   const hash = target.indexOf('#');
   const withoutFragment = hash === -1 ? target : target.slice(0, hash);
   const mark = withoutFragment.indexOf('?');
@@ -246,7 +241,7 @@ export const splitTarget = (target: string): RequestTarget => {
  * One bounded divergence: a request carrying *two* `Content-Length` headers
  * reaches Python as the first value (`Headers.get`) and reaches us as the
  * comma-joined pair, which `int()` refuses — so a duplicated length is a 400
- * here and possibly a 200 there.  Bun joins before any Effect code runs; the
+ * here and possibly a 200 there. Node joins before any Effect code runs; the
  * alternative is not available at this layer.
  */
 export const bodySignal = (headers: Headers.Headers): RequestBodySignal => {
@@ -350,7 +345,10 @@ export const handleRequest = (
   never,
   GatewayRouteServices | Observability
 > => {
-  const target = splitTarget(request.url);
+  // `HttpServerRequest.url` is adapter-defined. Recover the actual Node
+  // request target so literal `.` / `..` segments cannot be normalized away.
+  const rawTarget = NodeHttpServerRequest.toIncomingMessage(request).url ?? request.url;
+  const target = splitTarget(rawTarget);
   const method = request.method;
   const served = isGatewayMethod(method)
     ? respondGateway(
@@ -422,16 +420,14 @@ export type GatewayServerServices =
  * `main` reports as `error: …` on stderr with exit 2 (`:2205-2207`):
  * `cache_root.mkdir` (`:2092`) and the ready-file publish (`:2153-2154`).
  *
- * A refused *bind* is not in this union: `BunHttpServer.make` declares no error
- * channel, so an address already in use arrives as a defect.  It still exits 2
- * — {@link ../main.ts}'s teardown maps every non-interrupted exit that way —
- * but it is not a value this signature can promise.
+ * A refused bind is a typed `ServeError` in this union. `main` reports it
+ * through the same `error: …`, exit-2 startup path as Python's `OSError`.
  */
-export type GatewayServeError = PlatformError | ReadyFileError;
+export type GatewayServeError = PlatformError | ReadyFileError | ServeError;
 
 /**
  * `run_replay_gateway` (`:2114-2171`), in the order the Python performs it and
- * with the one substitution Bun forces.
+ * with the one substitution the asynchronous Node listener forces.
  *
  * ```
  * make_replay_gateway_server(...)   binds; --port 0 is resolved here   :2093
@@ -439,24 +435,20 @@ export type GatewayServeError = PlatformError | ReadyFileError;
  * identity_payload()               reads the *bound* port             :1302
  * ── the substitution ──────────────────────────────────────────────────────
  * serve()                          Python: serve_forever() last
- *                                  Bun:    MUST precede the ready file
+ *                                  Node:   MUST precede the ready file
  * ── /the substitution ─────────────────────────────────────────────────────
  * _acquire_ready_lock + write      + print the canonical line         :2153
  * ```
  *
- * Python may publish before serving because `ThreadingHTTPServer.__init__` has
- * already bound *and listened*, and nothing answers on that socket but its own
- * handler.  `BunHttpServer.make` also binds immediately — but it binds with
- * Bun's built-in `404 not found` handler attached, so between `make` and
- * `serve` the port answers 404 from library code (spike S4, asserted).
- * Publishing there would hand out a URL that lies for as long as the layer
- * stack takes to build.  Hence: serve first, publish second.
+ * Python may publish before serving because `ThreadingHTTPServer` already owns
+ * the handler path. Node binds before `serve` installs its request listener;
+ * publishing in that interval hands out a URL that accepts but hangs. Hence:
+ * serve first, publish second.
  *
- * The finalizers unwind in the mirror order — ready file unlinked (identity and
- * pid guarded), then the lock released, then the socket closed — because
- * `ReadyFile.publish` registers on *this* scope and `Scope` releases in
- * reverse acquisition order, which is Python's `finally` block (`:2164-2169`)
- * for free.
+ * The listener lives in a child scope whose close finalizer is registered
+ * after readiness. Parent-scope LIFO therefore closes the listener first,
+ * then removes the owned ready record, then releases its lock, matching
+ * Python's shutdown contract (`:2164-2169`).
  */
 export const serveGateway: Effect.Effect<
   GatewayHandle,
@@ -466,29 +458,40 @@ export const serveGateway: Effect.Effect<
   const config = yield* GatewayConfig;
   const fileSystem = yield* FileSystem.FileSystem;
 
-  const server = yield* BunHttpServer.make({ port: config.port, hostname: config.host });
-  const address = server.address;
-  const port = address._tag === 'TcpAddress' ? address.port : config.port;
-
-  // `:2092` — created before the gateway serves anything, and never touched
-  // again: the loaders own everything inside it.
+  // Python creates the cache before it attempts to bind. Besides preserving
+  // failure precedence, this means an unusable cache never reserves a port.
   yield* fileSystem.makeDirectory(config.cacheRoot, { recursive: true });
 
-  const identity = makeGatewayIdentity({ config, boundPort: port, pid: process.pid });
+  // The listener has its own scope so its close can be registered *after* the
+  // ready resources. Parent scopes finalize in LIFO order: listener first,
+  // then owned-ready unlink, then flock release, matching Python's finally.
+  const listenerScope = yield* Scope.make();
+  return yield* Effect.gen(function* () {
+    const server = yield* Scope.extend(
+      NodeHttpServer.make(createServer, { port: config.port, host: config.host }),
+      listenerScope,
+    );
+    const address = server.address;
+    const port = address._tag === 'TcpAddress' ? address.port : config.port;
+    const identity = makeGatewayIdentity({ config, boundPort: port, pid: process.pid });
 
-  // Spike law: the app is attached before anyone is told where to find it.
-  yield* server.serve(Effect.provideService(gatewayApp, GatewayIdentity, identity));
+    yield* server.serve(Effect.provideService(gatewayApp, GatewayIdentity, identity));
 
-  const readyFile = yield* ReadyFile;
-  const ready = yield* readyFile.publish(identity.payload);
+    const readyFile = yield* ReadyFile;
+    const ready = yield* readyFile.publish(identity.payload);
 
-  return {
-    host: config.host,
-    port,
-    url: Gateway.gatewaySelfUrl(config.host, port),
-    identity,
-    ready,
-  };
+    yield* Effect.addFinalizer((exit) => Scope.close(listenerScope, exit));
+
+    return {
+      host: config.host,
+      port,
+      url: Gateway.gatewaySelfUrl(config.host, port),
+      identity,
+      ready,
+    };
+  }).pipe(
+    Effect.onError((cause) => Scope.close(listenerScope, Exit.failCause(cause))),
+  );
 });
 
 /**

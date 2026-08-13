@@ -114,12 +114,13 @@ const PPM_TWO = [
 
 /**
  * A real autosave is megabytes of pixels; the header the scan cares about is
- * the first few lines.  `PPM_PREFIX_BYTES` bounds the read, and this file is
- * the proof that bounding it changes no answer — CPython reads the same header
- * out of the same file and the differential compares the bodies.
+ * the first few logical lines. This fixture puts a player row after a single
+ * comment larger than the old 512 KiB byte prefix, proving the reader bounds
+ * by Python's 513 complete lines rather than by bytes.
  */
 const PPM_BIG = [
   'P3',
+  `# ${'padding'.repeat(80_000)}`,
   '# playerno:0:color:(  0, 103, 165):name:"AgentPlace1"',
   '# playerno:2:color:(255,  20, 147):name:"Blackbeard"',
   '4 4',
@@ -946,7 +947,7 @@ describe('watch.json and frames: the disk projection, against CPython', () => {
     expect(watch.headers.get('content-type')).toBe(Gateway.GATEWAY_PROBLEM_CONTENT_TYPE);
   });
 
-  test('a megabyte autosave is read as a bounded prefix, with the same answer', async () => {
+  test('a player row after a >512 KiB line is read within the 513-line bound', async () => {
     stub().reset();
     stub().setMode('not-found');
     const oracle = runOracle(runsRoot(), OPTIONS, [[BIG_PPM, 'frames']]);

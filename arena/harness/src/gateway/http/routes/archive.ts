@@ -143,20 +143,31 @@ export const archiveRouteOptions = (
 // Frame sources — the I/O half of _archive_frames
 // ---------------------------------------------------------------------------
 
-/**
- * How much of a `*.map.ppm` is read before `archivePpmPlayers` sees it.
- *
- * Python opens the autosave in text mode and iterates lines, breaking out of
- * the scan at line 513 *or* at the first non-comment line — so it reads one
- * buffered block of a file that is mostly pixels.  Reading the whole thing per
- * frame would turn a 40-frame `watch.json` into hundreds of megabytes of I/O.
- *
- * The prefix is cut back to the last complete line, so no truncated line can
- * be matched, and the scan cannot look past line 513 anyway: a header whose
- * first 512 KiB do not contain the player comments is a header whose scan had
- * already stopped.
- */
-export const PPM_PREFIX_BYTES = 512 * 1024;
+/** Python's scan consumes at most 513 complete logical lines. */
+const PPM_LOGICAL_LINES = 513;
+
+/** Bounded by line count rather than bytes: PPM comments have no byte limit. */
+const PPM_READ_CHUNK_BYTES = 64 * 1024;
+
+/** Python stops once a post-magic line terminates the comment header. */
+const ppmHeaderDone = (text: string): boolean => {
+  const lines = text.split(/\r\n|\r|\n/u);
+  let playerSeen = false;
+  for (let index = 0; index < lines.length - 1; index += 1) {
+    const line = lines[index] ?? '';
+    if (index > 0 && !line.startsWith('#')) {
+      const stripped = line.trim();
+      if (playerSeen || (stripped !== '' && stripped !== 'P3')) return true;
+    }
+    if (/^#\s*playerno:/u.test(line)) playerSeen = true;
+  }
+  const partial = lines.at(-1) ?? '';
+  if (lines.length > 1 && !partial.startsWith('#')) {
+    const stripped = partial.trimStart();
+    if (stripped !== '' && (playerSeen || !'P3'.startsWith(stripped))) return true;
+  }
+  return false;
+};
 
 /** `_send_local_file`'s copy loop (`:1515`) and `_stream_upstream`'s (`:1484`). */
 export const ARCHIVE_STREAM_CHUNK_BYTES = 64 * 1024;
@@ -166,31 +177,60 @@ const NOT_FOUND = (problem: 'archiveDataNotFound' | 'archiveFileNotFound'): NotF
 
 const attemptSync = <A>(thunk: () => A): Option.Option<A> => Option.getRight(Either.try(thunk));
 
-/** The bounded head of an autosave, decoded with `errors="replace"`. */
-const readPpmPrefix = (path: string): string =>
+/** The first 513 complete universal-newline lines, decoded with `errors="replace"`. */
+const readPpmLines = (path: string): string =>
   Option.getOrElse(
     Option.flatMap(
       attemptSync(() => openSync(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)),
       (fd) => {
         const bytes = attemptSync(() => {
-          const size = fstatSync(fd).size;
-          const length = Math.min(size, PPM_PREFIX_BYTES);
-          const buffer = new Uint8Array(length);
-          const read = readSync(fd, buffer, 0, length, 0);
-          return { chunk: buffer.subarray(0, Math.max(read, 0)), whole: length >= size };
+          const parts: Uint8Array[] = [];
+          let lines = 0;
+          let previousWasCr = false;
+          let done = false;
+          while (!done && lines < PPM_LOGICAL_LINES) {
+            const buffer = new Uint8Array(PPM_READ_CHUNK_BYTES);
+            const count = readSync(fd, buffer, 0, buffer.byteLength, null);
+            if (count <= 0) break;
+            let keep = count;
+            for (let index = 0; index < count; index += 1) {
+              const byte = buffer[index];
+              if (byte === 0x0d) {
+                lines += 1;
+                previousWasCr = true;
+              } else if (byte === 0x0a) {
+                if (!previousWasCr) lines += 1;
+                previousWasCr = false;
+              } else {
+                previousWasCr = false;
+              }
+              if (lines >= PPM_LOGICAL_LINES) {
+                keep = index + 1;
+                done = true;
+                break;
+              }
+            }
+            parts.push(buffer.subarray(0, keep));
+            if (!done) {
+              const length = parts.reduce((total, part) => total + part.byteLength, 0);
+              const prefix = new Uint8Array(length);
+              parts.reduce((offset, part) => {
+                prefix.set(part, offset);
+                return offset + part.byteLength;
+              }, 0);
+              done = ppmHeaderDone(new TextDecoder('utf-8').decode(prefix));
+            }
+          }
+          const length = parts.reduce((total, part) => total + part.byteLength, 0);
+          const joined = new Uint8Array(length);
+          parts.reduce((offset, part) => {
+            joined.set(part, offset);
+            return offset + part.byteLength;
+          }, 0);
+          return joined;
         });
-        Option.getOrElse(
-          attemptSync(() => closeSync(fd)),
-          () => undefined,
-        );
-        return Option.map(bytes, (value) => {
-          // `errors="replace"`: a torn multi-byte sequence at the cut must not
-          // fail the read, it must become U+FFFD exactly as CPython's decoder
-          // would have made it.
-          const text = new TextDecoder('utf-8').decode(value.chunk);
-          const lastBreak = text.lastIndexOf('\n');
-          return value.whole || lastBreak < 0 ? text : text.slice(0, lastBreak + 1);
-        });
+        Option.getOrElse(attemptSync(() => closeSync(fd)), () => undefined);
+        return Option.map(bytes, (value) => new TextDecoder('utf-8').decode(value));
       },
     ),
     () => '',
@@ -238,7 +278,7 @@ const frameSources = (
                 pairing.ppmName === null
                   ? []
                   : archivePpmPlayers(
-                      readPpmPrefix(join(ppmDirectory, pairing.ppmName)),
+                      readPpmLines(join(ppmDirectory, pairing.ppmName)),
                       archive.places,
                     ),
             }),

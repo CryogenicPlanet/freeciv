@@ -74,14 +74,12 @@ import {
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import {
   compareCodePoints,
-  decodeJsonValueFromString,
   Gateway,
   isGameId,
   isTerminalRunState,
+  type CanonRecord,
+  type CanonValue,
   type FrameIndex,
-  type JsonArray,
-  type JsonObject,
-  type JsonValue,
   type WireDecodeError,
 } from '@arena/wire';
 import {
@@ -105,7 +103,7 @@ import {
   type NotFoundProblem,
 } from '../errors.ts';
 import { type Canonical, type Untrusted, untrustedField } from '../public.ts';
-import { parsePythonJson } from '../python-json.ts';
+import { isCanonRecord, parsePythonJson } from '../python-json.ts';
 
 /** What a read of `runs_root` can fail with: a 404 or a 503, never anything else. */
 export type RunsError = ArchiveUnavailable | NotFound;
@@ -127,25 +125,17 @@ const asNotFound = (problem: Gateway.GatewayProblemName): NotFound =>
   new NotFound({ problem: isNotFoundProblem(problem) ? problem : 'notFound' });
 
 // ---------------------------------------------------------------------------
-// darwin open(2) flags — spike law
+// platform open(2) flags — spike law
 // ---------------------------------------------------------------------------
 
 /** `O_RDONLY`. */
 export const O_RDONLY = 0x0000_0000;
 
-/**
- * darwin `O_NOFOLLOW`.
- *
- * Spelled out for the same reason as {@link O_CLOEXEC}: a constant that reads
- * back `undefined` contributes `0` to a flag word instead of failing, and the
- * symlink refusal (`test_replay_gateway.py:1309` — a `watch_frames/000000.png`
- * replaced by a link to `auth.json`) would silently stop happening.  Linux
- * spells this `0o400000`; this port targets darwin.
- */
-export const O_NOFOLLOW = 0x0000_0100;
+/** `O_NOFOLLOW`: `0x100` on Darwin, `0x20000` on Linux. */
+export const O_NOFOLLOW = process.platform === 'linux' ? 0x0002_0000 : 0x0000_0100;
 
-/** darwin `O_CLOEXEC` — absent from Bun's `node:fs` constants (spike law). */
-export const O_CLOEXEC = 0x0100_0000;
+/** `O_CLOEXEC`: `0x1000000` on Darwin, `0x80000` on Linux. */
+export const O_CLOEXEC = process.platform === 'linux' ? 0x0008_0000 : 0x0100_0000;
 
 /** The tail of `replay.jsonl` `_last_replay_turn` reads (`:1189`). */
 export const REPLAY_TAIL_BYTES = 65536;
@@ -284,18 +274,24 @@ const decodeUtf8 = (bytes: Uint8Array): Option.Option<string> =>
 const decodeLatin1 = (bytes: Uint8Array): string =>
   Array.from(bytes, (byte) => String.fromCharCode(byte)).join('');
 
-/** `json.loads`, narrowed to what `JSON.parse` accepts; see the module doc. */
-const parseJson = (text: string): Option.Option<JsonValue> =>
-  Option.getRight(decodeJsonValueFromString(text));
+/** `json.loads`, preserving Python `int` values beyond JavaScript's safe range. */
+const parseJson = (text: string): Option.Option<CanonValue> =>
+  Option.getRight(parsePythonJson(text));
 
-// `Array.isArray` does not narrow a `ReadonlyArray` member out of a union in
-// its false branch; a declared guard does.
-const isJsonArray = (value: JsonValue): value is JsonArray => Array.isArray(value);
+const asJsonObject = (value: CanonValue): Option.Option<CanonRecord> =>
+  isCanonRecord(value) ? Option.some(value) : Option.none();
 
-const asJsonObject = (value: JsonValue): Option.Option<JsonObject> =>
-  value !== null && typeof value === 'object' && !isJsonArray(value)
-    ? Option.some(value)
-    : Option.none();
+/** A Python-aware document converted only for a strict wire-schema decode. */
+const canonToJson = (value: CanonValue): unknown =>
+  typeof value === 'bigint'
+    ? Number(value)
+    : Array.isArray(value)
+      ? value.map(canonToJson)
+      : typeof value === 'object' && value !== null
+        ? Object.fromEntries(
+            Object.entries(value).map(([key, item]) => [key, canonToJson(item)]),
+          )
+        : value;
 
 /** `Path.read_text` — follows symlinks, no size ceiling, closes either way. */
 const readWholeFile = (path: string): Either.Either<Uint8Array, FsFailure> =>
@@ -330,7 +326,7 @@ export interface RunsRepositoryApi {
   readonly runsRoot: string;
 
   /** `_read_manifest` (`:557`) — the raw `manifest.json`, id-checked. */
-  readonly readManifest: (gameId: string) => Effect.Effect<JsonObject, RunsError>;
+  readonly readManifest: (gameId: string) => Effect.Effect<CanonRecord, RunsError>;
 
   /** {@link readManifest} through wire's strict schema, for callers that want it. */
   readonly decodeManifest: (
@@ -384,7 +380,7 @@ export class RunsRepository extends Context.Tag('@arena/harness/gateway/RunsRepo
 const readArchiveJson = (
   path: string,
   label: Gateway.ArchiveJsonLabel,
-): Effect.Effect<JsonObject, RunsError> =>
+): Effect.Effect<CanonRecord, RunsError> =>
   Effect.scoped(
     Effect.flatMap(
       Effect.mapError(
@@ -416,9 +412,9 @@ const readArchiveJson = (
  */
 const makeReadManifest =
   (runsRoot: string) =>
-  (gameId: string): Effect.Effect<JsonObject, RunsError> =>
+  (gameId: string): Effect.Effect<CanonRecord, RunsError> =>
     Effect.suspend(() => {
-      const gone: Either.Either<JsonObject, RunsError> = Either.left(
+      const gone: Either.Either<CanonRecord, RunsError> = Either.left(
         new NotFound({ problem: 'gameNotFound' }),
       );
       if (!isGameId(gameId) || isSymlink(join(runsRoot, gameId))) {
@@ -836,7 +832,9 @@ export const makeRunsRepository = (runsRoot: string): RunsRepositoryApi => {
     runsRoot: root,
     readManifest,
     decodeManifest: (gameId) =>
-      Effect.flatMap(readManifest(gameId), (manifest) => Gateway.decodeManifest(manifest)),
+      Effect.flatMap(readManifest(gameId), (manifest) =>
+        Gateway.decodeManifest(canonToJson(manifest)),
+      ),
     terminalArchive,
     lastReplayTurn,
     diskGamesIndex: (options) => Effect.map(diskGameRows(options), gamesIndex),

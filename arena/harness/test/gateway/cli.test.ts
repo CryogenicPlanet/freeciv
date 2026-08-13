@@ -18,7 +18,7 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { CliConfig, CommandDescriptor, HelpDoc } from '@effect/cli';
 import { FileSystem } from '@effect/platform';
-import { BunFileSystem, BunPath, BunTerminal } from '@effect/platform-bun';
+import { NodeFileSystem, NodePath, NodeTerminal } from '@effect/platform-node';
 import { Gateway } from '@arena/wire';
 import { Effect, Either, Layer, Option } from 'effect';
 import { mkdir, mkdtemp, realpath, rm, symlink } from 'node:fs/promises';
@@ -209,7 +209,7 @@ const floatBits = (value: number): string => {
   return [...new Uint8Array(view.buffer)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 };
 
-const FILE_SYSTEM = BunFileSystem.layer;
+const FILE_SYSTEM = NodeFileSystem.layer;
 
 const runFs = <A>(effect: Effect.Effect<A, never, FileSystem.FileSystem>): Promise<A> =>
   Effect.runPromise(Effect.provide(effect, FILE_SYSTEM));
@@ -649,7 +649,7 @@ describe('the Python differential', () => {
 // The flag surface
 // ---------------------------------------------------------------------------
 
-const CLI_ENVIRONMENT = Layer.mergeAll(BunFileSystem.layer, BunPath.layer, BunTerminal.layer);
+const CLI_ENVIRONMENT = Layer.mergeAll(NodeFileSystem.layer, NodePath.layer, NodeTerminal.layer);
 
 /**
  * Parse an argv tail through the real command descriptor.

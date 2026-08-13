@@ -65,9 +65,7 @@ import {
   type GameId,
   Gateway,
   isGameId,
-  isJsonObject,
   isTerminalRunState,
-  type JsonValue,
   type RunStateTolerant,
   UnrecognizedRunState,
 } from '@arena/wire';
@@ -266,40 +264,22 @@ export const archiveLeaderboard = (
 /**
  * A relayed JSON value, with its integers spelled the way CPython read them.
  *
- * `json.loads` distinguishes `753` from `753.0` and `json.dumps` writes each
- * back as it found it; `JSON.parse` cannot, so an integral number is restored
- * to a `bigint` here — the int-first rule `@arena/wire`'s `WireNumber`
- * already states for exactly this ambiguity.  Reachable only through
- * `victory.json`'s `turn` and `year`, which `_archive_victory` copies out of
- * the file with no validation whatsoever (`:704`), including when they hold
- * objects or arrays — hence the recursion.
- *
- * The one thing it cannot recover is a *float* that happens to be integral: a
- * hand-written `"turn": 753.0` re-emits as `753`.  Nothing downstream can tell
- * the two apart once `JSON.parse` has run, and the engine's writer only ever
- * emits integers here.
- *
- * This is now the **only** place in the port that guesses.  The two other sites
- * that carried the same rule — `_games`' relayed upstream rows and
- * `services/runs.ts`'s `victory.json` passthrough — read their text through
- * `../python-json.ts` instead and know the answer rather than inferring it.
- * The guess survives here because `archiveVictory` is typed over
- * `@arena/wire`'s `JsonValue` (whose `MatchVictory` schema has no `bigint`
- * member), and widening that schema is wire's change to make, not this
- * package's.
+ * Disk readers use `parsePythonJson`, so Python integers already arrive as
+ * `bigint` and integral floats remain `number`; no post-parse numeric guess is
+ * permitted here because it would collapse a disk literal such as `753.0`.
  */
-const relayedJson = (value: JsonValue): CanonValue =>
-  typeof value === 'number'
-    ? Number.isInteger(value)
-      ? BigInt(value)
-      : value
-    : Array.isArray(value)
-      ? value.map(relayedJson)
-      : isJsonObject(value)
-        ? Object.fromEntries(
-            Object.entries(value).map(([key, item]) => [key, relayedJson(item)]),
-          )
-        : value;
+const relayedJson = (value: unknown): CanonValue => {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'bigint') return value;
+  if (typeof value === 'number') return value;
+  if (Array.isArray(value)) return value.map(relayedJson);
+  if (isUntrusted(value)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, relayedJson(item)]),
+    );
+  }
+  return null;
+};
 
 /**
  * `_archive_victory` (`:681`) minus the `victory.json` read.
@@ -317,7 +297,7 @@ export const archiveVictory = (
   record: Option.Option<unknown>,
 ): Option.Option<Canonical<Gateway.MatchVictory>> => {
   const value = Option.getOrUndefined(record);
-  if (!isJsonObject(value)) return Option.none();
+  if (!isUntrusted(value)) return Option.none();
   const code = value['victory'];
   if (typeof code !== 'string' || code === '') return Option.none();
   const winners = value['winners'];

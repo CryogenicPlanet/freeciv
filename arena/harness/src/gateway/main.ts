@@ -53,7 +53,7 @@ import {
 import { CliApp, Command, ValidationError } from '@effect/cli';
 import type { FileSystem } from '@effect/platform';
 import type { Teardown } from '@effect/platform/Runtime';
-import { BunContext, BunRuntime } from '@effect/platform-bun';
+import { NodeContext, NodeRuntime } from '@effect/platform-node';
 import { Cause, Console, Effect, Exit, Layer, Option } from 'effect';
 import {
   GATEWAY_CLI_ERROR_EXIT_CODE,
@@ -181,7 +181,7 @@ export const configuredServices: Layer.Layer<GatewayConfiguredServices, never, G
  * `provideMerge` keeps {@link GatewayConfig} in the output because the server
  * reads `host`, `port` and `cacheRoot` back out of it; the `FileSystem` the
  * config resolution needs stays in the *requirements* and is satisfied once, at
- * the very top, by `BunContext.layer`.
+ * the very top, by `NodeContext.layer`.
  */
 export const gatewayLayer = (
   args: GatewayCliArgs,
@@ -304,7 +304,7 @@ const errorLabel = (error: object): string =>
  * an exception's `str()`, nothing in the repo reads it (`local_stack.py`'s
  * `_wait_http` greps the ready record for `"ok":true`, on stdout and over
  * HTTP), and reproducing CPython's `OSError` spelling would mean inventing
- * errno strings for failures Bun words differently.  What *is* parity material
+ * errno strings for failures Node words differently. What *is* parity material
  * is the stream, the `error: ` prefix and the exit code — all three are here.
  *
  * A `ValidationError` is already on stderr with a usage block by the time it
@@ -332,7 +332,7 @@ export const reportStartupFailure = (cause: Cause.Cause<unknown>): Effect.Effect
  *   exit code for a bad command line is also 2)
  *
  * A defect lands in the third arm on purpose: a refused bind arrives that way
- * (`BunHttpServer.make` declares no error channel), and in Python it is an
+ * (`NodeHttpServer.make` declares no error channel), and in Python it is an
  * `OSError` — exit 2 either way.
  */
 export const gatewayTeardown: Teardown = <E, A>(
@@ -355,7 +355,7 @@ export const main = (
 ): Effect.Effect<void, GatewayStartupError | ValidationError.ValidationError> =>
   runGatewayCli(argv).pipe(
     Effect.tapErrorCause(reportStartupFailure),
-    Effect.provide(BunContext.layer),
+    Effect.provide(NodeContext.layer),
   );
 
 /**
@@ -368,7 +368,7 @@ export const main = (
  * addition* to the `error: …` line, and `main` prints exactly one.
  */
 if (import.meta.main) {
-  BunRuntime.runMain(main(process.argv), {
+  NodeRuntime.runMain(main(process.argv), {
     disableErrorReporting: true,
     teardown: gatewayTeardown,
   });

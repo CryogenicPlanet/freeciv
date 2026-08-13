@@ -4,11 +4,11 @@
  * Every other suite in this directory tests a piece with the socket removed —
  * dispatch as a pure function, routes against an injected `fetch`, the ready
  * publisher against a temporary directory.  This one exists for the claims that
- * only survive contact with Bun, and it is organized around them:
+ * only survive contact with Node's HTTP server, and it is organized around them:
  *
- * 1. **The ready record is never published into the 404 window.**  Spike S4
- *    found that `BunHttpServer.make` binds *and answers* — with Bun's built-in
- *    `404 not found` — before `serve(app)` attaches ours.  So the ordering is
+ * 1. **The ready record is never published before the request listener.**
+ *    `NodeHttpServer.make` binds before `serve(app)` attaches ours, so a client
+ *    in that interval connects but receives no response. The ordering is
  *    not a style preference, it is the difference between a client that reads
  *    the record and connects and a client that is told 404 by code we did not
  *    write.  The test is the Python's (`test_ready_file_is_private_and_removed_on_clean_shutdown`,
@@ -19,7 +19,7 @@
  *    404.
  * 2. **The request line Python saw.**  Fragments, absolute-form targets,
  *    doubled leading slashes, a bare `?`, and `%2F` staying literal are all
- *    decisions made between Bun's `Request` and `dispatch`, and `fetch` cannot
+ *    decisions made between Node's request parser and `dispatch`, and `fetch` cannot
  *    express most of them — so those tests speak HTTP/1.1 down a raw socket.
  * 3. **The verbs `do_GET` never sees.**  `TRACE` is the stdlib's HTML
  *    `501 Unsupported method ('TRACE')` with *no* security headers, while the
@@ -30,7 +30,7 @@
  *    is proxied.
  * 5. **One wide event per request**, on the refusals as well as the successes.
  *
- * Where Bun's own parser refuses a message before any Effect code runs — an
+ * Where Node's own parser refuses a message before any Effect code runs — an
  * unparseable `Content-Length`, `Transfer-Encoding: identity`, an invented verb
  * — the divergence is asserted rather than papered over, and the *decision*
  * those inputs would have driven is still pinned as a pure function
@@ -55,9 +55,10 @@ import {
 } from '@arena/telemetry';
 import { HelpDoc, ValidationError } from '@effect/cli';
 import { Headers } from '@effect/platform';
-import { BunContext, BunHttpServer } from '@effect/platform-bun';
-import { Cause, Console, Data, Effect, Exit, FiberId, Layer, Option, Ref } from 'effect';
+import { NodeContext, NodeHttpServer } from '@effect/platform-node';
+import { Cause, Console, Data, Effect, Either, Exit, FiberId, Layer, Option, Ref } from 'effect';
 import { mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -339,6 +340,19 @@ const probingSink = (into: Array<ReadyProbe>): ReadyLineSink => (line) =>
     into.push({ line, status: response.status, body: await response.text() });
   });
 
+/** Node listens before `serve` attaches a handler, but emits no fallback body. */
+const probingUnservedSink = (into: Array<ReadyProbe>): ReadyLineSink => (line) =>
+  Effect.promise(async () => {
+    try {
+      const response = await fetch(`${stringField(line, 'url')}/health`, {
+        signal: AbortSignal.timeout(50),
+      });
+      into.push({ line, status: response.status, body: await response.text() });
+    } catch {
+      into.push({ line, status: 0, body: '' });
+    }
+  });
+
 // ---------------------------------------------------------------------------
 // The layer stack under test
 // ---------------------------------------------------------------------------
@@ -346,11 +360,13 @@ const probingSink = (into: Array<ReadyProbe>): ReadyLineSink => (line) =>
 interface HarnessOptions {
   readonly readyFile: string;
   readonly sink: ReadyLineSink;
+  readonly readyLayer?: Layer.Layer<ReadyFile>;
+  readonly port?: bigint;
 }
 
-const configArguments = (readyFile: string) => ({
+const configArguments = (readyFile: string, port = 0n) => ({
   host: HOST,
-  port: 0n,
+  port,
   serviceUrl: OFFLINE_UPSTREAM,
   runsRoot,
   cacheRoot,
@@ -375,7 +391,7 @@ const harnessLayer = (options: HarnessOptions) =>
   Layer.mergeAll(
     runsRepositoryLayer(runsRoot),
     upstreamClientLayer({ serviceUrl: OFFLINE_UPSTREAM, timeout: '2 seconds' }),
-    readyFileLayer({ path: options.readyFile, sink: options.sink }),
+    options.readyLayer ?? readyFileLayer({ path: options.readyFile, sink: options.sink }),
     ReplayDerivationUnavailable,
     ObservabilityTest.pipe(
       Layer.provide(
@@ -387,11 +403,11 @@ const harnessLayer = (options: HarnessOptions) =>
       ),
       Layer.orDie,
     ),
-    gatewayConfigLayer(configArguments(options.readyFile)).pipe(
-      Layer.provide(BunContext.layer),
+    gatewayConfigLayer(configArguments(options.readyFile, options.port)).pipe(
+      Layer.provide(NodeContext.layer),
       Layer.orDie,
     ),
-    BunContext.layer,
+    NodeContext.layer,
   );
 
 /** Start a gateway, hand it to `use`, and tear the whole scope down after. */
@@ -431,14 +447,13 @@ describe('startup: the ready record is published only after serve() attaches the
     expect(observed.url).toBe(`http://${HOST}:${observed.port}`);
   });
 
-  test('the guard has teeth: publishing before serve() sees the library 404', async () => {
-    // The same three steps in the wrong order. If `serveGateway` ever regressed
-    // to this, the test above would go red — which is the only reason to write
-    // it down.
+  test('the guard has teeth: publishing before serve() exposes no gateway response', async () => {
+    // Node has bound and is accepting, but no request listener exists until
+    // `serve(app)`. Publishing in that window gives a client a URL that hangs.
     const probes: Array<ReadyProbe> = [];
     const misordered = Effect.gen(function* () {
       const config = yield* GatewayConfig;
-      const server = yield* BunHttpServer.make({ port: 0, hostname: HOST });
+      const server = yield* NodeHttpServer.make(createServer, { port: 0, host: HOST });
       const address = server.address;
       const port = address._tag === 'TcpAddress' ? address.port : -1;
       const identity = makeGatewayIdentity({ config, boundPort: port, pid: process.pid });
@@ -451,16 +466,77 @@ describe('startup: the ready record is published only after serve() attaches the
     await Effect.runPromise(
       Effect.scoped(misordered).pipe(
         Effect.provide(
-          harnessLayer({ readyFile: readyPath('misordered'), sink: probingSink(probes) }),
+          harnessLayer({ readyFile: readyPath('misordered'), sink: probingUnservedSink(probes) }),
         ),
         Effect.asVoid,
         Effect.orDie,
       ),
     );
 
-    expect(probes).toHaveLength(1);
-    expect(probes[0]?.status).toBe(404);
-    expect(probes[0]?.body).toBe('not found');
+    expect(probes).toEqual([{ line: probes[0]?.line ?? '', status: 0, body: '' }]);
+  });
+
+  test('shutdown closes the listener before ready cleanup runs', async () => {
+    const observed: Array<string> = [];
+    const orderingLayer = Layer.succeed(ReadyFile, {
+      publish: (payload) =>
+        Effect.gen(function* () {
+          const port = payload['port'];
+          yield* Effect.addFinalizer(() =>
+            typeof port === 'bigint'
+              ? Effect.flatMap(probeConnect(Number(port)), (state) =>
+                  Effect.sync(() => observed.push(`ready-cleanup:${state}`)),
+                )
+              : Effect.sync(() => observed.push('ready-cleanup:invalid-port')),
+          );
+          return {
+            path: Option.none(),
+            lockPath: Option.none(),
+            bytes: Option.none(),
+            line: '',
+          };
+        }),
+    });
+
+    await withGateway(
+      {
+        readyFile: readyPath('shutdown-order'),
+        sink: probingSink([]),
+        readyLayer: orderingLayer,
+      },
+      () => Effect.void,
+    );
+
+    expect(observed).toEqual(['ready-cleanup:refused']);
+  });
+
+  test('a refused bind is a typed startup failure and publishes nothing', async () => {
+    const blocker = Bun.serve({
+      hostname: HOST,
+      port: 0,
+      fetch: () => new Response('occupied'),
+    });
+    const path = readyPath('bind-failure');
+    try {
+      const outcome = await Effect.runPromise(
+        Effect.either(
+          Effect.scoped(serveGateway).pipe(
+            Effect.provide(
+              harnessLayer({
+                readyFile: path,
+                sink: probingSink([]),
+                port: BigInt(blocker.port ?? 0),
+              }),
+            ),
+          ),
+        ),
+      );
+      expect(Either.isLeft(outcome)).toBe(true);
+      if (Either.isLeft(outcome)) expect(outcome.left._tag).toBe('ServeError');
+      expect(() => statSync(path)).toThrow();
+    } finally {
+      await blocker.stop(true);
+    }
   });
 
   test('cache_root is created before anything is served, parents included', async () => {
@@ -526,6 +602,18 @@ const REQUEST_CASES: ReadonlyArray<Case> = [
       expect(response.headers.get('x-content-type-options')).toBe('nosniff');
       expect(response.headers.get('referrer-policy')).toBe('no-referrer');
     },
+  },
+  {
+    name: 'literal dot segments remain in the raw target and do not route',
+    target: '/v1/games/../health',
+    status: 404,
+    check: jsonError(Gateway.GATEWAY_PROBLEM_MESSAGES.notFound),
+  },
+  {
+    name: 'percent-encoded dot segments remain in the raw target and do not route',
+    target: '/v1/games/%2e%2e/health',
+    status: 404,
+    check: jsonError(Gateway.GATEWAY_PROBLEM_MESSAGES.notFound),
   },
   {
     name: 'a bare trailing ? is no query at all',
@@ -626,11 +714,11 @@ const REQUEST_CASES: ReadonlyArray<Case> = [
   },
   {
     // DIVERGENCE, measured: Python answers `400 invalid Content-Length` from
-    // `_reject_body` (`:1390`); Bun's parser refuses the message before any
+    // `_reject_body` (`:1390`); Node's parser refuses the message before any
     // Effect code runs and writes its own bodiless `400 Bad Request`. Same
     // status, different body, and nothing this layer can reach. The *decision*
     // is still pinned — see the `bodySignal` table below.
-    name: "an unparseable Content-Length never reaches us: Bun's own 400",
+    name: "an unparseable Content-Length never reaches us: Node's own 400",
     target: '/health',
     headers: [['Content-Length', 'abc']],
     status: 400,
@@ -640,14 +728,21 @@ const REQUEST_CASES: ReadonlyArray<Case> = [
     },
   },
   {
-    // DIVERGENCE, measured: `Transfer-Encoding: identity` is a legal header
-    // value that Python treats as "a body is present"; Bun rejects the framing
-    // outright. `chunked` — the case above — does reach us.
-    name: "Transfer-Encoding: identity never reaches us either: Bun's own 400",
+    // Node's parser rejects this transfer-coding on Darwin but delivers it on
+    // Linux. Both paths answer 400; Linux reaches `_reject_body` like Python.
+    name: 'Transfer-Encoding: identity is rejected before serving',
     target: '/health',
     headers: [['Transfer-Encoding', 'identity']],
     status: 400,
-    check: (response) => expect(response.body).toBe(''),
+    check: (response) => {
+      if (process.platform === 'linux') {
+        expect(response.body).toBe('{"error":"GET request bodies are not accepted"}');
+        expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+      } else {
+        expect(response.body).toBe('');
+        expect(response.headers.has('x-content-type-options')).toBe(false);
+      }
+    },
   },
 ];
 
@@ -667,6 +762,23 @@ describe('the request line, spoken down a raw socket', () => {
       expect(response.status).toBe(one.status);
       one.check(response);
     });
+  });
+
+  test('a raw cross-game A/../B target is rejected before any upstream request', async () => {
+    const gameA = 'game_AAAAAAAAAAAAAAAAAAAAAAAA';
+    const gameB = 'game_BBBBBBBBBBBBBBBBBBBBBBBB';
+    const before = upstreamRequests.length;
+    const response = await withGateway(
+      { readyFile: readyPath('cross-game-dotdot'), sink: probingSink([]) },
+      (handle) =>
+        wire(handle.port, {
+          method: 'GET',
+          target: `/v1/games/${gameA}/../${gameB}/replay.json`,
+        }),
+    );
+    expect(response.status).toBe(404);
+    expect(response.body).toBe(`{"error":"${Gateway.GATEWAY_PROBLEM_MESSAGES.notFound}"}`);
+    expect(upstreamRequests.length).toBe(before);
   });
 });
 
@@ -704,7 +816,7 @@ describe('methods: the stdlib answers the unmapped ones, we answer the rest', ()
     expect(response.headers.get('content-length')).toBe('30');
   });
 
-  const UNMAPPED: ReadonlyArray<string> = ['TRACE', 'CONNECT'];
+  const UNMAPPED: ReadonlyArray<string> = ['TRACE'];
 
   UNMAPPED.forEach((method) => {
     test(`${method} is the stdlib HTML 501, with none of our headers`, async () => {
@@ -723,7 +835,7 @@ describe('methods: the stdlib answers the unmapped ones, we answer the rest', ()
       expect(response.headers.has('referrer-policy')).toBe(false);
       expect(response.headers.has('cache-control')).toBe(false);
       // DIVERGENCE, measured: Python's reason phrase carries the verb
-      // (`501 Unsupported method ('TRACE')`). Bun writes the canonical phrase
+      // (`501 Unsupported method ('TRACE')`). Node writes the canonical phrase
       // for the status whatever the `Response.statusText` says, so the wire
       // says `Not Implemented` — while the value we built still carries the
       // right text, asserted below.
@@ -731,22 +843,32 @@ describe('methods: the stdlib answers the unmapped ones, we answer the rest', ()
     });
   });
 
-  test('the response value carries the reason phrase Bun then discards', () => {
+  test('CONNECT is intercepted by Node before the request handler', async () => {
+    // Node emits CONNECT on its separate `connect` event. The Effect adapter
+    // intentionally installs only request/upgrade handlers, so no response is
+    // available to gateway code at this layer.
+    const response = await withGateway(
+      { readyFile: readyPath('method-CONNECT'), sink: probingSink([]) },
+      (handle) => wire(handle.port, { method: 'CONNECT', target: '/health' }),
+    );
+    expect(response.status).toBe(0);
+    expect(response.body).toBe('');
+  });
+
+  test('the response value carries the reason phrase Node then discards', () => {
     expect(unsupportedMethod('TRACE').statusText).toBe("Unsupported method ('TRACE')");
     expect(unsupportedMethod('TRACE').status).toBe(501);
   });
 
-  test('an invented verb never reaches us at all — Bun closes the connection', async () => {
+  test("an invented verb never reaches us at all — Node's parser writes 400", async () => {
     // DIVERGENCE, measured: Python answers `501 Unsupported method ('FOO')`.
-    // Bun's parser accepts only known methods and drops the connection with no
-    // response bytes, so there is nothing for the gateway to answer with. It is
-    // recorded here rather than in a comment because a future Bun that starts
-    // delivering `FOO` should make this test fail and the port grow a case.
+    // Node's parser rejects the method token before the request event and emits
+    // its own 400, so there is nothing for the Effect app to answer with.
     const response = await withGateway(
       { readyFile: readyPath('method-FOO'), sink: probingSink([]) },
       (handle) => wire(handle.port, { method: 'FOO', target: '/health' }),
     );
-    expect(response.status).toBe(0);
+    expect(response.status).toBe(400);
     expect(response.body).toBe('');
   });
 

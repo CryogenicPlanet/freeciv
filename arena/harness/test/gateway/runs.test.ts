@@ -440,16 +440,15 @@ describe('RunsRepository', () => {
   });
 
   describe('open(2) flags', () => {
-    test('O_RDONLY and O_NOFOLLOW agree with node:fs on darwin', () => {
+    test('O_RDONLY and O_NOFOLLOW agree with node:fs on this platform', () => {
       expect(O_RDONLY).toBe(constants.O_RDONLY);
       expect(O_NOFOLLOW).toBe(constants.O_NOFOLLOW);
-      expect(O_NOFOLLOW).toBe(0x0000_0100);
+      expect(O_NOFOLLOW).toBe(process.platform === 'linux' ? 0x0002_0000 : 0x0000_0100);
     });
 
     test('O_CLOEXEC is hardcoded because Bun does not define it', () => {
-      // Spike law: reading it from `constants` would contribute 0 silently.
       expect(Object.hasOwn(constants, 'O_CLOEXEC')).toBe(false);
-      expect(O_CLOEXEC).toBe(0x0100_0000);
+      expect(O_CLOEXEC).toBe(process.platform === 'linux' ? 0x0008_0000 : 0x0100_0000);
     });
   });
 
@@ -458,6 +457,20 @@ describe('RunsRepository', () => {
       const manifest = run(state.repo.readManifest(COMPLETED));
       expect(manifest['game_id']).toBe(COMPLETED);
       expect(manifest['state']).toBe('completed');
+    });
+
+    test('preserves a Python integer beyond Number.MAX_SAFE_INTEGER', () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), 'arena-manifest-int-')));
+      const id = 'game_manifestLargeInt000001';
+      mkdirSync(join(root, id), { recursive: true });
+      writeFileSync(
+        join(root, id, 'manifest.json'),
+        `{"game_id":"${id}","counter":9007199254740993}\n`,
+        'utf8',
+      );
+      const manifest = run(makeRunsRepository(root).readManifest(id));
+      expect(manifest['counter']).toBe(9_007_199_254_740_993n);
+      rmSync(root, { recursive: true, force: true });
     });
 
     test('decodeManifest runs the strict wire schema over the same bytes', () => {
@@ -635,6 +648,7 @@ describe('RunsRepository', () => {
       // already erased the distinction — and published a row Python hides.
       write('game_floatTurnDivergence1', '{"turn":5.0}\n');
       write('game_intTurnAgrees00000001', '{"turn":5}\n');
+      write('game_largeIntExact00000001', '{"turn":9007199254740993}\n');
       // The remaining gap, and it is the other direction: `isinstance(True,
       // int)` is True and `True > 0`, so CPython returns `True` and publishes
       // `"current_turn": true`.  `Gateway.GameRow` types that field as an
@@ -643,6 +657,9 @@ describe('RunsRepository', () => {
       write('game_boolTurnDivergence01', '{"turn":true}\n');
       expect(run(repo.lastReplayTurn('game_floatTurnDivergence1'))).toEqual(Option.none());
       expect(run(repo.lastReplayTurn('game_intTurnAgrees00000001'))).toEqual(Option.some(5n));
+      expect(run(repo.lastReplayTurn('game_largeIntExact00000001'))).toEqual(
+        Option.some(9_007_199_254_740_993n),
+      );
       expect(run(repo.lastReplayTurn('game_boolTurnDivergence01'))).toEqual(Option.none());
 
       // The float half against CPython itself, not against a remembered claim.

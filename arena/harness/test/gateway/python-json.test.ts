@@ -170,16 +170,10 @@ describe('refusals', () => {
     });
   });
 
-  test.if(PYTHON_AVAILABLE)('CPython refuses them too, except where it is laxer', () => {
-    // `json.loads` accepts `NaN`/`Infinity` and this reader does not — the one
-    // documented gap, and it is the same gap `JSON.parse` already had.  Every
-    // *other* refusal above is shared, which is what this asserts.
+  test.if(PYTHON_AVAILABLE)('CPython refuses the same malformed documents', () => {
     REFUSED.forEach((text) => {
       expect({ text, cpython: oracle(text) }).toEqual({ text, cpython: 'ERR' });
     });
-    expect(oracle('{"a":NaN}')).not.toBe('ERR');
-    expect(Either.isLeft(parsePythonJson('{"a":NaN}'))).toBe(true);
-    expect(Either.isLeft(parsePythonJson('{"a":Infinity}'))).toBe(true);
   });
 });
 
@@ -194,6 +188,16 @@ describe('the reader itself', () => {
     expect(typeof value['e']).toBe('number');
     expect(value['i']).toBe(7n);
     expect(value['neg']).toBe(-7n);
+  });
+
+  test('NaN and infinities are accepted with CPython values', () => {
+    const value = Either.getOrThrowWith(
+      parsePythonJsonObject('{"nan":NaN,"positive":Infinity,"negative":-Infinity}'),
+      (error) => new Error(error.message),
+    );
+    expect(Number.isNaN(value['nan'])).toBe(true);
+    expect(value['positive']).toBe(Number.POSITIVE_INFINITY);
+    expect(value['negative']).toBe(Number.NEGATIVE_INFINITY);
   });
 
   test('a string that looks like the marker survives as a string', () => {
