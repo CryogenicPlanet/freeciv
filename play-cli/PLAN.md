@@ -56,7 +56,7 @@ play-cli/
   test/                 # bun test; golden fixtures ported from play/tests/
 ```
 
-Package manager: `bun` (single package, not a workspace). Dependencies pinned to the
+Package manager: `bun` (the package participates in the repository root workspace). Dependencies pinned to the
 composio catalog versions: `effect ^3.22.1`, `@effect/cli ^0.77.0`,
 `@effect/platform ^0.97.1`, `@effect/platform-bun ^0.91.2`. No other runtime deps
 without a note in NOTES.md.
