@@ -1,73 +1,19 @@
 /**
- * Boot both gateways from **one** flags array.
+ * Boot Python and TypeScript gateways from one flag builder and compare their
+ * argv. Only `--ready-file` and `--cache-root` differ: the former is exclusively
+ * locked, while sharing the latter could let one implementation answer from the
+ * other's derived data.
  *
- * The parity rig's first assertion is not about a response body — it is about
- * the command line.  Two implementations answering identically to two
- * *different* configurations proves nothing, and the way that happens in
- * practice is not malice but drift: a flag renamed on one side, a default that
- * moved, an argument order that stopped mattering.  So this module builds the
- * flags **once**, from one function body, and hands the result to two binaries:
- *
- * ```
- * python3 -m agent_eval.replay_gateway   <flags>
- * bun     src/gateway/main.ts            <flags>
- * ```
- *
- * {@link argvParity} then reads the two argvs back off the booted pair and
- * reports which flags differ.  Exactly two may: {@link SLOT_SCOPED_FLAGS}.
- *
- * ## Why `--cache-root` and `--ready-file` *must* differ
- *
- * They are the only two flags naming a resource a second process cannot share:
- *
- * - **`--ready-file`** is held under an exclusive `flock` for the process
- *   lifetime (`services/ready-file.ts`).  A shared one is not a subtle bug: the
- *   second gateway refuses to start and exits 2.
- * - **`--cache-root`** is where the derivation subprocess writes
- *   `replay.json`/`board.json`/`events.json`, keyed by game and turn.  Sharing
- *   it would let whichever gateway ran first *answer for the other one*, and
- *   the rig would then report perfect parity on a body only one implementation
- *   ever produced.  That is precisely the failure a parity rig exists to not
- *   have.
- *
- * Every other flag — host, port, service URL, runs root, repo root, and the two
- * optional ones — is byte-identical between the two processes.
- *
- * ## Ports come from the ready files, not from a guess
- *
- * Both are spawned with `--port 0`, so the kernel picks.  The bound port is
- * published in the ready record (`identity_payload`, `replay_gateway.py:1301`),
- * written atomically under the lock *before* the socket serves.
- * {@link awaitReady} polls for it with a deadline and gives up early when the
- * child exits first, so a gateway that refuses its configuration is reported as
- * "exited 2, stderr: …" instead of as a forty-second timeout.
- *
- * ## The user's stack is never touched
- *
- * Every process here binds `--port 0` and writes under a private `mkdtemp`
- * scratch.  {@link bootGatewayPair} additionally *refuses* two things:
- *
- * 1. a runs root or a scratch inside the repo's `.agent-eval/` — that directory
- *    belongs to a running `local_stack`, and a rig writing a cache or a ready
- *    file into it could disturb a live game;
- * 2. a `--service-url` whose port a **running** stack claims
- *    ({@link liveStackPorts}), which is the only thing standing between a
- *    mistyped `PARITY_SERVICE_URL` and a real match's supervisor.
- *
- * Teardown kills only the pids this module spawned, and
- * {@link StopReport.orphans} is the proof that it did.
- *
- * Run `bun test/parity/boot.ts` for the module's self-test.
- *
- * @module
+ * Both bind port 0 and publish the actual port atomically through private ready
+ * files. Paths inside `.agent-eval` and service ports claimed by a running
+ * stack are refused. Every spawned child is registered immediately so teardown
+ * can kill setup failures and report orphans.
  */
 
 import { Either } from 'effect';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
-import { describeOutcome, isWireResponse, wireGet } from './wire-client.ts';
-import type { WireOutcome } from './wire-client.ts';
 
 // ---------------------------------------------------------------------------
 // Where things are
@@ -102,21 +48,7 @@ export const GATEWAY_HOST = '127.0.0.1' as const;
 /** The state directory a running `local_stack` owns.  Never written to here. */
 export const LIVE_STACK_DIR: string = join(REPO_ROOT, '.agent-eval');
 
-/**
- * Where a running `local_stack` publishes its ready records — one directory
- * *below* {@link LIVE_STACK_DIR}.
- *
- * `agent_eval/local_stack.py:491-492` builds `stack_root = state_dir /
- * "local-stack"` and writes `supervisor-{pid}-{token}.json` and
- * `gateway-{pid}-{token}.json` into it.  Neither name ends in `.ready.json`,
- * and neither file is in `.agent-eval/` itself — where the only `*.ready.json`
- * files are hand-made leftovers from other rigs.  Reading the wrong directory
- * with the wrong pattern is not a near miss: it finds every dead file and none
- * of the live ones, which is a guard that reports "safe" precisely when it is
- * wrong.  Measured on this checkout before the fix: `[57922, 57922]` (a gateway
- * that exited on 2 August) while four records of two *running* stacks sat
- * unread.
- */
+/** Ready records published by running stacks, one level below state root. */
 export const LIVE_STACK_RECORDS_DIR: string = join(LIVE_STACK_DIR, 'local-stack');
 
 // ---------------------------------------------------------------------------
@@ -144,40 +76,8 @@ export const paritySkipWarning = (rig: string, whatDidNotRun: string): string =>
 // ---------------------------------------------------------------------------
 
 /**
- * RFC 5737 TEST-NET-1 — reserved for documentation, guaranteed unroutable.
- *
- * The correct "upstream is down" fixture, and the reason is a measured trap: a
- * *released ephemeral port* is not one.  Bind `127.0.0.1:0`, read the port,
- * close the socket and hand that URL to a gateway, and the kernel is free to
- * hand the same port to the next listener — which, often enough, is the gateway
- * itself.  It then proxies to itself, and the rig either deadlocks or reports a
- * fabricated success.  An address that cannot be routed cannot be reused.
- *
- * Pair it with {@link UNROUTABLE_UPSTREAM_TIMEOUT_S}: a connect here hangs until
- * *someone's* timeout fires, and it must be the gateway's.
- *
- * ## What this fixture is *for*, measured
- *
- * A refused connect and a hung connect are different branches, and only this
- * one exercises `--upstream-timeout-s`.  Against `GET /v1/games`, with the
- * gateways booted by this module:
- *
- * | upstream | `-s` | Python | TypeScript |
- * |---|---|---|---|
- * | {@link REFUSED_UPSTREAM_URL} | default | `200` in 3ms | `200` in 4ms |
- * | {@link REFUSED_UPSTREAM_URL} | 1 | `200` in 1ms | `200` in 4ms |
- * | this | 1 | `200` in 1007ms | `200` in 1030ms |
- * | this | 3 | `200` in 3006ms | `200` in ~3020ms |
- *
- * Both honour the flag and then serve the disk fallback.  That third row is
- * what this fixture exists for, and it is the row that was **red** when the rig
- * was first run: the TypeScript side answered *nothing* and the connection was
- * closed at 12s, whatever `-s` said, because
- * `HttpApp.toHandled` runs a handler uninterruptibly and an `Effect.timeout`
- * inside an uninterruptible region waits for the arm it just cancelled (see
- * `src/gateway/server.ts#gatewayApp`).  A rig that only ever used a *refused*
- * upstream (as the earlier gateway smoke rig did) reports parity here, because
- * a refusal is instant on both sides and never reaches the timeout path at all.
+ * RFC 5737 TEST-NET-1 connect-timeout fixture. Unlike a released ephemeral
+ * port it cannot be rebound by the gateway, which would create a self-proxy.
  */
 export const UNROUTABLE_UPSTREAM_URL = 'http://192.0.2.1:9' as const;
 
@@ -356,7 +256,6 @@ export const argvParity = (pair: GatewayPair): ArgvParity => {
  */
 const registry = ((): {
   readonly add: (child: Bun.Subprocess) => Bun.Subprocess;
-  readonly pids: () => ReadonlyArray<number>;
   readonly killAll: () => Promise<ReadonlyArray<number>>;
 } => {
   const children: Bun.Subprocess[] = [];
@@ -365,7 +264,6 @@ const registry = ((): {
       children.push(child);
       return child;
     },
-    pids: () => children.map((child) => child.pid),
     killAll: async () => {
       const killed = await Promise.all(
         children.map(async (child): Promise<ReadonlyArray<number>> => {
@@ -379,9 +277,6 @@ const registry = ((): {
     },
   };
 })();
-
-/** Every pid this module has spawned in this process, healthy or not. */
-export const bootedPids = (): ReadonlyArray<number> => registry.pids();
 
 /**
  * Put a child *another* file spawned under the same teardown, at the
@@ -928,107 +823,3 @@ export const withGatewayPair = async <A>(
   pair.cleanup();
   return outcome.ok ? outcome.value : Promise.reject(outcome.error);
 };
-
-// ---------------------------------------------------------------------------
-// Self-test
-// ---------------------------------------------------------------------------
-
-/**
- * What `bun test/parity/boot.ts` checks, as a value — so a `.test.ts` in this
- * directory can assert on it without re-deriving the rig.
- */
-export interface SelfTestReport {
-  readonly readyFilesAppeared: ByImpl<boolean>;
-  readonly ports: ByImpl<number>;
-  readonly portsDiffer: boolean;
-  /** The `/health` status, or the failure tag when there was no response. */
-  readonly health: ByImpl<number | string>;
-  /** Which framing rule ended each read — `content-length` is the law working. */
-  readonly healthCompletedBy: ByImpl<string>;
-  readonly argv: ArgvParity;
-  /** Both cache roots exist and are empty after `freshCaches()`. */
-  readonly cachesFresh: boolean;
-  readonly stop: StopReport;
-  /** Pids the safety net had to `SIGKILL`.  Must be empty. */
-  readonly killedByNet: ReadonlyArray<number>;
-  readonly ok: boolean;
-}
-
-/** A `/health` status, or the failure tag when there was no response at all. */
-const outcomeStatus = (outcome: WireOutcome): number | string =>
-  isWireResponse(outcome) ? outcome.status : outcome._tag;
-
-/** Which framing rule ended the read — `content-length` is the law working. */
-const outcomeFraming = (outcome: WireOutcome): string =>
-  isWireResponse(outcome) ? outcome.completedBy : describeOutcome(outcome);
-
-/**
- * Boot both against one empty fixture root, hit `/health` on each, and report.
- *
- * The upstream is the unroutable fixture with a one-second timeout: `/health`
- * is served locally by both gateways and never proxies, so no stub is needed
- * and no port is bound beyond the two `--port 0` listeners this function owns
- * and tears down.
- */
-export const selfTest = async (): Promise<SelfTestReport> => {
-  const runsRoot = realpathSync(mkdtempSync(join(tmpdir(), 'arena-parity-runs-')));
-  const pair = unwrapPair(
-    await bootGatewayPair({
-      runsRoot,
-      serviceUrl: UNROUTABLE_UPSTREAM_URL,
-      upstreamTimeoutSeconds: UNROUTABLE_UPSTREAM_TIMEOUT_S,
-      scenario: 'selftest',
-    }),
-  );
-  const readyFilesAppeared = byImpl(
-    await Bun.file(pair.python.readyFile).exists(),
-    await Bun.file(pair.typescript.readyFile).exists(),
-  );
-  const pyHealth = await wireGet(pair.python.origin, '/health');
-  const tsHealth = await wireGet(pair.typescript.origin, '/health');
-
-  const cacheRoots = await pair.freshCaches();
-  const cachesFresh = cacheRoots.every((root) => readdirSync(root).length === 0);
-  const argv = argvParity(pair);
-  const ports = byImpl(pair.python.port, pair.typescript.port);
-  const stop = await pair.stop();
-  pair.cleanup();
-  rmSync(runsRoot, { recursive: true, force: true });
-  const killedByNet = await killAllBooted();
-
-  return {
-    readyFilesAppeared,
-    ports,
-    portsDiffer: ports.python !== ports.typescript,
-    health: byImpl(outcomeStatus(pyHealth), outcomeStatus(tsHealth)),
-    healthCompletedBy: byImpl(outcomeFraming(pyHealth), outcomeFraming(tsHealth)),
-    argv,
-    cachesFresh,
-    stop,
-    killedByNet,
-    ok:
-      readyFilesAppeared.python &&
-      readyFilesAppeared.typescript &&
-      ports.python !== ports.typescript &&
-      outcomeStatus(pyHealth) === 200 &&
-      outcomeStatus(tsHealth) === 200 &&
-      argv.sameFlagOrder &&
-      argv.divergent.join(',') === SLOT_SCOPED_FLAGS.join(',') &&
-      cachesFresh &&
-      stop.exitCodes.python === 0 &&
-      stop.exitCodes.typescript === 0 &&
-      stop.readyFilesRemoved.python &&
-      stop.readyFilesRemoved.typescript &&
-      stop.orphans.length === 0 &&
-      killedByNet.length === 0,
-  };
-};
-
-if (import.meta.main) {
-  const report = await selfTest();
-  // This file's evidence has to reach a terminal, and there is no Logger in a
-  // bare `bun` script.
-  // oxlint-disable-next-line effecttsgo/global-console
-  console.log(JSON.stringify(report, null, 2));
-  process.exit(report.ok ? 0 : 1);
-}

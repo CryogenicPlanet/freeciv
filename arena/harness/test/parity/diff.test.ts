@@ -1,97 +1,17 @@
 /**
- * **The diff matrix.**  Both gateways, every upstream, every request, compared.
+ * Python/TypeScript parity across every upstream fixture and request leg.
+ * Status, reason, selected headers, and bodies (including binary bodies) are
+ * exact; matching non-responses are separately rejected so silence cannot pass.
  *
- * `boot.ts` proves the two processes were configured identically.  `stub-supervisor.ts`
- * makes the upstream a variable this rig owns completely.  `wire-client.ts` puts
- * bytes on a socket that no client library would let through.  This file is
- * what those three exist for: a cartesian product of **upstream fixture × request**,
- * replayed against CPython and the TypeScript port, compared on status, on a
- * header subset, and on **body bytes**.
+ * Only `/health` process identity fields are normalized. Measured runtime-level
+ * divergences live in `waivers.ts`, are replayed, and self-invalidate when the
+ * implementations converge. Raw targets and malformed framing use the socket
+ * client because `fetch` cannot preserve them.
  *
- * ## What is crossed with what, exactly
- *
- * The product is **upstream fixture x request**, and it is worth spelling out
- * because the obvious reading of "the whole cross product" is not what runs:
- *
- * | Axis | Size | Crossed |
- * |---|---|---|
- * | upstream scenario | 9 — `upstream-down` + one per {@link STUB_MODES} entry (+1 opt-in live) | with every leg |
- * | request leg | 79 — 41 {@link ROUTE_LEGS} + 38 {@link CASE_LEGS} | with every scenario |
- * | route family | 12/12 `RouteDecision` tags | with every scenario |
- * | fixture class | 8/8 reached; **one representative** (`terminal-valid`) gets the route sweep | *not* crossed with routes |
- *
- * So it is 9 x 79 = 711 comparison legs, not 8 x 12 x 9.  Seven of the eight
- * fixture classes carry a direct probe each — `/status`, or `/frames` for the
- * terminal ones, and three legs for the torn tail — and are otherwise seen
- * through the `/v1/games` index body; only `terminal-valid` is asked every
- * route.  That is a deliberate trade (the fixture axis is about *disk state*,
- * which the archive layer reads once per document) and not a full product, and
- * a claim of one would be overstated.
- *
- * ## What is compared
- *
- * | Aspect | Rule |
- * |---|---|
- * | outcome | a response, or the same failure tag on both sides — a closed connection is a comparison subject, not an error |
- * | answered at all | **both** sides must produce a response, in every scenario, except the one waived `HEAD` truncation. Without this the row above would score a mutual timeout as parity |
- * | status | equal |
- * | reason phrase | equal.  Included because it is the *only* observable of the discarded-`statusText` waiver; without it that waiver could never be policed |
- * | headers | {@link COMPARED_HEADERS}, case-insensitively, values exact |
- * | body | **byte for byte**, JSON and PNG and stdlib HTML alike |
- *
- * Excluded, per the behavior dossier §15 and for the same reasons
- * `smoke-live.test.ts` excludes them: `Server` and `Date` (stdlib versus Bun),
- * `Connection` (HTTP/1.0 has no keep-alive), and header order and case (both
- * insignificant in HTTP; CPython emits `Allow`, Bun emits `allow`).
- *
- * ## The two exemptions, and why neither is a hole
- *
- * 1. **`normalizers.ts`** rewrites five `/health` fields that are properties of
- *    *the answering process* rather than of the port.  Every other body,
- *    including every other JSON body, is compared with no normalizer at all —
- *    which is possible only because this rig pins `--viewer-public-url`
- *    ({@link MATRIX_VIEWER_PUBLIC_URL}) on both sides, so the gateway's own port
- *    never reaches an archive document.  That is a *configuration* choice
- *    rather than a comparison weakening: the flag is byte-identical in both
- *    argvs, and `argvParity` asserts it.
- * 2. **`waivers.ts`** lists the six scenario-independent divergences imposed by
- *    a runtime's HTTP layer below code the port owns. Each waived leg still
- *    asserts the TypeScript side's actual behavior; a waiver that stops being
- *    needed fails the suite.
- *
- * Anything else that diverges is a bug, and this file reports it as one.
- *
- * ## There are no open findings
- *
- * This file used to pin real defects as expected-to-fail legs so the suite
- * stayed runnable while they were open.  All four closed — three in the gateway
- * and one into `waivers.ts` as a measured decision — so the table and its
- * machinery are gone rather than left empty, and every leg below is an ordinary
- * comparison.  The history is kept where the table was; see *The findings this
- * ratchet caught*.
- *
- * ## The user's stack is never touched
- *
- * Every process this file spawns binds `--port 0` under a private `mkdtemp`;
- * `bootGatewayPair` refuses a path inside `.agent-eval/` *and* a
- * `--service-url` whose port a running stack holds; the stubs bind
- * `127.0.0.1:0`.  The one leg that could reach a real service —
- * `PARITY_SERVICE_URL` — is opt-in, and is **refused** when it names a port a
- * live `local_stack` ready record claims.  "Live" is load-bearing in both
- * directions: `boot.ts#liveStackPorts` reads the directory `local_stack.py`
- * actually writes (`.agent-eval/local-stack/`, not `.agent-eval/`), takes the
- * port out of a supervisor record that has no `port` key, and drops records
- * whose pid is gone — the earlier guard did none of the three and reported two
- * dead ports while four live ones went unseen.  Teardown happens inside
- * `beforeAll`, which is what makes the orphan check a question with a right
- * answer.
- *
- * ## The platform gate is announced
- *
- * Everything below runs on Linux and Darwin. The *first* test is unconditional
- * and reports an unsupported-platform skip.
- *
- * @module
+ * All children bind port 0 in private scratch space. Live-stack paths and ports
+ * are refused, and the optional `PARITY_SERVICE_URL` cannot name a running
+ * local stack. Linux and Darwin run the matrix; the first test makes every
+ * unsupported-platform skip visible (or fatal under `ARENA_REQUIRE_PARITY=1`).
  */
 
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
@@ -137,19 +57,10 @@ import { bodyLatin1, isWireResponse, type WireOutcome, wireRequest } from './wir
 /** Linux and Darwin have the native locking support needed by the full rig. */
 const PLATFORM_SUPPORTED = PARITY_PLATFORM_SUPPORTED;
 
-/**
- * Unconditional, and deliberately the first test in the file.
- *
- * `test/gateway/smoke-live.test.ts:842-871` establishes the pattern for exactly
- * this rig and states the reason: *a gate that vanishes is indistinguishable
- * from a gate that passed*.  Without this, `bun test` on any non-darwin box
- * prints `0 pass / 4 skip / 0 fail` for a file whose job is to compare 711 legs
- * against CPython, and exits 0.
- */
+/** Unconditional: a gated matrix must not be indistinguishable from a pass. */
 test('the diff matrix is not silently skipped', () => {
   if (!PLATFORM_SUPPORTED) {
-    // oxlint-disable-next-line effecttsgo/global-console -- a skipped oracle has
-    // to reach a terminal; there is no Logger in a bun:test process.
+    // oxlint-disable-next-line effecttsgo/global-console -- skipped parity must reach the terminal
     console.warn(
       paritySkipWarning(
         'the parity diff matrix',
@@ -170,15 +81,7 @@ test('the diff matrix is not silently skipped', () => {
 // Configuration shared by every scenario
 // ---------------------------------------------------------------------------
 
-/**
- * Pinned on both sides, which is what buys the byte-for-byte body rule.
- *
- * `_archive_base` (`:1881`) is `viewer_public_url or str(identity["url"])`, so
- * *without* this flag every status, result, watch and frames document would
- * carry the answering gateway's own ephemeral port and no body would be
- * comparable without a normalizer.  With it, the only process-scoped bytes left
- * in the whole matrix are `/health`'s five fields.
- */
+/** Prevents each gateway's ephemeral port from entering archive bodies. */
 const MATRIX_VIEWER_PUBLIC_URL = 'http://viewer.parity.invalid';
 
 /**
@@ -187,13 +90,7 @@ const MATRIX_VIEWER_PUBLIC_URL = 'http://viewer.parity.invalid';
  */
 const MATRIX_UPSTREAM_TIMEOUT_S = UNROUTABLE_UPSTREAM_TIMEOUT_S;
 
-/**
- * Generous: a cold `replay.json` shells out to
- * `python3 -m agent_eval.replay_derive_cli`.  It is a deadlock detector, not a
- * budget — the framing law in `wire-client.ts` is what keeps a healthy request
- * from approaching it, and the TypeScript gateway's own 12s idle close ends the
- * legs that never answer well before this fires.
- */
+/** Deadlock detector with room for cold savegame derivation. */
 const LEG_TIMEOUT_MS = 25_000;
 
 /** Legs in flight per scenario.  Both gateways are threaded/async; 10 is idle-cheap. */
@@ -202,12 +99,7 @@ const LEG_CONCURRENCY = 10;
 /** Scenarios booted at once.  Each is two processes plus a stub. */
 const SCENARIO_CONCURRENCY = 3;
 
-/**
- * Nine scenarios (ten with the opt-in live one), 79 legs each, both sides — about
- * 1400 requests, eighteen spawned processes and eight stubs.  Measured at ~25s
- * since `--upstream-timeout-s` started working on both sides; it was ~300s when
- * a third of the legs waited out Bun's 12s idle close.
- */
+/** Suite timeout for all processes, stubs, and request legs. */
 const MATRIX_TIMEOUT_MS = 900_000;
 
 /** The header subset parity is asserted on. */
@@ -282,10 +174,7 @@ const fixtureId = (scenario: ParityScenario['scenario']): string => {
 /** `game_parity_torn_tail_08` — the class no other leg asks a direct question. */
 const TORN_TAIL_GAME_ID = fixtureId('torn-tail');
 
-/**
- * The routes the brief enumerates, plus the shapes `request-cases.ts` does not
- * cover.  Order is replay order; nothing here depends on it.
- */
+/** Route sweep plus shapes absent from `request-cases.ts`. */
 const ROUTE_LEGS: ReadonlyArray<MatrixLeg> = [
   get('health', '/health', 'the only route that never proxies; the five volatile fields live here', {
     bodyRule: 'health',
@@ -310,14 +199,7 @@ const ROUTE_LEGS: ReadonlyArray<MatrixLeg> = [
   get('events-json', `/v1/games/${VALID_GAME_ID}/events.json`, 'the third derivation, whose numeric fields are rebuilt as bigint'),
   get('events-query-400', `/v1/games/${VALID_GAME_ID}/events.json?turn=1`, 'events reject any query at all, from the handler rather than the router'),
   get('video-mp4', `/v1/games/${VALID_GAME_ID}/video.mp4`, 'no game.mp4 on disk: the binary family 404 with its own message'),
-  // --- the eighth fixture class, probed directly ----------------------------
-  //
-  // `game_parity_torn_tail_08` is the only class `request-cases.ts` reaches
-  // *exclusively* through the `/v1/games` index body, where a wrong
-  // `current_turn` is one number among four rows.  These three ask it a
-  // question of its own: the backwards tail scan that walks past a half-written
-  // final line to the last line that parses (turn 3, from four lines of which
-  // the fourth is torn) is what decides all three answers.
+  // Probe torn-tail fallback to the last complete replay row directly.
   get('torn-tail-status', `/v1/games/${TORN_TAIL_GAME_ID}/status`, 'the torn-tail run on its own route, not as an index row'),
   get('torn-tail-watch', `/v1/games/${TORN_TAIL_GAME_ID}/watch.json`, 'the widest projection of a run whose replay tail is unparseable'),
   get('torn-tail-frames', `/v1/games/${TORN_TAIL_GAME_ID}/frames`, 'the frame listing of a non-terminal run, from the same torn archive'),
@@ -450,14 +332,7 @@ interface ScenarioSpec {
 /** `upstream-down` plus one per stub mode, plus the opt-in live leg. */
 const stubScenarioName = (mode: StubMode): string => `stub-${mode}`;
 
-/**
- * The unroutable-address fixture, per the parity-client law.
- *
- * A *released ephemeral port* is not an upstream-down fixture: the kernel is
- * free to hand it to the next binder, which in a rig whose gateways bind
- * ephemeral ports has been observed to be the gateway, proxying to itself.
- * RFC 5737 TEST-NET-1 cannot be routed and cannot be reused.
- */
+/** RFC 5737 address; unlike a released port it cannot be reused by the gateway. */
 const UPSTREAM_DOWN: ScenarioSpec = {
   name: 'upstream-down',
   serviceUrl: UNROUTABLE_UPSTREAM_URL,
@@ -471,25 +346,7 @@ const LIVE_SERVICE_URL: string | undefined = process.env['PARITY_SERVICE_URL'];
 // Live-stack safety
 // ---------------------------------------------------------------------------
 
-/**
- * The ports a running `local_stack` claims live in `boot.ts` — see
- * {@link liveStackPorts}, which reads `.agent-eval/local-stack/*.json`, takes a
- * `port` **or** the port of `url`/`internal_service_url`/`upstream_service_url`
- * (a supervisor record has no `port` key at all, and a supervisor is what
- * `--service-url` names), and drops records whose pid is not alive.
- *
- * It is used twice, and the second use is the one that matters: this file
- * refuses the *scenario*, and `bootGatewayPair` refuses the *boot*, so a caller
- * that never consults this verdict is still guarded.
- */
-
-/**
- * Refuse a `PARITY_SERVICE_URL` that names a port the live stack published.
- *
- * The ground rule is absolute: the user's running stack and any live game are
- * off limits.  An opt-in environment variable is not consent to proxy a real
- * match's supervisor through a test rig.
- */
+/** Refuse the optional service when a live-stack record claims its port. */
 type LiveVerdict =
   | { readonly _tag: 'Absent'; readonly why: string }
   | { readonly _tag: 'Refused'; readonly why: string }
@@ -559,14 +416,7 @@ interface ScenarioReport {
   readonly contentLengthSelfConsistent: boolean;
 }
 
-/**
- * Bounded-concurrency `map`, without an index cell mutated in place.
- *
- * Each worker recurses on an accumulator of `[position, value]` pairs and the
- * results are reassembled by position at the end, so nothing writes into a
- * shared array and the output order is the input order regardless of who
- * finished first.
- */
+/** Bounded concurrent map that restores input order. */
 const mapPool = async <A, B>(
   items: ReadonlyArray<A>,
   limit: number,
@@ -693,12 +543,7 @@ const headerMap = (
     names.map((name) => [name, isWireResponse(outcome) ? outcome.headers.get(name) : null]),
   );
 
-/**
- * Every way this leg's two outcomes disagree, as values.
- *
- * Waivers are *not* applied here: the full list is computed first so the
- * evidence table can show what a waiver is actually hiding.
- */
+/** All raw divergences; waivers are applied only by `unwaived`. */
 const divergences = (leg: MatrixLeg, sides: Sided<WireOutcome>): ReadonlyArray<Divergence> => {
   const { python, typescript } = sides;
   if (!isWireResponse(python) || !isWireResponse(typescript)) {
@@ -788,61 +633,6 @@ const unwaived = (
   );
 
 // ---------------------------------------------------------------------------
-// The findings this ratchet caught, and what each one became
-// ---------------------------------------------------------------------------
-
-/**
- * **There are no open findings.**  Every leg below is an ordinary `test`.
- *
- * This file used to carry an `OPEN_FINDINGS` table: real defects, pinned as an
- * explicit `(scenario, leg)` set of expected-to-fail legs so the suite stayed
- * runnable while they were open.  The table ratcheted in both directions — a
- * fix turned its legs green, which failed the suite until the entry was
- * deleted, and a *new* leg falling into the same hole was an ordinary failing
- * test because it was not on the list.  It is empty now, and an empty table is
- * dead machinery, so it is gone: the next divergence is simply a failing test,
- * which is the strongest form of the same ratchet.
- *
- * What the four entries were is worth keeping, because what a fix *was* is the
- * most useful thing this file can tell the next reader:
- *
- * 1. **`upstream-timeout-ignored`** — every upstream-touching route in the two
- *    scenarios whose upstream never answers (`upstream-down`, `stub-hang`): 32
- *    legs on which CPython served the disk archive after exactly the configured
- *    second and the TypeScript side answered *nothing*, its connection closed at
- *    ~12s by Bun's idle timeout.  Cause: `HttpApp.toHandled` runs a handler
- *    inside `Effect.uninterruptible`, and a forked fiber inherits that, so
- *    `Effect.timeout` decided on time and then waited for the arm it had just
- *    cancelled.  Fix: `Effect.interruptible` at the app, which is what
- *    `@effect/platform`'s own routers do per route
- *    (`src/gateway/server.ts#gatewayApp`).  Re-measured: `200` in 1030ms
- *    against `192.0.2.1:9` at `-s 1`, and no stderr.
- * 2. **`frame-index-overflow-500`** — `frame-huge` and
- *    `frame-beyond-safe-integer` in *every* scenario answered a bare `500` with
- *    an empty body.  Cause: wire's `FrameIndexFromPngName` transform calls
- *    `FrameIndex.make(Number(digits))` and `Schema.int()` is
- *    `Number.isSafeInteger`, so the brand threw a `ParseError` *inside* the
- *    decode, escaping the `Either` the tolerant decoder promises.  Fix: a total
- *    parse in the dispatcher that routes an unrepresentable index to an index no
- *    six-digit archive can hold (`http/dispatch.ts#frameIndexFromPngName`), so
- *    the leg misses the lookup and answers CPython's `404 map frame does not
- *    exist` byte for byte.
- * 3. **`loader-integer-saturates-at-2-53`** — `replay-after-turn-2-53-plus-1`
- *    in the five scenarios that derive from disk: `?after_turn=9007199254740993`
- *    came back as `"next_after_turn":9007199254740991`, because
- *    `routes/replay.ts#toLoaderInteger` clamped the query's exact `bigint` to
- *    `Number.MAX_SAFE_INTEGER` on the way into a derivation service whose inputs
- *    were `number`.  Fix: `bigint` in `services/derivation.ts`'s two loader
- *    input types, and `toLoaderInteger` deleted rather than fixed — there is now
- *    no seam to saturate at.  The leg is an ordinary comparison from here on,
- *    and the derived body echoes the digits CPython echoes.
- * 4. **`binary-disk-fallback-chunked`** — originally accepted as a framing
- *    waiver. The later Node server edge preserves the known length while still
- *    streaming, so all four frame legs now compare normally and the
- *    self-invalidated waiver was removed.
- */
-
-// ---------------------------------------------------------------------------
 // The run
 // ---------------------------------------------------------------------------
 
@@ -898,21 +688,7 @@ const renderReport = (reports: ReadonlyMap<string, ScenarioReport>): ReadonlyArr
     ];
   });
 
-/**
- * Every `(leg, side)` that produced **no response at all**, as `leg/side`.
- *
- * Two-sided on purpose, and that is the point.  The comparison in
- * {@link divergences} treats "neither side answered, and the failure tags
- * match" as parity — which it must, because a closed connection *is* a
- * comparison subject — but that reading is only safe if something else insists
- * a leg answered in the first place.  Nothing did: a mutual timeout in any of
- * the seven healthy scenarios would have compared no status, no header and no
- * byte, and passed. This matrix therefore refuses a non-response explicitly
- * rather than accepting matching absence as parity.
- *
- * A leg the scenario never ran at all is reported here too, rather than being
- * silently absent from the list.
- */
+/** Non-responses per leg/side; prevents mutual silence from passing as parity. */
 const missingResponses = (report: ScenarioReport): ReadonlyArray<string> =>
   MATRIX_LEGS.flatMap((leg): ReadonlyArray<string> => {
     const sides = report.outcomes.get(leg.name);
@@ -1069,14 +845,7 @@ describe.if(PLATFORM_SUPPORTED)('the diff matrix', () => {
 // The waiver list polices itself
 // ---------------------------------------------------------------------------
 
-/**
- * The scenarios a waiver claims to diverge in — its own list, or all of them.
- *
- * Naming a subset is a claim in both directions, and this function is only the
- * first half of it: the listed scenarios are checked below, and the unlisted
- * ones are checked by the ordinary per-leg comparison above, which applies no
- * exemption at all because {@link isWaived} consults the same list.
- */
+/** A waiver's explicit scenario subset, or every scenario. */
 const waivedScenarios = (waiver: ParityWaiver): ReadonlyArray<string> =>
   waiver.scenarios === undefined
     ? SCENARIO_NAMES
@@ -1130,16 +899,7 @@ describe.if(PLATFORM_SUPPORTED)('waivers', () => {
     });
   });
 
-  /**
-   * The other half of a scenario-scoped waiver: outside the scenarios it names,
-   * the leg is compared in full and must **match**.
-   *
-   * Without this, narrowing a waiver's scenario list would be indistinguishable
-   * from widening it — the per-leg tests would pass either way if the leg
-   * happened to agree everywhere, and a leg that started diverging in a sixth
-   * scenario would be caught only by the summary below.  This says it directly,
-   * on the one entry that has a list.
-   */
+  /** Scenario-scoped waivers exempt nothing outside their declared subset. */
   test('a scenario-scoped waiver exempts nothing outside its own scenarios', () => {
     const leaks = MATRIX_WAIVERS.filter((waiver) => waiver.scenarios !== undefined).flatMap(
       (waiver) =>
@@ -1154,15 +914,7 @@ describe.if(PLATFORM_SUPPORTED)('waivers', () => {
     expect(leaks).toEqual([]);
   });
 
-  /**
-   * The summary claim the whole rig makes: outside the waiver list, the two
-   * gateways are byte-identical everywhere, in every scenario.
-   *
-   * Redundant with the per-leg tests by construction, and deliberately so — it
-   * is the one assertion whose failure message names *every* new divergence at
-   * once instead of one per test.  There is no open-findings escape hatch in it
-   * any more, because there are no open findings.
-   */
+  /** Aggregate all unwaived divergences for one complete failure report. */
   test('no leg outside the waiver list diverges anywhere', () => {
     const offenders = SCENARIO_NAMES.flatMap((scenario) =>
       MATRIX_LEGS.flatMap((leg) => {
@@ -1182,12 +934,7 @@ describe.if(PLATFORM_SUPPORTED)('waivers', () => {
 // The fixture table, against the CPython oracle
 // ---------------------------------------------------------------------------
 
-/**
- * `request-cases.ts` records what CPython answered when the table was
- * measured.  Re-checking it against a *live* CPython in the upstream-down
- * scenario is what keeps the fixture honest — and it is the only assertion in
- * this file that is about one implementation rather than about the pair.
- */
+/** Recheck the recorded request-case expectations against live CPython. */
 describe.if(PLATFORM_SUPPORTED)('the request-case table still describes CPython', () => {
   CASE_LEGS.forEach((leg) => {
     test(leg.name, () => {

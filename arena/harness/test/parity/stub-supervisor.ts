@@ -1,70 +1,13 @@
 /**
- * The parity rig's upstream: one `Bun.serve` stub, one **mode** per instance.
+ * Controlled upstream personalities for the differential rig. Each mode is a
+ * separate server and answers every target consistently, keeping gateway
+ * routing out of the fixture decision.
  *
- * The differential rig points the Python gateway and the TypeScript gateway at
- * the same upstream and compares what comes back out.  That only proves
- * something if the upstream is a variable the rig controls completely, which
- * is what this module is: eight fixed personalities, each a whole server, each
- * answering *every* target the same way.
- *
- * ## Why a mode is an instance and not a route
- *
- * A stub that decided its behavior from the path would make the gateway's
- * routing part of the fixture — and the routing is exactly what is under test.
- * `makeStub('not-found-404')` answers 404 to `/v1/games`, to
- * `/v1/games/{id}/status`, and to a target the rig invented; so a leg that
- * expects the disk-fallback branch gets it no matter which route the gateway
- * decided to forward, and a leg that *does not* get 404 has found a real
- * divergence rather than a fixture gap.  The cost is one `Bun.serve` per mode,
- * which is a few hundred microseconds.
- *
- * ## The modes
- *
- * | Mode | Answer | What it is the fixture for |
- * |---|---|---|
- * | `ok-json` | 200 + JSON with **deliberately non-canonical spacing** | byte relay: `_send` hands upstream bytes back untouched (`:1898`) |
- * | `not-found-404` | 404 + JSON | the disk-fallback branch (`UPSTREAM_FALLBACK_STATUSES`) |
- * | `method-405` | 405 + `Allow` | the *other* disk-fallback status — separately, because 404 and 405 reach it by different lines |
- * | `redirect-302` | 302 + `Location` | the refused redirect: a gateway that follows is a bug |
- * | `portless` | 502 + `X-Portless: 1` + `text/html` | the three-condition offline probe (`:1419-1432`) |
- * | `oversize-9mib` | streamed 9 MiB JSON, no `Content-Length` | the 8 MiB read cap (`MAX_PROXY_JSON_BYTES`) |
- * | `hang` | never answers | the read timeout — it must outlast `--upstream-timeout-s 1` |
- * | `binary-ok` | mp4-ish bytes + `ETag` + `Last-Modified` | the binary relay and its header allowlist |
- *
- * ## Two things the spacing is doing
- *
- * {@link okJsonBodyFor} emits bodies no canonical writer could produce — two
- * spaces after a comma, a space before one, keys out of sorted order.  Python's
- * `_canonical` is `json.dumps(..., sort_keys=True, separators=(",", ":"))`, so
- * *any* body that went through a serializer on the way out comes back sorted
- * and space-free.  If a relayed body still has its spaces, the bytes were
- * relayed; if it does not, something re-serialized them.  That is a stronger
- * assertion than comparing parsed documents, and it is the only one that
- * distinguishes the two gateways' one non-relaying JSON route (`/v1/games`,
- * which *does* re-serialize, deliberately) from the ten that relay.
- *
- * The index body also carries `"current_turn": 7.0`.  A re-serializing route
- * has to spell it back `7.0`, not `7` — the `parsePythonJson` property, and
- * the one number in this file whose exact bytes are load-bearing.
- *
- * ## What this module is not
- *
- * It is not an upstream-*down* fixture.  A stub that has been closed leaves a
- * released ephemeral port behind, and the kernel will hand that port to the
- * next binder — which, in a rig where the gateway itself binds ephemeral
- * ports, has been observed to be the gateway, proxying to itself.  The two
- * legitimate "nothing is listening" fixtures are {@link makeStub}`('hang')`
- * (accepts, reads, never answers — the *read* timeout) and an RFC 5737
- * unroutable address such as `http://192.0.2.1:9/` with a one-second timeout
- * (never accepts — the *connect* timeout).  Neither is a recycled port.
- *
- * Every server here binds `127.0.0.1:0`.  Nothing in this module can collide
- * with a running local stack, and nothing in it spawns a process.
- *
- * @module
+ * Modes cover non-canonical JSON relay (including load-bearing `7.0`), 404/405
+ * fallback, redirect refusal, portless 502 detection, streamed oversize JSON,
+ * read timeout, and binary/header relay. Every server binds `127.0.0.1:0` and
+ * must not be used as a released-port connect-down fixture.
  */
-
-import { Effect, type Scope } from 'effect';
 
 // ---------------------------------------------------------------------------
 // Modes
@@ -111,9 +54,8 @@ export interface RecordedRequest {
 /**
  * A running stub, scoped to its owner: whoever calls {@link makeStub} closes it.
  *
- * Disposable both ways — `await using stub = makeStub('ok-json')` releases at
- * the end of the block, and {@link stubScoped} releases at the end of an Effect
- * `Scope`.  `close()` is idempotent.
+ * `await using stub = makeStub('ok-json')` releases at the end of the block.
+ * `close()` is idempotent.
  */
 export interface StubHandle extends AsyncDisposable {
   readonly mode: StubMode;
@@ -437,8 +379,7 @@ const HANDLERS: Readonly<
 };
 
 /**
- * Start one stub in one mode.  The caller owns it; close it, or bind it to a
- * scope with `await using` / {@link stubScoped}.
+ * Start one stub in one mode. The caller owns it; close it or use `await using`.
  *
  * `idleTimeout: 0` because `hang` must be allowed to hold a connection open
  * past any timeout the rig configures — Bun's default would close it at ten
@@ -477,13 +418,3 @@ export const makeStub = (mode: StubMode): StubHandle => {
     [Symbol.asyncDispose]: close,
   };
 };
-
-/**
- * {@link makeStub} bound to an Effect `Scope` — the shape the rig's layers want,
- * and the one that closes the stub even when the leg fails.
- */
-export const stubScoped = (mode: StubMode): Effect.Effect<StubHandle, never, Scope.Scope> =>
-  Effect.acquireRelease(
-    Effect.sync(() => makeStub(mode)),
-    (stub) => Effect.promise(() => stub.close()),
-  );

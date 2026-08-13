@@ -1,43 +1,11 @@
 /**
- * **State and cache fuzz** — the parity questions that only exist *between*
- * requests.
+ * Cross-request parity for cold/warm/re-cold caches, corrupt entries,
+ * concurrent derivation, live fixture mutation, upstream flapping, restart,
+ * and ready-file contention/takeover.
  *
- * `diff.test.ts` replays a request table against a fleet of upstreams and
- * compares each answer.  Every leg there is independent by construction: the
- * fixture tree never moves, the derivation cache is emptied only for the one
- * cold/warm pair, and each scenario's upstream has one fixed personality for
- * the whole run.  That leaves a whole class of divergence unexamined — the one
- * where the two gateways answer identically *once* and then disagree about
- * what they are allowed to remember:
- *
- * | Question | Legs here |
- * |---|---|
- * | is a warm answer the cold answer, byte for byte, on both sides? | {@link DERIVATION_ROUTES} × cold/warm/warm-again/re-cold |
- * | do the two caches end up holding the same files? | the cache-tree digest legs |
- * | what does a *corrupt* cache entry do — trusted, re-derived, or fatal? | the poison legs |
- * | do concurrent identical cold requests agree with the serial answer? | the burst legs |
- * | does either gateway hold a manifest, an index or a frame in memory? | the mutation legs |
- * | does an upstream that flaps up → down → up leave anything stuck? | the flap legs |
- * | does a derivation cache survive a restart, and is it still trusted? | the reboot legs |
- * | does a second gateway refuse a `--ready-file` an incumbent holds? | the lock legs |
- *
- * ## What this file pins, and what it does not
- *
- * **Only agreement.** Every assertion below was measured green against both
- * gateways; a divergence found by the same hunt belongs in the file that owns
- * the ratchet. Binary routes now include `Content-Length` in that agreement
- * after the Node server edge closed the former framing waiver.
- *
- * ## The fixture tree is copied, never used in place
- *
- * `fixtures/runs` is committed and read-only to the rig; half the legs here
- * rewrite a manifest or delete a savegame mid-run, so everything runs against
- * a `mkdtemp` copy.  Every process binds `--port 0` under a private scratch,
- * the upstream is either a `127.0.0.1:0` stub or a raw socket this file owns,
- * and `bootGatewayPair` refuses anything inside `.agent-eval/`.  A running
- * `local_stack` cannot be reached from here.
- *
- * @module
+ * The committed tree is copied before mutation. Every gateway and stub binds
+ * port 0 in private scratch space, and boot rejects `.agent-eval`, so no live
+ * stack or fixture can be modified.
  */
 
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
@@ -84,20 +52,10 @@ import { bodyLatin1, isWireResponse, wireRequest, type WireOutcome } from './wir
 /** Linux and Darwin have the native locking support needed by the full rig. */
 const PLATFORM_SUPPORTED = PARITY_PLATFORM_SUPPORTED;
 
-/**
- * Unconditional, and the only test this file registers outside the gated
- * `describe`.
- *
- * The pattern and the reason are `test/gateway/smoke-live.test.ts:842-871`'s: a
- * gate that vanishes is indistinguishable from a gate that passed, and every
- * mutation below — a torn ready file, a poisoned cache, a locked descriptor —
- * would contribute zero assertions on a box that never announced it skipped
- * them.
- */
+/** Unconditional: unsupported-platform skips must be visible or required to fail. */
 test('the state and cache fuzz is not silently skipped', () => {
   if (!PLATFORM_SUPPORTED) {
-    // oxlint-disable-next-line effecttsgo/global-console -- a skipped oracle has
-    // to reach a terminal; there is no Logger in a bun:test process.
+    // oxlint-disable-next-line effecttsgo/global-console -- skipped parity must reach the terminal
     console.warn(
       paritySkipWarning(
         'the state and cache fuzz',
@@ -292,12 +250,7 @@ const cloneFixtures = (destination: string): string => {
 const manifestPath = (runsRoot: string, gameId: string): string =>
   join(runsRoot, gameId, 'manifest.json');
 
-/**
- * A predicate rather than an assertion: a manifest is a value read off a disk
- * this file is actively corrupting, so "it parsed and it is an object" has to
- * be established, not claimed.  An unreadable manifest reads back as `{}`,
- * which is exactly what the legs that spread it want.
- */
+/** Corrupt/unreadable manifests reduce to `{}` for mutation setup. */
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
@@ -340,16 +293,8 @@ interface FlapUpstream {
 const FLAP_404_BODY = '{ "error": "no such game",  "stub": "flap-404" }';
 
 /**
- * One raw TCP server that **never releases its port**.
- *
- * "Down" has to be a reset rather than a closed listener: a released ephemeral
- * port is not a legal upstream-down fixture, because the kernel can hand it to
- * a gateway, which then proxies to itself (`boot.ts`,
- * `UNROUTABLE_UPSTREAM_URL`).  A reset also reaches the gateway's
- * `UpstreamUnavailable` branch *immediately*, which is the point: that branch
- * is the only one that relabels an orphaned run `interrupted`, and the rig's
- * existing down-fixtures cannot observe it on the TypeScript side (finding
- * `upstream-timeout-ignored`).
+ * A stable-port upstream: `reset` reaches `UpstreamUnavailable` without the
+ * self-proxy race caused by releasing and reusing an ephemeral port.
  */
 const makeFlapUpstream = (): Promise<FlapUpstream> => {
   const state: { mode: FlapMode } = { mode: 'up' };
@@ -386,12 +331,7 @@ const makeFlapUpstream = (): Promise<FlapUpstream> => {
 // Raw single-gateway spawns, for the ready-file legs
 // ---------------------------------------------------------------------------
 
-/**
- * `boot.ts` cannot answer the ready-file questions: `awaitReady` polls for a
- * record, and a record that is *already there* satisfies it before the child
- * has written anything — so a gateway that refuses its ready file reads back
- * as a successful boot pointing at somebody else's port.
- */
+/** Raw spawn result for ready files that may predate the child. */
 interface SpawnOutcome {
   readonly exitCode: number | null;
   readonly signal: string | null;
@@ -403,11 +343,7 @@ interface SpawnOutcome {
 const streamText = (stream: unknown): Promise<string> =>
   stream instanceof ReadableStream ? new Response(stream).text() : Promise.resolve('');
 
-/**
- * `JSON.parse` as a value — the same boundary, spelled the same way as
- * `normalizers.ts:174` and `boot.ts`'s reader.  A half-written ready record is
- * an expected poll result here, not an exception.
- */
+/** Half-written ready records are expected probe values, not exceptions. */
 const safeJson = (text: string): unknown =>
   Either.getOrNull(Either.try(() => JSON.parse(text) as unknown));
 
@@ -451,11 +387,7 @@ const spawnGateway = (
     ),
   );
 
-/**
- * How long a gateway that is *expected to keep running* is left alone before
- * it is SIGINTed.  A gateway that refuses its ready file exits long before
- * this, so the wait is a ceiling and not a cost.
- */
+/** Ceiling for a gateway expected to remain live; refusals exit earlier. */
 const LIVE_PROBE_MS = 3_000;
 
 /** Spawn, wait up to `waitMs`, SIGINT if still alive, and report. */
@@ -1082,15 +1014,7 @@ describe.if(PLATFORM_SUPPORTED)('state and cache fuzz', () => {
         });
     });
 
-    /**
-     * The per-turn cache is named after the *file name*
-     * (`derivationTurnCacheName`), so a rewritten savegame keeps its key — and
-     * yet neither gateway serves the pre-rewrite document.  Measured, not
-     * assumed: the warm answer moves, it moves to exactly the answer a cold
-     * cache produces from the same bytes, and both implementations move
-     * together.  A port that trusted the key alone would fail the second
-     * expectation while still passing the first.
-     */
+    /** A rewritten save under the same filename must invalidate its warm answer. */
     test('a savegame rewritten behind its own cache key is not served from cache', () => {
       const stale = report().mutation.find((leg) => leg.name === 'mutate:replay-stale-cache');
       const cold = report().mutation.find((leg) => leg.name === 'mutate:replay-cold-on-corrupt-save');
@@ -1123,14 +1047,7 @@ describe.if(PLATFORM_SUPPORTED)('state and cache fuzz', () => {
       );
     });
 
-    /**
-     * A 404 upstream and an *unreachable* one take different index paths in
-     * `_games`: the fallback status re-serves `_disk_games_index` raw, while
-     * `UpstreamUnavailable` goes through `_disk_rows_with_interrupted`, which
-     * relabels orphaned runs and drops lobby husks.  Both gateways must make
-     * the same choice, and the two bodies must genuinely differ — otherwise
-     * this leg is not testing the branch it claims to.
-     */
+    /** `UpstreamUnavailable` relabels orphans and drops husks unlike fallback 404. */
     test('the down sweep takes the relabeling index path on both sides', () => {
       const up = report().flapUp1[0];
       const down = report().flapDown[0];

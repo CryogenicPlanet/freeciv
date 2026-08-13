@@ -18,10 +18,9 @@
  * test owns and closes its own stub; the shared-port checks at the bottom are
  * the only place two live at once.
  */
-// oxlint-disable effecttsgo/global-fetch, effecttsgo/global-fetch-in-effect -- these tests assert what a stub puts on a socket, and an `HttpClient` layer between the assertion and the wire is exactly the thing that must not be in the way
+// oxlint-disable effecttsgo/global-fetch -- these tests assert what a stub puts on a socket, and an `HttpClient` layer between the assertion and the wire is exactly the thing that must not be in the way
 // oxlint-disable effecttsgo/global-console -- the measured numbers (bytes past the cap, milliseconds held) are the evidence a reader of the run needs
 import { describe, expect, test } from 'bun:test';
-import { Effect } from 'effect';
 import {
   BINARY_ETAG,
   BINARY_LAST_MODIFIED,
@@ -45,7 +44,6 @@ import {
   STUB_MODES,
   type StubHandle,
   type StubMode,
-  stubScoped,
 } from './stub-supervisor.ts';
 
 const MiB = 1024 * 1024;
@@ -512,30 +510,6 @@ describe('the handle — one instance per mode, and it releases', () => {
 
     expect(before).toHaveLength(0);
     expect(after).toHaveLength(1);
-  });
-
-  test('stubScoped closes the server when the scope closes', async () => {
-    const port = await Effect.runPromise(
-      Effect.scoped(
-        Effect.flatMap(stubScoped('ok-json'), (stub) =>
-          Effect.promise(async () => {
-            const response = await fetch(`${stub.origin}${GAMES}`);
-            expect(response.status).toBe(200);
-            await response.text();
-            return stub.port;
-          }),
-        ),
-      ),
-    );
-
-    // Nothing else in this process binds a port, so a refusal here is the
-    // release and not a coincidence. (This is a liveness check on a port we
-    // just owned — never a stand-in for an "upstream is down" fixture, which
-    // is what `hang` and an unroutable address are for.)
-    const [outcome] = await Promise.allSettled([
-      fetch(`http://127.0.0.1:${port}${GAMES}`, { signal: AbortSignal.timeout(1000) }),
-    ]);
-    expect(outcome?.status).toBe('rejected');
   });
 
   test('await using releases it too', async () => {

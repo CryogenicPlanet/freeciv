@@ -1,55 +1,12 @@
 /**
- * **The query/parameter space, pinned where the two gateways agree.**
+ * Differential seeds for `after_turn`, `limit`, `turn`, query shape, Unicode
+ * integer parsing, HTTP parser boundaries, and traversal-shaped raw targets.
+ * Stub legs compare forwarded canonical queries; disk legs compare fallback;
+ * derive legs exercise real saves and exact integer width.
  *
- * `diff.test.ts` compares a route table; this file compares the *values inside
- * a route* — `after_turn`, `limit`, `turn`, and the shape of the query string
- * that carries them.  It exists because those three integers are the only
- * user-controlled numbers the gateway parses, they are parsed by
- * `int()`-compatible code rather than by `Number()`, and every boundary in that
- * parser is a place two implementations can drift apart while every status code
- * in the route table stays identical.
- *
- * ## What a leg proves
- *
- * Each leg is one request-target replayed against both gateways in two upstream
- * phases:
- *
- * - **`stub`** — an `ok-json` stub upstream.  A query that survives its parser
- *   is relayed as a 200, and the stub's request log shows the **normalized**
- *   query each gateway forwarded (`after_turn=N&limit=N`, `turn=N`).  That
- *   makes the *canonicalization* observable, not just the verdict: a leg where
- *   both sides answer 200 but forward `after_turn=5` and `after_turn=05` is a
- *   divergence this file catches and a status comparison would not.  It also
- *   pins the promise that a 400 opens no socket at all — the forwarded list is
- *   empty on both sides for every refusal below.
- * - **`disk`** — `http://127.0.0.1:1`, refused instantly, so both gateways take
- *   the disk fallback and the same leg is compared through a second code path.
- *   ({@link REFUSED_UPSTREAM_URL} and not the RFC 5737 unroutable fixture:
- *   `boot.ts` documents that the TypeScript gateway answers *nothing* for 12s
- *   on that path, which would drown a query finding in an unrelated one.)
- * - **`derive`** — the `disk` phase against the one fixture with real
- *   autosaves, so the derivation subprocess runs and the loaders' integer width
- *   is observable in the body.
- *
- * ## Agreements and runtime-boundary waivers are pinned here
- *
- * Every leg without a waiver agrees byte for byte on both sides. The four
- * runtime-boundary disagreements remain `waivers.ts` entries with measured
- * signatures, and each fails if either side moves or the implementations begin
- * to agree. A waiver nobody can observe is a waiver nobody can police.
- *
- * ## The traversal corpus
- *
- * {@link TRAVERSAL_LEGS} replays escape-shaped and normalization-sensitive
- * targets, including raw cross-game `A/../B`. Node now preserves the raw request
- * target at the server edge, so that cross-game case is ordinary byte parity:
- * both gateways refuse it. Backslash and self-dot cases retain their narrower
- * traversal-safety assertion because their refusal bodies differ.
- *
- * Every process this file spawns binds `--port 0` under a private `mkdtemp`,
- * and the stub binds `127.0.0.1:0`; nothing here can reach a running stack.
- *
- * @module
+ * Unwaived legs compare bytes. Runtime-boundary waivers replay their measured
+ * signatures and self-invalidate. Traversal legs require both gateways to
+ * refuse, including raw cross-game `A/../B`. All listeners use private port 0.
  */
 
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
@@ -78,11 +35,7 @@ const ABSENT_GAME_ID = 'game_parity_absent_wellformed_id';
 /** Under the 20-char floor, so the router refuses it before any query is read. */
 const SHORT_GAME_ID = 'tooshort';
 
-/**
- * Pinned so an archive body never carries the answering process's own port —
- * the same reason `diff.test.ts` pins it, and what lets this file compare every
- * body byte for byte with no normalizer.
- */
+/** Prevents each gateway's ephemeral port from entering archive bodies. */
 const VIEWER_PUBLIC_URL = 'http://viewer.parity.invalid';
 
 // ---------------------------------------------------------------------------
@@ -123,14 +76,7 @@ const eventsTarget = (id: string, query: string): string => `/v1/games/${id}/eve
 
 const nines = (count: number): string => '9'.repeat(count);
 
-/**
- * `after_turn` and `limit` on `replay.json` (`_replay_query`, `:1555`).
- *
- * The block is dense on `int()` rather than on the range check on purpose: the
- * range check is two comparisons and the parser is where the two languages'
- * defaults disagree — `Number('1_0')` is `NaN`, `Number('')` is `0`,
- * `Number(' 5 ')` is `5`, and exactly one of those three matches Python.
- */
+/** Python-`int()` compatibility seeds for replay pagination. */
 const REPLAY_SEEDS: ReadonlyArray<QuerySeed> = [
   { suffix: 'no-query', query: '', why: 'both parameters default (0, 250)' },
   { suffix: 'bare-question-mark', query: '?', why: 'a bare ? is NO query: urlsplit reports ""' },
@@ -419,25 +365,9 @@ const proxyPhaseLegs = (phase: 'stub' | 'disk'): ReadonlyArray<FuzzLeg> => [
 // ---------------------------------------------------------------------------
 
 /**
- * The four divergences `waivers.ts` accepts at the two runtimes' HTTP layers.
- *
- * These are legs like any other — replayed on both sides, in the `disk` phase,
- * with the same client — and the only thing that differs is what their test
- * asserts: not equality, which is impossible, but the **measured signature
- * pair**, which fails if either side moves and fails if the two ever agree.
- * Without them each waiver would be a paragraph nobody re-measures.
- *
- * The `disk` phase, and not `stub`, because a relaying upstream would answer
- * the two legs whose query *parses* on one side (`turn=1`, `turn=5`) with its
- * own 200 on both sides and hide half the pair; against a refused upstream the
- * request reaches the archive and the absent game answers `404`, which is the
- * TypeScript behavior the waiver pins.
- *
- * Every byte here is deliberate.  `\u00d9\u00a1` is written as two latin-1
- * characters because `wire-client.ts` writes the request line with
- * `latin1`, so those are the raw bytes `D9 A1` on the socket — which is UTF-8
- * for `U+0661` and not valid latin-1 digits.  `\u0085` is one raw byte, `85`,
- * for the same reason.
+ * Measured HTTP-runtime waiver legs. Disk fallback exposes parser differences
+ * a relaying stub could hide. Latin-1 request writes make `\u00d9\u00a1` raw
+ * bytes D9 A1 (UTF-8 U+0661) and `\u0085` the single byte 85.
  */
 const BOUNDARY_LEGS: ReadonlyArray<Omit<FuzzLeg, 'phase'>> = [
   {
@@ -472,19 +402,9 @@ const BOUNDARY_LEGS: ReadonlyArray<Omit<FuzzLeg, 'phase'>> = [
 // ---------------------------------------------------------------------------
 
 /**
- * Escape-shaped targets, and the promise that none of them escapes.
- *
- * Bun resolves `..`, `%2e%2e` and `\\` in the request target *before* dispatch
- * and `urlsplit` does not, so this family is where a normalization difference
- * could turn into a route the client never named.  Every leg here is an
- * ordinary equality leg — both gateways answer the same `404` to all of them —
- * and the corpus-wide test additionally asserts the property that matters on
- * its own terms: neither side ever answers 2xx to one.
- *
- * The corpus is chosen to cover the escapes that would matter if one worked:
- * up and out of `/v1/games` into `/health`, an encoded separator inside the
- * game id, `..` inside the archive's frame path, and a `..` sequence that names
- * `/etc/passwd`.
+ * Escape and normalization corpus: plain/encoded dot segments, encoded slash,
+ * backslash, archive escape, cross-game traversal, and leading slash collapse.
+ * Every target must be refused by both gateways.
  */
 const TRAVERSAL_LEGS: ReadonlyArray<Omit<FuzzLeg, 'phase'>> = [
   {

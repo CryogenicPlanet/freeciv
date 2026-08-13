@@ -1,53 +1,11 @@
 /**
- * The **one** body normalization the parity matrix is allowed to perform, and
- * the argument for why it is the only one.
+ * The matrix's only body normalization. `/health` process identity fields
+ * cannot match across two processes, so their raw value tokens are replaced
+ * without parsing or reserializing; every other byte remains exact.
  *
- * Every other body in the matrix is compared **byte for byte** — a JSON
- * document, a PNG, CPython's stdlib HTML error page, all of it.  That is the
- * point: the two gateways serialize through different writers, and a rig that
- * compared parsed documents would not notice `1.0` where Python wrote `1`,
- * which is the exact four-byte defect `test/gateway/smoke-live.test.ts` was
- * written to catch.  So the default rule here is `bytes`, and it has no
- * options.
- *
- * ## Why `/health` needs an exception at all
- *
- * `identity_payload()` (`agent_eval/replay_gateway.py:1301`) reports facts
- * about **the process answering**, not about the port: its pid, the port the
- * kernel handed *it*, the self-URL built from that port, the cache root it was
- * given, and the identity digest derived from that cache root.  Two processes
- * cannot agree on those and remain two processes.  Everything else in the
- * payload — `schema_version`, `ok`, `kind`, `protocol_version`, `host`,
- * `repo_root`, `upstream_service_url`, `runs_root`, `viewer_public_url` —
- * comes from flags both gateways were handed identically by `boot.ts`, so it
- * is compared verbatim.
- *
- * ## Textual substitution, not structural comparison
- *
- * {@link normalizeHealthBody} rewrites the *value token* of each volatile
- * field in the raw response text and leaves every other byte alone.  It does
- * **not** parse and re-serialize, because a `JSON.parse` round trip is exactly
- * the machinery that hides a spelling difference: key order, `1` versus `1.0`,
- * `\/` versus `/` would all be normalized away for free.  After substitution
- * the two texts are compared with the same byte rule as everything else.
- *
- * The substitution is a flat-object regex, and it is safe *because* the payload
- * is flat: `identity_payload` is a `dict[str, str | int | bool]` with no nested
- * object or array in it (`src/gateway/http/routes/health.ts:75-93`).  A nested
- * value would need a real parser, and the assertion in
- * {@link healthPayloadIsFlat} is what keeps that assumption from rotting
- * silently.
- *
- * ## The normalization is itself under test
- *
- * Every field below must **actually differ** between the two processes.  A
- * normalization that no longer hides anything is a normalization that is
- * quietly weakening the comparison, so {@link compareHealthBodies} reports
- * `VolatileFieldAgrees` for it and the matrix fails.  The inverse — a *sixth*
- * field drifting apart — surfaces as an ordinary `Differ`, because the
- * post-substitution comparison is still byte-exact.
- *
- * @module
+ * The payload must remain flat, every listed volatile field must exist and
+ * differ, and any additional difference fails. This makes the exemption
+ * self-invalidating rather than a permanent comparison hole.
  */
 
 import { Either } from 'effect';
@@ -65,12 +23,7 @@ export interface VolatileHealthField {
   readonly why: string;
 }
 
-/**
- * The five fields — and *only* these five — that the matrix rewrites.
- *
- * Measured, not assumed: `test/parity/diff.test.ts` asserts that the set of
- * `/health` keys whose values differ is exactly this set, in both directions.
- */
+/** The five process-specific fields, and only these five. */
 export const VOLATILE_HEALTH_FIELDS: ReadonlyArray<VolatileHealthField> = [
   {
     field: 'pid',
@@ -94,14 +47,7 @@ export const VOLATILE_HEALTH_FIELDS: ReadonlyArray<VolatileHealthField> = [
   },
 ];
 
-/**
- * `host` is deliberately **not** here.
- *
- * It is `--host 127.0.0.1`, spelled once in `boot.ts` and handed to both
- * processes, so it is byte-identical and normalizing it would be dead weight
- * that silently widens the exemption.  The same argument covers `repo_root`,
- * `runs_root`, `upstream_service_url` and `viewer_public_url`.
- */
+/** Shared flag-derived fields remain exact rather than normalized. */
 export const NON_VOLATILE_HEALTH_FIELDS: ReadonlyArray<string> = [
   'schema_version',
   'ok',
@@ -120,15 +66,7 @@ export const VOLATILE_PLACEHOLDER = '<volatile>';
 // Substitution
 // ---------------------------------------------------------------------------
 
-/**
- * `"field":<value>` where `<value>` is a JSON string, or a run of bytes up to
- * the next `,` or `}`.
- *
- * Correct only for a flat object — see {@link healthPayloadIsFlat}, which is
- * how the matrix keeps that precondition honest.  Anchored on the quoted key so
- * a *value* that happens to contain `"pid":` (a cache root under a directory
- * named that, say) cannot be mistaken for the key.
- */
+/** Match one value token in a flat object, anchored on its quoted key. */
 const fieldPattern = (field: string): RegExp =>
   new RegExp(`("${field}":)("(?:[^"\\\\]|\\\\.)*"|[^,}]*)`);
 
@@ -140,13 +78,7 @@ export interface NormalizedHealthBody {
   readonly replaced: Readonly<Record<string, string | null>>;
 }
 
-/**
- * Rewrite the volatile values out of one `/health` body.
- *
- * Total: a field the body does not carry is recorded as `null` rather than
- * treated as an error, so an implementation that *dropped* `pid` shows up as a
- * missing field in {@link compareHealthBodies} instead of as a thrown parse.
- */
+/** Replace volatile values; missing fields are recorded as `null`. */
 export const normalizeHealthBody = (text: string): NormalizedHealthBody =>
   VOLATILE_HEALTH_FIELDS.reduce<NormalizedHealthBody>(
     (accumulated, { field }) => {
@@ -162,27 +94,11 @@ export const normalizeHealthBody = (text: string): NormalizedHealthBody =>
     { text, replaced: {} },
   );
 
-/**
- * `JSON.parse` as a value.
- *
- * `JSON.parse` is the one stdlib boundary in this file that reports failure by
- * throwing, and a body that does not parse is an *expected* input here — the
- * `/health?x=1` rejection is a problem body and takes the byte rule — so
- * `Either.try` converts the throw at the boundary and nothing downstream has to
- * know it was ever an exception.
- */
+/** Parse as a value; non-JSON is an expected comparison input. */
 const jsonOrNull = (text: string): unknown =>
   Either.getOrNull(Either.try(() => JSON.parse(text) as unknown));
 
-/**
- * True when `text` is a JSON object with no nested object or array — the
- * precondition {@link normalizeHealthBody}'s regex rests on.
- *
- * Deliberately structural rather than a schema check: the question is not
- * "is this a valid identity payload" (the byte comparison answers that) but
- * "could a value hide a `,` or a `}` from a flat-object regex".  Total: a body
- * that does not parse at all is `false`, which is the conservative answer.
- */
+/** Validate the flat-object precondition required by textual substitution. */
 export const healthPayloadIsFlat = (text: string): boolean => {
   const parsed: unknown = jsonOrNull(text);
   return (
@@ -234,15 +150,7 @@ export type BodyVerdict =
 /** The body as one comparable latin-1 string — lossless for PNG and mp4 alike. */
 export const comparableBody = (response: WireResponse): string => bodyLatin1(response);
 
-/**
- * Compare two `/health` bodies: substitute the volatile values, then compare
- * the remaining bytes exactly.
- *
- * Three failure modes are reported before the byte comparison, because each is
- * a stronger statement than "the bodies differ": a payload that is not flat
- * (the regex cannot be trusted), a volatile field one side does not send, and a
- * volatile field that no longer differs.
- */
+/** Substitute volatile tokens, validate the exemption, then compare bytes. */
 export const compareHealthBodies = (python: string, typescript: string): BodyVerdict => {
   const flatness: ReadonlyArray<BodyVerdict> = (
     [
@@ -282,14 +190,7 @@ export const compareHealthBodies = (python: string, typescript: string): BodyVer
       };
 };
 
-/**
- * The matrix's body comparison, in one function.
- *
- * `rule` is the leg's declared rule, not a guess from the payload: a
- * `/health` leg that answered `400 {"error":…}` (the `?x=1` rejection) has no
- * volatile fields in it at all, so the health rule degrades to the byte rule
- * rather than reporting five missing fields.
- */
+/** Apply health normalization only to successful declared health legs. */
 export const compareBodies = (
   rule: BodyRule,
   python: WireResponse,

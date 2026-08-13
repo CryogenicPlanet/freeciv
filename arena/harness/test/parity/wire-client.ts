@@ -179,10 +179,6 @@ export type WireOutcome = WireResponse | WireFailure;
 export const isWireResponse = (outcome: WireOutcome): outcome is WireResponse =>
   outcome._tag === 'Response';
 
-/** The body as UTF-8 text.  For JSON bodies, which is most of them. */
-export const bodyUtf8 = (response: WireResponse): string =>
-  Buffer.from(response.bodyBytes).toString('utf8');
-
 /**
  * The body as latin-1 — one character per byte, lossless, comparable.
  *
@@ -599,14 +595,3 @@ export const wireGet = (
   target: string,
   options: Omit<WireRequest, 'method' | 'target'> = {},
 ): Promise<WireOutcome> => wireRequest(origin, { ...options, method: 'GET', target });
-
-/**
- * A one-line rendering of an outcome, for a rig's evidence table.
- *
- * Deliberately lossy and deliberately not a comparison key — assertions read
- * the fields.
- */
-export const describeOutcome = (outcome: WireOutcome): string =>
-  isWireResponse(outcome)
-    ? `${outcome.status} ${outcome.completedBy} ${outcome.bodyBytes.byteLength}B`
-    : outcome._tag;
