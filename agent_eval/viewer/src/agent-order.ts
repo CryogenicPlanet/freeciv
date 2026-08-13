@@ -15,7 +15,6 @@
  */
 
 import { NATIVE_AI_LABEL, displayControllerLabel } from './faction-label'
-import { sortedCopy } from './ordered'
 
 /** The controller fields every side-shaped payload carries some subset of. */
 export interface ControllerSource {
@@ -56,8 +55,7 @@ export function agentFirstBy<T>(
   sides: readonly T[],
   isAgent: (side: T) => boolean,
 ): T[] {
-  return sortedCopy(
-    sides,
+  return sides.toSorted(
     (left, right) => Number(isAgent(right)) - Number(isAgent(left)),
   )
 }

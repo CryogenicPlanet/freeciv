@@ -14,7 +14,6 @@ import { DisplayPaletteProvider } from './display-palette'
 import { actorColors } from './event-log'
 import { formatYear } from './game-year'
 import { MAP_HASH, mapSectionOpen, rememberMapSection } from './map-preference'
-import { reversedCopy, sortedCopy } from './ordered'
 import { controlProtocolLabel, placeLabel, timingModeLabel } from './picker-model'
 import { frameImageUrl, resolveViewerRoute } from './route'
 import type {
@@ -55,7 +54,7 @@ const CLAMPED_LINE_RAIL = 'block min-w-0 overflow-hidden text-ellipsis whitespac
 function mergeSnapshots(current: ReplaySnapshot[], incoming: ReplaySnapshot[]) {
   const merged = new Map(current.map((snapshot) => [snapshot.turn, snapshot]))
   for (const snapshot of incoming) merged.set(snapshot.turn, snapshot)
-  return sortedCopy([...merged.values()], (a, b) => a.turn - b.turn)
+  return [...merged.values()].toSorted((a, b) => a.turn - b.turn)
 }
 
 function stateLabel(state: string) {
@@ -140,7 +139,7 @@ function MatchViewer({ route }: { route: RouteContext }) {
         const load = await fetchWatchWithOptionalReplay(route, 0, controller.signal)
         setWatch(load.watch)
         if (load.replay) {
-          setSnapshots(sortedCopy(load.replay.snapshots, (a, b) => a.turn - b.turn))
+          setSnapshots(load.replay.snapshots.toSorted((a, b) => a.turn - b.turn))
           if (load.replay.catalog) setCatalog(load.replay.catalog)
           setWarnings(load.replay.warnings)
         }
@@ -303,21 +302,23 @@ function MatchViewer({ route }: { route: RouteContext }) {
   const timing = timingModeLabel(game)
   const duration = matchDurationLabel(game)
   const protocol = controlProtocolLabel(game.control_protocol)
-  const comparisonRows = sortedCopy(orderedPlaces.map((place) => {
+  const comparisonRows = orderedPlaces.map((place) => {
     const telemetry = playerForPlace(selectedSnapshot?.players ?? [], place.place)
     const authoritative = game.leaderboard.find((entry) => entry.place === place.place)
     return {
       place,
       score: historicalComparison ? telemetry?.score : authoritative?.score ?? telemetry?.score,
     }
-  }), (a, b) => (b.score ?? Number.NEGATIVE_INFINITY) - (a.score ?? Number.NEGATIVE_INFINITY))
+  }).toSorted(
+    (a, b) => (b.score ?? Number.NEGATIVE_INFINITY) - (a.score ?? Number.NEGATIVE_INFINITY),
+  )
 
   function chooseTurn(turn: number) {
     setSelectedTurn(turn)
     setLive(turn === lastTurn)
   }
 
-  const previousTurn = reversedCopy(availableTurns).find((turn) => turn < selectedTurn)
+  const previousTurn = availableTurns.toReversed().find((turn) => turn < selectedTurn)
   const nextTurn = availableTurns.find((turn) => turn > selectedTurn)
 
   function stepReplay(turn: number | undefined) {
@@ -517,7 +518,7 @@ function MatchViewer({ route }: { route: RouteContext }) {
                 </div>
                 <div className="mt-[14px] pt-3 border-t border-t-[var(--color-line)]">
                   <small className="block mb-[7px] text-[var(--color-muted)] font-bold text-[7px] leading-none font-readout tracking-[.1em] uppercase">Acquisition history</small>
-                  <div className="flex flex-wrap gap-[5px]">{acquisitions.length ? reversedCopy(acquisitions.slice(-4)).map((acquisition, index) => <span className="py-[5px] px-[7px] border border-line text-muted bg-[var(--color-page)] text-[8px]" key={`${acquisition.turn}-${acquisition.name}-${index}`}><b className="mr-[5px] text-[var(--color-muted)] font-medium text-[7px] leading-none font-readout">T{acquisition.turn}</b>{acquisition.name}</span>) : <em className="text-[var(--color-muted)] text-[9px] not-italic">No new technology recorded yet</em>}</div>
+                  <div className="flex flex-wrap gap-[5px]">{acquisitions.length ? acquisitions.slice(-4).toReversed().map((acquisition, index) => <span className="py-[5px] px-[7px] border border-line text-muted bg-[var(--color-page)] text-[8px]" key={`${acquisition.turn}-${acquisition.name}-${index}`}><b className="mr-[5px] text-[var(--color-muted)] font-medium text-[7px] leading-none font-readout">T{acquisition.turn}</b>{acquisition.name}</span>) : <em className="text-[var(--color-muted)] text-[9px] not-italic">No new technology recorded yet</em>}</div>
                 </div>
               </article>
             )
@@ -598,7 +599,7 @@ function MatchViewer({ route }: { route: RouteContext }) {
           </>
         ) : (
           <div className="event-stream">
-            {reversedCopy(watch.timeline.slice(-12)).map((event) => (
+            {watch.timeline.slice(-12).toReversed().map((event) => (
               <article key={event.turn}>
                 <b>T{event.turn}</b>
                 <span>{event.year ?? '—'}</span>

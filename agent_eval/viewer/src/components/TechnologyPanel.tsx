@@ -1,5 +1,4 @@
 import React from 'react'
-import { sortedCopy } from '../ordered'
 import type { ReplayPlayer, ReplaySnapshot, Technology } from '../types'
 import { competitorLabel, technologyState } from '../view-model'
 import { ColorMark } from './ColorMark'
@@ -34,10 +33,8 @@ export function TechnologyPanel({
     return (current?.gained_tech_ids ?? []).map((id) => ({ turn: snapshot.turn, id }))
   })
   const techById = new Map(catalog.map((technology) => [technology.id, technology]))
-  const depths = sortedCopy(
-    [...new Set(catalog.map((technology) => technology.depth ?? 0))],
-    (a, b) => a - b,
-  )
+  const depths = [...new Set(catalog.map((technology) => technology.depth ?? 0))]
+    .toSorted((a, b) => a - b)
 
   return (
     <section className="panel technology-panel" aria-labelledby="technology-title">

@@ -1,5 +1,4 @@
 import React, { useMemo } from 'react'
-import { sortedCopy } from '../ordered'
 import type { ReplayPlayer, ReplaySnapshot, Technology } from '../types'
 import { agentFirstBy, isAgentController } from '../agent-order'
 import { displayPlayerColor } from '../display-color'
@@ -128,7 +127,7 @@ export function buildTechnologyProgressSeries(
     }
   }
 
-  const orderedSnapshots = sortedCopy(snapshots, (left, right) => left.turn - right.turn)
+  const orderedSnapshots = snapshots.toSorted((left, right) => left.turn - right.turn)
   if (!orderedSnapshots.length) {
     return {
       status: 'snapshots-unavailable',
@@ -189,10 +188,8 @@ export function buildTechnologyProgressSeries(
   const series = agentFirstBy(
     [...builders.entries()], ([, builder]) => isAgentController(builder.player),
   ).map(([seatId, builder]) => {
-    const values = sortedCopy(
-      [...builder.valuesByTurn.values()],
-      (left, right) => left.turn - right.turn,
-    )
+    const values = [...builder.valuesByTurn.values()]
+      .toSorted((left, right) => left.turn - right.turn)
     const first = values[0]
     const latest = values.at(-1)
     if (first === undefined || latest === undefined) {

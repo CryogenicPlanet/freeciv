@@ -24,7 +24,6 @@
 
 import { LruCache } from './board-loader'
 import { terrainColor } from './board-geometry'
-import { sortedCopy } from './ordered'
 
 /** Terrain fills a faction color must stay clear of. */
 const BOARD_COLORS: readonly string[] = [
@@ -191,7 +190,7 @@ function paletteKey(factions: readonly DisplayFaction[]): string {
  * record the same color, the lower player id decides what that color paints as.
  */
 export function buildDisplayPalette(factions: readonly DisplayFaction[]): DisplayPalette {
-  const ordered = sortedCopy(factions, (left, right) => left.playerId - right.playerId)
+  const ordered = factions.toSorted((left, right) => left.playerId - right.playerId)
   const key = paletteKey(ordered)
   const cached = paletteCache.get(key)
   if (cached) return cached

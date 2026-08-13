@@ -7,7 +7,6 @@ import type {
   ReplaySnapshot,
   Technology,
 } from './types'
-import { sortedCopy } from './ordered'
 import { placeLabel } from './picker-model'
 import { agentFirst, agentFirstBy, isNativeController } from './agent-order'
 import {
@@ -286,10 +285,10 @@ export function turnsAvailable(
   snapshots: ReplaySnapshot[],
   frames: ReplayFrame[],
 ): number[] {
-  return sortedCopy([...new Set([
+  return [...new Set([
     ...snapshots.map((snapshot) => snapshot.turn),
     ...frames.flatMap((frame) => (
       frame.turn == null || !Number.isFinite(frame.turn) ? [] : [frame.turn]
     )),
-  ])], (a, b) => a - b)
+  ])].toSorted((a, b) => a - b)
 }

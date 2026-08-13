@@ -1,5 +1,4 @@
 import { nativeAiLabel } from './faction-label'
-import { sortedCopy } from './ordered'
 import type { GamePlace, GameSummary } from './types'
 
 const GAME_ID_RE = /^[A-Za-z0-9_-]{20,80}$/
@@ -80,7 +79,7 @@ export function placeLabel(place: GamePlace): string {
 }
 
 export function sortedGames(games: GameSummary[]): GameSummary[] {
-  return sortedCopy(games, (a, b) => {
+  return games.toSorted((a, b) => {
     const active = Number(ACTIVE_STATES.has(b.state)) - Number(ACTIVE_STATES.has(a.state))
     if (active) return active
     return (b.created_at ?? 0) - (a.created_at ?? 0)

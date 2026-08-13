@@ -1,5 +1,3 @@
-import { sortedCopy } from './ordered'
-
 export class LatestRequestGate {
   private generation = 0
 
@@ -49,10 +47,8 @@ export function priorAvailableTurns(
   limit = 32,
 ): number[] {
   if (!Number.isInteger(limit) || limit < 1) return []
-  return sortedCopy(
-    [...new Set(turns)].filter(
-      (turn) => Number.isInteger(turn) && turn > 0 && turn < selectedTurn,
-    ),
-    (left, right) => right - left,
-  ).slice(0, limit)
+  return [...new Set(turns)]
+    .filter((turn) => Number.isInteger(turn) && turn > 0 && turn < selectedTurn)
+    .toSorted((left, right) => right - left)
+    .slice(0, limit)
 }

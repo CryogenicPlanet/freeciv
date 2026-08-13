@@ -1,4 +1,3 @@
-import { sortedCopy } from './ordered'
 import type { GameEvent, GamePlace, ReplayPlayer } from './types'
 
 /** Short chips for the log's right rail; unknown kinds render their raw name. */
@@ -172,14 +171,12 @@ export function heaviestPerWindow(
     const held = best.get(window)
     if (!held || event.weight > held.weight) best.set(window, event)
   }
-  return sortedCopy([...best.values()], (left, right) => left.turn - right.turn)
+  return [...best.values()].toSorted((left, right) => left.turn - right.turn)
 }
 
 export function omittedSummary(omitted: Readonly<Record<string, number>>): string {
-  const parts = sortedCopy(
-    Object.entries(omitted),
-    ([left], [right]) => left.localeCompare(right),
-  )
+  const parts = Object.entries(omitted)
+    .toSorted(([left], [right]) => left.localeCompare(right))
     .map(([kind, count]) => `${count} ${eventKindLabel(kind).toLowerCase()}`)
   return parts.join(', ')
 }
