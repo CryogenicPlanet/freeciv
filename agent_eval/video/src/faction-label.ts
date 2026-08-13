@@ -29,14 +29,16 @@ export const DYNAMIC_LABEL = 'Freeciv dynamic'
  * Levels outside this table render as a plain "CPU": naming a difficulty we
  * have not deliberately translated is worse than naming none.
  */
-const DIFFICULTY_NAMES: Readonly<Record<string, string>> = {
+const DIFFICULTY_NAMES = {
   hard: 'Hard',
   cheating: 'Deity',
-}
+} satisfies Readonly<Record<string, string>>
+
+const DIFFICULTY_NAME_BY_LEVEL = new Map<string, string>(Object.entries(DIFFICULTY_NAMES))
 
 /** "CPU", or "CPU: Deity" when the difficulty is one we name. */
 export function nativeAiLabel(difficulty?: string | null): string {
-  const name = DIFFICULTY_NAMES[difficulty?.trim().toLowerCase() ?? '']
+  const name = DIFFICULTY_NAME_BY_LEVEL.get(difficulty?.trim().toLowerCase() ?? '')
   return name ? `${NATIVE_AI_LABEL}: ${name}` : NATIVE_AI_LABEL
 }
 

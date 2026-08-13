@@ -12,19 +12,24 @@
 
 import { useEffect, useState } from 'react'
 import { cancelRender, continueRender, delayRender, staticFile } from 'remotion'
+import { z } from 'zod'
 import { buildFilm, type Film } from './film'
-import { parseEvents, parseFrames, parseMeta, type DatasetMeta } from './schema'
+import {
+  parseEvents, parseFrames, parseMeta, type DatasetMeta, type JsonValue,
+} from './schema'
 
 export function datasetPath(gameId: string, file: string): string {
   return staticFile(`exports/${gameId}/${file}`)
 }
 
-async function fetchJson(url: string): Promise<unknown> {
+const JSON_VALUE_SCHEMA = z.json()
+
+async function fetchJson(url: string): Promise<JsonValue> {
   const response = await fetch(url)
   if (!response.ok) {
     throw new Error(`cannot read ${url}: HTTP ${response.status}`)
   }
-  return await response.json() as unknown
+  return JSON_VALUE_SCHEMA.parse(await response.json())
 }
 
 export async function loadMeta(gameId: string): Promise<DatasetMeta> {
@@ -63,8 +68,8 @@ export function useFilm(gameId: string): Film | null {
         setFilm(loaded)
         continueRender(handle)
       })
-      .catch((reason: unknown) => {
-        cancelRender(reason instanceof Error ? reason : new Error(String(reason)))
+      .catch((cause: unknown) => {
+        cancelRender(cause instanceof Error ? cause : new Error(String(cause)))
       })
     return () => {
       live = false

@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import React, { useMemo } from 'react'
 import { SHELL, withAlpha } from '../theme'
 
 export interface ChartSeries {

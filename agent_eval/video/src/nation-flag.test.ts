@@ -66,7 +66,7 @@ describe('hasFlagAsset', () => {
       'English', 'Spanish', 'Italian', 'Portuguese', 'Aztec',
       'Babylonian', 'Greek', 'Pirate', 'Barbarian',
     ]) {
-      expect(hasFlagAsset(nation), nation).toBe(true)
+      expect(hasFlagAsset(nation)).toBe(true)
     }
   })
 })
@@ -80,22 +80,22 @@ describe('the generated files', () => {
     // empty framed box back on screen.
     expect(FLAG_ASSETS.length).toBeGreaterThan(0)
     for (const slug of FLAG_ASSETS) {
-      expect(existsSync(join(PUBLIC, 'flags', `${slug}.svg`)), slug).toBe(true)
+      expect(existsSync(join(PUBLIC, 'flags', `${slug}.svg`))).toBe(true)
     }
   })
 
   it('keeps the manifest a subset of the map', () => {
     const slugs = new Set(Object.values(NATION_FLAGS))
-    for (const slug of FLAG_ASSETS) expect(slugs.has(slug), slug).toBe(true)
+    for (const slug of FLAG_ASSETS) expect(slugs.has(slug)).toBe(true)
   })
 
   it('maps every nation to a non-empty slug', () => {
     const entries = Object.entries(NATION_FLAGS)
     expect(entries.length).toBeGreaterThan(500)
     for (const [nation, slug] of entries) {
-      expect(nation.length, nation).toBeGreaterThan(0)
+      expect(nation.length).toBeGreaterThan(0)
       // Hyphens are real: `guinea-bissau`, `nuu-chah-nulth`.
-      expect(slug, nation).toMatch(/^[a-z0-9_-]+$/)
+      expect(slug).toMatch(/^[a-z0-9_-]+$/)
     }
   })
 })

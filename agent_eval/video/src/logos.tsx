@@ -22,7 +22,7 @@
  * the argument by throwing all of their colours away.
  */
 
-import type { CSSProperties, ReactElement } from 'react'
+import React, { type CSSProperties, type ReactElement } from 'react'
 import { staticFile } from 'remotion'
 
 /**
@@ -39,25 +39,28 @@ export const PROVIDERS = ['anthropic', 'google', 'openai'] as const
 
 export type Provider = (typeof PROVIDERS)[number]
 
-const HARNESS_NAMES: Record<Harness, string> = {
+const HARNESS_NAMES = {
   'claude-code': 'Claude Code',
   codex: 'Codex',
   opencode: 'opencode',
   pi: 'pi',
-}
+} satisfies Record<Harness, string>
 
-const PROVIDER_NAMES: Record<Provider, string> = {
+const PROVIDER_NAMES = {
   anthropic: 'Anthropic',
   google: 'Google',
   openai: 'OpenAI',
-}
+} satisfies Record<Provider, string>
+
+const HARNESS_VALUES = new Set<string>(HARNESSES)
+const PROVIDER_VALUES = new Set<string>(PROVIDERS)
 
 export function isHarness(value: string): value is Harness {
-  return (HARNESSES as readonly string[]).includes(value)
+  return HARNESS_VALUES.has(value)
 }
 
 export function isProvider(value: string): value is Provider {
-  return (PROVIDERS as readonly string[]).includes(value)
+  return PROVIDER_VALUES.has(value)
 }
 
 export function harnessName(harness: Harness): string {
@@ -118,8 +121,8 @@ export interface ControllerParts {
  * hand-ordered, because a hand-ordered list is one careless insert away from
  * being wrong in a way no type catches.
  */
-const HARNESSES_LONGEST_FIRST: readonly Harness[] = [...HARNESSES]
-  .sort((left, right) => right.length - left.length)
+const HARNESSES_LONGEST_FIRST: readonly Harness[] = HARNESSES
+  .toSorted((left, right) => right.length - left.length)
 
 /**
  * Pull the harness and model back out of a `controller_label`.
@@ -151,10 +154,10 @@ export function splitControllerLabel(label: string): ControllerParts {
  * display. The two directions are deliberate inverses -- shorten the key,
  * expand the name.
  */
-const HARNESS_MODEL_PREFIX: Readonly<Partial<Record<Harness, string>>> = {
-  'claude-code': 'claude-',
-  codex: 'gpt-',
-}
+const HARNESS_MODEL_PREFIX = new Map<Harness, string>([
+  ['claude-code', 'claude-'],
+  ['codex', 'gpt-'],
+])
 
 /**
  * What to call a model on screen: its recorded name, with the vendor prefix
@@ -170,7 +173,7 @@ export function displayModelName(
 ): string | null {
   const trimmed = model?.trim()
   if (!trimmed) return null
-  const prefix = harness == null ? undefined : HARNESS_MODEL_PREFIX[harness]
+  const prefix = harness == null ? undefined : HARNESS_MODEL_PREFIX.get(harness)
   if (prefix === undefined) return trimmed
   return trimmed.toLowerCase().startsWith(prefix) ? trimmed : `${prefix}${trimmed}`
 }
@@ -222,7 +225,7 @@ interface MarkLayer {
   readonly opacity: number
 }
 
-const HARNESS_MARKS: Record<Harness, readonly MarkLayer[]> = {
+const HARNESS_MARKS = {
   'claude-code': [{ file: 'logos/harness/claude-code.svg', opacity: 1 }],
   codex: [{ file: 'logos/harness/codex.svg', opacity: 1 }],
   opencode: [
@@ -230,13 +233,13 @@ const HARNESS_MARKS: Record<Harness, readonly MarkLayer[]> = {
     { file: 'logos/harness/opencode-block.svg', opacity: 0.45 },
   ],
   pi: [{ file: 'logos/harness/pi.svg', opacity: 1 }],
-}
+} satisfies Record<Harness, readonly MarkLayer[]>
 
-const PROVIDER_MARKS: Record<Provider, readonly MarkLayer[]> = {
+const PROVIDER_MARKS = {
   anthropic: [{ file: 'logos/provider/anthropic.svg', opacity: 1 }],
   google: [{ file: 'logos/provider/google.svg', opacity: 1 }],
   openai: [{ file: 'logos/provider/openai.svg', opacity: 1 }],
-}
+} satisfies Record<Provider, readonly MarkLayer[]>
 
 /**
  * Every asset the registry can reach, as a `public/`-relative path. Exported so

@@ -18,13 +18,15 @@
     "react": "19.2.0",
     "react-dom": "19.2.0",
     "remotion": "4.0.506",
-    "tailwindcss": "^4.3.3"
+    "tailwindcss": "^4.3.3",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@freeciv/oxlint-config": "workspace:*",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
     "oxlint": "1.77.0",
+    "oxlint-tsgolint": "^7.0.2001",
     "typescript": "5.9.3",
     "vitest": "^4.1.10"
   }

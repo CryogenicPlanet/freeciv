@@ -2,11 +2,30 @@
  * Types and narrowing parsers for the dataset written by
  * `python -m agent_eval.video_export`.
  *
- * Everything crossing the JSON boundary arrives as `unknown` and is narrowed
- * by hand here, so no `any` and no unchecked cast reaches a component. A
- * malformed export fails loudly at load time instead of rendering a blank
- * panel for ninety seconds.
+ * Everything crossing the JSON boundary is decoded to `JsonValue` before these
+ * domain parsers run, so no unchecked value reaches a component. A malformed
+ * export fails loudly at load time instead of rendering a blank panel for
+ * ninety seconds.
  */
+
+import { z } from 'zod'
+
+export interface JsonObject {
+  readonly [key: string]: JsonValue
+}
+
+export type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | readonly JsonValue[]
+  | JsonObject
+
+type JsonField = JsonValue | undefined
+
+const FINITE_NUMBER_SCHEMA = z.number().finite()
+const STRING_VALUE_SCHEMA = z.string()
 
 export interface TerrainEntry {
   readonly code: string
@@ -92,7 +111,7 @@ export interface GameEvent {
   /** The extractor's 1-100 importance scale. */
   readonly weight: number
   /** The emitter's payload, mirrored as-is; `event-log.ts` owns its meaning. */
-  readonly data: Readonly<Record<string, unknown>>
+  readonly data: JsonObject
 }
 
 export interface EventLog {
@@ -123,51 +142,65 @@ class DatasetError extends Error {
   }
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
+function isRecord(value: JsonField): value is JsonObject {
+  return value !== null
+    && value !== undefined
+    && !Array.isArray(value)
+    && Object.getPrototypeOf(value) === Object.prototype
 }
 
-function record(value: unknown, where: string): Record<string, unknown> {
+function record(value: JsonField, where: string): JsonObject {
   if (!isRecord(value)) throw new DatasetError(`${where} must be an object`)
   return value
 }
 
-function array(value: unknown, where: string): readonly unknown[] {
+function array(value: JsonField, where: string): readonly JsonValue[] {
   if (!Array.isArray(value)) throw new DatasetError(`${where} must be an array`)
   return value
 }
 
-function integer(value: unknown, where: string): number {
-  if (typeof value !== 'number' || !Number.isFinite(value)) {
-    throw new DatasetError(`${where} must be a number`)
-  }
-  return value
+function finiteNumber(value: JsonField): number | null {
+  const result = FINITE_NUMBER_SCHEMA.safeParse(value)
+  return result.success ? result.data : null
 }
 
-function integerOr(value: unknown, fallback: number): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : fallback
+function stringValue(value: JsonField): string | null {
+  const result = STRING_VALUE_SCHEMA.safeParse(value)
+  return result.success ? result.data : null
 }
 
-function text(value: unknown, fallback = ''): string {
-  return typeof value === 'string' ? value : fallback
+function integer(value: JsonField, where: string): number {
+  const parsed = finiteNumber(value)
+  if (parsed === null) throw new DatasetError(`${where} must be a number`)
+  return parsed
 }
 
-function nullableText(value: unknown): string | null {
-  return typeof value === 'string' && value.length > 0 ? value : null
+function integerOr(value: JsonField, fallback: number): number {
+  return finiteNumber(value) ?? fallback
 }
 
-function stringRows(value: unknown, where: string): readonly string[] {
+function text(value: JsonField, fallback = ''): string {
+  return stringValue(value) ?? fallback
+}
+
+function nullableText(value: JsonField): string | null {
+  const parsed = stringValue(value)
+  return parsed !== null && parsed.length > 0 ? parsed : null
+}
+
+function stringRows(value: JsonField, where: string): readonly string[] {
   return array(value, where).map((row, index) => {
-    if (typeof row !== 'string') throw new DatasetError(`${where}[${index}] must be a string`)
-    return row
+    const parsed = stringValue(row)
+    if (parsed === null) throw new DatasetError(`${where}[${index}] must be a string`)
+    return parsed
   })
 }
 
-function optionalStringRows(value: unknown, where: string): readonly string[] | null {
+function optionalStringRows(value: JsonField, where: string): readonly string[] | null {
   return value === null || value === undefined ? null : stringRows(value, where)
 }
 
-function numberTuple(value: unknown, length: number, where: string): readonly number[] {
+function numberTuple(value: JsonField, length: number, where: string): readonly number[] {
   const entries = array(value, where)
   if (entries.length !== length) {
     throw new DatasetError(`${where} must hold ${length} numbers`)
@@ -175,7 +208,7 @@ function numberTuple(value: unknown, length: number, where: string): readonly nu
   return entries.map((entry, index) => integer(entry, `${where}[${index}]`))
 }
 
-function parseCities(value: unknown): readonly CityTuple[] | null {
+function parseCities(value: JsonField): readonly CityTuple[] | null {
   if (value === null || value === undefined) return null
   return array(value, 'frame.cities').map((entry, index) => {
     const [x, y, playerId, size, capital] = numberTuple(entry, 5, `frame.cities[${index}]`)
@@ -183,7 +216,7 @@ function parseCities(value: unknown): readonly CityTuple[] | null {
   })
 }
 
-function parseUnits(value: unknown): readonly UnitTuple[] | null {
+function parseUnits(value: JsonField): readonly UnitTuple[] | null {
   if (value === null || value === undefined) return null
   return array(value, 'frame.units').map((entry, index) => {
     const [x, y, playerId, count] = numberTuple(entry, 4, `frame.units[${index}]`)
@@ -191,17 +224,18 @@ function parseUnits(value: unknown): readonly UnitTuple[] | null {
   })
 }
 
-function parseCityNames(value: unknown): ReadonlyMap<string, string> | null {
+function parseCityNames(value: JsonField): ReadonlyMap<string, string> | null {
   if (value === null || value === undefined) return null
   const source = record(value, 'frame.city_names')
   const names = new Map<string, string>()
   for (const [key, name] of Object.entries(source)) {
-    if (typeof name === 'string') names.set(key, name)
+    const parsed = stringValue(name)
+    if (parsed !== null) names.set(key, parsed)
   }
   return names
 }
 
-function parseStat(value: unknown, where: string): PlayerStat {
+function parseStat(value: JsonValue, where: string): PlayerStat {
   const source = record(value, where)
   return {
     playerId: integer(source['player_id'], `${where}.player_id`),
@@ -221,7 +255,7 @@ function parseStat(value: unknown, where: string): PlayerStat {
   }
 }
 
-function parsePlayer(value: unknown, where: string): PlayerEntry {
+function parsePlayer(value: JsonValue, where: string): PlayerEntry {
   const source = record(value, where)
   const seatId = nullableText(source['seat_id'])
   return {
@@ -238,11 +272,12 @@ function parsePlayer(value: unknown, where: string): PlayerEntry {
   }
 }
 
-export function parseMeta(value: unknown): DatasetMeta {
+export function parseMeta(value: JsonValue): DatasetMeta {
   const source = record(value, 'meta.json')
   const bits: Record<string, number> = {}
   for (const [key, bit] of Object.entries(record(source['infrastructure_bits'] ?? {}, 'meta.infrastructure_bits'))) {
-    if (typeof bit === 'number' && Number.isFinite(bit)) bits[key] = bit
+    const parsed = finiteNumber(bit)
+    if (parsed !== null) bits[key] = parsed
   }
   const width = integer(source['width'], 'meta.width')
   const height = integer(source['height'], 'meta.height')
@@ -258,9 +293,12 @@ export function parseMeta(value: unknown): DatasetMeta {
     aiDifficulty: nullableText(source['ai_difficulty']),
     error: nullableText(source['error']),
     seeds: array(source['seeds'] ?? [], 'meta.seeds')
-      .filter((seed): seed is number => typeof seed === 'number'),
-    startedAt: typeof source['started_at'] === 'number' ? source['started_at'] : null,
-    finishedAt: typeof source['finished_at'] === 'number' ? source['finished_at'] : null,
+      .flatMap((seed) => {
+        const parsed = finiteNumber(seed)
+        return parsed === null ? [] : [parsed]
+      }),
+    startedAt: finiteNumber(source['started_at']),
+    finishedAt: finiteNumber(source['finished_at']),
     width,
     height,
     topology: text(source['topology']),
@@ -282,7 +320,7 @@ export function parseMeta(value: unknown): DatasetMeta {
   }
 }
 
-export function parseEvents(value: unknown): EventLog {
+export function parseEvents(value: JsonValue): EventLog {
   const source = record(value, 'events.json')
   const entries = array(source['events'] ?? [], 'events.events')
   const events = entries.map((entry, index) => {
@@ -292,7 +330,10 @@ export function parseEvents(value: unknown): EventLog {
       kind: text(event['kind'], 'unknown'),
       summary: text(event['summary']),
       actors: array(event['actors'] ?? [], `events[${index}].actors`)
-        .filter((actor): actor is string => typeof actor === 'string'),
+        .flatMap((actor) => {
+          const parsed = stringValue(actor)
+          return parsed === null ? [] : [parsed]
+        }),
       weight: integerOr(event['weight'], 0),
       data: isRecord(event['data']) ? event['data'] : {},
     }
@@ -305,7 +346,7 @@ export function parseEvents(value: unknown): EventLog {
   }
 }
 
-export function parseFrames(value: unknown): readonly RawFrame[] {
+export function parseFrames(value: JsonValue): readonly RawFrame[] {
   const source = record(value, 'frames.json')
   const entries = array(source['frames'], 'frames.frames')
   if (entries.length === 0) throw new DatasetError('frames.json holds no turns')
@@ -315,7 +356,7 @@ export function parseFrames(value: unknown): readonly RawFrame[] {
     return {
       turn: integer(frame['turn'], `frames[${index}].turn`),
       year: integerOr(frame['year'], 0),
-      boardTurn: typeof boardTurn === 'number' ? boardTurn : null,
+      boardTurn: finiteNumber(boardTurn),
       interpolated: frame['interpolated'] === true,
       terrain: optionalStringRows(frame['terrain'], `frames[${index}].terrain`),
       owners: optionalStringRows(frame['owners'], `frames[${index}].owners`),

@@ -3,7 +3,7 @@
  * with the live standings panel, then the final leaderboard.
  */
 
-import { useMemo } from 'react'
+import React, { useMemo } from 'react'
 import { AbsoluteFill, Sequence, interpolate, useCurrentFrame, useVideoConfig } from 'remotion'
 import { BoardCanvas } from './components/BoardCanvas'
 import { DitherWave } from './components/DitherWave'

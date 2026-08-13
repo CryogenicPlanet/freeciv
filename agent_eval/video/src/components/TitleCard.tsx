@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import React, { type ReactNode } from 'react'
 import { interpolate, spring, useCurrentFrame, useVideoConfig } from 'remotion'
 import type { Film, PlayerTrack } from '../dataset/film'
 import { controllerDisplayName, nationDisplayName } from '../faction-label'

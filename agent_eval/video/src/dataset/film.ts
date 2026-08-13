@@ -204,7 +204,7 @@ export function buildFilm(
    * and among the natives the original seat order is untouched, so an
    * agent-vs-agent match is completely unaffected.
    */
-  const contenders = [...seated].sort((left, right) => {
+  const contenders = seated.toSorted((left, right) => {
     const leftNative = left.player.controllerType === 'native' ? 1 : 0
     const rightNative = right.player.controllerType === 'native' ? 1 : 0
     return leftNative - rightNative
