@@ -1,46 +1,6 @@
 /**
- * `do_GET`'s dispatch, as a pure ordered decision procedure.
- *
- * `agent_eval/replay_gateway.py:1965-2044` is a seventeen-step ladder of
- * `if ... return` statements, and **the order is the contract**.  Not one step
- * commutes with its neighbours:
- *
- * - the game-id check (`:1988`) precedes the query check (`:2005`), so
- *   `/v1/games/short/status?x=1` is a 404 and not a 400;
- * - the query check precedes the final 404 (`:2037`), so
- *   `/v1/games/{valid}/nonsense?x=1` is a 400 *about query parameters for a
- *   route that does not exist*;
- * - `replay.json`/`board.json`/`events.json` (`:1996-2004`) precede the query
- *   check, which is the only reason any route may carry a query at all;
- * - `_reject_body` (`:1967`) precedes path parsing, so a GET with a body on an
- *   unroutable path is a 400 and nothing is proxied.
- *
- * Match-order drift is therefore the bug class this module exists to prevent,
- * and the reason dispatch is a *pure function over four values* rather than a
- * router table wired into a server: the parity rig can enumerate it, and
- * `test/gateway/dispatch.test.ts` does.  The two suffix ladders are literal
- * data — {@link PRE_QUERY_ROUTES} and {@link POST_QUERY_ROUTES}, each rule
- * carrying the Python line it transcribes — so reordering a route is a visible
- * edit to an array, not a subtle move of a nested `if`.
- *
- * ## What this module deliberately does not do
- *
- * - **No I/O, no upstream, no disk.** A `Right` says only *which handler*, on
- *   *which game*, with *which upstream path*.  The fallback matrix is the
- *   handlers' business.
- * - **No error responses.** A `Left` is a {@link DispatchProblem} *value*
- *   carrying the verbatim `@arena/wire` message and its status; the single
- *   response site at the router edge renders it (`:2038`).
- * - **No query parsing.** `replay.json`/`board.json`/`events.json` receive the
- *   raw query string and reject or normalize it themselves (`:1554`, `:1799`,
- *   `:1728`) — including `events.json`, which 400s on *any* query but does so
- *   from the handler, so a non-empty query still dispatches here.
- * - **No percent-decoding, ever.** `parsed.path` keeps `%2F` literal, which is
- *   what makes `/v1/games/{id}%2Fstatus` a 404 rather than a traversal.
- *
- * Every bare `:NNN` citation is `agent_eval/replay_gateway.py`.
- *
- * @module
+ * Pure ordered request dispatch. Body rejection precedes path parsing; game-id validation precedes
+ * the query gate; viewer routes precede that gate. Paths are never percent-decoded.
  */
 
 import { Array as Arr, Either, Option } from 'effect';
@@ -231,52 +191,6 @@ export type RouteDecision =
   | ViewerJsonRoute
   | ArchiveBinaryRoute;
 
-/** The discriminant of a {@link RouteDecision}. */
-export type RouteTag = RouteDecision['_tag'];
-
-/**
- * Every route tag, in `do_GET` match order.
- *
- * Exported so a test can assert coverage rather than trust a reviewer to
- * notice a route nobody exercised.
- */
-export const ROUTE_TAGS = [
-  'Health',
-  'GamesIndex',
-  'ReplayJson',
-  'BoardJson',
-  'EventsJson',
-  'ArchiveStatus',
-  'ArchiveResult',
-  'ArchiveWatch',
-  'ArchiveFrames',
-  'LatestFramePng',
-  'VideoMp4',
-  'FramePng',
-] as const satisfies ReadonlyArray<RouteTag>;
-
-/**
- * Which Python handler a decision belongs to.  The fallback matrix differs per
- * family and must not be unified — see the behavior dossier §4.
- */
-export type RouteFamily = 'health' | 'gamesIndex' | 'archiveJson' | 'viewerJson' | 'archiveBinary';
-
-/** Route tag → handler family.  Total by construction. */
-export const ROUTE_FAMILY: { readonly [T in RouteTag]: RouteFamily } = {
-  Health: 'health',
-  GamesIndex: 'gamesIndex',
-  ArchiveStatus: 'archiveJson',
-  ArchiveResult: 'archiveJson',
-  ArchiveWatch: 'archiveJson',
-  ArchiveFrames: 'archiveJson',
-  ReplayJson: 'viewerJson',
-  BoardJson: 'viewerJson',
-  EventsJson: 'viewerJson',
-  FramePng: 'archiveBinary',
-  LatestFramePng: 'archiveBinary',
-  VideoMp4: 'archiveBinary',
-};
-
 /** The `kind` argument `_archive_json_route` is called with (`:1887`). */
 export type ArchiveJsonView = 'status' | 'result' | 'watch' | 'frames';
 
@@ -330,19 +244,14 @@ interface RouteContext {
   readonly query: string;
 }
 
-/** One rung of a ladder: the Python line it transcribes, and its decision. */
-export interface SuffixRule {
-  /** Line of the `if` in `agent_eval/replay_gateway.py`. */
-  readonly line: number;
+interface SuffixRule {
   readonly decide: (context: RouteContext) => Option.Option<RouteDecision>;
 }
 
 const onSuffix = (
-  line: number,
   expected: ReadonlyArray<string>,
   build: (context: RouteContext) => RouteDecision,
 ): SuffixRule => ({
-  line,
   decide: (context) =>
     segmentsEqual(context.suffix, expected) ? Option.some(build(context)) : Option.none(),
 });
@@ -355,20 +264,20 @@ const viewerUpstreamPath = (gameId: GameId, segment: string): string =>
  * `:1996-2004` — matched **before** the query gate, which is the only reason
  * any route may carry a query string.
  */
-export const PRE_QUERY_ROUTES: ReadonlyArray<SuffixRule> = [
-  onSuffix(1996, [GATEWAY_ROUTE_SEGMENTS.replayJson], (context) => ({
+const PRE_QUERY_ROUTES: ReadonlyArray<SuffixRule> = [
+  onSuffix([GATEWAY_ROUTE_SEGMENTS.replayJson], (context) => ({
     _tag: 'ReplayJson',
     gameId: context.gameId,
     upstreamPath: viewerUpstreamPath(context.gameId, GATEWAY_ROUTE_SEGMENTS.replayJson),
     query: context.query,
   })),
-  onSuffix(1999, [GATEWAY_ROUTE_SEGMENTS.boardJson], (context) => ({
+  onSuffix([GATEWAY_ROUTE_SEGMENTS.boardJson], (context) => ({
     _tag: 'BoardJson',
     gameId: context.gameId,
     upstreamPath: viewerUpstreamPath(context.gameId, GATEWAY_ROUTE_SEGMENTS.boardJson),
     query: context.query,
   })),
-  onSuffix(2002, [GATEWAY_ROUTE_SEGMENTS.eventsJson], (context) => ({
+  onSuffix([GATEWAY_ROUTE_SEGMENTS.eventsJson], (context) => ({
     _tag: 'EventsJson',
     gameId: context.gameId,
     upstreamPath: viewerUpstreamPath(context.gameId, GATEWAY_ROUTE_SEGMENTS.eventsJson),
@@ -380,10 +289,8 @@ export const PRE_QUERY_ROUTES: ReadonlyArray<SuffixRule> = [
  * `:2010-2035` — matched **after** the query gate, so every rung here is
  * unreachable with a non-empty query.
  */
-export const POST_QUERY_ROUTES: ReadonlyArray<SuffixRule> = [
+const POST_QUERY_ROUTES: ReadonlyArray<SuffixRule> = [
   {
-    // `:2010` — `if not suffix or suffix == ["status"]`, one branch, two forms.
-    line: 2010,
     decide: (context) =>
       context.suffix.length === 0 || segmentsEqual(context.suffix, [GATEWAY_ROUTE_SEGMENTS.status])
         ? Option.some({
@@ -394,23 +301,22 @@ export const POST_QUERY_ROUTES: ReadonlyArray<SuffixRule> = [
           } satisfies ArchiveStatusRoute)
         : Option.none(),
   },
-  onSuffix(2013, [GATEWAY_ROUTE_SEGMENTS.result], (context) => ({
+  onSuffix([GATEWAY_ROUTE_SEGMENTS.result], (context) => ({
     _tag: 'ArchiveResult',
     gameId: context.gameId,
     upstreamPath: context.dispatchedPath,
   })),
-  onSuffix(2016, [GATEWAY_ROUTE_SEGMENTS.watchJson], (context) => ({
+  onSuffix([GATEWAY_ROUTE_SEGMENTS.watchJson], (context) => ({
     _tag: 'ArchiveWatch',
     gameId: context.gameId,
     upstreamPath: context.dispatchedPath,
   })),
-  onSuffix(2019, [GATEWAY_ROUTE_SEGMENTS.frames], (context) => ({
+  onSuffix([GATEWAY_ROUTE_SEGMENTS.frames], (context) => ({
     _tag: 'ArchiveFrames',
     gameId: context.gameId,
     upstreamPath: context.dispatchedPath,
   })),
   onSuffix(
-    2022,
     [GATEWAY_ROUTE_SEGMENTS.frames, GATEWAY_ROUTE_SEGMENTS.latestPng],
     (context) => ({
       _tag: 'LatestFramePng',
@@ -418,7 +324,7 @@ export const POST_QUERY_ROUTES: ReadonlyArray<SuffixRule> = [
       upstreamPath: context.dispatchedPath,
     }),
   ),
-  onSuffix(2025, [GATEWAY_ROUTE_SEGMENTS.videoMp4], (context) => ({
+  onSuffix([GATEWAY_ROUTE_SEGMENTS.videoMp4], (context) => ({
     _tag: 'VideoMp4',
     gameId: context.gameId,
     upstreamPath: context.dispatchedPath,
@@ -438,7 +344,6 @@ export const POST_QUERY_ROUTES: ReadonlyArray<SuffixRule> = [
     // while here it is not a finite JS number and 404s now.  Same status, a
     // different message (`not found` vs `map frame does not exist`), only for
     // inputs no archive can hold — six digits is the on-disk width.
-    line: 2028,
     decide: (context) =>
       context.suffix.length === 2 && context.suffix[0] === GATEWAY_ROUTE_SEGMENTS.frames
         ? Option.map(

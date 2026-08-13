@@ -1,59 +1,13 @@
 /**
- * The single site where a gateway error becomes a response.
- *
- * ## One response site
- *
- * `agent_eval/replay_gateway.py` funnels every non-2xx body through `_problem`
- * (`:1381`), reached from exactly two places: the `except GatewayProblem` at
- * `:2038` and the `except Exception` at `:2040`.  No handler writes an error;
- * handlers `raise`, and the router edge renders.  The behavior dossier calls
- * this the port's first invariant, and it is the reason this module exists as a
- * module: {@link toResponse} is the *only* function in the harness that turns a
- * failure into bytes, and {@link respondGateway} is the only place it is
- * called.  A route module that imports `HttpServerResponse` to build a 404 has
- * broken the invariant even if the bytes happen to match.
- *
- * ## What is fixed, and what is per class
- *
- * `_send_headers` (`:1335-1355`) writes, in this order: the content type, the
- * content length, `X-Content-Type-Options: nosniff`, `Referrer-Policy:
- * no-referrer`, then either the caller's header mapping or — when there is none
- * and the status is ≥ 400 — `Cache-Control: no-store`.  The security pair is
- * unconditional on *every* response the gateway writes, proxied bodies
- * included; the Python suite never asserts it (pytest dossier U-H1/U-H2), so it
- * is asserted here.
- *
- * Two things vary by class and are therefore tables rather than constants:
- * {@link PROBLEM_CACHE_CONTROL} and {@link PROBLEM_HEADERS}.  Today the first is
- * uniformly `no-store` and the second is empty except for the 405's
- * `Allow: GET` (`:2046-2057`) — the tables are keyed by tag so that a class
- * that ever needs to differ has one place to say so, and so that the test can
- * prove the current answer for every tag rather than for the one that was
- * remembered.
- *
- * ## Bytes, not objects
- *
- * The body is `_canonical({"error": message})` — sorted keys, `(",", ":")`
- * separators, `ensure_ascii=False`, UTF-8 — produced by
- * `@arena/wire`'s {@link Gateway.gatewayProblemBytes} rather than by
- * `JSON.stringify`, because the parity rig compares bytes.  `Content-Length` is
- * the length of those bytes; the Bun adapter derives it from the body and
- * strips the body (only the body) from a HEAD, which is how `HEAD /health`
- * keeps `Content-Length: 30` while sending nothing (dossier §7.2, §15).
- *
- * @module
+ * The single gateway-error response site. Every gateway response gets the security pair and
+ * gateway-built JSON is `no-store`; only 405 adds `Allow: GET`.
  */
 
 import { Gateway } from '@arena/wire';
 import { HttpServerResponse } from '@effect/platform';
 import { Cause, Effect, Either } from 'effect';
 import { GATEWAY_SECURITY_HEADERS } from '../constants.ts';
-import {
-  type GatewayError,
-  type GatewayErrorTag,
-  gatewayProblem,
-  InternalError,
-} from '../errors.ts';
+import { type GatewayError, gatewayProblem, InternalError } from '../errors.ts';
 
 // ---------------------------------------------------------------------------
 // Headers
@@ -79,47 +33,8 @@ export { GATEWAY_SECURITY_HEADERS } from '../constants.ts';
 export const withSecurityHeaders = (response: HttpServerResponse.HttpServerResponse): HttpServerResponse.HttpServerResponse =>
   HttpServerResponse.setHeaders(response, GATEWAY_SECURITY_HEADERS);
 
-/**
- * `Cache-Control` per error class.
- *
- * Uniformly `no-store` today: `_problem` goes through `_json`, which passes no
- * header mapping, so `_send_headers`' `status >= 400` default fires for all of
- * them (`:1353-1354`).  Keyed by tag anyway — the mapped type makes the table
- * total, so a new class cannot be added to the taxonomy without answering this.
- */
-export const PROBLEM_CACHE_CONTROL: { readonly [T in GatewayErrorTag]: string } = {
-  ArchiveUnavailable: Gateway.GATEWAY_PROBLEM_CACHE_CONTROL,
-  BadRequest: Gateway.GATEWAY_PROBLEM_CACHE_CONTROL,
-  InternalError: Gateway.GATEWAY_PROBLEM_CACHE_CONTROL,
-  MethodNotAllowed: Gateway.GATEWAY_PROBLEM_CACHE_CONTROL,
-  NotFound: Gateway.GATEWAY_PROBLEM_CACHE_CONTROL,
-  UpstreamHttpError: Gateway.GATEWAY_PROBLEM_CACHE_CONTROL,
-  UpstreamInvalid: Gateway.GATEWAY_PROBLEM_CACHE_CONTROL,
-  UpstreamTooLarge: Gateway.GATEWAY_PROBLEM_CACHE_CONTROL,
-  UpstreamUnavailable: Gateway.GATEWAY_PROBLEM_CACHE_CONTROL,
-};
-
 const NO_EXTRA_HEADERS: Readonly<Record<string, string>> = {};
-
-/**
- * Headers a class adds beyond the security pair and its cache control.
- *
- * Only the 405 has any: `Allow: GET` (`:2050`), which
- * `test_private_routes_and_all_mutations_never_reach_upstream` asserts by exact
- * value for all six mapped verbs — HEAD included.
- */
-export const PROBLEM_HEADERS: { readonly [T in GatewayErrorTag]: Readonly<Record<string, string>> } =
-  {
-    ArchiveUnavailable: NO_EXTRA_HEADERS,
-    BadRequest: NO_EXTRA_HEADERS,
-    InternalError: NO_EXTRA_HEADERS,
-    MethodNotAllowed: { allow: Gateway.GATEWAY_METHOD_NOT_ALLOWED_ALLOW },
-    NotFound: NO_EXTRA_HEADERS,
-    UpstreamHttpError: NO_EXTRA_HEADERS,
-    UpstreamInvalid: NO_EXTRA_HEADERS,
-    UpstreamTooLarge: NO_EXTRA_HEADERS,
-    UpstreamUnavailable: NO_EXTRA_HEADERS,
-  };
+const METHOD_NOT_ALLOWED_HEADERS = { allow: Gateway.GATEWAY_METHOD_NOT_ALLOWED_ALLOW };
 
 // ---------------------------------------------------------------------------
 // Bodies
@@ -210,8 +125,8 @@ export const toResponse = (error: GatewayError): HttpServerResponse.HttpServerRe
   return gatewayJsonResponse({
     status: rendered.status,
     body: rendered.body,
-    cacheControl: PROBLEM_CACHE_CONTROL[error._tag],
-    headers: PROBLEM_HEADERS[error._tag],
+    cacheControl: Gateway.GATEWAY_PROBLEM_CACHE_CONTROL,
+    headers: error._tag === 'MethodNotAllowed' ? METHOD_NOT_ALLOWED_HEADERS : NO_EXTRA_HEADERS,
   });
 };
 

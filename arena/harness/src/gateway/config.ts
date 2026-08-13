@@ -1,46 +1,6 @@
 /**
- * The replay gateway's construction-time configuration.
- *
- * This is the port of everything `agent_eval/replay_gateway.py` does *before*
- * it binds a socket: `_normalize_service_url` (`:129-161`), `_loopback_host`
- * (`:164-172`), `_identity` (`:175-183`), `gateway_config` (`:186-218`) and
- * the two validations `make_replay_gateway_server` performs on its way there
- * (`:2081-2084`).
- *
- * ## Why so much of it is hand-rolled
- *
- * Three of the Python primitives look like one-liners in JavaScript and are
- * not:
- *
- * 1. **`urllib.parse.urlsplit` is not `new URL`.**  `URL` percent-encodes a
- *    path (`/a b` becomes `/a%20b`), resolves `.`/`..` segments before anyone
- *    can reject them, and lowercases nothing the same way.  The gateway's
- *    normalized URL is concatenated onto every proxied path (`_upstream_url`,
- *    `:1398`) and folded into the identity digest, so a single re-encoded byte
- *    changes which upstream is contacted *and* which ready-file the local
- *    stack looks for.  {@link urlsplit} below is a transcription of CPython's
- *    splitter, verified against `python3` by `test/gateway/cli.test.ts`.
- * 2. **`int()`/`float()` are not `Number()`.**  Python accepts `5_0` (= 50),
- *    `+3`, surrounding whitespace and Unicode decimal digits, and rejects
- *    `0x10` and `1__0`.  `--port` and `--upstream-timeout-s` are `type=int` /
- *    `type=float` in `_parser()`, so the CLI inherits all of it.  See
- *    {@link pythonInt} and {@link pythonFloat}.
- * 3. **`Path.resolve()` follows symlinks.**  On macOS `/tmp` is a symlink to
- *    `/private/tmp`, which is where every test run and most local stacks put
- *    their runs/cache roots — so a lexical `path.resolve` would produce a
- *    *different identity digest* than the Python for the same arguments.
- *    {@link resolvePath} reimplements `posixpath.realpath(strict=False)`.
- *
- * ## Ordering is part of the contract
- *
- * `main` reports the first failure and exits 2 (`:2205-2207`), so which error
- * a bad invocation produces depends on validation order.  It is host → port →
- * timeout → service URL → viewer URL, matching `make_replay_gateway_server`
- * calling `_loopback_host` and the port check before `gateway_config`
- * (`:2081-2091`), and `gateway_config` checking the timeout before it
- * normalizes anything (`:196-208`).  {@link makeGatewayConfig} keeps it.
- *
- * @module
+ * Gateway configuration with Python-compatible URL, numeric, path, identity, and loopback rules.
+ * JavaScript trim/number/url helpers are not equivalent for the accepted edge cases.
  */
 
 import { FileSystem } from '@effect/platform';

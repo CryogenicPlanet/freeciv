@@ -1,22 +1,4 @@
-/**
- * The error taxonomy and the one response site, pinned to the byte.
- *
- * Three things are being defended here, in descending order of how quietly
- * they break:
- *
- * 1. **The catalogue is covered exactly once.**  `@arena/wire` owns
- *    thirty-seven verbatim messages; the taxonomy partitions them across nine
- *    classes.  A message that lands in two classes, in none, or under a status
- *    that disagrees with `GATEWAY_PROBLEM_STATUS` fails here rather than in a
- *    parity diff months later.
- * 2. **The response bytes.**  Not "a 404 with an error key" — the exact
- *    canonical body, `Content-Type`, `Content-Length`, `Cache-Control`, the
- *    security pair, and the 405's `Allow`.  The Python suite asserts almost
- *    none of this (pytest dossier U-H1…U-H5), which is why it is asserted here.
- * 3. **Nothing leaks.**  A defect, and an error carrying a private cause, must
- *    both render the fixed public message and nothing else —
- *    `test_events_loader_failures_stay_public`'s promise, kept at the renderer.
- */
+/** Exact error status, body, headers, 405, and private-detail coverage. */
 
 import { describe, expect, test } from 'bun:test';
 import { Gateway } from '@arena/wire';
@@ -27,7 +9,6 @@ import {
   ArchiveUnavailable,
   BAD_REQUEST_PROBLEMS,
   BadRequest,
-  GATEWAY_ERROR_TAGS,
   type GatewayError,
   gatewayProblem,
   InternalError,
@@ -43,8 +24,6 @@ import {
   catchGatewayErrors,
   GATEWAY_SECURITY_HEADERS,
   gatewayJsonResponse,
-  PROBLEM_CACHE_CONTROL,
-  PROBLEM_HEADERS,
   renderProblemBody,
   respondGateway,
   toResponse,
@@ -171,15 +150,6 @@ describe('the taxonomy is a partition of the wire catalogue', () => {
       status: 400,
       message: Gateway.GATEWAY_PROBLEM_MESSAGES.healthQuery,
     });
-  });
-
-  test('the per-class tables are total over the taxonomy', () => {
-    expect(Object.keys(PROBLEM_CACHE_CONTROL).toSorted()).toEqual(GATEWAY_ERROR_TAGS.toSorted());
-    expect(Object.keys(PROBLEM_HEADERS).toSorted()).toEqual(GATEWAY_ERROR_TAGS.toSorted());
-    // Today every class is no-store; the table exists so that stays a fact.
-    expect(new Set(Object.values(PROBLEM_CACHE_CONTROL))).toEqual(
-      new Set([Gateway.GATEWAY_PROBLEM_CACHE_CONTROL]),
-    );
   });
 });
 

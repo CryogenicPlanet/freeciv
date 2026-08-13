@@ -1,27 +1,4 @@
-/**
- * The ready file, measured against the Python that owns its format.
- *
- * Four things can silently break in a port of `run_replay_gateway`'s
- * ready-file half, and each one has a test here that would actually catch it:
- *
- * 1. **The bytes.** The file is `json.dump(indent=2, sort_keys=True)` +
- *    `"\n"`; the stdout line is `_canonical`. Both are diffed against
- *    `agent_eval.replay_gateway._write_private_json` / `._canonical`
- *    themselves — the real functions, imported in a child `python3`, fed the
- *    same payload — rather than against a transcription of what they do.
- * 2. **The lock.** `<ready>.lock` under `flock(LOCK_EX|LOCK_NB)`, checked in
- *    both directions against a live `python3` holder that calls
- *    `_acquire_ready_lock` itself.
- * 3. **The guard.** The finalizer unlinks only a record whose `identity` and
- *    `pid` are still ours; a replacement publisher's record survives.
- * 4. **The finalizer running at all**, including on fiber interrupt — which is
- *    how a real gateway shuts down, and the case a hand-rolled `try/finally`
- *    port gets wrong.
- *
- * Everything is `Scope`-owned: temp directories, python children, and the
- * publications themselves. No process outlives a test, and the user's running
- * stack is never contacted.
- */
+/** Ready-file ownership, permissions, locking, atomicity, and cleanup coverage. */
 import { describe, expect, test } from 'bun:test';
 import { Data, Effect, Either, Exit, Fiber, Option, Ref, type Scope } from 'effect';
 import {

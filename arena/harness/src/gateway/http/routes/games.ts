@@ -1,53 +1,6 @@
 /**
- * `/v1/games` — `_games` (`:1600`), the index and its four branches.
- *
- * Bare `:NNN` citations are `agent_eval/replay_gateway.py`.
- *
- * ## Upstream first, disk second — and "disk" is not one rule
- *
- * The route opens the supervisor before touching the filesystem and reaches
- * for disk only when upstream *provably* has nothing.  The behavior dossier's
- * §4 matrix exists because a port that unifies the branches is wrong in three
- * separate places:
- *
- * | | upstream 2xx | 404 / 405 | offline | anything else |
- * |---|---|---|---|---|
- * | `/v1/games` | merge, **bounded**, re-serialized | raw disk index, **no relabel**, unbounded | disk rows **relabelled**, unbounded | problem |
- * | `status` / `result` (`./archive.ts`) | **relay bytes** | terminal archive | terminal archive (*identical*) | problem |
- *
- * Three consequences worth naming because each one is invisible until a
- * differential run catches it:
- *
- * 1. **`/v1/games` is the one JSON route whose 2xx is not relayed.**  Every
- *    other route hands the upstream's exact bytes back (`_send`, `:1898`);
- *    this one parses, merges the disk rows the upstream did not claim, and
- *    re-emits through the canonical writer.  An upstream body
- *    `{"schema_version": 1, "games": []}` comes back key-sorted and
- *    space-free — and every numeric literal comes back spelled the way
- *    `json.loads` read it, which is why the parse is `parsePythonJson` and not
- *    `JSON.parse` (`../../python-json.ts`).
- * 2. **Only one of the two disk branches relabels.**  Offline rewrites
- *    non-terminal runs as `interrupted` and drops the ones with no recorded
- *    turn; upstream-404/405 serves `_disk_games_index` *raw* (`:1650`), so
- *    lobby husks are visible and their `outcome.status` is `"pending"` — a
- *    value unreachable through any other branch (trap B3).
- * 3. **No route falls back on 5xx.**  A 500 from upstream is a 500 downstream
- *    carrying `upstream returned HTTP 500`, never masked by stale disk data
- *    (`test_games_500_never_masks_failure_with_disk_index`).  That is the one
- *    integrity property the whole matrix exists to protect, and it is the
- *    single most likely port bug: a `catch → serve from disk`.
- *
- * The archive half of that table lives in `./archive.ts`, which serves all
- * four JSON views rather than the two this module used to duplicate.
- *
- * ## What this module refuses to do
- *
- * It builds no responses.  The handler answers with a
- * {@link GatewayJsonPayload} — a status and bytes — or fails with a
- * `../../errors.ts` value that `../respond.ts` renders, once, at the router
- * edge.  Nothing here knows what a header is.
- *
- * @module
+ * `/v1/games`: offline uses interrupted disk rows, 404/405 uses raw disk rows, 2xx is decoded,
+ * merged, and reserialized, and every other status is an error.
  */
 
 import { type CanonRecord, type CanonValue, Gateway } from '@arena/wire';

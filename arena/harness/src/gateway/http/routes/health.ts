@@ -1,41 +1,4 @@
-/**
- * `/health` — the one route that never opens the upstream — and the gateway's
- * own identity.
- *
- * Bare `:NNN` citations are `agent_eval/replay_gateway.py`.
- *
- * ## Two things live here, and they belong together
- *
- * 1. **{@link GatewayIdentity}** — `identity_payload()` (`:1301`), the single
- *    object that is `/health`'s body, the ready file's record and the stdout
- *    line, plus the two facts every archive projection derives from it
- *    (`_archive_base`, `:1881`).  It is a *service* rather than a pure function
- *    of {@link GatewayConfigValues} because it needs the **bound** port: with
- *    `--port 0` the kernel picks, and `identity_payload` reads
- *    `server.server_address` after the socket is listening (`:1302`).  Building
- *    it once at bind time is also what keeps `/health` from re-deriving a
- *    digest on every request.
- *
- * 2. **{@link healthRoute}** — dispatch step 1 (`:1970`).  Two lines of code,
- *    and the interesting part is what it does *not* do: no upstream contact, no
- *    disk read, no size bound (`_json`, `:1976`).  The query rejection that
- *    guards it (`400 healthQuery`) belongs to `../dispatch.ts` and has already
- *    happened by the time this runs.
- *
- * ## Handlers return values, not responses
- *
- * Every route in this directory answers with a `../json.ts#GatewayJsonPayload`
- * — a status and the exact bytes — or fails with a `../../errors.ts` value.
- * The single response site (`../respond.ts`) turns either into an
- * `HttpServerResponse`.  That is the port's first invariant (behavior dossier
- * §0) and the reason nothing here imports `HttpServerResponse`.
- *
- * The two serializers themselves (`_json`, `_bounded_json`) used to live in
- * this module and now live in `../json.ts`, because three route modules needed
- * them and only one of the three is `/health`.
- *
- * @module
- */
+/** Local health identity projection; it never contacts upstream or disk. */
 
 import { type CanonRecord, Gateway } from '@arena/wire';
 import { Context, Effect, Layer, Option } from 'effect';

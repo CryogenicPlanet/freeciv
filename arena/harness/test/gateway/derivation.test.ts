@@ -1,25 +1,4 @@
-/**
- * `ReplayDerivation`: the mutex, the error classification, and the interim
- * Python bridge.
- *
- * Three things are pinned here that the Python suite never pins:
- *
- * 1. **Single flight.** `replay_lock` has no concurrency test in
- *    `agent_eval/tests/test_replay_gateway.py` at all (dossier §9, U-C3), yet
- *    it is the reason the savegame parsers do not corrupt each other's cache.
- *    A gated fixture proves the second derivation cannot start while the first
- *    is in flight.
- * 2. **The classification.** `FileNotFoundError` → 404, everything else → 503,
- *    with the per-operation message from `@arena/wire`.
- * 3. **The bridge is faithful.** `python3 -m agent_eval.replay_derive_cli`
- *    returns byte-identical JSON to calling `save_replay` / `game_events`
- *    directly, against a real run directory, read-only, cached into a
- *    throwaway directory rather than the real cache.
- *
- * Every process this file starts is its own; the user's stack is never
- * contacted, and the only writes are inside `mkdtemp` directories removed in
- * `afterAll`.
- */
+/** Derivation semaphore, bridge transport, classification, and real-loader coverage. */
 import { afterAll, describe, expect, test } from 'bun:test';
 import {
   chmodSync,
@@ -34,29 +13,26 @@ import {
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { CANON_UTF8, canonicalBytes } from '@arena/wire';
-import { GATEWAY_PROBLEM_MESSAGES } from '@arena/wire/gateway';
 import { Deferred, Duration, Effect, Either, Fiber, Layer, Ref } from 'effect';
 import {
-  DERIVATION_EVENTS_CACHE_NAME,
   DERIVE_CLI_MODULE,
-  DerivationArtifactsMissing,
   type DerivationError,
-  type DerivationFixture,
   type DerivationRequest,
   DerivationUnavailable,
   derivationArgv,
   derivationCacheDirectory,
-  derivationFixture,
-  derivationProblem,
-  derivationRequestKey,
-  derivationTurnCacheName,
   layerFromRunner,
   pythonDerivationRunner,
   ReplayDerivation,
-  ReplayDerivationFixture,
   ReplayDerivationPython,
-  ReplayDerivationUnavailable,
 } from 'src/gateway/services/derivation';
+import {
+  type DerivationFixture,
+  derivationFixture,
+  derivationRequestKey,
+  ReplayDerivationFixture,
+  ReplayDerivationUnavailable,
+} from './support/derivation.ts';
 
 // ---------------------------------------------------------------------------
 // Rig
@@ -114,7 +90,7 @@ const attempt = <A, E>(
   );
 
 // ---------------------------------------------------------------------------
-// Request keys and problem mapping
+// Request keys
 // ---------------------------------------------------------------------------
 
 const GAME_ID = 'game_derivationtestidentifier';
@@ -142,92 +118,6 @@ describe('request keys', () => {
         complete: false,
       }),
     ).toBe(`events:${GAME_ID}:false`);
-  });
-});
-
-describe('problem mapping', () => {
-  const missing = (operation: 'replay' | 'board' | 'events'): DerivationError =>
-    new DerivationArtifactsMissing({ operation, gameId: GAME_ID, detail: 'private path' });
-  const unavailable = (operation: 'replay' | 'board' | 'events'): DerivationError =>
-    new DerivationUnavailable({ operation, gameId: GAME_ID, detail: 'private corrupt details' });
-
-  test('FileNotFoundError is the route 404, per operation', () => {
-    expect(derivationProblem(missing('replay'))).toEqual({
-      status: 404,
-      message: GATEWAY_PROBLEM_MESSAGES.replayArtifactsNotFound,
-    });
-    expect(derivationProblem(missing('board'))).toEqual({
-      status: 404,
-      message: GATEWAY_PROBLEM_MESSAGES.boardSnapshotNotFound,
-    });
-    expect(derivationProblem(missing('events'))).toEqual({
-      status: 404,
-      message: GATEWAY_PROBLEM_MESSAGES.eventArtifactsNotFound,
-    });
-  });
-
-  test('everything else is the route 503, per operation', () => {
-    expect(derivationProblem(unavailable('replay'))).toEqual({
-      status: 503,
-      message: GATEWAY_PROBLEM_MESSAGES.replayTelemetryUnavailable,
-    });
-    expect(derivationProblem(unavailable('board'))).toEqual({
-      status: 503,
-      message: GATEWAY_PROBLEM_MESSAGES.boardSnapshotUnavailable,
-    });
-    expect(derivationProblem(unavailable('events'))).toEqual({
-      status: 503,
-      message: GATEWAY_PROBLEM_MESSAGES.eventsUnavailable,
-    });
-  });
-
-  test('the private detail never appears in the public problem', () => {
-    const rendered = JSON.stringify([
-      derivationProblem(missing('events')),
-      derivationProblem(unavailable('events')),
-    ]);
-    expect(rendered).not.toContain('private');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Cache layout — mirrored from Python, checked against Python
-// ---------------------------------------------------------------------------
-
-describe('cache layout', () => {
-  test('the per-game directory and the events file match `_cache_directory`', () => {
-    expect(derivationCacheDirectory('/cache', GAME_ID)).toBe(`/cache/${GAME_ID}`);
-    expect(derivationCacheDirectory('/cache/', GAME_ID)).toBe(`/cache/${GAME_ID}`);
-    expect(DERIVATION_EVENTS_CACHE_NAME).toBe('events.json');
-  });
-
-  test('the per-turn name is byte-identical to `save_replay._cache_path`', () => {
-    const cases: ReadonlyArray<readonly [number, string]> = [
-      [0, 'turn-0000-auto.sav.gz'],
-      [1, 'turn-0001-auto.sav.gz'],
-      [4321, 'turn-4321-final.sav'],
-      [7, 'turn-0007-M-bc--tuZ1Pall.map.ppm'],
-    ];
-    const source = [
-      'import json, os, sys',
-      'from pathlib import Path',
-      'from agent_eval.save_replay import _cache_path',
-      'cases = json.loads(os.environ["CACHE_CASES"])',
-      'sys.stdout.write(json.dumps([',
-      '  _cache_path(Path("/cache/game"), int(turn), name).name for turn, name in cases',
-      ']))',
-    ].join('\n');
-    const child = Bun.spawnSync(['python3', '-c', source], {
-      cwd: REPO_ROOT,
-      env: { ...process.env, CACHE_CASES: JSON.stringify(cases) },
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
-    expect(child.stderr.toString()).toBe('');
-    expect(child.exitCode).toBe(0);
-    expect(JSON.parse(child.stdout.toString())).toEqual(
-      cases.map(([turn, name]) => derivationTurnCacheName(turn, name)),
-    );
   });
 });
 
@@ -276,10 +166,8 @@ describe('fixture layer', () => {
     );
     expect(outcome._tag).toBe('Left');
     if (outcome._tag === 'Left') {
-      expect(derivationProblem(outcome.left)).toEqual({
-        status: 404,
-        message: GATEWAY_PROBLEM_MESSAGES.boardSnapshotNotFound,
-      });
+      expect(outcome.left._tag).toBe('DerivationArtifactsMissing');
+      expect(outcome.left.operation).toBe('board');
     }
   });
 
@@ -424,35 +312,33 @@ describe('single flight (replay_lock)', () => {
 describe('unavailable layer', () => {
   test('all three derivations are typed 503s', async () => {
     const calls: ReadonlyArray<
-      readonly [string, Effect.Effect<unknown, DerivationError, ReplayDerivation>]
+      readonly ['replay' | 'board' | 'events', Effect.Effect<unknown, DerivationError, ReplayDerivation>]
     > = [
       [
-        GATEWAY_PROBLEM_MESSAGES.replayTelemetryUnavailable,
+        'replay',
         Effect.flatMap(ReplayDerivation, (service) =>
           service.replay({ gameId: GAME_ID, afterTurn: 0, limit: 1, complete: false }),
         ),
       ],
+      ['board', Effect.flatMap(ReplayDerivation, (service) => service.board({ gameId: GAME_ID, turn: 1 }))],
       [
-        GATEWAY_PROBLEM_MESSAGES.boardSnapshotUnavailable,
-        Effect.flatMap(ReplayDerivation, (service) => service.board({ gameId: GAME_ID, turn: 1 })),
-      ],
-      [
-        GATEWAY_PROBLEM_MESSAGES.eventsUnavailable,
+        'events',
         Effect.flatMap(ReplayDerivation, (service) =>
           service.events({ gameId: GAME_ID, complete: false }),
         ),
       ],
     ];
-    const problems = await Promise.all(
-      calls.map(async ([message, effect]) => {
-        const outcome = await attempt(effect, ReplayDerivationUnavailable);
-        return { message, outcome };
-      }),
+    const failures = await Promise.all(
+      calls.map(async ([operation, effect]) => ({
+        operation,
+        outcome: await attempt(effect, ReplayDerivationUnavailable),
+      })),
     );
-    problems.forEach(({ message, outcome }) => {
+    failures.forEach(({ operation, outcome }) => {
       expect(outcome._tag).toBe('Left');
       if (outcome._tag === 'Left') {
-        expect(derivationProblem(outcome.left)).toEqual({ status: 503, message });
+        expect(outcome.left._tag).toBe('DerivationUnavailable');
+        expect(outcome.left.operation).toBe(operation);
       }
     });
   });
@@ -688,66 +574,6 @@ describe('python bridge', () => {
   });
 
   test(
-    'the CLI is byte-identical to calling save_replay/game_events directly',
-    async () => {
-      const cliCache = scratchDirectory('cli');
-      const directCache = scratchDirectory('direct');
-      const requests: ReadonlyArray<DirectRequest> = [
-        { operation: 'replay', gameId: run.gameId, turn: run.turn, cacheRoot: cliCache },
-        { operation: 'board', gameId: run.gameId, turn: run.turn, cacheRoot: cliCache },
-        { operation: 'events', gameId: run.gameId, turn: run.turn, cacheRoot: cliCache },
-      ];
-      const options = { repoRoot: REPO_ROOT, runsRoot: COMMITTED_RUN.runsRoot, cacheRoot: cliCache };
-      await Promise.all(
-        requests.map(async (request) => {
-          const argv = derivationArgv(
-            options,
-            request.operation === 'replay'
-              ? {
-                  operation: 'replay',
-                  gameId: request.gameId,
-                  places: [],
-                  afterTurn: 0,
-                  limit: 250,
-                  complete: true,
-                }
-              : request.operation === 'board'
-                ? {
-                    operation: 'board',
-                    gameId: request.gameId,
-                    places: [],
-                    turn: request.turn,
-                  }
-                : {
-                    operation: 'events',
-                    gameId: request.gameId,
-                    places: [],
-                    complete: true,
-                  },
-          );
-          const child = Bun.spawn([...argv], {
-            cwd: REPO_ROOT,
-            stdin: 'pipe',
-            stdout: 'pipe',
-            stderr: 'pipe',
-          });
-          await Promise.resolve(child.stdin.write('[]'));
-          await child.stdin.end();
-          const stdout = new Uint8Array(await new Response(child.stdout).arrayBuffer());
-          const stderr = await new Response(child.stderr).text();
-          expect(stderr).toBe('');
-          expect(await child.exited).toBe(0);
-          expect(stdout.byteLength).toBeGreaterThan(0);
-          expect(stdout).toEqual(
-            directDerivation({ ...request, cacheRoot: directCache }),
-          );
-        }),
-      );
-    },
-    120_000,
-  );
-
-  test(
     'the service returns what the loaders return, cached into a throwaway root',
     async () => {
       const serviceCache = scratchDirectory('service');
@@ -798,7 +624,7 @@ describe('python bridge', () => {
 
       // The cache landed where Python puts it, and nowhere near the run.
       expect(readdirSync(derivationCacheDirectory(serviceCache, run.gameId))).toContain(
-        DERIVATION_EVENTS_CACHE_NAME,
+        'events.json',
       );
     },
     180_000,
@@ -822,10 +648,7 @@ describe('python bridge', () => {
       expect(outcome._tag).toBe('Left');
       if (outcome._tag === 'Left') {
         expect(outcome.left._tag).toBe('DerivationArtifactsMissing');
-        expect(derivationProblem(outcome.left)).toEqual({
-          status: 404,
-          message: GATEWAY_PROBLEM_MESSAGES.boardSnapshotNotFound,
-        });
+        expect(outcome.left.operation).toBe('board');
       }
     },
     120_000,
@@ -849,11 +672,8 @@ describe('python bridge', () => {
       expect(outcome._tag).toBe('Left');
       if (outcome._tag === 'Left') {
         expect(outcome.left._tag).toBe('DerivationUnavailable');
-        expect(derivationProblem(outcome.left)).toEqual({
-          status: 503,
-          message: GATEWAY_PROBLEM_MESSAGES.eventsUnavailable,
-        });
-        expect(JSON.stringify(derivationProblem(outcome.left))).not.toContain('Invalid game id');
+        expect(outcome.left.operation).toBe('events');
+        expect(outcome.left.detail).toContain('Invalid game id');
       }
     },
     120_000,

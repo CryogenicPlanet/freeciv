@@ -1,24 +1,5 @@
-/**
- * `UpstreamClient` against a stub upstream that misbehaves the way a real
- * supervisor does.
- *
- * The suite is organized around the six things a port of `_open_upstream` /
- * `_upstream_json_or_status` gets wrong: the 8 MiB cap, the 64 KiB drain, the
- * refused redirect, the three-condition Portless probe, the timeout, and a
- * disconnect mid-stream.  Two rigs are used deliberately:
- *
- * - a real `Bun.serve` stub for everything that has to be true *on a socket* —
- *   that a cancelled reader actually stops the upstream, that bytes survive
- *   the round trip unchanged, that a 2 MiB error body is not drained whole;
- * - an injected `fetch` for the cases a socket cannot produce on demand — a
- *   `Content-Length` of `8_388_609` (Python's `int()`, not `Number()`), a
- *   transport that never answers (driven by `TestClock` instead of ten real
- *   seconds), and the exact `RequestInit` the live layer builds.
- *
- * Every stub process is owned here: one server, stopped in `afterAll`.
- */
+/** Bounded upstream transport, relay, timeout, Portless, header, and scope coverage. */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { Gateway } from '@arena/wire';
 import { Chunk, Duration, Effect, Fiber, Option, Stream, TestClock, TestContext } from 'effect';
 import {
   MAX_PROXY_ERROR_BYTES,
@@ -30,16 +11,15 @@ import {
   type FetchLike,
   isUpstreamBody,
   layerLive,
-  layerTest,
   make,
   mediaType,
   parsePythonInt,
   UpstreamClient,
   type UpstreamClientApi,
-  upstreamFailureProblem,
   type UpstreamJson,
   upstreamUrl,
 } from 'src/gateway/services/upstream.ts';
+import { upstreamLayerTest } from './support/upstream.ts';
 
 const MiB = 1024 * 1024;
 const ERROR_CHUNK_BYTES = 8 * 1024;
@@ -339,10 +319,6 @@ describe('the 8 MiB cap (:1521)', () => {
     expect(failure.source).toBe('content-length');
     expect(failure.bytesRead).toBe(0);
     expect(failure.bytesRetained).toBe(0);
-    expect(upstreamFailureProblem(failure)).toEqual({
-      status: 502,
-      message: Gateway.GATEWAY_PROBLEM_MESSAGES.upstreamJsonTooLarge,
-    });
   });
 
   test('a streamed 9 MiB body is abandoned just past the cap, not drained', async () => {
@@ -406,21 +382,9 @@ describe('redirects are never followed (:102-106)', () => {
     expect(failure._tag).toBe('UpstreamRedirect');
     if (failure._tag !== 'UpstreamRedirect') return;
     expect(failure.status).toBe(302);
-    expect(upstreamFailureProblem(failure)).toEqual({
-      status: 502,
-      message: Gateway.GATEWAY_PROBLEM_MESSAGES.upstreamRedirect,
-    });
     // The Location was not fetched.
     expect(upstream().requests().length - before).toBe(1);
     expect(lastRequest().target).toBe('/redirect');
-  });
-
-  test('a relayed non-redirect status keeps its own status and message', () => {
-    // The mapping the router applies to an UpstreamStatus the route rejects.
-    expect(Gateway.upstreamProblem(500)).toEqual({
-      status: 500,
-      message: 'upstream returned HTTP 500',
-    });
   });
 });
 
@@ -431,10 +395,6 @@ describe('the Portless probe (:1419) — all three conditions', () => {
     expect(failure._tag).toBe('UpstreamOffline');
     if (failure._tag !== 'UpstreamOffline') return;
     expect(failure.reason).toBe('portless');
-    expect(upstreamFailureProblem(failure)).toEqual({
-      status: 502,
-      message: Gateway.GATEWAY_PROBLEM_MESSAGES.upstreamUnavailable,
-    });
     const pulled = upstream().pulled('/portless/offline') - before;
     console.log(`  [upstream] portless drain: upstream produced ${pulled} of ${ERROR_CHUNKS} chunks`);
     expect(pulled).toBeLessThan(ERROR_CHUNKS / 2);
@@ -465,7 +425,6 @@ describe('transport failure and timeout (:1434)', () => {
     expect(failure._tag).toBe('UpstreamOffline');
     if (failure._tag !== 'UpstreamOffline') return;
     expect(failure.reason).toBe('transport');
-    expect(upstreamFailureProblem(failure).status).toBe(502);
   });
 
   test('the request timeout is TestClock-drivable — no ten-second wait', async () => {
@@ -491,7 +450,6 @@ describe('transport failure and timeout (:1434)', () => {
     expect(failure._tag).toBe('UpstreamOffline');
     if (failure._tag !== 'UpstreamOffline') return;
     expect(failure.reason).toBe('timeout');
-    expect(upstreamFailureProblem(failure).status).toBe(502);
   });
 });
 
@@ -584,12 +542,6 @@ describe('openBinary (:1938)', () => {
     expect(failure._tag).toBe('UpstreamBodyError');
     if (failure._tag !== 'UpstreamBodyError') return;
     expect(failure.reason).toBe('read');
-    // Python lets the read error escape to the do_GET catch-all: a 500, and
-    // pointedly not the 502 that would let a route serve disk data instead.
-    expect(upstreamFailureProblem(failure)).toEqual({
-      status: 500,
-      message: Gateway.GATEWAY_PROBLEM_MESSAGES.internalError,
-    });
   });
 });
 
@@ -604,7 +556,7 @@ const responder =
 describe('the injected-transport layer', () => {
   test('the live layer builds a manual-redirect GET with only the fixed headers', async () => {
     const seen: Array<{ url: string; init: RequestInit }> = [];
-    const layer = layerTest({
+    const layer = upstreamLayerTest({
       serviceUrl: 'http://upstream.test',
       fetch: responder(seen, () => new Response('{}')),
     });

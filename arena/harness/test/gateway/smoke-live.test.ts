@@ -1,69 +1,4 @@
-/**
- * Live smoke parity — the two gateways as **real processes**, side by side.
- *
- * Every other file under `test/gateway/` exercises the port's modules in
- * process: `dispatch` as a function, a route as an `Effect`, `_archive_watch`
- * against a CPython oracle invoked with `python3 -c`.  That is the right way
- * to pin a projection, and it is structurally unable to catch the class of bug
- * this file exists for — the ones that only exist once there is a socket, an
- * argv, a ready file and an operating system in the way:
- *
- * - a flag the TypeScript CLI spells differently, so the two servers are not
- *   actually configured the same way;
- * - a ready file that appears before the socket answers, so a supervisor races
- *   the first request;
- * - a request Bun's HTTP parser rejects *before* the handler runs, where the
- *   port has no opportunity to produce Python's body at all;
- * - a body that differs by four bytes because a number crossed a process
- *   boundary and came back a float.
- *
- * All four are below, and three of them were found here.
- *
- * ## The rig
- *
- * One fixture `runs_root` built from `arena/wire/test/fixtures/runs`, shared by
- * both servers — the disk is not a variable.  Two phases, each spawning a
- * *fresh pair* of processes with the same argv modulo `--cache-root` and
- * `--ready-file` (which must differ: a shared cache would let one process's
- * derivation answer for the other, and a shared ready file is refused by the
- * `flock` the ready-file service takes):
- *
- * | Phase | `--service-url` | What it proves |
- * |---|---|---|
- * | `offline` | `http://127.0.0.1:1` — a port nothing listens on | the whole disk-fallback matrix, end to end |
- * | `upstream` | a recording `Bun.serve` stub | relay, forwarded targets, the failure branches |
- *
- * Requests go over a **raw socket**, not `fetch`: parity needs request targets
- * `fetch` normalizes away (`//v1/games`, `…/status/`), methods it refuses to
- * pair with a body (`GET` with `Content-Length`), and verbs it will not send
- * (`TRACE`).  The client sends `Connection: close` so both HTTP/1.0 Python and
- * HTTP/1.1 Bun end the response the same way — at EOF.
- *
- * ## What is compared, and what is deliberately not
- *
- * Compared: **status**, **body bytes**, and the header subset
- * {@link COMPARED_HEADERS}.  Excluded, per the behavior dossier §15: `Server`
- * and `Date` (stdlib vs Bun), `Connection` (HTTP/1.0 has no keep-alive),
- * header *order* and header *case* (both are insignificant in HTTP, and Python
- * emits `Allow` where Bun emits `allow`).
- *
- * Two response fields cannot be equal by construction, because the two
- * processes are two processes: every URL a body contains carries the gateway's
- * own port, and `/health` additionally reports `identity`, `pid`, `port`,
- * `cache_root` and `upstream_service_url`.  {@link normalize} rewrites the
- * origins; `/health` is compared field-wise with exactly that set excluded and
- * *asserted* to be the only difference, which is a stronger claim than
- * skipping the route.
- *
- * ## Processes
- *
- * `beforeAll` spawns, probes and **stops** both pairs; `afterAll` is only a
- * safety net and a `rm -rf`.  Doing the teardown inside `beforeAll` is what
- * lets {@link ORPHAN_CHECK} be a real test: by the time it runs, every pid this
- * file created has already been waited on, so `ps -p` is asked a question with
- * a right answer.  The user's running stack is never contacted — the only
- * upstreams are a dead port and a stub this file owns.
- */
+/** Live CPython-vs-TypeScript process parity over raw HTTP and shared fixtures. */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { Gateway } from '@arena/wire';
 import {
@@ -806,8 +741,6 @@ beforeAll(async () => {
   const upstream = await runPhase('upstream', stub.origin, runsRoot, scratch, stub);
   const stubHeadersSeen = stub.lastHeaders();
   state.rig = { runsRoot, scratch, stub, offline, upstream, stubHeadersSeen };
-  // oxlint-disable-next-line effecttsgo/global-console -- the leg-by-leg table
-  // is this file's deliverable and has to reach a terminal, not a Logger.
   console.log(['', ...offline.table, ...upstream.table, ''].join('\n'));
 }, RIG_TIMEOUT_MS);
 
@@ -856,8 +789,6 @@ const REQUIRE_PARITY = process.env['ARENA_REQUIRE_PARITY'] !== undefined;
 
 test('the live parity rig is not silently skipped', () => {
   if (!DARWIN) {
-    // oxlint-disable-next-line effecttsgo/global-console -- a skipped oracle has
-    // to reach a terminal; there is no Logger in a bun:test process.
     console.warn(
       `\n!! live smoke parity DID NOT RUN: platform is ${process.platform}, not darwin.\n` +
         '!! ~50 legs x 2 phases of Python-vs-TypeScript byte parity contributed ZERO\n' +

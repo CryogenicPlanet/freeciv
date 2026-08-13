@@ -1,27 +1,4 @@
-/**
- * `dispatch` against `do_GET`'s ladder — table by table, in match order.
- *
- * The bug class this suite exists for is **match-order drift**: every
- * assertion below that looks redundant is pinning a step whose *position* is
- * the contract, not its condition.  Four of them would pass a hand-written
- * router that gets the order wrong and returns a plausible answer:
- *
- * - `/v1/games/short/status?x=1` is a 404, because the id check precedes the
- *   query gate (`:1988` before `:2005`);
- * - `/v1/games/{valid}/nonsense?x=1` is a *400 about query parameters*,
- *   because the query gate precedes the final 404 (`:2005` before `:2037`);
- * - `HEAD /health` with a body is a 405, not the body's 400, because
- *   `do_HEAD` never calls `_reject_body`;
- * - `/v1/games/{id}/status/` and `/v1/games/{id}/replay.json/` disagree about
- *   the trailing slash they forward, because the archive families proxy
- *   `parsed.path` and the viewer families rebuild an f-string.
- *
- * Every bare `:NNN` is `agent_eval/replay_gateway.py`, and the last block
- * re-reads that file to check the ladders' own citations still point at the
- * routes they claim.
- */
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+/** Ordered route behavior matrix, including refusal precedence and forwarded paths. */
 import { describe, expect, test } from 'bun:test';
 import { Either, Option } from 'effect';
 import { FrameIndex, GameId, Gateway } from '@arena/wire';
@@ -35,14 +12,9 @@ import {
   ARCHIVE_JSON_VIEWS,
   collapseLeadingSlashes,
   dispatch,
-  POST_QUERY_ROUTES,
-  PRE_QUERY_ROUTES,
-  ROUTE_FAMILY,
-  ROUTE_TAGS,
   type DispatchProblem,
   type RequestBodySignal,
   type RouteDecision,
-  type RouteTag,
 } from 'src/gateway/http/dispatch';
 
 const MESSAGES = Gateway.GATEWAY_PROBLEM_MESSAGES;
@@ -329,26 +301,20 @@ describe('every route', () => {
   });
 
   test('the cases cover all twelve routes', () => {
-    const seen = new Set<RouteTag>(
-      ROUTE_CASES.map((route) => route.expect._tag),
-    );
-    expect([...seen].toSorted()).toEqual(ROUTE_TAGS.toSorted());
-  });
-
-  test('every tag names the handler family whose fallback matrix applies', () => {
-    expect(ROUTE_TAGS.map((tag) => ROUTE_FAMILY[tag])).toEqual([
-      'health',
-      'gamesIndex',
-      'viewerJson',
-      'viewerJson',
-      'viewerJson',
-      'archiveJson',
-      'archiveJson',
-      'archiveJson',
-      'archiveJson',
-      'archiveBinary',
-      'archiveBinary',
-      'archiveBinary',
+    const seen = new Set<RouteDecision['_tag']>(ROUTE_CASES.map((route) => route.expect._tag));
+    expect([...seen].toSorted()).toEqual([
+      'ArchiveFrames',
+      'ArchiveResult',
+      'ArchiveStatus',
+      'ArchiveWatch',
+      'BoardJson',
+      'EventsJson',
+      'FramePng',
+      'GamesIndex',
+      'Health',
+      'LatestFramePng',
+      'ReplayJson',
+      'VideoMp4',
     ]);
   });
 
@@ -560,52 +526,5 @@ describe('leading-slash collapse', () => {
   test('it is idempotent, so the socket edge may collapse the raw target first', () => {
     const once = collapseLeadingSlashes(`//v1/games/${GAME}/status`);
     expect(collapseLeadingSlashes(once)).toBe(once);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// The ladders are data, and the data still cites the right lines
-// ---------------------------------------------------------------------------
-
-describe('the ladders encode do_GET’s order', () => {
-  test('the pre-query ladder is exactly the three query-bearing routes, in order', () => {
-    expect(PRE_QUERY_ROUTES.map((rule) => rule.line)).toEqual([1996, 1999, 2002]);
-  });
-
-  test('the post-query ladder is the remaining routes, in order', () => {
-    expect(POST_QUERY_ROUTES.map((rule) => rule.line)).toEqual([
-      2010, 2013, 2016, 2019, 2022, 2025, 2028,
-    ]);
-  });
-
-  test('both ladders are strictly ascending, as the source is', () => {
-    const lines = [...PRE_QUERY_ROUTES, ...POST_QUERY_ROUTES].map((rule) => rule.line);
-    expect(lines).toEqual(lines.toSorted((left, right) => left - right));
-    expect(new Set(lines).size).toBe(lines.length);
-  });
-
-  test('every cited line still selects that route in the Python', () => {
-    const source = readFileSync(
-      join(import.meta.dir, '..', '..', '..', '..', 'agent_eval', 'replay_gateway.py'),
-      'utf8',
-    ).split('\n');
-    const citations: ReadonlyArray<readonly [number, string]> = [
-      [1996, 'replay.json'],
-      [1999, 'board.json'],
-      [2002, 'events.json'],
-      [2010, 'not suffix'],
-      [2013, 'result'],
-      [2016, 'watch.json'],
-      [2019, 'frames'],
-      [2022, 'latest.png'],
-      [2025, 'video.mp4'],
-      [2028, 'len(suffix) == 2'],
-    ];
-    // A five-line window because `:2028` opens a multi-line `if (`; the point
-    // is that the citation still lands on the route it names, not that the
-    // condition fits on one line.
-    expect(
-      citations.filter(([line, needle]) => !source.slice(line - 1, line + 4).join('\n').includes(needle)),
-    ).toEqual([]);
   });
 });

@@ -1,60 +1,7 @@
 /**
- * The gateway ready file — one publisher, one record, cleaned up by whoever
- * wrote it.
- *
- * Port of the ready-file half of `run_replay_gateway`
- * (`agent_eval/replay_gateway.py:2114-2171`), which is three cooperating
- * pieces the Python spells out in order:
- *
- * ```python
- * ready_lock = _acquire_ready_lock(ready_path)   # :2153  flock(LOCK_EX|LOCK_NB) on <ready>.lock
- * _write_private_json(ready_path, ready)         # :2154  atomic, 0600, indent=2 sort_keys=True
- * on_ready(ready)                                # :2156  main prints _canonical(...) to stdout
- * ...
- * finally:
- *     _remove_owned_ready_file(ready_path, identity, pid)   # :2166  guarded unlink
- *     _release_ready_lock(ready_lock)                       # :2169  AFTER the unlink
- * ```
- *
- * Here that is one scoped resource: {@link ReadyFileService.publish} acquires
- * the lock and the record, and hands the release back to the caller's
- * `Scope`.  Nesting the two `acquireRelease`s in the Python's acquisition
- * order gives the Python's *release* order for free — unlink first, unlock
- * second — which is the ordering that makes the guard sound: a replacement
- * publisher can only take the lock after the incumbent has already decided
- * whether to delete the record, so it can never lose a newer record to an
- * older process's cleanup.
- *
- * ## The three byte formats
- *
- * The *same* object is emitted in two different spellings, and this module
- * owns both:
- *
- * | Sink | Spelling | Source |
- * |---|---|---|
- * | `<ready-file>` | `json.dump(indent=2, sort_keys=True)` + `"\n"`, `ensure_ascii=True` | `_write_private_json`, `:221-240` |
- * | stdout | `_canonical` — compact, sorted, `ensure_ascii=False` | `main`, `:2201-2203` |
- *
- * The file is **not** canonical JSON.  Emitting canonical bytes into the file
- * would still parse, and would still pass every Python test, and would still
- * be wrong for anything that diffs or digests the file.  {@link readyFileText}
- * is the pretty writer; the canonical one already lives in `@arena/wire` and
- * is imported, not rewritten.
- *
- * ## What the port adds
- *
- * `flock(2)` is not in Bun's `node:fs`, so it comes through `bun:ffi` against
- * the host libc: `libSystem.B.dylib` / `__error()` on Darwin and
- * `libc.so.6` / `__errno_location()` on Linux.  Both paths interoperate with
- * Python's `fcntl.flock`; only the errno accessor and the platform constants
- * differ.  The lock descriptor additionally carries `O_CLOEXEC`, which the
- * Python does not set: a `flock` lives on the open file description, so an
- * inherited descriptor in a spawned freeciv process would keep the lock alive
- * past this process's death.  `O_CLOEXEC` is spelled out per platform because
- * `node:fs`'s `constants.O_CLOEXEC` reads back `undefined` under Bun, and
- * `undefined` in a `|` chain contributes a silent `0`.
- *
- * @module
+ * Exclusive ready-file publication. Lock ownership, private permissions, atomic replacement, and
+ * unlink-only-if-owned prevent one gateway from deleting or impersonating another's record.
+ * Scoped finalizers preserve listener/ready/lock teardown order.
  */
 
 import { FFIType, dlopen, read } from 'bun:ffi';

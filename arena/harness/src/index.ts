@@ -1,22 +1,4 @@
-/**
- * Barrel for `@arena/harness`.
- *
- * Two things live here and nothing else:
- *
- * - the package's identity and the wire revision it was built against, which a
- *   run's telemetry records;
- * - the **gateway's entry points** — the command, the layer stack, the app and
- *   the startup sequence.  Deliberately a short list: the port's modules are
- *   deep and heavily cited, and a caller that needs `dispatch` or
- *   `RunsRepository` should import the module that owns it so the citation
- *   travels with the import.  What a *consumer* needs is how to start a
- *   gateway, and how to embed one in a process it already owns (the parity rig
- *   runs two at once, which is why {@link serveGateway} is exported as a value
- *   and not hidden behind `main`).
- *
- * The barrel re-exports no error classes and no message strings: those are
- * `@arena/wire`'s, and one of the port's rules is that they are declared once.
- */
+/** Public harness identity and gateway embedding entry points. */
 import { TELEMETRY_PACKAGE } from '@arena/telemetry';
 import { WIRE_PACKAGE, WIRE_REVISION } from '@arena/wire';
 
@@ -42,7 +24,6 @@ export {
   gatewayServeCommand,
   gatewayTeardown,
   type GatewayStartupError,
-  main as gatewayMain,
   runGatewayCli,
 } from './gateway/main.ts';
 

@@ -1,61 +1,7 @@
 /**
- * `/v1/games/{id}/replay.json` — and the skeleton its two siblings share.
- *
- * Every bare `:NNN` cites `agent_eval/replay_gateway.py`.
- *
- * ## Why three route modules and one skeleton
- *
- * `_replay` (`:1655`), `_events` (`:1727`) and `_board` (`:1819`) are the same
- * seventeen lines three times over.  The behavior dossier §4.3 writes them as
- * one program with three holes in it:
- *
- * ```
- * <query parse>                              # differs; runs BEFORE any network I/O
- * status, body = upstream(path, normalized)  # 2xx -> relay the exact bytes
- * offline or 404/405 -> manifest -> loader   # differs: which loader, which kwargs
- * anything else      -> upstreamProblem(status)
- * _bounded_json(200, project(value))         # differs: events projects, the others do not
- * ```
- *
- * {@link viewerJsonRoute} is that program; `./board.ts` and `./events.ts` fill
- * the holes.  It lives here rather than in a fourth module because this file is
- * the family's namesake — the Python mutex is called `replay_lock`, the dossier
- * calls the family "the replay routes", and a route module that only forwards
- * to a helper is harder to read than one that owns it.
- *
- * ## The three things this module refuses to do
- *
- * 1. **It never builds an error response.**  Every refusal is a
- *    `Data.TaggedError` from `../../errors.ts`; the single response site at the
- *    router edge renders it (`:2038`).  The two functions here that produce
- *    bytes — {@link relayUpstreamJson} and `../json.ts#boundedJsonResponse` —
- *    produce *success* bytes.
- * 2. **It never re-serializes a 2xx from upstream.**  `_send(status, body, …)`
- *    (`:1666`, `:1742`, `:1830`) relays the bytes `_read_json_response`
- *    returned, so upstream key order, whitespace and float spelling survive.
- *    A `JSON.parse`/`stringify` round trip here would be invisible in a unit
- *    test and fatal in the parity rig.
- * 3. **It never merges the two 8 MiB errors.**  An oversized *upstream* body is
- *    502 `upstreamJsonTooLarge` and does **not** fall back to disk (§5.1); an
- *    oversized *locally built* body is 503 `archiveJsonTooLarge` (§5.2).
- *    Different status, different message, different subject.
- *
- * ## The one deliberate simplification
- *
- * Python's offline branch reads the manifest as
- * `_terminal_archive(...).manifest` and falls back to `_read_manifest` on **any**
- * `GatewayProblem` (`:1687-1693`).  `_terminal_archive` opens with
- * `_read_manifest` (`:774`) and returns *that same dict*, and every extra
- * failure it can add is a `GatewayProblem` that the `except` swallows — so the
- * manifest, and every error the request can end with, is identical to calling
- * `_read_manifest` alone.  Dossier §4.3 states the equivalence and permits the
- * collapse provided the swallow is kept; collapsing keeps it by construction
- * (there is nothing left to swallow) and costs one fewer `report.json` read.
- * The property the swallow protects — *an interrupted, non-terminal run still
- * serves its disk replay when upstream is gone* — is pinned by
- * `test/gateway/routes-replay.test.ts`.
- *
- * @module
+ * Shared replay/board/events query and fallback pipeline. Query decoding follows Python
+ * `unquote` and `int()` behavior; 2xx bytes relay unchanged, only offline/404/405 reach disk,
+ * and loader details never enter public errors.
  */
 
 import {
@@ -315,11 +261,8 @@ const DERIVATION_UNAVAILABLE: { readonly [K in DerivationOperation]: ArchiveUnav
 /**
  * A derivation failure as the taxonomy.
  *
- * The service already classifies (`derivationProblem`); this names the *class*
- * that carries the classification, which is what the renderer needs.  The two
- * tables are pinned to `derivationProblem`'s status and message in
- * `test/gateway/routes-replay.test.ts` for all six combinations, so neither
- * table can be edited alone.  The failure's `detail` is dropped here and never
+ * The two tables cover every operation and keep the route-specific 404/503
+ * mapping next to the taxonomy conversion. The failure's `detail` is dropped here and never
  * reaches a body — `test_events_loader_failures_stay_public`.
  */
 export const gatewayErrorFromDerivation = (error: DerivationError): GatewayError =>

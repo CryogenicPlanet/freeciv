@@ -1,55 +1,6 @@
 /**
- * The `_public_*` family of `agent_eval/replay_gateway.py`, as values.
- *
- * Every bare `:NNN` below cites that file.  These ten functions are the
- * gateway's *sanitizer*: they take a value read off disk — a manifest a
- * supervisor wrote, a loader's derived event log — and narrow it to something
- * a spectator may see.  They are the reason a run directory full of
- * `controller_fingerprint`, `controller_metadata`, `owner_token` and absolute
- * filesystem paths can be served to a browser at all.
- *
- * ## Three rules the port keeps
- *
- * 1. **Total, never failing.**  Python annotates the inputs `Any` and answers
- *    for every one of them: a fallback, a default, an empty list, or `None`
- *    meaning "drop this row".  Nothing here raises, so nothing here returns an
- *    `Either`.  A shape that cannot be published is dropped
- *    ({@link Option.none}), which is the only failure mode in this module.
- * 2. **Allowlist, not denylist.**  A key reaches the output because it was
- *    named here, never because it survived a filter.  Adding a field to a
- *    manifest cannot leak it.
- * 3. **Byte-exact.**  The output is canonicalized by the caller
- *    (`canonicalBytes`, sorted keys, `(",", ":")`), so a Python `int` must be a
- *    `bigint` here and a Python `float` a `number` — see `@arena/wire`'s
- *    `numeric.ts`.  That is why {@link publicInt} answers `bigint` and
- *    {@link publicNumber} answers `number` for the same JSON input.
- *
- * ## Why the return types say `Canonical<...>`
- *
- * A decoded `Gateway.GamePlace` is not directly canonicalizable: `@arena/wire`
- * spells "this key may be absent" as `Schema.optional(...)`, whose type
- * includes `undefined`, and `undefined` is not a `CanonValue`.  Every value
- * this module produces *is* canonicalizable — a key it does not publish is
- * absent, never present-and-`undefined` — and {@link Canonical} is the type
- * that says so, so a caller can hand a result straight to `canonicalBytes`
- * with no conversion pass and no cast.
- *
- * ## Divergences from CPython, all of them deliberate
- *
- * - **`int` vs `float` is unobservable after `JSON.parse`.**  Python's
- *   `isinstance(turn, int)` refuses the `3.0` that `json` produced from
- *   `3.0`; JavaScript cannot tell it from `3`.  Affects {@link publicEvent}'s
- *   `turn` and `weight` only, where Python drops the row and this port keeps
- *   it.  Unreachable from a real loader, whose turns are Python `int`s.
- * - **`str.strip()` is not `String.prototype.trim()`.**  Python strips `\x85`
- *   (NEL) and does not strip U+FEFF; ECMAScript does the opposite.
- *   {@link publicText} uses an explicit transcription of the code points
- *   `str.isspace()` accepts.
- * - **Slicing counts code points.**  `rendered[:limit]` is code points in
- *   Python and UTF-16 units in JavaScript; an astral character would be cut in
- *   half and would change the byte length of the canonical body.
- *
- * @module
+ * Total allowlist projections for spectator-visible data. Preserve Python whitespace/code-point,
+ * truthiness, ordering, and `int`/`float` behavior; unknown/private fields must never pass through.
  */
 
 import { Option } from 'effect';

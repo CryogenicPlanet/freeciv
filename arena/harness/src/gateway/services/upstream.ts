@@ -1,95 +1,10 @@
 /**
- * `UpstreamClient` — the gateway's only door to the Freeciv supervisor.
- *
- * This is the port of `_open_upstream` / `_upstream_json_or_status` /
- * `_read_json_response` / `_stream_upstream`'s reading half
- * (`agent_eval/replay_gateway.py:1398-1552`).  Every bare `:NNN` below cites
- * that file.
- *
- * ## What this module is responsible for
- *
- * Exactly one thing: turning "the gateway wants `path?query` from upstream"
- * into either bytes, a status, or a typed failure — **without ever buffering
- * more than it is allowed to**.  Two entry points, because Python has two:
- *
- * - {@link UpstreamClientApi.jsonOrStatus} (`:1541`) — 2xx bodies are read
- *   incrementally and retained up to `MAX_PROXY_JSON_BYTES + 1` bytes so the
- *   `len(value) > MAX` test (`:1534`) can be made without a 9 MiB string ever
- *   existing; non-2xx bodies are read-and-discarded up to
- *   `MAX_PROXY_ERROR_BYTES` (`:1550`) and the status comes back as a value,
- *   because 404/405 are *fallback triggers* for the routes, not errors.
- * - {@link UpstreamClientApi.openBinary} (`:1938`) — a `Scope`-owned reader
- *   plus the `PROXY_RESPONSE_HEADERS` subset (`:56-62`), for the frame/video
- *   routes that stream rather than buffer.
- *
- * ## What it is deliberately NOT responsible for
- *
- * - **It builds no responses.**  Failures are `Data.TaggedError` values
- *   carrying the *public* problem (`status` + message from
- *   `@arena/wire`'s `GATEWAY_PROBLEM_MESSAGES`) through {@link UpstreamFailure};
- *   the one response site at the router edge renders them.  Nothing here
- *   knows what a `Response` looks like.
- * - **It does not decide fallback.**  A 404 is a value; whether that means
- *   "serve the archive" (`_archive_json_route`) or "serve the raw disk index"
- *   (`_games`) differs per route family and belongs to the routes.
- * - **It never decodes a body.**  2xx bytes are `Uint8Array` end to end
- *   (`:1898` relays them verbatim); a `Response.text()` round trip would
- *   destroy the byte parity the whole port is measured on.
- *
- * ## The three subtleties that are easy to lose in a port
- *
- * 1. **The Portless probe (`:1419-1432`) is not "any 502".**  All three of
- *    `status == 502`, `X-Portless: 1` and a media type of exactly `text/html`
- *    are required before the gateway is allowed to say "offline" and reach for
- *    disk.  Two of the three is an ordinary 502 relay — see
- *    {@link isPortlessOffline}.
- * 2. **A redirect is never followed and never relayed** (`:102-106`).  The
- *    fetch is `redirect: 'manual'`, and on the JSON path a 3xx surfaces as
- *    {@link UpstreamRedirect}, whose problem is wire's
- *    `upstreamProblem(status)` — a 502 `upstream redirects are not allowed`.
- *    Making it a *failure* rather than a status value is what stops a route
- *    from accidentally treating a 302 as a fallback trigger.  The binary path
- *    keeps it a status ({@link UpstreamBinaryResponse.status}) because
- *    `_stream_upstream` (`:1453`) drains it first and the same
- *    `upstreamProblem` mapping applies at the route.
- * 3. **No inbound header is ever copied** (`:1409`).  The request headers are
- *    a fixed set ({@link upstreamRequestHeaders}); `Authorization`, `Cookie`,
- *    `X-Forwarded-*` and `Range` do not cross this boundary.
- *
- * ## Every failure here has a tag no other module claims
- *
- * These four classes sit in a *different* channel from `../errors.ts`'s
- * taxonomy, and two of them used to share a `_tag` string with a taxonomy class
- * — `UpstreamUnavailable` and `UpstreamHttpError` each existed twice, as two
- * unrelated classes with two different shapes.  A tag is a **runtime**
- * discriminator: `Effect.catchTag('UpstreamHttpError', …)` on a channel that
- * could hold either would dispatch on the string, read `error.status` off a
- * value that has none, and render `status: undefined`.  The type system kept
- * the channels apart, so it was latent — and duplicating a tag defeats the one
- * guarantee `Data.TaggedError` exists to give.  Renamed to
- * {@link UpstreamOffline} and {@link UpstreamRedirect}, which are also the
- * better names: this module reports *what happened on the socket*, and
- * `../errors.ts` reports *what the client is told*.
- *
- * ## Divergences from CPython, chosen deliberately
- *
- * - Python's socket timeout applies per read, and a read that times out
- *   escapes `_upstream_json_or_status` uncaught → the `do_GET` catch-all
- *   (`:2040`) → **500 internal error**, not a 502.  That is reproduced:
- *   {@link UpstreamBodyError} carries the 500, while only the request phase
- *   maps to {@link UpstreamOffline} (`:1434`).
- * - `Headers.get` joins duplicate response headers with `", "` where Python's
- *   `email.message.Message.get` returns the first.  Only reachable when an
- *   upstream sends a duplicate `ETag`/`Cache-Control`; not worth a raw-header
- *   parser.
- * - The Portless probe's drain is `Effect.ignore`d: in Python a read error
- *   inside that `except` block escapes to the 500 handler, which is a strictly
- *   worse answer than the 502 the probe already decided on.
- *
- * @module
+ * Bounded upstream client. Success bytes are never decoded; redirects are not followed; credentials
+ * are never forwarded; only the exact 502 + X-Portless + text/html signature is offline. Readers are
+ * request-scoped and cancelled on timeout, interruption, or disconnect. `parsePythonInt` intentionally
+ * accepts Python signs, underscores, whitespace, and Unicode decimal digits.
  */
 
-import { Gateway } from '@arena/wire';
 import { Chunk, Context, Data, Duration, Effect, Layer, Option, Ref, type Scope, Stream } from 'effect';
 import {
   DEFAULT_UPSTREAM_TIMEOUT_SECONDS,
@@ -174,11 +89,6 @@ export const parsePythonInt = (text: string): Option.Option<bigint> => {
 // Failures
 // ---------------------------------------------------------------------------
 
-const problemOf = (name: Gateway.GatewayProblemName): Gateway.GatewayProblemResponse => {
-  const message = Gateway.GATEWAY_PROBLEM_MESSAGES[name];
-  return { status: Gateway.GATEWAY_PROBLEM_STATUS[message], message };
-};
-
 /**
  * `UpstreamOffline` (`:85`, raised at `:1429`/`:1435`) — the upstream is
  * *provably gone*, which is the one condition (besides a 404/405) that lets a
@@ -193,12 +103,7 @@ export class UpstreamOffline extends Data.TaggedError('UpstreamOffline')<{
   readonly reason: 'transport' | 'timeout' | 'portless';
   readonly url: string;
   readonly cause: unknown;
-}> {
-  /** 502 `the upstream Freeciv service is unavailable`. */
-  get problem(): Gateway.GatewayProblemResponse {
-    return problemOf('upstreamUnavailable');
-  }
-}
+}> {}
 
 /**
  * `:1527` / `:1535` — the upstream JSON body is over `MAX_PROXY_JSON_BYTES`.
@@ -224,12 +129,7 @@ export class UpstreamJsonTooLarge extends Data.TaggedError('UpstreamJsonTooLarge
    */
   readonly bytesRetained: number;
   readonly url: string;
-}> {
-  /** 502 `the upstream JSON response is too large`. */
-  get problem(): Gateway.GatewayProblemResponse {
-    return problemOf('upstreamJsonTooLarge');
-  }
-}
+}> {}
 
 /**
  * A 3xx from upstream (`:102-106` refuses to follow it).
@@ -242,12 +142,7 @@ export class UpstreamJsonTooLarge extends Data.TaggedError('UpstreamJsonTooLarge
 export class UpstreamRedirect extends Data.TaggedError('UpstreamRedirect')<{
   readonly status: number;
   readonly url: string;
-}> {
-  /** `upstreamProblem(status)`: 502 `upstream redirects are not allowed` for a 3xx. */
-  get problem(): Gateway.GatewayProblemResponse {
-    return Gateway.upstreamProblem(this.status);
-  }
-}
+}> {}
 
 /**
  * The body failed *while being read* — a truncated response, a disconnect, or
@@ -263,12 +158,7 @@ export class UpstreamBodyError extends Data.TaggedError('UpstreamBodyError')<{
   readonly reason: 'read' | 'timeout';
   readonly url: string;
   readonly cause: unknown;
-}> {
-  /** 500 `the replay gateway encountered an internal error`. */
-  get problem(): Gateway.GatewayProblemResponse {
-    return problemOf('internalError');
-  }
-}
+}> {}
 
 /** Everything {@link UpstreamClient} can fail with. */
 export type UpstreamFailure =
@@ -276,14 +166,6 @@ export type UpstreamFailure =
   | UpstreamJsonTooLarge
   | UpstreamRedirect
   | UpstreamBodyError;
-
-/**
- * The public problem an upstream failure renders as, for the single response
- * site.  Total: adding a failure without a problem is a type error.
- */
-export const upstreamFailureProblem = (
-  failure: UpstreamFailure,
-): Gateway.GatewayProblemResponse => failure.problem;
 
 // ---------------------------------------------------------------------------
 // Request / response values
@@ -811,9 +693,4 @@ export class UpstreamClient extends Context.Tag('@arena/harness/gateway/Upstream
 /** Live layer: the global `fetch`, `redirect: 'manual'`, fixed request headers. */
 export const layerLive = (
   options: Omit<UpstreamClientOptions, 'fetch'>,
-): Layer.Layer<UpstreamClient> => Layer.succeed(UpstreamClient, make(options));
-
-/** Test layer: same client, injected transport. No socket required. */
-export const layerTest = (
-  options: UpstreamClientOptions & { readonly fetch: FetchLike },
 ): Layer.Layer<UpstreamClient> => Layer.succeed(UpstreamClient, make(options));

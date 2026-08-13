@@ -1,55 +1,5 @@
 /**
- * The replay gateway's error taxonomy — every failure a handler is allowed to
- * produce, as a value.
- *
- * ## Why these nine classes and not thirty-seven
- *
- * Python raises one exception type, `GatewayProblem(status, message)`
- * (`agent_eval/replay_gateway.py:80`), with `UpstreamUnavailable` (`:85`) as
- * its single subclass.  The subclass exists because *one* failure has to be
- * distinguishable at a `except` site: only `UpstreamUnavailable` selects the
- * disk-fallback arm of the fallback matrix, and only on the routes that catch
- * it (behavior dossier §4).  Every other problem unwinds to the one response
- * site at `:2038` untouched.
- *
- * A port that copied that shape — one error carrying a free-form status and
- * string — would let any handler invent a message, which is precisely the
- * regression the wire catalogue exists to prevent.  So the taxonomy here is the
- * *catalogue*, partitioned by status:
- *
- * | Class | Status | Carries |
- * |---|---|---|
- * | {@link BadRequest} | 400 | one of {@link BAD_REQUEST_PROBLEMS} |
- * | {@link NotFound} | 404 | one of {@link NOT_FOUND_PROBLEMS} |
- * | {@link MethodNotAllowed} | 405 | nothing (`Allow: GET` is added when it is rendered) |
- * | {@link InternalError} | 500 | the defect, for the log only |
- * | {@link UpstreamUnavailable} | 502 | why the supervisor is gone |
- * | {@link UpstreamTooLarge} | 502 | nothing |
- * | {@link UpstreamInvalid} | 502 | nothing |
- * | {@link UpstreamHttpError} | the upstream's own status, 3xx → 502 | that status |
- * | {@link ArchiveUnavailable} | 503 | one of {@link ARCHIVE_UNAVAILABLE_PROBLEMS} |
- *
- * The partition is total and disjoint: `test/gateway/respond.test.ts` checks
- * that the four name lists plus the five fixed-message classes cover
- * `GATEWAY_PROBLEM_MESSAGES` exactly once each, and that every name's status in
- * `GATEWAY_PROBLEM_STATUS` equals the status of the class that owns it.  A
- * message added to `@arena/wire` and not placed here fails that test.
- *
- * ## Strings are never written here
- *
- * A class carries the *symbolic name* of its message
- * (`new NotFound({ problem: 'terminalArchiveNotFound' })`); the text comes from
- * `GATEWAY_PROBLEM_MESSAGES` at construction.  There is no literal message in
- * this file, and there must never be one — the viewer renders `payload.error`
- * verbatim, so a reworded string is a user-visible regression.
- *
- * ## Rendering lives next door
- *
- * These values know their status and their message and nothing else.  Bytes,
- * headers, and the catch sites are `./http/respond.ts`, which is the single
- * place a response is built (behavior dossier §0, "ONE response site").
- *
- * @module
+ * Typed gateway failures. Public messages always come from `@arena/wire`; private causes are log-only.
  */
 
 import { Gateway } from '@arena/wire';
@@ -342,25 +292,6 @@ export type GatewayError =
   | UpstreamInvalid
   | UpstreamTooLarge
   | UpstreamUnavailable;
-
-/** The `_tag` of a {@link GatewayError} — the key of every per-class table. */
-export type GatewayErrorTag = GatewayError['_tag'];
-
-/**
- * Every tag, so a table over the taxonomy can be checked for totality at
- * runtime as well as in the type system.
- */
-export const GATEWAY_ERROR_TAGS = [
-  'ArchiveUnavailable',
-  'BadRequest',
-  'InternalError',
-  'MethodNotAllowed',
-  'NotFound',
-  'UpstreamHttpError',
-  'UpstreamInvalid',
-  'UpstreamTooLarge',
-  'UpstreamUnavailable',
-] as const satisfies readonly GatewayErrorTag[];
 
 /**
  * The `(status, message)` pair Python's `raise GatewayProblem(status, message)`

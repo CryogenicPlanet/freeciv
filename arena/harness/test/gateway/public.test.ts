@@ -1,24 +1,4 @@
-/**
- * `src/gateway/public.ts` against its oracle.
- *
- * Two kinds of test, and the second is the one that matters:
- *
- * 1. **Behaviour** — the rules `agent_eval/replay_gateway.py`'s `_public_*`
- *    family states, written as assertions.  These cover the shapes a fixture
- *    cannot reach (lone surrogates, `__proto__` keys) and the ones the Python
- *    suite never exercises at all (`PUBLIC_SCORE_METRICS`, the `\x85` strip).
- * 2. **Differential** — the same input handed to CPython's real functions
- *    through `python3 -c`, with both sides canonicalized (`sort_keys=True`,
- *    `(",", ":")`, `ensure_ascii=False`) and compared as **text**.  That
- *    catches what an eyeballed expectation cannot: a `180` where Python wrote
- *    `180.0`, a key this port emits and Python omits, a different sort.
- *
- * The differential driver spawns one short-lived `python3` per call.  It reads
- * only `agent_eval/replay_gateway.py`, writes nothing, and touches no running
- * stack.
- *
- * @module
- */
+/** Public projection allowlist and CPython differential coverage. */
 
 import { describe, expect, it } from 'bun:test';
 import { Either, Option } from 'effect';

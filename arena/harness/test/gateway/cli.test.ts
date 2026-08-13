@@ -1,20 +1,4 @@
-/**
- * `src/gateway/config.ts` + `src/gateway/cli.ts` against the Python they port.
- *
- * The interesting half of this file is a **differential**: one `python3`
- * subprocess imports `agent_eval.replay_gateway` and reports what the real
- * `_normalize_service_url`, `_loopback_host`, `_identity`, `gateway_config`,
- * `int()`, `float()`, `repr()` and `Path.expanduser().resolve()` produce for a
- * corpus of inputs, and every one of them is compared against the port.
- * Hand-written expectations would only pin what I already believed; the oracle
- * pins what CPython does — including the three things I had wrong first
- * (`int("5_0")` is `50`, `str(ip_address("::ffff:7f00:1"))` is
- * `"::ffff:127.0.0.1"`, and `link/..` is the link *target's* parent).
- *
- * The subprocess reads one JSON job on stdin and exits; nothing outlives the
- * describe block.  Symlink fixtures live in a `mkdtemp` directory removed in
- * `afterAll`.
- */
+/** CLI/config behavior and Python-compatibility coverage. */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { CliConfig, CommandDescriptor, HelpDoc } from '@effect/cli';
 import { FileSystem } from '@effect/platform';
@@ -29,6 +13,7 @@ import {
   GatewayConfig,
   GatewayConfigError,
   expandUser,
+  gatewayConfigLayer,
   gatewayIdentity,
   loopbackHost,
   makeGatewayConfig,
@@ -50,9 +35,8 @@ import {
   PYTHON_GATEWAY_PROG,
   formatStartupError,
   gatewayCommand,
-  gatewayConfigLayerFromCli,
 } from '../../src/gateway/cli.ts';
-import type { GatewayCliArgs, GatewayCliParsed } from '../../src/gateway/cli.ts';
+import type { GatewayCliArgs } from '../../src/gateway/cli.ts';
 
 // ---------------------------------------------------------------------------
 // The Python oracle
@@ -705,7 +689,7 @@ describe('_parser() — the flag surface', () => {
       readyFile: '/ready.json',
       upstreamTimeoutSeconds: 10,
       viewerPublicUrl: Option.none(),
-    } satisfies GatewayCliParsed);
+    } satisfies GatewayCliArgs);
   });
 
   test('the declared defaults are argparse\u2019s', () => {
@@ -762,7 +746,7 @@ describe('_parser() — the flag surface', () => {
       readyFile: '/ready.json',
       upstreamTimeoutSeconds: 2.5,
       viewerPublicUrl: Option.some('https://v'),
-    } satisfies GatewayCliParsed);
+    } satisfies GatewayCliArgs);
   });
 
   test('the argv local_stack.py actually spawns parses', async () => {
@@ -796,7 +780,7 @@ describe('_parser() — the flag surface', () => {
       readyFile: '/repo/.agent-eval/local-stack/gateway-77873-d06bcf4656.json',
       upstreamTimeoutSeconds: 10,
       viewerPublicUrl: Option.some('https://freeciv.localhost'),
-    } satisfies GatewayCliParsed);
+    } satisfies GatewayCliArgs);
   });
 
   test('--flag=value is accepted, as argparse accepts it', async () => {
@@ -1029,7 +1013,7 @@ describe('makeGatewayConfig', () => {
   test('the layer hands one validated configuration to its consumer', async () => {
     const values = await Effect.runPromise(
       Effect.provide(
-        Effect.provide(GatewayConfig, gatewayConfigLayerFromCli(BASE)).pipe(Effect.orDie),
+        Effect.provide(GatewayConfig, gatewayConfigLayer(BASE)).pipe(Effect.orDie),
         FILE_SYSTEM,
       ),
     );
@@ -1043,7 +1027,7 @@ describe('makeGatewayConfig', () => {
   test('a rejected configuration fails the layer rather than throwing', async () => {
     const outcome = await Effect.runPromise(
       Effect.provide(
-        Effect.either(Effect.provide(Effect.void, gatewayConfigLayerFromCli({ ...BASE, host: '8.8.8.8' }))),
+        Effect.either(Effect.provide(Effect.void, gatewayConfigLayer({ ...BASE, host: '8.8.8.8' }))),
         FILE_SYSTEM,
       ),
     );

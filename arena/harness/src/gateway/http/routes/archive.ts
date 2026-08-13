@@ -1,50 +1,7 @@
 /**
- * The archive route families: `_archive_json_route` (`:1887`) and
- * `_archive_binary_route` (`:1935`).
- *
- * Every bare `:NNN` below cites `agent_eval/replay_gateway.py`.
- *
- * Seven of the twelve routes land here — `status`, `result`, `watch.json`,
- * `frames` on the JSON side, `frames/{n}.png`, `frames/latest.png` and
- * `video.mp4` on the binary side — because Python serves them with exactly two
- * functions.  They share a fallback rule and disagree about everything else:
- *
- * | | JSON family | binary family |
- * |---|---|---|
- * | upstream 2xx | relay the **bytes**, gateway headers | **stream** the socket, upstream headers |
- * | upstream 404/405 | build the archive projection | serve the archive **file** |
- * | offline | identical to 404/405 | identical to 404/405 |
- * | any other status | `upstreamProblem(status)` | `upstreamProblem(status)` — still JSON (trap B5) |
- * | `Cache-Control` | `no-store`, always | `public, max-age=31536000, immutable` on a file; whatever upstream sent (often nothing) on a proxy |
- *
- * ## The three things a port gets wrong here
- *
- * 1. **A 500 on `frames/3.png` is not an image.**  `_stream_upstream`'s
- *    non-2xx arm (`:1453-1462`) drains 64 KiB and writes a JSON problem, so the
- *    binary route answers `application/json; charset=utf-8` with
- *    `{"error":"upstream returned HTTP 500"}` under the upstream's own status.
- *    Only 404/405 and offline reach the disk (trap B5).
- * 2. **A proxied 2xx carries no `Cache-Control` unless upstream sent one.**
- *    `_send_headers` only defaults to `no-store` when the header mapping is
- *    empty *and* the status is ≥ 400, and a proxied 2xx always has a mapping
- *    (trap B6).  The immutable header belongs to `_send_local_file` (`:1510`)
- *    and to nothing else.
- * 3. **The forwarded path is the dispatcher's, verbatim.**  Both families pass
- *    `parsed.path` (`:2011`, `:2023`), so `/v1/games/{id}/status/` proxies
- *    *with* its trailing slash (trap B1).  Dispatch has already put that in
- *    `route.upstreamPath`; this module concatenates nothing.
- *
- * ## What this module does not do
- *
- * It builds **no error response**.  Every refusal is a `../../errors.ts` value
- * in the `E` channel, rendered once at the router edge by
- * `../respond.ts#respondGateway`.  The only responses constructed here are the
- * three *successful* shapes Python has — a canonical JSON body, a proxied
- * stream, and a local file — and two of them go through
- * `../respond.ts#gatewayJsonResponse` so the header discipline stays in one
- * place.
- *
- * @module
+ * Archive JSON and binary routes. Upstream is attempted before disk, and only offline/404/405
+ * permit fallback. Local files use `O_NOFOLLOW` plus descriptor `fstat` so symlinks and non-files
+ * cannot expose private data; request-scope finalizers close readers and descriptors.
  */
 
 import { type CanonValue, type FrameIndex, Gateway } from '@arena/wire';
@@ -97,7 +54,7 @@ import {
   type ArchiveJsonRoute,
   type ArchiveJsonView,
 } from '../dispatch.ts';
-import { boundedJsonResponse, jsonPayloadResponse, relayedJsonPayload } from '../json.ts';
+import { boundedJsonResponse, jsonPayloadResponse } from '../json.ts';
 import { withSecurityHeaders } from '../respond.ts';
 
 // ---------------------------------------------------------------------------
@@ -388,7 +345,7 @@ export const archiveJsonRoute = (
       onSuccess: (result) =>
         isUpstreamBody(result)
           ? // 2xx: the upstream's exact bytes and its own status (§6).
-            Effect.succeed(jsonPayloadResponse(relayedJsonPayload(result.status, result.body)))
+            Effect.succeed(jsonPayloadResponse({ status: result.status, body: result.body }))
           : isUpstreamFallbackStatus(result.status)
             ? archiveJsonFromDisk(route, options)
             : Effect.fail(new UpstreamHttpError({ upstreamStatus: result.status })),

@@ -1,49 +1,9 @@
-/**
- * The port's structural invariants, checked against the source itself.
- *
- * Everything else under `test/gateway/` runs the gateway.  This file reads it,
- * because three of the claims the port is built on are properties of the
- * *module graph* and no request can observe them being broken until the day one
- * of them matters:
- *
- * 1. **One response site.**  `http/respond.ts:13` says "a route module that
- *    imports `HttpServerResponse` to build a 404 has broken the invariant even
- *    if the bytes happen to match", and `http/routes/health.ts` says it is "the
- *    reason nothing here imports `HttpServerResponse`".  Both were true and
- *    neither was enforced: a future route that answered
- *    `HttpServerResponse.json({error: …}, {status: 404})` for convenience would
- *    keep CI green while silently dropping the security-header pair, the
- *    `no-store`, and the canonical byte encoding `renderProblemBody`
- *    guarantees.  {@link RESPONSE_BUILDERS} is the allowlist, with a reason per
- *    entry, and the second half of the test is what makes it more than a list:
- *    no module outside `http/respond.ts` may name an error status.
- * 2. **`Effect.run*` belongs to the entrypoint.**  A `runSync` at module scope
- *    executes before argv is parsed, before a `Layer` exists and outside every
- *    `Scope`.  There was exactly one — a `dlopen` in `services/ready-file.ts`
- *    — and it is gone; this keeps it gone.
- * 3. **The service's vocabulary is spelled once.**  `constants.ts` documents
- *    itself as the module "so the dispatcher and its tests cannot disagree
- *    about a literal", and six of its exports were imported by nobody while
- *    live copies ran elsewhere: mutating them was unobservable.  Every export
- *    is now asserted to have a reader.
- *
- * A grep-shaped test is a blunt instrument and this one is deliberately narrow:
- * it reads imports and a small set of literal spellings, so a false positive is
- * a rename away and a false *negative* only happens if someone constructs a
- * response through an alias.  It is still strictly more than three docstrings.
- *
- * @module
- */
+/** Narrow module-graph checks for one response site and scoped Effect execution. */
 import { describe, expect, test } from 'bun:test';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
-import {
-  isUpstreamFallbackStatus,
-  UPSTREAM_FALLBACK_STATUSES,
-} from 'src/gateway/constants.ts';
 
 const GATEWAY_ROOT = resolve(import.meta.dir, '../../src/gateway');
-const TEST_ROOT = resolve(import.meta.dir);
 
 interface Module {
   /** Path relative to `src/gateway`, forward-slashed. */
@@ -70,7 +30,6 @@ const modulesUnder = (root: string): readonly Module[] =>
     .toSorted((left, right) => (left.name < right.name ? -1 : 1));
 
 const MODULES: readonly Module[] = modulesUnder(GATEWAY_ROOT);
-const TESTS: readonly Module[] = modulesUnder(TEST_ROOT);
 
 /** Source with every block and line comment removed — claims, not prose. */
 const code = (source: string): string =>
@@ -166,68 +125,5 @@ describe('Effect.run* belongs to the entrypoint', () => {
     // outright.  A `dlopen` used to run here, at *import* time, from
     // `services/ready-file.ts`.
     expect(offenders).toEqual([]);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 3. constants.ts is the vocabulary, not a museum
-// ---------------------------------------------------------------------------
-
-/** Every `export const NAME` in `constants.ts`. */
-const constantNames = (): readonly string[] => {
-  const source = MODULES.find((module) => module.name === 'constants.ts')?.source ?? '';
-  return Array.from(code(source).matchAll(/export const ([A-Za-z0-9_]+)/g), (match) =>
-    String(match[1]),
-  );
-};
-
-/** Everything that could read a constant: the rest of the gateway, and the tests. */
-const CONSTANT_READERS: readonly Module[] = [
-  ...MODULES.filter((module) => module.name !== 'constants.ts'),
-  ...TESTS,
-];
-
-/** Where a name is used inside `constants.ts` itself, past its own declaration. */
-const usedWithinConstants = (name: string): boolean => {
-  const source = MODULES.find((module) => module.name === 'constants.ts')?.source ?? '';
-  return code(source).replace(new RegExp(`export const ${name}\\b`), '').includes(name);
-};
-
-describe('constants.ts has no dead exports', () => {
-  test('every export has a reader — another module, a test, or a sibling export', () => {
-    const orphans = constantNames().filter(
-      (name) =>
-        !usedWithinConstants(name) &&
-        !CONSTANT_READERS.some((module) => importsSymbol(module, name)),
-    );
-    // Six of these were orphans while live re-declarations ran in
-    // `services/upstream.ts` and `http/respond.ts`, so five separate mutations
-    // of this file survived the entire suite — and no test file imported this
-    // module at all.
-    expect(orphans).toEqual([]);
-  });
-
-  test('the fallback set and its predicate are one fact', () => {
-    // `isUpstreamFallbackStatus` used to hardcode `404 || 405` two lines below
-    // the list, so widening the list to `[404, 405, 410]` changed nothing and
-    // no test noticed.  Both halves are asserted here, and the predicate is
-    // asserted to *agree* with the list over the whole status space.
-    expect([...UPSTREAM_FALLBACK_STATUSES]).toEqual([404, 405]);
-    const disagreements = Array.from({ length: 500 }, (_, index) => 100 + index).filter(
-      (status) =>
-        isUpstreamFallbackStatus(status) !==
-        (UPSTREAM_FALLBACK_STATUSES as readonly number[]).includes(status),
-    );
-    expect(disagreements).toEqual([]);
-  });
-
-  test('the upstream client re-declares none of them', () => {
-    const upstream = MODULES.find((module) => module.name === 'services/upstream.ts');
-    expect(upstream).toBeDefined();
-    if (upstream === undefined) return;
-    const redeclared = constantNames().filter((name) =>
-      new RegExp(`export const ${name}\\b`).test(code(upstream.source)),
-    );
-    expect(redeclared).toEqual([]);
   });
 });

@@ -1,28 +1,4 @@
-/**
- * `src/gateway/python-json.ts` against CPython's `json` module.
- *
- * The reader has one job — read a JSON text the way `json.loads` reads it, so
- * that re-emitting it through the canonical writer reproduces `json.dumps`'s
- * bytes — and one obligation that is easy to overlook: **not** to change what
- * counts as JSON.  It rewrites the text before handing it to `JSON.parse`, so
- * a document that used to be refused must still be refused and a document that
- * used to be accepted must come back meaning the same thing.
- *
- * So there are three suites here and the first is the load-bearing one:
- *
- * 1. **The differential.**  For every input, `canonicalText(parse(text))` is
- *    compared against `json.dumps(json.loads(text), sort_keys=True,
- *    separators=(",", ":"), ensure_ascii=False)` run in a real `python3`.  Any
- *    disagreement about `1` vs `1.0`, about a large integer, about `-0`, about
- *    key order or about escaping shows up as a byte difference.
- * 2. **The refusals.**  A table of malformed texts, each asserted to fail here
- *    *and* to fail `JSON.parse` — the rewrite must not smuggle anything in.
- * 3. **The collision.**  The marker is U+0000, which cannot appear raw in a
- *    JSON string but can appear escaped, so `"\u0000i5"` is a document that
- *    looks exactly like a marked integer.  It must come back a string.
- *
- * @module
- */
+/** Python-number JSON parsing and canonical round-trip coverage. */
 import { describe, expect, test } from 'bun:test';
 import { CANON_UTF8, canonicalText } from '@arena/wire';
 import { Either } from 'effect';

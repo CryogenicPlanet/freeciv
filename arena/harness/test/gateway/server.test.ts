@@ -1,47 +1,4 @@
-/**
- * The assembled gateway, on a real socket.
- *
- * Every other suite in this directory tests a piece with the socket removed —
- * dispatch as a pure function, routes against an injected `fetch`, the ready
- * publisher against a temporary directory.  This one exists for the claims that
- * only survive contact with Node's HTTP server, and it is organized around them:
- *
- * 1. **The ready record is never published before the request listener.**
- *    `NodeHttpServer.make` binds before `serve(app)` attaches ours, so a client
- *    in that interval connects but receives no response. The ordering is
- *    not a style preference, it is the difference between a client that reads
- *    the record and connects and a client that is told 404 by code we did not
- *    write.  The test is the Python's (`test_ready_file_is_private_and_removed_on_clean_shutdown`,
- *    R2): the *sink itself* fetches `url + "/health"`, so the assertion is made
- *    at the exact instant the record becomes visible.  And because a passing
- *    ordering test is worthless if it cannot fail, `the guard has teeth`
- *    rebuilds the same startup in the wrong order and watches it produce the
- *    404.
- * 2. **The request line Python saw.**  Fragments, absolute-form targets,
- *    doubled leading slashes, a bare `?`, and `%2F` staying literal are all
- *    decisions made between Node's request parser and `dispatch`, and `fetch` cannot
- *    express most of them — so those tests speak HTTP/1.1 down a raw socket.
- * 3. **The verbs `do_GET` never sees.**  `TRACE` is the stdlib's HTML
- *    `501 Unsupported method ('TRACE')` with *no* security headers, while the
- *    six mapped verbs are the JSON 405 with `Allow: GET`.  A port that answers
- *    405 for everything is more correct than Python and fails byte parity.
- * 4. **`_reject_body` before anything else**, including before the path is
- *    looked at, so a GET with a body on an unroutable path is a 400 and nothing
- *    is proxied.
- * 5. **One wide event per request**, on the refusals as well as the successes.
- *
- * Where Node's own parser refuses a message before any Effect code runs — an
- * unparseable `Content-Length`, `Transfer-Encoding: identity`, an invented verb
- * — the divergence is asserted rather than papered over, and the *decision*
- * those inputs would have driven is still pinned as a pure function
- * (`bodySignal`).  Every such case is marked `DIVERGENCE, measured`.
- *
- * Ownership: every server, temporary directory and stub is created and torn
- * down by this file.  No process outlives a test and the user's running stack
- * is never contacted: the "upstream" is a stub this file starts, answering the
- * portless-offline signature, so every route falls back to a `runs_root` this
- * file made.
- */
+/** Raw HTTP parity plus startup publication and resource-ordering coverage. */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { Gateway } from '@arena/wire';
 import {
@@ -88,7 +45,7 @@ import {
   type GatewayHandle,
 } from 'src/gateway/server.ts';
 import type { RequestBodySignal } from 'src/gateway/http/dispatch.ts';
-import { ReplayDerivationUnavailable } from 'src/gateway/services/derivation.ts';
+import { ReplayDerivationUnavailable } from './support/derivation.ts';
 import {
   GatewayIdentity,
   makeGatewayIdentity,

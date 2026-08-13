@@ -1,57 +1,10 @@
-/**
- * The gateway's command line — the port of `_parser()`
- * (`agent_eval/replay_gateway.py:2174-2185`).
- *
- * Nine flags, four of them required, no positionals, no subcommands.  The
- * Python declares them with bare `add_argument` calls and passes no `help=`
- * text to any of them, so there is no help copy to reproduce: what a user sees
- * is argparse's generated usage line, and the closest honest port is options
- * with no descriptions.
- *
- * ```
- * usage: python3 -m agent_eval.replay_gateway [-h] [--host HOST] [--port PORT]
- *        --service-url SERVICE_URL --runs-root RUNS_ROOT --cache-root CACHE_ROOT
- *        [--repo-root REPO_ROOT] --ready-file READY_FILE
- *        [--upstream-timeout-s UPSTREAM_TIMEOUT_S]
- *        [--viewer-public-url VIEWER_PUBLIC_URL]
- * ```
- *
- * ## `type=int` and `type=float` are Python's, not JavaScript's
- *
- * `--port` and `--upstream-timeout-s` are declared with `type=int` and
- * `type=float`, which means `--port 5_0` binds port 50, `--port ' 5 '` binds 5,
- * and `--upstream-timeout-s 1e3` is a thousand seconds.  Both go through
- * `pythonInt`/`pythonFloat` from `./config.ts` rather than `Options.integer` /
- * `Options.float`, whose parsers reject all three.  The rejection message is
- * argparse's — `argument --port: invalid int value: '0x10'` — because it is
- * the only part of the failure a caller can match on.
- *
- * ## Known, deliberate divergences from argparse
- *
- * - **`prog`.** argparse prints `python3 -m agent_eval.replay_gateway`; this
- *   command is named {@link GATEWAY_CLI_NAME} because a `@effect/cli` command
- *   name is also the token subcommands are matched against.  The Python's
- *   `prog` is kept as {@link PYTHON_GATEWAY_PROG} for anything that reports
- *   which implementation is running.
- * - **Prefix matching.** argparse accepts unambiguous abbreviations
- *   (`--serv=…`); `@effect/cli` requires the full flag.  Nothing in the repo
- *   abbreviates — `local_stack.py:540-548` spells every flag out.
- * - **Built-ins.** `@effect/cli` adds `--help`, `--version`, `--wizard` and
- *   `--completions`; argparse adds only `-h/--help`.  Extra built-ins cannot
- *   change how a valid invocation parses.
- *
- * `local_stack.py:540-548` passes every flag except `--upstream-timeout-s`, so
- * that default is the one that has to be right in practice.
- *
- * @module
- */
+/** Gateway CLI surface. Numeric flags deliberately use Python `int()`/`float()` semantics. */
 
 import { Command, HelpDoc, Options, ValidationError } from '@effect/cli';
 import { Effect } from 'effect';
-import type { Either, Option } from 'effect';
+import type { Either } from 'effect';
 import {
   GatewayConfigError,
-  gatewayConfigLayer,
   pythonFloat,
   pythonInt,
   pythonRepr,
@@ -167,17 +120,6 @@ export const gatewayCommand: Command.Command<
 > = Command.make(GATEWAY_CLI_NAME, gatewayCliOptions);
 
 /**
- * The parsed command line, as a `Layer`.
- *
- * This is the seam between the two halves of the port: everything above it
- * deals in strings a user typed, everything below it deals in a validated
- * {@link GatewayConfigValues}.  Re-exported here (it is defined next to the
- * validation it performs) so a caller needs one import to get from `argv` to a
- * running gateway.
- */
-export const gatewayConfigLayerFromCli: typeof gatewayConfigLayer = gatewayConfigLayer;
-
-/**
  * `main`'s failure line (`:2206`): `print(f"error: {exc}", file=sys.stderr)`,
  * followed by exit code 2.
  */
@@ -185,24 +127,3 @@ export const formatStartupError = (error: GatewayConfigError): string => `error:
 
 /** The exit code `main` uses for a rejected configuration (`:2207`). */
 export const GATEWAY_CLI_ERROR_EXIT_CODE = 2 as const;
-
-/**
- * The type of {@link gatewayCliOptions}' parse result, asserted against
- * {@link GatewayCliArgs}.
- *
- * `Options.optional` yields `Option<string>` and the two numeric flags yield
- * `bigint`/`number`, so this alias is the compile-time proof that the parser
- * and the config constructor agree — including that `--port` stays unbounded
- * until the range check runs.
- */
-export type GatewayCliParsed = {
-  readonly host: string;
-  readonly port: bigint;
-  readonly serviceUrl: string;
-  readonly runsRoot: string;
-  readonly cacheRoot: string;
-  readonly repoRoot: string;
-  readonly readyFile: string;
-  readonly upstreamTimeoutSeconds: number;
-  readonly viewerPublicUrl: Option.Option<string>;
-};

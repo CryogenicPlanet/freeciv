@@ -1,63 +1,8 @@
 /**
- * The socket edge: everything between a Node request and the one response
- * site, plus the startup order the ready file depends on.
- *
- * This module is the assembly, not the behavior.  Dispatch is a pure function
- * (`./http/dispatch.ts`), every refusal is a value (`./errors.ts`), every
- * refusal is rendered exactly once (`./http/respond.ts`), and each route family
- * is its own module under `./http/routes/`.  What is left — and what lives
- * here — is the four things only the edge can do:
- *
- * 1. **Recover the request line Python saw.**  `BaseHTTPRequestHandler` hands
- *    `do_GET` a `urlsplit(self.path)`; Node preserves the raw request target. The
- *    fragment must be dropped, the query must be the *raw* string (`''` means
- *    no query, so a bare trailing `?` is no query), and the path must **never**
- *    be percent-decoded — `%2F` staying literal is the only reason
- *    `/v1/games/{id}%2Fstatus` is a 404 rather than a traversal (pytest dossier
- *    D5).
- * 2. **Classify the entity body from headers alone.**  `_reject_body`
- *    (`:1384-1396`) never reads the socket, and it could not here anyway: spike
- *    the adapter does not expose a GET entity body (`request.body === null`)
- *    while still delivering `Content-Length`/`Transfer-Encoding`.  Detection
- *    yes, payload no — which is exactly what the Python needs.
- * 3. **Answer the verbs `do_GET` never sees.**  A verb with no `do_<VERB>` is
- *    rejected by the stdlib *before* any gateway code runs, as an **HTML** page
- *    with `Connection: close` and none of the security headers (behavior
- *    dossier §1.1).  `TRACE` is `501 Unsupported method ('TRACE')`, not the
- *    JSON 405 — a port that answers 405 for every non-GET verb is *more*
- *    correct than Python and fails byte parity.  {@link unsupportedMethod} is
- *    that page, transcribed from `http.server`'s
- *    `DEFAULT_ERROR_MESSAGE_FORMAT`; the JSON 405 belongs to the six *mapped*
- *    verbs and comes out of `dispatch` like every other refusal.
- *
- * ## Node has pre-handler behavior of its own, and it is not Python's
- *
- * Measured against this app (`test/gateway/server.test.ts`): `TRACE` reaches
- * {@link unsupportedMethod}; `CONNECT` is diverted to Node's unhandled tunnel
- * event; an invented verb gets Node's parser-level bodiless 400; malformed
- * `Content-Length` is also a parser-level 400; and `Transfer-Encoding: identity`
- * reaches `_reject_body` and gets the gateway JSON 400, matching Python.
- *
- * None of these are fixable at this layer — the bytes never reach Effect code —
- * so they are written down instead, and {@link bodySignal} keeps the *decision*
- * testable as a pure function even where the socket will not deliver the input.
- * 4. **Publish the ready record last.** `NodeHttpServer.make` binds before
- *    `serve(app)` installs the request listener. A client in that interval can
- *    connect but receives no response, so the ready file is published only
- *    after `serve()` returns. The ready sink itself probes `/health`.
- *
- * Every bare `:NNN` citation is `agent_eval/replay_gateway.py`.
- *
- * ## What this module deliberately does not do
- *
- * - **It builds no error body.**  The 501 above is the stdlib's, produced
- *   before routing exists; everything downstream of {@link dispatch} fails with
- *   a `../errors.ts` value and {@link respondGateway} renders it.
- * - **It does not special-case HEAD.** `dispatch` answers 405 with the GET
- *   body computed in full; the Node adapter strips the body and keeps
- *   `Content-Length`, which is what Python's HEAD does on the wire (§7.2, §15).
- *
- * @module
+ * Raw HTTP edge and scoped server startup. Raw targets are retained because URL parsing normalizes
+ * security-relevant paths; unmapped verbs keep CPython's pre-router HTML response. Startup creates
+ * cache, lock, listener, and ready publication in order, with LIFO cleanup of listener, ready file,
+ * and lock.
  */
 
 import { annotate, Observability, withWideEvent } from '@arena/telemetry';

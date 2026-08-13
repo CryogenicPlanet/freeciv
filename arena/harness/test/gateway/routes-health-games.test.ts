@@ -1,28 +1,4 @@
-/**
- * `/health`, `/v1/games` and the two archive-JSON views, against a scripted
- * upstream and a real `runs_root`.
- *
- * The suite is organized around the three claims the handlers exist to make,
- * because each one is a separate way to be wrong:
- *
- * 1. **Upstream first, and the fallback is not one rule.**  `/v1/games` has
- *    four branches with three serializers; `status`/`result` have three
- *    branches with two.  The pair of tests that matter most are the ones that
- *    prove the *disagreement*: offline relabels a non-terminal run
- *    `interrupted` and drops a lobby husk, while an upstream 404 serves the
- *    same directory raw — husk visible, `outcome.status` `"pending"`.  A port
- *    that unified the two disk branches passes every other assertion here.
- * 2. **A 2xx is bytes.**  The passthrough is checked by byte comparison
- *    against a body containing non-canonical spacing and unsorted keys, plus
- *    the negative: those bytes are *not* what the canonical writer would have
- *    produced.  Equality of parsed JSON proves nothing.
- * 3. **Nothing else reaches disk.**  A 500, a redirect, an unparseable index —
- *    each is a failure value, and the upstream is contacted exactly once.
- *
- * Every upstream is an injected `fetch` that records what it was asked for;
- * no socket is opened, no process is spawned, and the temporary `runs_root` is
- * removed in `afterAll`.
- */
+/** Health, games-index, and archive JSON fallback behavior matrices. */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import {
   CANON_UTF8,
@@ -44,7 +20,6 @@ import { join, resolve } from 'node:path';
 import type { GatewayConfigValues } from 'src/gateway/config.ts';
 import { HttpServerResponse } from '@effect/platform';
 import type { GatewayError } from 'src/gateway/errors.ts';
-import { gatewayErrorFromUpstream } from 'src/gateway/errors.ts';
 import type { ArchiveResultRoute, ArchiveStatusRoute } from 'src/gateway/http/dispatch.ts';
 import {
   boundedGatewayJson,
@@ -64,13 +39,8 @@ import {
   makeGatewayIdentity,
 } from 'src/gateway/http/routes/health.ts';
 import { RunsRepository, layer as runsLayer } from 'src/gateway/services/runs.ts';
-import {
-  type FetchLike,
-  layerTest as upstreamLayerTest,
-  UpstreamBodyError,
-  UpstreamClient,
-  UpstreamJsonTooLarge,
-} from 'src/gateway/services/upstream.ts';
+import type { FetchLike, UpstreamClient } from 'src/gateway/services/upstream.ts';
+import { upstreamLayerTest } from './support/upstream.ts';
 
 // ---------------------------------------------------------------------------
 // Fixture tree
@@ -356,7 +326,6 @@ describe('/health', () => {
     const payload = okOf(await run(healthRoute, upstream));
 
     expect(payload.status).toBe(200);
-    expect(payload.source).toBe('gateway');
     expect(upstream.urls()).toEqual([]);
 
     const config = configFor(runsRootRef.current, Option.none());
@@ -453,7 +422,6 @@ describe('/v1/games', () => {
     const payload = okOf(await run(gamesIndexRoute, upstream));
 
     expect(payload.status).toBe(200);
-    expect(payload.source).toBe('gateway');
     expect(upstream.urls()).toEqual([`${SERVICE_URL}/v1/games`]);
 
     const running = rowFor(payload, RUNNING);
@@ -505,7 +473,6 @@ describe('/v1/games', () => {
     const upstream = jsonUpstream(200, body);
     const payload = okOf(await run(gamesIndexRoute, upstream));
 
-    expect(payload.source).toBe('gateway');
     // Not a relay: the bytes are the canonical writer's, not the upstream's —
     // keys sorted, spaces gone, and `7` still spelled as a Python `int`.  A
     // port that let `JSON.parse` turn it into a JS number writes `7.0` here.
@@ -769,35 +736,5 @@ describe('differential against agent_eval.replay_gateway', () => {
 
     const result = okOf(await archivePayload(resultRoute(COMPLETED), jsonUpstream(404, '{}')));
     expect(text(result)).toBe(oracle.result);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// The client → taxonomy bridge
-// ---------------------------------------------------------------------------
-
-describe('gatewayErrorFromUpstream', () => {
-  test('maps the three relayable client failures onto the renderer\'s taxonomy', () => {
-    const tooLarge = gatewayErrorFromUpstream(
-      new UpstreamJsonTooLarge({
-        source: 'content-length',
-        capBytes: 8 * 1024 * 1024,
-        bytesRead: 0,
-        bytesRetained: 0,
-        url: SERVICE_URL,
-      }),
-    );
-    expect(tooLarge._tag).toBe('UpstreamTooLarge');
-    expect(tooLarge.status).toBe(502);
-    expect(tooLarge.message).toBe(Gateway.GATEWAY_PROBLEM_MESSAGES.upstreamJsonTooLarge);
-
-    const readFailure = gatewayErrorFromUpstream(
-      new UpstreamBodyError({ reason: 'read', url: SERVICE_URL, cause: 'private detail' }),
-    );
-    expect(readFailure._tag).toBe('InternalError');
-    expect(readFailure.status).toBe(500);
-    expect(readFailure.message).toBe(Gateway.GATEWAY_PROBLEM_MESSAGES.internalError);
-    // The cause is for the log; nothing about it is in the public message.
-    expect(readFailure.message).not.toContain('private');
   });
 });

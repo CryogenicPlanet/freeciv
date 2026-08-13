@@ -1,24 +1,4 @@
-/**
- * The replay gateway's own constants — the ones `@arena/wire` does not own.
- *
- * Wire owns everything that travels *inside* a payload: the message catalogue
- * and its statuses (`Gateway.GATEWAY_PROBLEM_MESSAGES`), the id grammars
- * (`GAME_ID_RE`, `FRAME_INDEX_RE`), the archive path builders, the archive
- * content types and `ARCHIVE_BINARY_CACHE_CONTROL`.  None of that is repeated
- * here; this module is the *service's* vocabulary — the literals that appear in
- * `agent_eval/replay_gateway.py` and nowhere on the wire as data:
- *
- * - the fixed route paths and path segments `do_GET` matches (`:1965-2037`),
- * - the HTTP methods the handler answers at all (`:2059-2064`),
- * - the proxy's size caps, header allowlist and fixed request headers
- *   (`:54-62`, `:1402-1438`),
- * - the security headers written on every response (`:1347-1348`),
- * - the "upstream has nothing" status set that gates every disk fallback.
- *
- * Every citation `:NNN` is `agent_eval/replay_gateway.py`.
- *
- * @module
- */
+/** Gateway-owned HTTP routes, limits, forwarding policy, and security headers. */
 
 // ---------------------------------------------------------------------------
 // Methods

@@ -1,64 +1,7 @@
 /**
- * `RunsRepository` — every read the replay gateway performs against `runs_root`.
- *
- * This is the *I/O half* of the disk view.  The shaping half is
- * `../archive.ts` and `../public.ts`, which are deliberately free of the
- * filesystem: they take a manifest, a report and a victory record and return
- * payloads.  This module is what opens the files, refuses the symlinks,
- * enumerates the frames, reads the tail of `replay.jsonl`, and swallows
- * exactly the failures Python swallows.  Bare `:NNN` citations are
- * `agent_eval/replay_gateway.py`.
- *
- * ```
- * _read_manifest              :557   readManifest        (+ ../archive.ts)
- * _read_archive_json          :573   readArchiveJson
- * _archive_victory            :681   readVictoryRecord   (+ archiveVictory)
- * _terminal_archive           :773   terminalArchive     (+ terminalArchiveView)
- * _safe_archive_directory     :871   safeArchiveDirectory
- * _archive_regular_files      :885   archiveRegularFiles
- * _archive_frame_path        :1007   frameFile           (+ selectFramePng)
- * _archive_video_path        :1022   videoFile
- * _last_replay_turn          :1178   lastReplayTurn
- * _disk_games_index          :1242   diskGamesIndex      (+ diskGameRow)
- * _disk_rows_with_interrupted:1582   diskRowsWithInterrupted
- * ```
- *
- * ## Three rules this module exists to keep
- *
- * **1. `diskGamesIndex` cannot fail.**  Python wraps every per-run read in
- * `except GatewayProblem: continue` (`:1258`), so a half-written manifest, a
- * symlinked run directory, or a `report.json` that is a directory removes one
- * row and nothing else.  Its error channel here is `never` — the only way to
- * make that structural rather than remembered.
- *
- * **2. Everything else fails as a `../errors.ts` value.**  Nothing here builds
- * a response: a route `catchTag`s `NotFound` / `ArchiveUnavailable` and
- * `../http/respond.ts` renders them, once.
- *
- * **3. Untrusted JSON stays untrusted.**  `readManifest` hands back the
- * document, not a decoded `Gateway.Manifest`, because the projections read a
- * *dict* through `publicText` / `publicInt` / `publicNumber` and coerce
- * whatever they find.  Decoding with the strict schema first would drop rows
- * Python serves — a manifest missing `commands_file` still produces an index
- * row.  {@link RunsRepositoryApi.decodeManifest} is there for callers that do
- * want the schema.
- *
- * ## Two deliberate divergences, both unreachable from a real run
- *
- * - `_last_replay_turn` accepts a *Python* `int`, so `{"turn": 5.0}` is
- *   rejected (a float) while `{"turn": true}` is accepted (`bool` subclasses
- *   `int`, and `True > 0`).  The float half is reproduced exactly — the tail is
- *   read with `../python-json.ts`, which keeps `5` and `5.0` apart — and the
- *   bool half is **not**: Python would then publish `"current_turn": true`,
- *   and `Gateway.GameRow` (whose schema this port may not edit) types that
- *   field as an integer, so `true` is refused here and the row is dropped.
- *   `save_replay` writes turns with `int`, so neither spelling occurs.
- * - `json.load` accepts `NaN` / `Infinity` literals and `JSON.parse` does not.
- *   For `manifest.json` and `report.json` the outcomes agree anyway — Python
- *   parses such a document and then fails the `isinstance(value, dict)` check
- *   with the same 503 this port raises on the parse.
- *
- * @module
+ * Filesystem `RunsRepository`. Reads are bounded and symlink-safe, malformed per-run data is skipped
+ * where Python skips it, replay tails preserve Python line splitting and integer spelling, and
+ * terminal projections remain shared with `archive.ts` for the database backend.
  */
 import { Array as Arr, Context, Data, Effect, Either, Layer, Option, type Scope } from 'effect';
 import {

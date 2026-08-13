@@ -1,22 +1,4 @@
-/**
- * `RunsRepository` against a real `runs_root`, with CPython as the oracle.
- *
- * The tree is built from `arena/wire/test/fixtures/runs` — the same archived
- * manifests and reports the wire schemas were transcribed from — plus the
- * synthetic runs no capture contains: a symlinked run directory, a symlinked
- * `manifest.json`, a torn `replay.jsonl` tail, a lobby husk with an empty one,
- * and an oversize manifest.
- *
- * The differential is the point.  `python3 -c` imports
- * `agent_eval.replay_gateway` and calls `_disk_games_index`,
- * `_last_replay_turn`, `_read_manifest` and `_terminal_archive` on the *same
- * directory*, then canonicalizes with the gateway's own `_canonical`.  This
- * file compares those bytes to `canonicalText` over the rows this port builds,
- * so every field, every coercion and the sort order are pinned at once rather
- * than one `expect` at a time.  A projection this port gets subtly wrong —
- * `created_at` spelled `0` instead of `0.0`, a place key present instead of
- * omitted, a dense rank off by one — fails here and nowhere else.
- */
+/** Filesystem repository behavior and CPython differential coverage. */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { Effect, Either, Option } from 'effect';
 import {

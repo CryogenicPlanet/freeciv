@@ -1,31 +1,4 @@
-/**
- * The archive routes — `watch.json`, `frames`, `frames/{n}.png`,
- * `frames/latest.png`, `video.mp4` — against a real socket and a real
- * `runs_root`, with CPython as the oracle for every body built from disk.
- *
- * Three rigs, because the three claims need different evidence:
- *
- * 1. **A `Bun.serve` stub upstream**, whose bodies are produced chunk by chunk
- *    with a counter.  That counter is the only way to observe the things this
- *    module is really about: that a 10 MiB frame reaches the client *while the
- *    upstream is still sending it*, that a 500's body is drained 64 KiB deep
- *    and not 2 MiB deep, and that a 404 is not drained at all.
- * 2. **A fixture `runs_root`** built from `arena/wire/test/fixtures/runs`, with
- *    the two synthetic hazards the corpus has no example of: a frame that is a
- *    symlink to a secret, and an archive with no `saves/` directory.
- * 3. **`python3 -c`** importing `agent_eval.replay_gateway` and canonicalizing
- *    `_archive_watch` / `_archive_frames` over the *same* directory.  The disk
- *    bodies are compared as bytes against that, so the frame pairing, the PPM
- *    player rows, the `timeline`, and every URL are pinned at once.
- *
- * Requests go through `dispatch` and come back through `respondGateway`, so the
- * routing facts this module depends on — a leading-zero frame name is a 404
- * that never opens a socket, a query on an archive route is a 400 — are
- * asserted on the same path a real request takes.
- *
- * Every process this file starts, it stops: one stub upstream, torn down in
- * `afterAll`.  The user's stack is never contacted.
- */
+/** Archive route fallback, relay, streaming, local-file security, and exact body coverage. */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { Gateway } from '@arena/wire';
 import { HttpServerResponse } from '@effect/platform';

@@ -1,48 +1,4 @@
-/**
- * `main` and the layer stack — `agent_eval/replay_gateway.py:2188-2213`.
- *
- * ```python
- * def main(argv=None):
- *     args = _parser().parse_args(argv)
- *     try:
- *         run_replay_gateway(..., on_ready=lambda value: print(_canonical(value).decode(), flush=True))
- *     except KeyboardInterrupt:
- *         return 0
- *     except (OSError, ValueError) as exc:
- *         print(f"error: {exc}", file=sys.stderr)
- *         return 2
- *     return 0
- * ```
- *
- * Four lines of Python and three obligations that a port loses one at a time:
- *
- * 1. **One error → exit-code site.**  Every construction-time refusal — a
- *    non-loopback host, a port outside `[0, 65535]`, a service URL carrying
- *    credentials, a non-positive timeout, a ready file another gateway already
- *    holds — reaches the *same* `except` and the *same* exit 2.  Here that is
- *    {@link gatewayTeardown}: one `Teardown` that reads the program's `Exit`
- *    and picks the code, so no branch of the program can pick its own.
- * 2. **Interruption is success.**  `KeyboardInterrupt` returns **0**, not 130
- *    and not 1.  `local_stack.py` stops the gateway with a signal on every
- *    clean shutdown, so a non-zero code there would make every normal run look
- *    like a failure.
- * 3. **The handshake line is the only thing on stdout.**  `log_message` is a
- *    no-op (`:1332`) and nothing else prints, which is why the ready line is
- *    written by the `ReadyFile` service's sink and never from here.
- *
- * ## The layer stack, and why it is built in two steps
- *
- * `gatewayConfigLayer` turns argv into a validated {@link GatewayConfig}; every
- * other service is parameterized *by* that configuration (`runs-root` for the
- * repository, the normalized service URL and the timeout for the upstream
- * client, `repo-root`/`cache-root` for the derivation bridge, `ready-file` for
- * the publisher).  So the stack is a `Layer.unwrapEffect` over the config tag
- * rather than a flat `mergeAll`: the second step cannot be written without the
- * first step's *values*, and expressing that as a dependency is what stops a
- * service from reaching for argv on its own.
- *
- * @module
- */
+/** Gateway CLI composition and scoped startup/teardown. */
 
 import {
   Observability,

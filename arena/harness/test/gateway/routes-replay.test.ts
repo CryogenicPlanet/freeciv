@@ -1,41 +1,4 @@
-/**
- * The viewer family: `replay.json`, `board.json`, `events.json`.
- *
- * These three routes are where the port can go wrong *quietly*, so the suite is
- * organized around the six ways it can:
- *
- * 1. **A 400 that reached the network.**  Every query refusal is asserted with
- *    the verbatim `@arena/wire` message *and* with "the upstream stub was never
- *    called and no loader ran" — Python parses the query before it opens a
- *    socket (`:1656`, `:1728`, `:1820`), and a port that validates after
- *    fetching is observationally different for a running match.
- * 2. **A 2xx that was re-serialized.**  The relay is byte-for-byte
- *    (`:1666`/`:1742`/`:1830`), so the assertion is on bytes, with an upstream
- *    body whose key order and spacing no canonical writer would reproduce.
- * 3. **The wrong fallback trigger.**  Only 404, 405 and a *provably gone*
- *    upstream reach disk.  A 500, a redirect and an oversized body must not —
- *    and each of those has its own status and message.
- * 4. **The two 8 MiB errors merged.**  Upstream oversize is 502
- *    `the upstream JSON response is too large`; a locally built body over the
- *    cap is 503 `archive JSON response is too large`.  Both are exercised in
- *    one block so the difference cannot be edited away.
- * 5. **A loader failure that leaked.**  `DerivationUnavailable` carries a
- *    `detail` for the log; the body is the catalogue message and nothing else.
- * 6. **The mutex lost.**  `replay_lock` serializes the three loaders across
- *    routes; the Python suite has no concurrency test at all, so the gated
- *    fixture here is the only thing standing between a port and a corrupted
- *    savegame cache.
- *
- * Two rigs, both owned by this file: a `mkdtemp` runs root removed in
- * `afterAll`, and an injected `fetch`.  No socket is opened, no process is
- * spawned, and the user's stack is never contacted.
- *
- * The query parsers were additionally checked against CPython 3.14.6 by a
- * differential (46 inputs including `5_0`, `+3`, `%205`, Arabic-Indic digits,
- * `%zz`, `%4` and a 22-digit turn) — zero mismatches.  The table in
- * `describe('the two query parsers')` is that differential's interesting rows,
- * frozen here so the property is checked without a Python interpreter.
- */
+/** Replay/board/events query, relay, fallback, sizing, failure, and mutex coverage. */
 
 import { afterAll, describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -61,9 +24,8 @@ import {
   Ref,
 } from 'effect';
 import { MAX_PROXY_JSON_BYTES } from 'src/gateway/constants';
-import { gatewayErrorFromUpstream } from 'src/gateway/errors';
+import type { GatewayError } from 'src/gateway/errors';
 import { boundedJsonResponse } from 'src/gateway/http/json';
-import { type GatewayError, gatewayProblem } from 'src/gateway/errors';
 import { dispatch, type RouteDecision } from 'src/gateway/http/dispatch';
 import { respondGateway } from 'src/gateway/http/respond';
 import { boardQuery, boardRoute } from 'src/gateway/http/routes/board';
@@ -71,7 +33,6 @@ import { eventsRoute } from 'src/gateway/http/routes/events';
 import {
   canonToJson,
   derivationPlaces,
-  gatewayErrorFromDerivation,
   parseQuery,
   pythonUnquote,
   replayQuery,
@@ -82,29 +43,19 @@ import {
 } from 'src/gateway/http/routes/replay';
 import {
   DerivationArtifactsMissing,
-  type DerivationError,
-  type DerivationOperation,
   type DerivationRequest,
-  DerivationUnavailable,
-  derivationFixture,
-  derivationProblem,
-  derivationRequestKey,
   layerFromRunner,
+} from 'src/gateway/services/derivation';
+import {
+  derivationFixture,
+  derivationRequestKey,
   ReplayDerivationFixture,
   ReplayDerivationUnavailable,
-} from 'src/gateway/services/derivation';
+} from './support/derivation.ts';
 import { untrustedField } from 'src/gateway/public';
 import { layer as runsLayer } from 'src/gateway/services/runs';
-import {
-  type FetchLike,
-  layerTest as upstreamLayerTest,
-  UpstreamBodyError,
-  UpstreamRedirect as UpstreamClientHttpError,
-  type UpstreamFailure,
-  upstreamFailureProblem,
-  UpstreamJsonTooLarge,
-  UpstreamOffline as UpstreamClientUnavailable,
-} from 'src/gateway/services/upstream';
+import type { FetchLike } from 'src/gateway/services/upstream';
+import { upstreamLayerTest } from './support/upstream.ts';
 
 // ---------------------------------------------------------------------------
 // Fixtures on disk
@@ -822,16 +773,28 @@ describe('the two size limits are different errors', () => {
 // ---------------------------------------------------------------------------
 
 describe('a loader failure is classified, and never quoted', () => {
-  const operations: readonly (readonly [
-    DerivationOperation,
-    () => ViewerRouteEffect,
-  ])[] = [
-    ['replay', () => replayOf(TERMINAL_GAME, '')],
-    ['board', () => boardOf(TERMINAL_GAME, 'turn=1')],
-    ['events', () => eventsOf(TERMINAL_GAME, '')],
-  ];
+  const operations = [
+    [
+      'replay',
+      Gateway.GATEWAY_PROBLEM_MESSAGES.replayArtifactsNotFound,
+      Gateway.GATEWAY_PROBLEM_MESSAGES.replayTelemetryUnavailable,
+      () => replayOf(TERMINAL_GAME, ''),
+    ],
+    [
+      'board',
+      Gateway.GATEWAY_PROBLEM_MESSAGES.boardSnapshotNotFound,
+      Gateway.GATEWAY_PROBLEM_MESSAGES.boardSnapshotUnavailable,
+      () => boardOf(TERMINAL_GAME, 'turn=1'),
+    ],
+    [
+      'events',
+      Gateway.GATEWAY_PROBLEM_MESSAGES.eventArtifactsNotFound,
+      Gateway.GATEWAY_PROBLEM_MESSAGES.eventsUnavailable,
+      () => eventsOf(TERMINAL_GAME, ''),
+    ],
+  ] as const;
 
-  operations.forEach(([operation, route]) => {
+  operations.forEach(([operation, missingMessage, unavailableMessage, route]) => {
     test(`${operation}: FileNotFoundError -> 404 with its own message`, async () => {
       const rig = makeRig({
         fetch: answering(404, ''),
@@ -845,12 +808,8 @@ describe('a loader failure is classified, and never quoted', () => {
           ),
       });
       const observed = await serve(route(), rig);
-      const expected = derivationProblem(
-        new DerivationArtifactsMissing({ operation, gameId: TERMINAL_GAME, detail: '' }),
-      );
       expect(observed.status).toBe(404);
-      expect(observed.status).toBe(expected.status);
-      expect(observed.bytes).toEqual(problemBytes(expected.message));
+      expect(observed.bytes).toEqual(problemBytes(missingMessage));
       expect(observed.text).not.toContain('private');
     });
 
@@ -860,12 +819,8 @@ describe('a loader failure is classified, and never quoted', () => {
         derivationLayer: ReplayDerivationUnavailable,
       });
       const observed = await serve(route(), rig);
-      const expected = derivationProblem(
-        new DerivationUnavailable({ operation, gameId: TERMINAL_GAME, detail: '' }),
-      );
       expect(observed.status).toBe(503);
-      expect(observed.status).toBe(expected.status);
-      expect(observed.bytes).toEqual(problemBytes(expected.message));
+      expect(observed.bytes).toEqual(problemBytes(unavailableMessage));
     });
   });
 
@@ -878,54 +833,12 @@ describe('a loader failure is classified, and never quoted', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// 7. The two translations, pinned to the modules that own them
-// ---------------------------------------------------------------------------
-
-describe('the failure translations cannot drift', () => {
-  const upstreamFailures: readonly UpstreamFailure[] = [
-    new UpstreamClientUnavailable({ reason: 'portless', url: 'u', cause: null }),
-    new UpstreamClientUnavailable({ reason: 'transport', url: 'u', cause: null }),
-    new UpstreamClientUnavailable({ reason: 'timeout', url: 'u', cause: null }),
-    new UpstreamJsonTooLarge({ source: 'body', capBytes: 1, bytesRead: 2, bytesRetained: 1, url: 'u' }),
-    new UpstreamJsonTooLarge({ source: 'content-length', capBytes: 1, bytesRead: 0, bytesRetained: 0, url: 'u' }),
-    new UpstreamClientHttpError({ status: 302, url: 'u' }),
-    new UpstreamClientHttpError({ status: 307, url: 'u' }),
-    new UpstreamBodyError({ reason: 'read', url: 'u', cause: null }),
-    new UpstreamBodyError({ reason: 'timeout', url: 'u', cause: null }),
-  ];
-
-  upstreamFailures.forEach((failure) => {
-    test(`${failure._tag} renders what UpstreamClient says it renders`, () => {
-      expect(gatewayProblem(gatewayErrorFromUpstream(failure))).toEqual(
-        upstreamFailureProblem(failure),
-      );
-    });
-  });
-
-  const derivationFailures: readonly DerivationError[] = (
-    ['replay', 'board', 'events'] as const
-  ).flatMap((operation) => [
-    new DerivationArtifactsMissing({ operation, gameId: TERMINAL_GAME, detail: 'x' }),
-    new DerivationUnavailable({ operation, gameId: TERMINAL_GAME, detail: 'x' }),
-  ]);
-
-  derivationFailures.forEach((failure) => {
-    test(`${failure._tag}/${failure.operation} renders what ReplayDerivation says`, () => {
-      expect(gatewayProblem(gatewayErrorFromDerivation(failure))).toEqual(
-        derivationProblem(failure),
-      );
-    });
-  });
-
-  test('canonToJson lowers a bigint and leaves everything else alone', () => {
+describe('derivation input projection', () => {
+  test('lowers canonical integers and rejects malformed places', () => {
     expect(canonToJson({ a: 1n, b: [2n, 'x', null, true, 1.5] })).toEqual({
       a: 1,
       b: [2, 'x', null, true, 1.5],
     });
-  });
-
-  test('derivationPlaces drops a manifest whose places are not rows', () => {
     expect(derivationPlaces({ game_id: TERMINAL_GAME, resolved_places: 'nonsense' })).toEqual([]);
     expect(derivationPlaces({ game_id: TERMINAL_GAME })).toEqual([]);
   });

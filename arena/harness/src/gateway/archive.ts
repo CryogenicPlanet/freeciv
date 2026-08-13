@@ -1,59 +1,6 @@
 /**
- * The `_archive_*` and `_disk_*` families of `agent_eval/replay_gateway.py`,
- * as values.
- *
- * Every bare `:NNN` cites that file.  Where `./public.ts` sanitizes a *field*,
- * this module assembles a *document*: the four archive payloads (`/status`,
- * `/watch.json`, `/frames`, `/result`), the games-index row, and the
- * interrupted relabel that keeps an orphaned run visible.  Together they are
- * everything the gateway can serve when the supervisor is gone — which is the
- * whole reason the disk fallback exists.
- *
- * ## Pure by construction
- *
- * `replay_gateway.py` interleaves reading and shaping: `_archive_victory`
- * opens `victory.json`, `_archive_frames` lists two directories,
- * `_terminal_archive` reads `manifest.json` and `report.json`.  Here the two
- * are split.  Every function below takes what was read — a parsed value, a
- * directory listing, a PPM's text — and returns what to serve.  No `Effect`,
- * no service, no filesystem; the I/O module reads, this module decides.
- *
- * | Python | reads | this module |
- * |---|---|---|
- * | `_terminal_archive` (`:773`) | `manifest.json`, `report.json` | {@link terminalArchiveView} |
- * | `_archive_victory` (`:681`) | `victory.json` | {@link archiveVictory} |
- * | `_archive_frames` (`:968`) | `watch_frames/`, `saves/` | {@link pairArchiveFrames} + {@link archiveFrames} |
- * | `_archive_ppm_players` (`:906`) | one `.map.ppm` | {@link archivePpmPlayers} |
- * | `_archive_frame_path` (`:1007`) | `watch_frames/` | {@link selectFramePng} |
- * | `_as_interrupted` (`:1211`) | `replay.jsonl`'s tail | {@link asInterrupted} |
- *
- * Failures are values.  The two functions that can refuse answer
- * `Either.left(name)` with a `Gateway.GatewayProblemName`; the route layer
- * turns that name into its tagged error and the one response site renders it.
- * No message string is spelled here.
- *
- * ## The traps this port had to preserve
- *
- * - **`benchmark_valid` is not the manifest's** (`:790`): it is
- *   `state == "completed" AND manifest.benchmark_valid is True`, and the
- *   *outcome* is then computed against `"completed" if benchmark_valid else
- *   "invalid"` (`:800`) rather than against the real state.  A `completed` run
- *   with `benchmark_valid: false` therefore reports `state: "completed"` and
- *   `outcome.status: "invalid"` in the same body.
- * - **Frames pair positionally** (`:975`): the *n*-th PNG by index takes the
- *   *n*-th PPM by name.  One missing autosave relabels every later frame, and
- *   a PNG past the end of the PPM list gets `turn: null` and the PNG's own
- *   name as `source_name`.
- * - **`_disk_game_row` and `_archive_status` disagree about
- *   `benchmark_valid`**: the row publishes the manifest's value when it is a
- *   real bool and `null` otherwise (`:1132`); the status narrows to a strict
- *   bool.
- * - **The interrupted summary quotes the *post-`max`* turn** (`:1229`) — the
- *   larger of the manifest's `current_turn` and the replay tail's.
- * - **A redacted invalid reason is replaced whole** (`:616`), before the
- *   dedupe, so a run whose every reason named a path publishes exactly one.
- *
- * @module
+ * Pure archive and games-index projections shared by filesystem and database backends.
+ * Keep Python's tolerant missing-data rules and its `int`/`float` distinction (`bigint`/`number`).
  */
 
 import { Either, Option } from 'effect';

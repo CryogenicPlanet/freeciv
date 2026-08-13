@@ -1,71 +1,11 @@
 /**
- * `ReplayDerivation` — the three savegame derivations behind one mutex.
- *
- * The Python gateway calls three loaders and nothing else touches a savegame:
- * `replay_from_autosaves`, `board_from_autosave`, `events_from_autosaves`
- * (`agent_eval/replay_gateway.py:262-320`).  Every call is wrapped in
- * `with server.replay_lock:` (`:1701`, `:1775`, `:1857`) — a single
- * process-wide `RLock` (`:1298`), **not** a per-game one, because the parsers
- * write into a shared per-game cache directory and are not concurrency-safe.
- * Nothing else is inside the lock: manifest reads, the archive projection and
- * all serialization happen outside it.
- *
- * This module is that shape in Effect: a service with three methods, a single
- * `Effect.Semaphore(1)` created per layer, and `withPermits(1)` around **the
- * loader invocation only**.  Reentrancy (the `R` in `RLock`) is never
- * exercised in Python — no loader calls back into the gateway — so a plain
- * semaphore is faithful.
- *
- * ## Errors are values, and they carry the route's classification
- *
- * The routes make exactly two classes out of a loader failure
- * (`:1712-1723`, `:1784-1795`, `:1866-1877`):
- *
- * - `FileNotFoundError` → **404**, message per operation.
- * - `OSError` / `UnicodeError` / `JSONDecodeError` / `ValueError` (which
- *   subsumes `SaveReplayError`), *or a result that is not a `Mapping`* →
- *   **503**, message per operation.
- *
- * So this service fails with {@link DerivationArtifactsMissing} or
- * {@link DerivationUnavailable}, and {@link derivationProblem} turns either
- * into the `{status, message}` the one response site renders.  The messages
- * and their statuses come from `@arena/wire`; none are re-declared here.
- * Neither error's `detail` is ever public — Python's rule is that loader
- * exception text never reaches a body
- * (`test_events_loader_failures_stay_public`), and `derivationProblem` is the
- * only sanctioned way to render one.
- *
- * ## The document is canonical, not `JSON.parse` output
- *
- * The three methods answer with a `CanonRecord` — `@arena/wire`'s model, where
- * a Python `int` is a `bigint` and a Python `float` is a `number` — because
- * `replay.json` and `board.json` relay the loader's document *whole*.  In
- * CPython there is no round trip at all: `_bounded_json` is handed the loader's
- * `dict`.  Here the document crosses a process boundary as text, so it is read
- * back by `../python-json.ts` rather than by `JSON.parse`, which would collapse
- * `1` and `1.0` and re-emit every integer in a replay page as a float.
- *
- * ## Three layers
- *
- * - {@link ReplayDerivationPython} — spawns `python3 -m
- *   agent_eval.replay_derive_cli`, an **explicit interim bridge replaced in
- *   phase 4** (see that module's docstring).  It exists so the gateway port
- *   can be finished and byte-compared before the savegame parsers are ported.
- * - {@link ReplayDerivationUnavailable} — every derivation is a typed 503.
- *   The honest layer for a gateway built without a Python checkout.
- * - {@link ReplayDerivationFixture} — a map, for tests.
- *
- * @module
+ * Three savegame derivations behind one process-wide semaphore. The interim bridge invokes
+ * `python3 -m agent_eval.replay_derive_cli`, sends public places on stdin, parses Python-number JSON,
+ * caps output, kills children on every exit, and classifies missing artifacts separately from
+ * unavailable loaders. Replace the runner, not this service contract, when parsers become native.
  */
 
-import { createHash } from 'node:crypto';
 import type { CanonRecord, JsonObject } from '@arena/wire';
-import {
-  GATEWAY_PROBLEM_MESSAGES,
-  GATEWAY_PROBLEM_STATUS,
-  type GatewayProblemMessage,
-  type GatewayProblemResponse,
-} from '@arena/wire/gateway';
 import { Context, Data, Duration, Effect, Either, Layer } from 'effect';
 import { parsePythonJsonObject } from '../python-json.ts';
 
@@ -133,20 +73,6 @@ export type DerivationRequest =
 
 const NO_PLACES: ResolvedPlaces = [];
 
-/**
- * A stable string identifying a request, for fixture maps and for logs.
- *
- * `places` are deliberately **not** part of the key: a fixture keyed by the
- * manifest's place projection would be unreadable, and the tests that care
- * about places assert on the recorded request instead.
- */
-export const derivationRequestKey = (request: DerivationRequest): string =>
-  request.operation === 'replay'
-    ? `replay:${request.gameId}:${String(request.afterTurn)}:${String(request.limit)}:${String(request.complete)}`
-    : request.operation === 'board'
-      ? `board:${request.gameId}:${String(request.turn)}`
-      : `events:${request.gameId}:${String(request.complete)}`;
-
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -176,31 +102,6 @@ export class DerivationUnavailable extends Data.TaggedError('DerivationUnavailab
 /** Every way a derivation can fail. Both are public-safe *classifications*. */
 export type DerivationError = DerivationArtifactsMissing | DerivationUnavailable;
 
-const NOT_FOUND_MESSAGE: { readonly [K in DerivationOperation]: GatewayProblemMessage } = {
-  replay: GATEWAY_PROBLEM_MESSAGES.replayArtifactsNotFound,
-  board: GATEWAY_PROBLEM_MESSAGES.boardSnapshotNotFound,
-  events: GATEWAY_PROBLEM_MESSAGES.eventArtifactsNotFound,
-};
-
-const UNAVAILABLE_MESSAGE: { readonly [K in DerivationOperation]: GatewayProblemMessage } = {
-  replay: GATEWAY_PROBLEM_MESSAGES.replayTelemetryUnavailable,
-  board: GATEWAY_PROBLEM_MESSAGES.boardSnapshotUnavailable,
-  events: GATEWAY_PROBLEM_MESSAGES.eventsUnavailable,
-};
-
-/**
- * The public `{status, message}` for a derivation failure — the only thing a
- * route may take from one.  Statuses come from wire's table rather than being
- * spelled again, so a message that moves between statuses moves here too.
- */
-export const derivationProblem = (error: DerivationError): GatewayProblemResponse => {
-  const message =
-    error._tag === 'DerivationArtifactsMissing'
-      ? NOT_FOUND_MESSAGE[error.operation]
-      : UNAVAILABLE_MESSAGE[error.operation];
-  return { status: GATEWAY_PROBLEM_STATUS[message], message };
-};
-
 // ---------------------------------------------------------------------------
 // The cache layout, mirrored
 // ---------------------------------------------------------------------------
@@ -208,26 +109,11 @@ export const derivationProblem = (error: DerivationError): GatewayProblemRespons
 /**
  * `<cache_root>/<game_id>` — `save_replay._cache_directory` (`:791-806`).
  *
- * The gateway itself never reads or writes inside `cache_root`; it creates it
- * once at startup and passes it through.  These helpers exist so a port can
- * *assert* on the layout (and so a test can prove it is caching where Python
- * caches) without reimplementing the discipline.
+ * The gateway creates `cache_root` and passes it through; the database cache
+ * mirror uses this helper to share the same per-game namespace.
  */
 export const derivationCacheDirectory = (cacheRoot: string, gameId: string): string =>
   `${cacheRoot.replace(/\/+$/, '')}/${gameId}`;
-
-/**
- * `turn-{turn:010d}-{sha256(source_name)[:12]}.json` —
- * `save_replay._cache_path` (`:836-838`).  The digest is over the save's
- * *file name*, UTF-8, not its contents.
- */
-export const derivationTurnCacheName = (turn: number, sourceName: string): string => {
-  const digest = createHash('sha256').update(sourceName, 'utf8').digest('hex').slice(0, 12);
-  return `turn-${String(turn).padStart(10, '0')}-${digest}.json`;
-};
-
-/** `events.json` — `game_events._events_cache_path` (`:913`). */
-export const DERIVATION_EVENTS_CACHE_NAME = 'events.json';
 
 // ---------------------------------------------------------------------------
 // The service
@@ -297,75 +183,6 @@ export const makeReplayDerivation = (
 /** Build a `ReplayDerivation` layer from any runner. */
 export const layerFromRunner = (run: DerivationRunner): Layer.Layer<ReplayDerivation> =>
   Layer.effect(ReplayDerivation, makeReplayDerivation(run));
-
-// ---------------------------------------------------------------------------
-// Layer: unavailable
-// ---------------------------------------------------------------------------
-
-const UNAVAILABLE_DETAIL = 'no derivation backend is configured';
-
-/**
- * Every derivation is a typed 503.
- *
- * This is the correct answer — not a crash and not a 500 — for a gateway with
- * no way to reach the savegame parsers: the Python routes reach the same 503
- * whenever the loader cannot produce a mapping, and the viewer already renders
- * it.
- */
-export const ReplayDerivationUnavailable: Layer.Layer<ReplayDerivation> = layerFromRunner(
-  (request) =>
-    Effect.fail(
-      new DerivationUnavailable({
-        operation: request.operation,
-        gameId: request.gameId,
-        detail: UNAVAILABLE_DETAIL,
-      }),
-    ),
-);
-
-// ---------------------------------------------------------------------------
-// Layer: fixture
-// ---------------------------------------------------------------------------
-
-/**
- * A fixture map: {@link derivationRequestKey} to the effect that answers it.
- *
- * Entries are *effects*, not values, so a test can gate one on a latch and
- * prove the semaphore actually serializes — which is the one property of this
- * service the Python suite never tests (it has no concurrency test for
- * `replay_lock` at all).
- */
-export type DerivationFixture = ReadonlyMap<
-  string,
-  Effect.Effect<CanonRecord, DerivationError>
->;
-
-/** A fixture map from plain success values. */
-export const derivationFixture = (
-  entries: Readonly<Record<string, CanonRecord>>,
-): DerivationFixture =>
-  new Map(
-    Object.entries(entries).map(([key, value]) => [key, Effect.succeed(value)] as const),
-  );
-
-/**
- * Answer from a map.  A key with no entry fails the way a loader with no
- * artifacts fails — `FileNotFoundError`, the route's 404 — so a test that
- * forgets a fixture sees the realistic error rather than a hang.
- */
-export const ReplayDerivationFixture = (
-  entries: DerivationFixture,
-): Layer.Layer<ReplayDerivation> =>
-  layerFromRunner((request) => {
-    const entry = entries.get(derivationRequestKey(request));
-    return entry ?? Effect.fail(
-      new DerivationArtifactsMissing({
-        operation: request.operation,
-        gameId: request.gameId,
-        detail: `no fixture for ${derivationRequestKey(request)}`,
-      }),
-    );
-  });
 
 // ---------------------------------------------------------------------------
 // Layer: python
