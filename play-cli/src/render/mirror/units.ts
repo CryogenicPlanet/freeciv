@@ -10,7 +10,7 @@
  */
 import { Effect } from 'effect';
 import type { PlayerError } from 'src/errors';
-import { isJsonObject } from 'src/schema/primitives';
+import { isJsonObject, type JsonValueInput } from 'src/schema/primitives';
 import {
   MISSING,
   aliasMap,
@@ -39,7 +39,7 @@ export const UNIT_COLUMNS: ReadonlyArray<string> = [
  * row read there say the same thing: where the unit is walking and how many
  * path steps of it are left.
  */
-const routeOrders = (route: unknown): string => {
+const routeOrders = (route: JsonValueInput): string => {
   if (!isJsonObject(route)) return '-';
   const destination = dig(route, 'destination');
   const where = isJsonObject(destination) ? position(destination) : '?';
@@ -56,7 +56,7 @@ const routeOrders = (route: unknown): string => {
 };
 
 /** `activity.name`, suffixed with its target when the payload names one. */
-const activityText = (item: unknown): string => {
+const activityText = (item: JsonValueInput): string => {
   const name = cell(dig(item, 'activity', 'name'));
   const target = dig(item, 'activity', 'target', 'name');
   return name !== '-' && target !== MISSING && target !== null
@@ -66,7 +66,7 @@ const activityText = (item: unknown): string => {
 
 /** `_render_units` — project a units page. */
 export const renderUnits = (
-  items: ReadonlyArray<unknown>,
+  items: ReadonlyArray<JsonValueInput>,
   aliases?: MirrorAliases | null
 ): Effect.Effect<RenderedSection, PlayerError> => {
   const names = aliasMap(

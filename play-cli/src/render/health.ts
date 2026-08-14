@@ -61,7 +61,7 @@ const headline = (health: HealthEnvelope): string =>
 const identityLine = (health: HealthEnvelope): string => {
   const seat = health.seat;
   let identity =
-    `seat ${scalar(seat.place)} ${seat.player_name} ` + `(${health.agent.controller_label})`;
+    `seat ${scalar(seat.place)} ${seat.player_name} (${health.agent.controller_label})`;
   const standing = seat.standing;
   if (standing !== undefined && standing !== 'active') {
     identity += ` | standing ${standing}`;

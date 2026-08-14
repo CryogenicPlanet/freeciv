@@ -6,6 +6,7 @@
  */
 import { Effect } from 'effect';
 import type { PlayerError } from 'src/errors';
+import { isJsonString, isWholeNumber } from 'src/schema/primitives';
 import {
   drift,
   isJsonObject,
@@ -41,7 +42,7 @@ export const economyText = (player: JsonValue): Effect.Effect<string, PlayerErro
   const plain = plainName(player);
   const parts: string[] = plain === null ? [] : [plain];
   const nation = player['nation'] ?? null;
-  if (typeof nation === 'string' && nation !== '') parts.push(`(${nation})`);
+  if (isJsonString(nation) && nation !== '') parts.push(`(${nation})`);
   if ('government' in player) parts.push(scalar(player['government'] ?? null));
   const economy = player['economy'] ?? null;
   if (isJsonObject(economy)) {
@@ -81,11 +82,11 @@ export const scoreText = (score: JsonValue): string => {
   if (!isJsonObject(score)) return '';
   const exact = score['exact'] ?? null;
   let text: string;
-  if (typeof exact === 'number' && Number.isInteger(exact)) {
+  if (isWholeNumber(exact)) {
     text = `score ${exact}`;
   } else {
     const lower = score['lower_bound'] ?? null;
-    if (typeof lower !== 'number' || !Number.isInteger(lower)) return '';
+    if (!isWholeNumber(lower)) return '';
     text = `score >=${lower}`;
   }
   const components = score['components'] ?? null;

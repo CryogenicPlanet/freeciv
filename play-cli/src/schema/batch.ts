@@ -10,15 +10,17 @@
  * building a batch body is U13's job, not the schema layer's.
  */
 import { Effect } from 'effect';
-import { DriftError, invalid } from 'src/errors';
+import { type DriftError, invalid } from 'src/errors';
 import { FULL_CONTROL_V2, V2_DISPOSITIONS } from 'src/constants';
 import {
   exact,
   field,
   isJsonObject,
+  isJsonString,
   jsonObject,
   opaque,
   type JsonObject,
+  type JsonValue,
   type SessionIdentity,
 } from 'src/schema/primitives';
 import { decodeRevision, type Revision } from 'src/schema/revision';
@@ -81,19 +83,22 @@ const DISPOSITION_FIELDS: ReadonlySet<string> = new Set([
   'error',
 ]);
 
-export const decodeCommand = (value: unknown): Effect.Effect<Command, DriftError> =>
+export const isDisposition = (value: JsonValue): value is Disposition =>
+  isJsonString(value) && V2_DISPOSITIONS.has(value);
+
+export const decodeCommand = (value: JsonValue): Effect.Effect<Command, DriftError> =>
   Effect.gen(function* () {
     const raw = yield* exact(value, COMMAND_FIELDS, 'command');
     const actionId = yield* opaque(field(raw, 'action_id'), 'command action ID');
     const args = field(raw, 'arguments');
     if (!isJsonObject(args)) {
-      return yield* Effect.fail(invalid('command arguments'));
+      return yield*invalid('command arguments');
     }
     return { action_id: actionId, arguments: yield* jsonObject(args, 'command arguments') };
   });
 
 export const decodeCommandBatch = (
-  value: unknown,
+  value: JsonValue,
   session: SessionIdentity
 ): Effect.Effect<CommandBatch, DriftError> =>
   Effect.gen(function* () {
@@ -102,19 +107,19 @@ export const decodeCommandBatch = (
       field(raw, 'schema_version') !== 2 ||
       field(raw, 'control_protocol') !== FULL_CONTROL_V2
     ) {
-      return yield* Effect.fail(invalid('command batch', 'protocol mismatch'));
+      return yield*invalid('command batch', 'protocol mismatch');
     }
     if (field(raw, 'game_id') !== session.gameId) {
-      return yield* Effect.fail(invalid('command batch', 'batch belongs to another game'));
+      return yield*invalid('command batch', 'batch belongs to another game');
     }
     if (field(raw, 'agent_id') !== session.agentId) {
-      return yield* Effect.fail(invalid('command batch', 'batch belongs to another agent'));
+      return yield*invalid('command batch', 'batch belongs to another agent');
     }
     const batchId = yield* opaque(field(raw, 'batch_id'), 'command batch ID');
     const revision = yield* decodeRevision(field(raw, 'state_revision'));
     const commands = field(raw, 'commands');
     if (!Array.isArray(commands) || commands.length !== 1) {
-      return yield* Effect.fail(invalid('command batch commands'));
+      return yield*invalid('command batch commands');
     }
     const decoded: Command[] = [];
     for (const command of commands) {
@@ -132,15 +137,15 @@ export const decodeCommandBatch = (
   });
 
 export const decodeBatchDisposition = (
-  value: unknown,
+  value: JsonValue,
   session: SessionIdentity
 ): Effect.Effect<BatchDisposition, DriftError> =>
   Effect.gen(function* () {
     const raw = yield* exact(value, DISPOSITION_FIELDS, 'cli batch disposition');
     const batchId = yield* opaque(field(raw, 'batch_id'), 'batch disposition ID');
     const disposition = field(raw, 'disposition');
-    if (typeof disposition !== 'string' || !V2_DISPOSITIONS.has(disposition)) {
-      return yield* Effect.fail(invalid('batch disposition'));
+    if (!isDisposition(disposition)) {
+      return yield*invalid('batch disposition');
     }
     const rawReceipt = field(raw, 'receipt');
     const receipt =
@@ -153,7 +158,7 @@ export const decodeBatchDisposition = (
       game_id: session.gameId,
       agent_id: session.agentId,
       batch_id: batchId,
-      disposition: disposition as Disposition,
+      disposition,
       receipt,
       error,
     } as const;

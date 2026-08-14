@@ -31,7 +31,7 @@ import {
   type ActionAliasEntry,
 } from 'src/services/aliases';
 import { expandActionAlias, expandAlias, looksLikeAlias } from 'src/services/alias-expand';
-import { PrivateFs } from 'src/services/private-fs';
+import { type PrivateFs } from 'src/services/private-fs';
 import {
   SessionStore,
   type Session,
@@ -103,7 +103,7 @@ export const refreshStaleAlias = (
     ) {
       return Option.none<AliasRebound>();
     }
-    const previous: Readonly<Record<string, ActionAliasEntry>> = { ...table.by_alias };
+    const previous = { ...table.by_alias } satisfies Readonly<Record<string, ActionAliasEntry>>;
     const semantics = entry.semantics;
     const drain = options.fetch(sessionPath, session, entry.actor_id);
     yield* options.locked ? drain : store.withRequestLock(sessionPath, drain);
@@ -113,19 +113,18 @@ export const refreshStaleAlias = (
     const matches = Object.entries(freshTable.by_alias)
       .filter(([, item]) => item.semantics === semantics)
       .map(([name]) => name)
-      .sort(byCodePoint);
+      .toSorted(byCodePoint);
     if (matches.length === 0) return Option.none<AliasRebound>();
     if (matches.length > 1) {
       // Fail closed: two actions now answer to one identity, and picking either
       // would be this client choosing the agent's move for it.
       const label = fresh.last_revision === null ? 'no revision' : revisionLabel(fresh.last_revision);
-      return yield* Effect.fail(
+      return yield*
         playerError(
           `action alias ${alias} names ${matches.length} actions at ` +
             `${label} ` +
             `(${matches.join(' ')}); name exactly one of them`
-        )
-      );
+        );
     }
     const { table: rebound } = rebindActionAliases(freshTable, previous);
     const next: V2ClientState = {
@@ -184,7 +183,7 @@ export const expandActionAliasRefreshing = (
     (original) =>
       Effect.gen(function* () {
         const rebound = yield* refreshStaleAlias(sessionPath, session, state, alias, options);
-        if (Option.isNone(rebound)) return yield* Effect.fail(original);
+        if (Option.isNone(rebound)) return yield*original;
         const identifier = yield* expandActionAlias(rebound.value.state, alias, sessionPath);
         return { identifier, state: rebound.value.state, note: rebound.value.note };
       })
@@ -233,7 +232,7 @@ export const resolveAliasArguments = (
     }
     const fetch = options.fetch;
     const refresh = options.noRefresh !== true && fetch !== undefined;
-    const resolved: Record<string, string> = { ...values };
+    const resolved = { ...values } satisfies Record<string, string>;
     const notes: string[] = [];
     let state = yield* store.readState(sessionPath, session);
     for (const [name, text] of Object.entries(raw)) {

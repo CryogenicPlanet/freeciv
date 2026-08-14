@@ -15,10 +15,10 @@
  * path.  Nothing is rebound until the file has been proved to be a session this
  * workspace joined, so a refused rebind leaves the previous binding intact.
  */
-import * as path from 'node:path';
+import { path } from 'src/services/platform';
 import { Args, Command, Options } from '@effect/cli';
 import { Effect, Option } from 'effect';
-import { PlayerError, playerError } from 'src/errors';
+import { type PlayerError, playerError } from 'src/errors';
 import { GAME_ID_RE } from 'src/constants';
 import { seatBindingLine } from 'src/render/join';
 import { render } from 'src/render/primitives';
@@ -27,7 +27,7 @@ import { jsonRequested, printJson } from 'src/services/json-output';
 import { PrivateFs, Workspace, type WorkspacePaths } from 'src/services/private-fs';
 import { SessionStore, type SessionStoreApi } from 'src/services/session-store';
 import type { PrivateFsApi } from 'src/services/private-fs';
-import type { JsonObject } from 'src/schema/primitives';
+import { field, isJsonString, type JsonObject } from 'src/schema/primitives';
 
 // ---------------------------------------------------------------------------
 // client.py:6418-6423 — _workspace_relative
@@ -60,25 +60,26 @@ export const resolveUseTarget = (
     }
     const sessions = yield* store.listSessions(value);
     if (sessions.length === 0) {
-      return yield* Effect.fail(
+      return yield*
         playerError(
           `this workspace holds no joined seat for ${value}. Join one ` +
             `with \`just join --game_id ${value} --name HARNESS-MODEL\`.`
-        )
-      );
+        );
     }
     if (sessions.length > 1) {
       const candidates = sessions
         .map((session) => `\`just use ${workspaceRelative(workspace, session)}\``)
         .join(', ');
-      return yield* Effect.fail(
+      return yield*
         playerError(
           `${value} has ${sessions.length} joined seats in this ` +
             `workspace; name the one you are playing: ${candidates}`
-        )
-      );
+        );
     }
-    return sessions[0] as string;
+    const session = sessions.at(0);
+    return session === undefined
+      ? yield* playerError(`this workspace holds no joined seat for ${value}`)
+      : session;
   });
 
 // ---------------------------------------------------------------------------
@@ -117,9 +118,8 @@ export const commandUse = (
       const found = yield* store.readSeatBinding();
       if (Option.isNone(found)) {
         const pinned = yield* store.preconfiguredGameId();
-        return yield* Effect.fail(
-          playerError(Option.isSome(pinned) ? preconfigured(pinned.value) : UNBOUND)
-        );
+        return yield*
+          playerError(Option.isSome(pinned) ? preconfigured(pinned.value) : UNBOUND);
       }
       const binding = found.value;
       if (json) {
@@ -140,18 +140,17 @@ export const commandUse = (
 
     const sessionPath = yield* resolveUseTarget(workspace, files, store, target);
     const session: JsonObject = yield* files.loadObject(sessionPath, 'session');
-    const game = session['game_id'];
+    const game = field(session, 'game_id');
     if (
-      typeof game !== 'string' ||
+      !isJsonString(game) ||
       !GAME_ID_RE.test(game) ||
-      typeof session['agent_token'] !== 'string'
+      !isJsonString(field(session, 'agent_token'))
     ) {
-      return yield* Effect.fail(
+      return yield*
         playerError(
           `${target} is not a session this workspace joined. Bind a seat ` +
             'by its game with `just use GAME_ID`.'
-        )
-      );
+        );
     }
     const replaced = yield* store.bindWorkspaceSeat(sessionPath, game);
     yield* store.setCurrentSession(sessionPath);

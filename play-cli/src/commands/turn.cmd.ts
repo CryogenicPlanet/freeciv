@@ -19,7 +19,7 @@
  * refusal that costs a model turn.
  */
 import { Command, Options } from '@effect/cli';
-import { Console, Effect, Layer } from 'effect';
+import { Console, Effect } from 'effect';
 import { playerError, type PlayError } from 'src/errors';
 import { exitWith, type ExitCodeSignal } from 'src/exit';
 import { dualFloat, resolveDual } from 'src/options';
@@ -59,7 +59,7 @@ import {
   type TurnCtx,
 } from 'src/services/turn-end';
 import { mirrorFile, mirrorIsFresh, type TurnHooks } from 'src/services/turn-pages';
-import { V2Client } from 'src/services/v2-client';
+import { type V2Client } from 'src/services/v2-client';
 import type { WaitHooks } from 'src/services/wait';
 
 // ---------------------------------------------------------------------------
@@ -141,15 +141,16 @@ export const liveTurnSeams: TurnSeamsFor = (sessionPath, session) =>
   Effect.gen(function* () {
     const files = yield* PrivateFs;
     const store = yield* SessionStore;
-    const provided = Layer.merge(
-      Layer.succeed(PrivateFs, files),
-      Layer.succeed(SessionStore, store)
-    );
-    const remember = (page: PageEnvelope): Effect.Effect<void, PlayError> =>
-      Effect.provide(
-        Effect.asVoid(rememberPage(sessionPath, session, { legal: false, page })),
-        provided
+    const give = <A, E>(
+      body: Effect.Effect<A, E, PrivateFs | SessionStore>
+    ): Effect.Effect<A, E> =>
+      Effect.provideService(
+        Effect.provideService(body, PrivateFs, files),
+        SessionStore,
+        store
       );
+    const remember = (page: PageEnvelope): Effect.Effect<void, PlayError> =>
+      give(Effect.asVoid(rememberPage(sessionPath, session, { legal: false, page })));
     /**
      * `_mirror_page` (client.py:3016-3027).
      *
@@ -189,10 +190,7 @@ export const liveTurnSeams: TurnSeamsFor = (sessionPath, session) =>
       // default and every wait tick rewrites `state/header.txt` shorter than
       // CPython leaves it.
       mirrorHealth: (health, command) =>
-        Effect.provide(
-          mirrorHealth(sessionPath, health, command, { commands: V2_PROTOCOL_CARD }),
-          provided
-        ),
+        give(mirrorHealth(sessionPath, health, command, { commands: V2_PROTOCOL_CARD })),
       holderSeat,
     };
     const phaseEnd: PhaseEndDeps = {
@@ -265,8 +263,8 @@ export const emitTurn = (
     : Effect.flatMap(
         renderTurn(result, renderers, {
           aliases: options.aliases ?? null,
-          ...(options.decisions === undefined ? {} : { decisions: options.decisions }),
-          ...(options.events === undefined ? {} : { events: options.events }),
+          decisions: options.decisions,
+          events: options.events,
         }),
         render
       );
@@ -325,12 +323,12 @@ export const commandTurnDecisions = (
           option_count: row.option_count,
         })),
       });
-      return;
+      return undefined;
     }
     const label = revision === null ? 'no revision' : revisionLabel(revision);
     if (rows.length === 0) {
       yield* render([`${label} decisions 0 — no actors need orders; ${V2_ONE_CALL_END}`]);
-      return;
+      return undefined;
     }
     const lines = [`${label} decisions ${rows.length}`, ...rows.map((row) => decisionLine(row))];
     // The list closes with the batch it implies, so reading who needs orders
@@ -338,6 +336,7 @@ export const commandTurnDecisions = (
     const batched = batchFocusCommand(rows);
     if (batched !== '') lines.push(batched);
     yield* render(lines);
+    return undefined;
   });
 
 // ---------------------------------------------------------------------------
@@ -408,8 +407,8 @@ export const runTurn = (
       });
       // An applied phase end never exits non-zero because of how the wait
       // after it turned out; only the end's own status reaches here.
-      if (outcome.exitCode !== 0) return yield* Effect.fail(exitWith(outcome.exitCode));
-      return;
+      if (outcome.exitCode !== 0) return yield*exitWith(outcome.exitCode);
+      return undefined;
     }
 
     const briefing = yield* store.withRequestLock(loaded.path, turnBriefingLocked(ctx));
@@ -419,6 +418,7 @@ export const runTurn = (
       decisions: briefing.decisions,
       events: briefing.events,
     });
+    return undefined;
   });
 
 // ---------------------------------------------------------------------------

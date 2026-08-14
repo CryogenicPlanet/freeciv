@@ -23,7 +23,17 @@ import { Layer } from 'effect';
 import { V2_RESTART_COMMANDS, V2_RESTART_OPTIONS } from 'src/constants';
 import { RefusalRender, type RefusalRenderApi } from 'src/render/refusal-seam';
 import { flat, scalar } from 'src/render/primitives';
-import { isJsonObject, type JsonObject, type JsonValue } from 'src/schema/primitives';
+import {
+  field,
+  isJsonBoolean,
+  isJsonNumber,
+  isJsonObject,
+  isJsonString,
+  isJsonValue,
+  type JsonObject,
+  type JsonValue,
+  type JsonValueInput,
+} from 'src/schema/primitives';
 import type { StructuredError } from 'src/schema/error';
 import { compactJson } from 'src/services/json-output';
 
@@ -64,16 +74,16 @@ export const ERROR_REMEDIES: ReadonlyMap<string, string> = new Map([
  * assumed.  Everything outside it falls back to the compact JSON encoding,
  * which is what CPython's `json.dumps` tail did.
  */
-const scalarText = (value: unknown): string => {
+const scalarText = (value: JsonValueInput): string => {
   if (value === null || value === undefined) return '-';
-  if (typeof value === 'boolean') return value ? 'yes' : 'no';
-  if (typeof value === 'number' || typeof value === 'string') return scalar(value);
-  return compactJson(value);
+  if (isJsonBoolean(value)) return value ? 'yes' : 'no';
+  if (isJsonNumber(value) || isJsonString(value)) return scalar(value);
+  return isJsonValue(value) ? compactJson(value) : '-';
 };
 
 /** Python's `sorted(details.items())`, by key. */
 const sortedEntries = (value: JsonObject): ReadonlyArray<readonly [string, JsonValue]> =>
-  Object.entries(value).sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+  Object.entries(value).toSorted(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
 
 // ---------------------------------------------------------------------------
 // _restart_command (client.py:5825-5838)
@@ -86,15 +96,14 @@ const sortedEntries = (value: JsonObject): ReadonlyArray<readonly [string, JsonV
  * page this client cannot spell; the remedy is withheld rather than guessed at,
  * and the raw `restart=` detail still prints so nothing is silently dropped.
  */
-export const restartCommand = (value: unknown): string => {
+export const restartCommand = (value: JsonValueInput): string => {
   if (!isJsonObject(value)) return '';
-  const query = value['query'];
-  const endpoint = value['endpoint'];
-  const base = typeof endpoint === 'string' ? V2_RESTART_COMMANDS.get(endpoint) : undefined;
+  const query = field(value, 'query');
+  const endpoint = field(value, 'endpoint');
+  const base = isJsonString(endpoint) ? V2_RESTART_COMMANDS.get(endpoint) : undefined;
   if (base === undefined || !isJsonObject(query) || Object.keys(query).length === 0) return '';
-  const spellable = Object.keys(query).every((key) =>
-    (V2_RESTART_OPTIONS as ReadonlyArray<string>).includes(key)
-  );
+  const restartOptions = new Set<string>(V2_RESTART_OPTIONS);
+  const spellable = Object.keys(query).every((key) => restartOptions.has(key));
   if (!spellable) return '';
   return V2_RESTART_OPTIONS.reduce((command, key) => {
     const argument = query[key];
@@ -110,11 +119,11 @@ export const restartCommand = (value: unknown): string => {
 
 /** Say when a rate-limited request may be sent again, in seconds. */
 export const retryAfterText = (details: JsonObject): string => {
-  const seconds = details['retry_after_seconds'];
-  if (typeof seconds !== 'number' || !Number.isFinite(seconds)) return '';
+  const seconds = field(details, 'retry_after_seconds');
+  if (!isJsonNumber(seconds)) return '';
   const text = `retry the same command in ${scalar(seconds)}s`;
-  const at = details['retry_after'];
-  return typeof at === 'string' && at !== '' ? `${text} (not before ${at})` : text;
+  const at = field(details, 'retry_after');
+  return isJsonString(at) && at !== '' ? `${text} (not before ${at})` : text;
 };
 
 // ---------------------------------------------------------------------------
@@ -134,7 +143,7 @@ const revisionSuffix = (value: JsonValue | undefined): string => {
  * positionally rather than probed; anything unexpected falls back to the raw
  * payload so nothing is ever silently dropped.
  */
-export const renderErrorPayload = (payload: unknown): ReadonlyArray<string> => {
+export const renderErrorPayload = (payload: JsonValueInput): ReadonlyArray<string> => {
   if (!isJsonObject(payload) || !isJsonObject(payload['error'])) {
     return [scalarText(payload)];
   }
@@ -150,11 +159,11 @@ export const renderErrorPayload = (payload: unknown): ReadonlyArray<string> => {
   const expressed = new Set(['safe_next', 'batch_id']);
   if (isJsonObject(details)) {
     const safeNext = details['safe_next'];
-    const remedy = typeof safeNext === 'string' ? ERROR_REMEDIES.get(safeNext) : undefined;
+    const remedy = isJsonString(safeNext) ? ERROR_REMEDIES.get(safeNext) : undefined;
     if (remedy !== undefined) {
       const batchId = details['batch_id'];
       const spelled =
-        typeof batchId === 'string' && batchId !== ''
+        isJsonString(batchId) && batchId !== ''
           ? remedy.replace('--batch_id ID', `--batch_id ${batchId}`)
           : remedy;
       lines.push(`next (${scalarText(safeNext)}): ${spelled}`);

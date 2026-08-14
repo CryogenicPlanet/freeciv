@@ -9,27 +9,29 @@
  * answer "when did my turns actually open" after the fact — and it is the
  * record of every `--exec` string this workspace ran.
  */
-import { Effect } from 'effect';
+import { DateTime, Effect } from 'effect';
 import type { PlayerError } from 'src/errors';
 import type { PrivateFs } from 'src/services/private-fs';
 import {
-  CONTROL_RE,
   MAX_LOG_LINE,
   MONITOR_LOG_FILE,
   appendMirror,
   codeSlice,
   mirrorDir,
   mirrorGuard,
+  replaceControlCharacters,
 } from 'src/services/mirror/store';
 
 const pad = (value: number, width: number): string => String(value).padStart(width, '0');
 
 /** CPython's `time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())`. */
-export const localTimestamp = (at: Date = new Date()): string =>
-  `${pad(at.getFullYear(), 4)}-${pad(at.getMonth() + 1, 2)}-${pad(at.getDate(), 2)}T${pad(
-    at.getHours(),
+export const localTimestamp = (at?: Date): string => {
+  const local = at ?? DateTime.toDate(DateTime.unsafeNow());
+  return `${pad(local.getFullYear(), 4)}-${pad(local.getMonth() + 1, 2)}-${pad(local.getDate(), 2)}T${pad(
+    local.getHours(),
     2
-  )}:${pad(at.getMinutes(), 2)}:${pad(at.getSeconds(), 2)}`;
+  )}:${pad(local.getMinutes(), 2)}:${pad(local.getSeconds(), 2)}`;
+};
 
 /** `append_monitor_log` — append one stamped, sanitized line. */
 export const appendMonitorLog = (
@@ -37,14 +39,15 @@ export const appendMonitorLog = (
   line: string,
   at?: Date
 ): Effect.Effect<string, PlayerError, PrivateFs> =>
-  Effect.suspend(() => {
+  Effect.gen(function* () {
     // CPython's `[:_MAX_LOG_LINE]` counts code points; a code-unit slice would
     // split a surrogate pair in half in every logged `--exec` string.
-    const sanitized = codeSlice(String(line).replace(CONTROL_RE, ' '), 0, MAX_LOG_LINE);
-    return appendMirror(
+    const sanitized = codeSlice(replaceControlCharacters(line), 0, MAX_LOG_LINE);
+    const now = at ?? DateTime.toDate(yield* DateTime.now);
+    return yield* appendMirror(
       dir,
       MONITOR_LOG_FILE,
-      `${localTimestamp(at ?? new Date())} ${sanitized}\n`
+      `${localTimestamp(now)} ${sanitized}\n`
     );
   });
 

@@ -25,9 +25,8 @@
  * the *health envelope* rather than the finished string precisely so this file
  * never reaches into a renderer (and so it never has to import U06).
  */
-import { Effect, Either } from 'effect';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
+import { Effect } from 'effect';
+import { fileSystem, path } from 'src/services/platform';
 import { FULL_CONTROL_V2, TERMINAL_STATES, V2_SATISFIED_WAKE_REASONS } from 'src/constants';
 import { playerError, type PlayError } from 'src/errors';
 import { V2_WAIT_EXIT_ACTIVE, V2_WAIT_EXIT_RETRY, V2_WAIT_EXIT_TERMINAL } from 'src/exit';
@@ -36,6 +35,7 @@ import { decodeHealth, type HealthEnvelope, type PhaseBlock, type WaitingOnSeat 
 import { decodePage, type PageEnvelope } from 'src/schema/page';
 import type { Revision } from 'src/schema/revision';
 import { decodeWait, type WaitEnvelope, type WaitUntil, type WakeReason } from 'src/schema/wait';
+import { isJsonNumber, isJsonString, type JsonObject } from 'src/schema/primitives';
 import { V2Client } from 'src/services/v2-client';
 import { SessionStore, credentialsOf, type Session } from 'src/services/session-store';
 
@@ -226,7 +226,7 @@ export const holderRemainingS = (
   const phase = health.phase;
   if (phase === null || holderSeat(phase) === null) return null;
   const remaining = phase.timing.remaining_s;
-  if (typeof remaining !== 'number' || !Number.isFinite(remaining)) return null;
+  if (!isJsonNumber(remaining)) return null;
   return Math.max(0, remaining);
 };
 
@@ -276,9 +276,8 @@ export const legacyWaitValue = (
           // `_legacy_wait_value` asserts this; the assertion is a real
           // invariant (`_wait_value` refuses `--until revision` without a
           // baseline), so a value error here is a client bug, not a refusal.
-          return yield* Effect.fail(
-            playerError('wait --until revision requires a previously validated state page')
-          );
+          return yield*
+            playerError('wait --until revision requires a previously validated state page');
         }
         return {
           wake:
@@ -343,10 +342,10 @@ const isWaitUntil = (value: string): value is WaitUntil =>
  * router's own not-found shape; a structured v2 refusal is an object and must
  * be raised, not silently downgraded to polling.
  */
-const isMissingRouteRefusal = (status: number, value: Readonly<Record<string, unknown>>): boolean => {
+const isMissingRouteRefusal = (status: number, value: JsonObject): boolean => {
   if (status !== 404) return false;
   const names = Object.keys(value);
-  return names.length === 1 && names[0] === 'error' && typeof value['error'] === 'string';
+  return names.length === 1 && names[0] === 'error' && isJsonString(value['error']);
 };
 
 export interface WaitValueOptions {
@@ -374,28 +373,26 @@ export const waitValue = (
   Effect.gen(function* () {
     const stateless = options.stateless === true;
     if (!(args.waitS >= 0 && args.waitS <= V2_WAIT_S_MAX)) {
-      return yield* Effect.fail(
-        playerError(`wait-s must be in [0, ${formatG(V2_WAIT_S_MAX)}]`)
-      );
+      return yield*
+        playerError(`wait-s must be in [0, ${formatG(V2_WAIT_S_MAX)}]`);
     }
     if (!(args.pollS >= 0.05 && args.pollS <= 30)) {
-      return yield* Effect.fail(playerError('poll-s must be in [0.05, 30]'));
+      return yield*playerError('poll-s must be in [0.05, 30]');
     }
     const until = args.until;
     if (stateless && until !== 'phase') {
-      return yield* Effect.fail(playerError('a stateless wait is phase-mode only'));
+      return yield*playerError('a stateless wait is phase-mode only');
     }
     const store = yield* SessionStore;
     const baseline = stateless
       ? null
       : (yield* store.readState(ctx.sessionPath, ctx.session)).last_revision;
     if (!isWaitUntil(until)) {
-      return yield* Effect.fail(playerError('wait --until must be phase or revision'));
+      return yield*playerError('wait --until must be phase or revision');
     }
     if (until === 'revision' && baseline === null) {
-      return yield* Effect.fail(
-        playerError('wait --until revision requires a previously validated state page')
-      );
+      return yield*
+        playerError('wait --until revision requires a previously validated state page');
     }
 
     const client = yield* V2Client;
@@ -518,15 +515,16 @@ export const waitUntilTurn = (
         return { budget, wait, first: false, done: false };
       });
 
-    const settled = yield* Effect.iterate(
-      {
-        budget: capS === null ? args.waitS : Math.min(args.waitS, capS),
-        wait: null,
-        first: true,
-        done: false,
-      } satisfies Cycle as Cycle,
-      { while: (state) => !state.done, body: cycle }
-    );
+    const initial: Cycle = {
+      budget: capS === null ? args.waitS : Math.min(args.waitS, capS),
+      wait: null,
+      first: true,
+      done: false,
+    };
+    const settled = yield* Effect.iterate(initial, {
+      while: (state) => !state.done,
+      body: cycle,
+    });
     return settled.wait === null
       ? yield* Effect.dieMessage('unreachable: the wait cycle settled without an envelope')
       : settled.wait;
@@ -552,18 +550,17 @@ export const waitCommandValue = (
     const forTurn = options.forTurn === true;
     const maximum = options.maxS ?? null;
     if (maximum !== null && !forTurn) {
-      return yield* Effect.fail(
-        playerError('wait --max bounds --for-turn; pass both or neither')
-      );
+      return yield*
+        playerError('wait --max bounds --for-turn; pass both or neither');
     }
     if (!forTurn) return yield* waitValue(ctx, args);
     if (!(maximum === null || (maximum >= 0 && maximum <= V2_WAIT_S_MAX))) {
-      return yield* Effect.fail(playerError(`max must be in [0, ${formatG(V2_WAIT_S_MAX)}]`));
+      return yield*playerError(`max must be in [0, ${formatG(V2_WAIT_S_MAX)}]`);
     }
     return yield* waitUntilTurn(ctx, waitArgs(args), {
       forTurn: true,
       capS: maximum,
-      ...(options.echo === undefined ? {} : { echo: options.echo }),
+      echo: options.echo,
     });
   });
 
@@ -571,11 +568,8 @@ export const waitCommandValue = (
 // _seat_rebound (client.py:10698-10705)
 // ---------------------------------------------------------------------------
 
-const realPath = (target: string): string =>
-  Either.getOrElse(
-    Either.try(() => fs.realpathSync.native(target)),
-    () => path.resolve(target)
-  );
+const realPath = (target: string): Effect.Effect<string> =>
+  Effect.orElseSucceed(fileSystem.realPath(target), () => path.resolve(target));
 
 /** Whether `just use` has pointed this workspace at a different seat. */
 export const seatRebound = (
@@ -585,5 +579,7 @@ export const seatRebound = (
     const store = yield* SessionStore;
     const current = yield* Effect.either(store.resolve(''));
     if (current._tag === 'Left') return false;
-    return realPath(current.right.path) !== realPath(sessionPath);
+    const currentPath = yield* realPath(current.right.path);
+    const expectedPath = yield* realPath(sessionPath);
+    return currentPath !== expectedPath;
   });

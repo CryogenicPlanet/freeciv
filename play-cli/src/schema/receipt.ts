@@ -9,14 +9,17 @@
  * not be retryable, and a `rejected` receipt must not carry that code at all.
  */
 import { Effect } from 'effect';
-import { DriftError, invalid } from 'src/errors';
+import { type DriftError, invalid } from 'src/errors';
 import { FULL_CONTROL_V2, V2_RECEIPT_STATES } from 'src/constants';
 import {
   exact,
   field,
+  isJsonBoolean,
+  isJsonString,
   isWholeNumber,
   opaque,
   type JsonObject,
+  type JsonValue,
   type SessionIdentity,
 } from 'src/schema/primitives';
 import { decodeError, decodeV2Header, type StructuredError } from 'src/schema/error';
@@ -118,13 +121,15 @@ const FEELING_STAGES = [
 
 const MOOD_KEYS = ['happy', 'content', 'unhappy', 'angry'] as const;
 
-const nonNegativeInt = (value: unknown): value is number =>
+const nonNegativeInt = (value: JsonValue): value is number =>
   isWholeNumber(value) && value >= 0;
 
-const distinct = <T>(values: ReadonlyArray<T>): boolean => new Set(values).size === values.length;
+const distinct = (values: ReadonlyArray<string>): boolean => new Set(values).size === values.length;
+const isReceiptState = (value: JsonValue): value is ReceiptState =>
+  isJsonString(value) && V2_RECEIPT_STATES.has(value);
 
 export const decodeInvestigation = (
-  value: unknown,
+  value: JsonValue,
   revision: Revision
 ): Effect.Effect<CityInvestigationObservation, DriftError> =>
   Effect.gen(function* () {
@@ -136,13 +141,13 @@ export const decodeInvestigation = (
       field(raw, 'freshness') !== 'captured_at_receipt_revision' ||
       !revisionsEqual(own, revision)
     ) {
-      return yield* Effect.fail(invalid('city investigation observation provenance'));
+      return yield*invalid('city investigation observation provenance');
     }
     const city = yield* exact(field(raw, 'city'), CITY_FIELDS, 'city investigation observation city');
     const name = field(city, 'name');
     const size = field(city, 'size');
-    if (typeof name !== 'string' || name.length === 0 || !isWholeNumber(size) || size < 1) {
-      return yield* Effect.fail(invalid('city investigation observation city'));
+    if (!isJsonString(name) || name.length === 0 || !isWholeNumber(size) || size < 1) {
+      return yield*invalid('city investigation observation city');
     }
 
     const production = yield* exact(
@@ -154,10 +159,10 @@ export const decodeInvestigation = (
     const productionName = field(production, 'name');
     if (
       (productionKind !== 'unit' && productionKind !== 'improvement') ||
-      typeof productionName !== 'string' ||
+      !isJsonString(productionName) ||
       productionName.length === 0
     ) {
-      return yield* Effect.fail(invalid('city investigation production'));
+      return yield*invalid('city investigation production');
     }
 
     const shields = yield* exact(
@@ -168,12 +173,12 @@ export const decodeInvestigation = (
     const stock = field(shields, 'stock');
     const surplus = field(shields, 'surplus');
     if (!nonNegativeInt(stock) || !isWholeNumber(surplus)) {
-      return yield* Effect.fail(invalid('city investigation shields'));
+      return yield*invalid('city investigation shields');
     }
 
     const improvementItems = field(city, 'improvements');
     if (!Array.isArray(improvementItems) || improvementItems.length > 1024) {
-      return yield* Effect.fail(invalid('city investigation improvements'));
+      return yield*invalid('city investigation improvements');
     }
     const improvements: Array<{ readonly id: string; readonly name: string }> = [];
     for (const item of improvementItems) {
@@ -183,8 +188,8 @@ export const decodeInvestigation = (
         'city investigation improvement'
       );
       const improvementName = field(improvement, 'name');
-      if (typeof improvementName !== 'string' || improvementName.length === 0) {
-        return yield* Effect.fail(invalid('city investigation improvement'));
+      if (!isJsonString(improvementName) || improvementName.length === 0) {
+        return yield*invalid('city investigation improvement');
       }
       improvements.push({
         id: yield* opaque(field(improvement, 'id'), 'improvement ID'),
@@ -195,7 +200,7 @@ export const decodeInvestigation = (
       !distinct(improvements.map((item) => item.id)) ||
       !distinct(improvements.map((item) => item.name))
     ) {
-      return yield* Effect.fail(invalid('city investigation improvements'));
+      return yield*invalid('city investigation improvements');
     }
 
     const citizens = yield* exact(
@@ -206,31 +211,32 @@ export const decodeInvestigation = (
 
     const feelingItems = field(citizens, 'feelings');
     if (!Array.isArray(feelingItems) || feelingItems.length !== FEELING_STAGES.length) {
-      return yield* Effect.fail(invalid('city investigation feelings'));
+      return yield*invalid('city investigation feelings');
     }
     const feelings: CityFeeling[] = [];
     for (const [index, item] of feelingItems.entries()) {
       const feeling = yield* exact(item, FEELING_FIELDS, 'city investigation feeling');
-      const moods = MOOD_KEYS.map((key) => field(feeling, key));
+      const stage = FEELING_STAGES.at(index);
+      const happy = field(feeling, MOOD_KEYS[0]);
+      const content = field(feeling, MOOD_KEYS[1]);
+      const unhappy = field(feeling, MOOD_KEYS[2]);
+      const angry = field(feeling, MOOD_KEYS[3]);
       if (
-        field(feeling, 'stage') !== FEELING_STAGES[index] ||
-        moods.some((mood) => !nonNegativeInt(mood))
+        stage === undefined ||
+        field(feeling, 'stage') !== stage ||
+        !nonNegativeInt(happy) ||
+        !nonNegativeInt(content) ||
+        !nonNegativeInt(unhappy) ||
+        !nonNegativeInt(angry)
       ) {
-        return yield* Effect.fail(invalid('city investigation feeling'));
+        return yield*invalid('city investigation feeling');
       }
-      const [happy, content, unhappy, angry] = moods as [number, number, number, number];
-      feelings.push({
-        stage: FEELING_STAGES[index],
-        happy,
-        content,
-        unhappy,
-        angry,
-      });
+      feelings.push({ stage, happy, content, unhappy, angry });
     }
 
     const specialistItems = field(citizens, 'specialists');
     if (!Array.isArray(specialistItems) || specialistItems.length > 256) {
-      return yield* Effect.fail(invalid('city investigation specialists'));
+      return yield*invalid('city investigation specialists');
     }
     const specialists: Array<{ readonly id: string; readonly name: string; readonly count: number }> =
       [];
@@ -239,11 +245,11 @@ export const decodeInvestigation = (
       const specialistName = field(specialist, 'name');
       const count = field(specialist, 'count');
       if (
-        typeof specialistName !== 'string' ||
+        !isJsonString(specialistName) ||
         specialistName.length === 0 ||
         !nonNegativeInt(count)
       ) {
-        return yield* Effect.fail(invalid('city investigation specialist'));
+        return yield*invalid('city investigation specialist');
       }
       specialists.push({
         id: yield* opaque(field(specialist, 'id'), 'specialist ID'),
@@ -255,7 +261,7 @@ export const decodeInvestigation = (
       !distinct(specialists.map((item) => item.id)) ||
       !distinct(specialists.map((item) => item.name))
     ) {
-      return yield* Effect.fail(invalid('city investigation specialists'));
+      return yield*invalid('city investigation specialists');
     }
 
     const specialistPopulation = specialists.reduce((total, item) => total + item.count, 0);
@@ -269,7 +275,7 @@ export const decodeInvestigation = (
         size
     );
     if (inconsistent) {
-      return yield* Effect.fail(invalid('city investigation population'));
+      return yield*invalid('city investigation population');
     }
 
     return {
@@ -317,7 +323,7 @@ export interface ReceiptOptions {
 }
 
 export const decodeReceipt = (
-  value: unknown,
+  value: JsonValue,
   session: SessionIdentity,
   options: ReceiptOptions = {}
 ): Effect.Effect<CommandReceipt, DriftError> =>
@@ -329,40 +335,39 @@ export const decodeReceipt = (
     const idempotent = field(raw, 'idempotent');
     if (
       (options.batchId !== undefined && receiptBatch !== options.batchId) ||
-      typeof state !== 'string' ||
-      !V2_RECEIPT_STATES.has(state) ||
-      typeof idempotent !== 'boolean'
+      !isReceiptState(state) ||
+      !isJsonBoolean(idempotent)
     ) {
-      return yield* Effect.fail(invalid('v2 receipt'));
+      return yield*invalid('v2 receipt');
     }
-    const receiptState = state as ReceiptState;
+    const receiptState = state;
 
     const terminalError = receiptState === 'rejected' || receiptState === 'ambiguous';
     let error: StructuredError | null = null;
     if (terminalError) {
       const decoded = yield* decodeError(field(raw, 'error'));
       if (decoded.state_revision === null || !revisionsEqual(decoded.state_revision, revision)) {
-        return yield* Effect.fail(invalid('v2 receipt error revision'));
+        return yield*invalid('v2 receipt error revision');
       }
       if (
         receiptState === 'ambiguous' &&
         (decoded.error.code !== 'action_outcome_ambiguous' || decoded.error.retryable)
       ) {
-        return yield* Effect.fail(invalid('ambiguous receipt'));
+        return yield*invalid('ambiguous receipt');
       }
       if (receiptState === 'rejected' && decoded.error.code === 'action_outcome_ambiguous') {
-        return yield* Effect.fail(invalid('rejected receipt'));
+        return yield*invalid('rejected receipt');
       }
       error = decoded;
     } else if (field(raw, 'error') !== null) {
-      return yield* Effect.fail(invalid('v2 receipt error'));
+      return yield*invalid('v2 receipt error');
     }
 
     const rawObservation = field(raw, 'observation');
     let observation: CityInvestigationObservation | null = null;
     if (rawObservation !== null) {
       if (receiptState !== 'applied') {
-        return yield* Effect.fail(invalid('v2 receipt observation'));
+        return yield*invalid('v2 receipt observation');
       }
       observation = yield* decodeInvestigation(rawObservation, revision);
     }

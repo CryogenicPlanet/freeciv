@@ -31,9 +31,9 @@ import {
 } from 'src/render/primitives';
 import { surplusText } from 'src/render/state/cities';
 import { cityOutputRows } from 'src/render/state/city-outputs';
+import { isJsonString, isWholeNumber } from 'src/schema/primitives';
 
-const isInteger = (value: JsonValue): value is number =>
-  typeof value === 'number' && Number.isInteger(value);
+const isInteger = isWholeNumber;
 
 /**
  * Say where the food is going, in the words the growth counter means.
@@ -57,7 +57,7 @@ export const cityGranaryText = (
     if (isInteger(food)) parts.push(`food ${food < 0 ? food : `+${food}`}/turn`);
     const turns = storage['growth_turns'] ?? null;
     if (turns === null) parts.push('no growth');
-    else if (!isInteger(turns)) return yield* Effect.fail(drift('city growth turns'));
+    else if (!isInteger(turns)) return yield*drift('city growth turns');
     else if (turns > 0) parts.push(`grows in ${turns}t`);
     else if (turns === 0) parts.push('!full, growth blocked');
     else parts.push(`!starving, famine in ${-turns}t`);
@@ -77,13 +77,14 @@ export const cityCitizensText = (item: JsonValue): Effect.Effect<string, PlayerE
     const fields = isJsonObject(item) ? item : {};
     const citizens = fields['citizens'] ?? null;
     if (!isJsonObject(citizens)) return '';
-    const moods = MOODS.map((name) => citizens[name] ?? null);
-    if (moods.some((value) => !isInteger(value))) {
-      return yield* Effect.fail(drift('city citizens'));
+    const counts = new Map<string, number>();
+    for (const name of MOODS) {
+      const value = citizens[name] ?? null;
+      if (!isInteger(value)) return yield* drift('city citizens');
+      counts.set(name, value);
     }
-    const counted = moods as ReadonlyArray<number>;
     const parts = [`citizens ${scalar(fields['size'] ?? null)}:`];
-    const listed = MOODS.map((name, index) => [name, counted[index] as number] as const)
+    const listed = MOODS.map((name) => [name, counts.get(name) ?? 0] as const)
       .filter(([, value]) => value !== 0)
       .map(([name, value]) => `${value} ${name}`);
     parts.push(listed.length > 0 ? listed.join(', ') : 'none placed');
@@ -91,7 +92,9 @@ export const cityCitizensText = (item: JsonValue): Effect.Effect<string, PlayerE
     if (isInteger(specialists) && specialists !== 0) {
       parts.push(`+ ${specialists} specialist`);
     }
-    const [happy, , unhappy, angry] = counted as [number, number, number, number];
+    const happy = counts.get('happy') ?? 0;
+    const unhappy = counts.get('unhappy') ?? 0;
+    const angry = counts.get('angry') ?? 0;
     if (happy < unhappy + 2 * angry) parts.push('!disorder');
     if (fields['citizen_counts_consistent'] === false) {
       parts.push('!counts self-healed by the server, not a partition');
@@ -163,7 +166,7 @@ export const cityManagementLines = (item: JsonValue): ReadonlyArray<string> => {
   if (isJsonObject(options)) {
     if (options['allow_disband'] === true) parts.push('!allow_disband');
     const citizens = options['new_citizens'] ?? null;
-    if (typeof citizens === 'string' && citizens !== '' && citizens !== 'default') {
+    if (isJsonString(citizens) && citizens !== '' && citizens !== 'default') {
       parts.push(`!new_citizens=${citizens}`);
     }
     if (options['conflict'] === true) parts.push('!options_conflict');

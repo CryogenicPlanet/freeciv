@@ -1,10 +1,11 @@
 /**
- * Opaque-ID shape predicates.
+ * Opaque-ID domain schemas.
  *
  * The regexes live in `src/constants.ts`; this module is the typed vocabulary
  * every other decoder and every alias table reads them through, so no unit
  * re-derives "is this an actor ID" from a raw pattern.
  */
+import { Schema } from 'effect';
 import {
   ACTOR_ID_RE,
   ALIAS_ENTITY_TYPES,
@@ -18,36 +19,28 @@ import {
   RELATION_ID_RE,
   TILE_ID_RE,
 } from 'src/constants';
+import { isJsonString, type JsonValue } from 'src/schema/primitives';
 
 export type ActorType = 'player' | 'city' | 'unit';
 export const ACTOR_TYPES: ReadonlySet<string> = new Set<ActorType>(['player', 'city', 'unit']);
 
-export const isOpaqueId = (value: unknown): value is string =>
-  typeof value === 'string' && OPAQUE_ID_RE.test(value);
+const identifierSchema = (identifier: string, pattern: RegExp) =>
+  Schema.String.pipe(Schema.pattern(pattern)).annotations({ identifier });
 
-export const isGameId = (value: unknown): value is string =>
-  typeof value === 'string' && GAME_ID_RE.test(value);
+export const isOpaqueId = Schema.is(identifierSchema('OpaqueId', OPAQUE_ID_RE));
+export const isGameId = Schema.is(identifierSchema('GameId', GAME_ID_RE));
+export const isControllerName = Schema.is(identifierSchema('ControllerName', CONTROLLER_RE));
+export const isActorId = Schema.is(identifierSchema('ActorId', ACTOR_ID_RE));
+export const isRelationId = Schema.is(identifierSchema('RelationId', RELATION_ID_RE));
+export const isTileId = Schema.is(identifierSchema('TileId', TILE_ID_RE));
+export const isCityId = Schema.is(identifierSchema('CityId', CITY_ID_RE));
+export const isCursor = Schema.is(identifierSchema('Cursor', CURSOR_RE));
+export const isCatalogId = Schema.is(identifierSchema('CatalogId', CATALOG_RE));
 
-export const isControllerName = (value: unknown): value is string =>
-  typeof value === 'string' && CONTROLLER_RE.test(value);
-
-export const isActorId = (value: unknown): value is string =>
-  typeof value === 'string' && ACTOR_ID_RE.test(value);
-
-export const isRelationId = (value: unknown): value is string =>
-  typeof value === 'string' && RELATION_ID_RE.test(value);
-
-export const isTileId = (value: unknown): value is string =>
-  typeof value === 'string' && TILE_ID_RE.test(value);
-
-export const isCityId = (value: unknown): value is string =>
-  typeof value === 'string' && CITY_ID_RE.test(value);
-
-export const isCursor = (value: unknown): value is string =>
-  typeof value === 'string' && CURSOR_RE.test(value);
-
-export const isCatalogId = (value: unknown): value is string =>
-  typeof value === 'string' && CATALOG_RE.test(value);
+const ActorTypeSchema = Schema.Literal('player', 'city', 'unit').annotations({
+  identifier: 'ActorType',
+});
+export const isActorType = Schema.is(ActorTypeSchema);
 
 /** `"unit_0123…"` → `"unit"`. Python spells this `actor_id.split("_", 1)[0]`. */
 export const idPrefix = (identifier: string): string => {
@@ -55,23 +48,17 @@ export const idPrefix = (identifier: string): string => {
   return cut < 0 ? identifier : identifier.slice(0, cut);
 };
 
-export const isActorType = (value: unknown): value is ActorType =>
-  typeof value === 'string' && ACTOR_TYPES.has(value);
-
-/**
- * Report whether a stored entity alias still names its own ID type.
- * Ports `_entity_alias_id_matches` (client.py:1625-1634).
- */
-export const entityAliasIdMatches = (alias: string, identifier: unknown): boolean => {
+/** Report whether a stored entity alias still names its own ID type. */
+export const entityAliasIdMatches = (alias: string, identifier: JsonValue): boolean => {
   const match = ENTITY_ALIAS_RE.exec(alias);
-  if (match === null || typeof identifier !== 'string') {
+  if (match === null || !isJsonString(identifier)) {
     return false;
   }
   const prefix = match[1];
   if (prefix === undefined) {
     return false;
   }
-  const kind = ALIAS_ENTITY_TYPES[prefix];
+  const kind = ALIAS_ENTITY_TYPES.get(prefix);
   if (kind === undefined) {
     return false;
   }

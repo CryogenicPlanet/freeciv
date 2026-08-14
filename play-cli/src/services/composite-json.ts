@@ -9,21 +9,23 @@
  * consumer that already parses `just wait --json` or `just turn --json` parses
  * the composite's members unchanged.
  */
-/**
- * Anything a composite part can be.
- *
- * Deliberately `unknown`: the parts are *validated envelopes* — a
- * `BatchDisposition`, a `WaitEnvelope`, a `TurnResult` — and narrowing the type
- * here would only force a cast at every call site without proving anything the
- * decoders have not already proved.
- */
-export type CompositePart = unknown;
+import type { TurnResult } from 'src/render/turn';
+import type { BatchDisposition } from 'src/schema/batch';
+import type { WaitEnvelope } from 'src/schema/wait';
+
+/** Anything a composite part can be — each member is already a validated envelope. */
+export type CompositePart =
+  | BatchDisposition
+  | WaitEnvelope
+  | TurnResult
+  | string
+  | null;
 
 export interface CompositeJson {
   readonly schema_version: 1;
   readonly command: string;
   readonly status: 'briefed';
-  readonly [part: string]: unknown;
+  readonly [part: string]: CompositePart | 1 | string;
 }
 
 /** Shape the one-call composite: the parts, each exactly as it was. */

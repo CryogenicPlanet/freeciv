@@ -13,7 +13,14 @@
  */
 import { Effect } from 'effect';
 import type { PlayerError } from 'src/errors';
-import { isJsonObject, type JsonObject } from 'src/schema/primitives';
+import {
+  isJsonObject,
+  isJsonString,
+  isWholeNumber,
+  type JsonObject,
+  type JsonValue,
+  type JsonValueInput,
+} from 'src/schema/primitives';
 import {
   DEFAULT_PROBABILITY,
   cell,
@@ -32,20 +39,19 @@ export const ACTION_COLUMNS: ReadonlyArray<string> = [
 ];
 
 /** `_argument_names` — `{name* count}`, required arguments starred. */
-export const argumentNames = (schema: unknown): string => {
+export const argumentNames = (schema: JsonValue): string => {
   if (!isJsonObject(schema)) return '-';
   const properties = schema['properties'];
   if (!isJsonObject(properties) || Object.keys(properties).length === 0) return '-';
   const required = schema['required'];
-  const names = new Set<unknown>(Array.isArray(required) ? required : []);
+  const names = new Set(Array.isArray(required) ? required.filter(isJsonString) : []);
   return `{${Object.keys(properties)
     .map((name) => (names.has(name) ? `${cell(name)}*` : cell(name)))
     .join(' ')}}`;
 };
 
 /** `isinstance(value, int)` for a coordinate — a JSON integer, never a bool. */
-const isCoordinate = (value: unknown): value is number =>
-  typeof value === 'number' && Number.isInteger(value);
+const isCoordinate = (value: JsonValueInput): value is number => isWholeNumber(value);
 
 /** `_target_text` — coordinates first, then a name, then the bare type. */
 export const targetText = (subject: JsonObject): string => {
@@ -55,13 +61,13 @@ export const targetText = (subject: JsonObject): string => {
   const y = target['y'];
   if (isCoordinate(x) && isCoordinate(y)) return `${x},${y}`;
   const name = target['name'];
-  if (typeof name === 'string' && name !== '') return cell(name);
+  if (isJsonString(name) && name !== '') return cell(name);
   const kind = target['type'];
-  return typeof kind === 'string' ? cell(kind) : '-';
+  return isJsonString(kind) ? cell(kind) : '-';
 };
 
 /** Python's `probability == _DEFAULT_PROBABILITY` — exact key set, equal values. */
-const isDefaultProbability = (value: unknown): boolean => {
+const isDefaultProbability = (value: JsonValue): boolean => {
   if (!isJsonObject(value)) return false;
   const defaults = Object.entries(DEFAULT_PROBABILITY);
   return (
@@ -70,7 +76,7 @@ const isDefaultProbability = (value: unknown): boolean => {
   );
 };
 
-const probabilityFlag = (probability: unknown): string => {
+const probabilityFlag = (probability: JsonValue): string => {
   if (!isJsonObject(probability)) return `p=${cell(probability)}`;
   const kind = cell(probability['kind']);
   const low = probability['minimum_percent'] ?? null;
@@ -84,7 +90,7 @@ const probabilityFlag = (probability: unknown): string => {
 /** `_action_flags` — everything about this capability that is not the default. */
 export const actionFlags = (subject: JsonObject, scopeActor: string | null): string => {
   const flags: string[] = [];
-  const probability = subject['probability'];
+  const probability = subject['probability'] ?? null;
   if (Object.hasOwn(subject, 'probability') && !isDefaultProbability(probability)) {
     flags.push(probabilityFlag(probability));
   }
@@ -113,7 +119,7 @@ export const actionFlags = (subject: JsonObject, scopeActor: string | null): str
 
 /** `_render_actions` — project one legal-actions page into catalog rows. */
 export const renderActions = (
-  items: ReadonlyArray<unknown>,
+  items: ReadonlyArray<JsonValue>,
   aliases: MirrorAliases | null | undefined,
   scopeActor: string | null
 ): Effect.Effect<RenderedSection, PlayerError> => {
@@ -135,7 +141,7 @@ export const renderActions = (
       named === undefined ? '-' : cell(named),
       cell(item['kind']),
       targetText(subject),
-      argumentNames(item['arguments_schema']),
+      argumentNames(item['arguments_schema'] ?? null),
       cell(item['label']),
       actionFlags(subject, scopeActor),
     ]);

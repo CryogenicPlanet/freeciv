@@ -4,15 +4,17 @@
  * Ports `_validate_descriptor` (client.py:1364-1394).
  */
 import { Effect } from 'effect';
-import { DriftError, invalid } from 'src/errors';
+import { type DriftError, invalid } from 'src/errors';
 import { ACTION_KIND_RE } from 'src/constants';
 import {
   exact,
   field,
   isJsonObject,
+  isJsonString,
   jsonObject,
   opaque,
   type JsonObject,
+  type JsonValue,
 } from 'src/schema/primitives';
 import { decodeRevision, revisionsEqual, type Revision } from 'src/schema/revision';
 
@@ -43,7 +45,7 @@ const LABEL_MAX = 240;
  * `DriftError.label` field renderers key remedies off.
  */
 export const decodeDescriptor = (
-  value: unknown,
+  value: JsonValue,
   revision: Revision,
   label = 'legal action descriptor'
 ): Effect.Effect<LegalActionDescriptor, DriftError> =>
@@ -55,19 +57,19 @@ export const decodeDescriptor = (
     const subject = field(raw, 'subject');
     const argumentsSchema = field(raw, 'arguments_schema');
     if (
-      typeof kind !== 'string' ||
+      !isJsonString(kind) ||
       !ACTION_KIND_RE.test(kind) ||
-      typeof descriptorLabel !== 'string' ||
+      !isJsonString(descriptorLabel) ||
       descriptorLabel.trim().length === 0 ||
       descriptorLabel.length > LABEL_MAX ||
       !isJsonObject(subject) ||
       !isJsonObject(argumentsSchema)
     ) {
-      return yield* Effect.fail(invalid('legal action descriptor'));
+      return yield*invalid('legal action descriptor');
     }
     const own = yield* decodeRevision(field(raw, 'state_revision'));
     if (!revisionsEqual(own, revision)) {
-      return yield* Effect.fail(invalid('legal action descriptor'));
+      return yield*invalid('legal action descriptor');
     }
     return {
       action_id: actionId,

@@ -17,7 +17,7 @@
  * and a safety net under `--await` when it is running.
  */
 import { Command, Options } from '@effect/cli';
-import { Effect, Option } from 'effect';
+import { DateTime, Effect, Option, Schema } from 'effect';
 import { playerError, type PlayerError, type SessionMissingError , attemptOr } from 'src/errors';
 import { exitWith, isExitCode, V2_WAIT_EXIT_RETRY } from 'src/exit';
 import { dualFloat, resolveDual } from 'src/options';
@@ -29,15 +29,15 @@ import {
   monitorStoppedLine,
 } from 'src/render/monitor';
 import { render } from 'src/render/primitives';
-import type { JsonObject } from 'src/schema/primitives';
+import { field, isWholeNumber, type JsonObject } from 'src/schema/primitives';
 import { jsonRequested } from 'src/services/json-output';
 import { mirrorPath, readPhaseMarker } from 'src/services/mirror';
 import { monitorExecRefusal, monitorExecRefusalMessage, V2_MONITOR_MAX_EXIT_CODE } from 'src/services/monitor-hook';
 import { monitorHolder, withMonitorLock } from 'src/services/monitor-lock';
 import { liveMonitorSeams, monitorLoop, type MonitorSeams } from 'src/services/monitor-loop';
-import { PrivateFs } from 'src/services/private-fs';
+import { type PrivateFs } from 'src/services/private-fs';
 import { SessionStore, type Session } from 'src/services/session-store';
-import { V2Client } from 'src/services/v2-client';
+import { type V2Client } from 'src/services/v2-client';
 import { systemWaitClock, waitArgs, type WaitClock } from 'src/services/wait';
 
 // ---------------------------------------------------------------------------
@@ -47,6 +47,10 @@ import { systemWaitClock, waitArgs, type WaitClock } from 'src/services/wait';
 /** What `os.kill(pid, SIGTERM)` did. */
 export type KillOutcome = 'signalled' | 'gone' | 'forbidden';
 
+const ProcessErrorSchema = Schema.Struct({ code: Schema.String }).annotations({
+  identifier: 'ProcessError',
+});
+
 export const systemKill = (pid: number): Effect.Effect<KillOutcome> =>
   Effect.sync(() =>
     attemptOr(
@@ -55,9 +59,9 @@ export const systemKill = (pid: number): Effect.Effect<KillOutcome> =>
         return 'signalled';
       },
       (cause) => {
-        const code = (cause as NodeJS.ErrnoException).code;
-        if (code === 'ESRCH') return 'gone';
-        if (code === 'EPERM') return 'forbidden';
+        if (!Schema.is(ProcessErrorSchema)(cause)) return 'signalled';
+        if (cause.code === 'ESRCH') return 'gone';
+        if (cause.code === 'EPERM') return 'forbidden';
         return 'signalled';
       }
     )
@@ -90,8 +94,10 @@ export interface MonitorHarness {
 const pad = (value: number): string => String(value).padStart(2, '0');
 
 /** CPython's `datetime.now().strftime("%H:%M:%S")`. */
-export const holderSince = (at: Date = new Date()): string =>
-  `${pad(at.getHours())}:${pad(at.getMinutes())}:${pad(at.getSeconds())}`;
+export const holderSince = (at?: Date): string => {
+  const local = at ?? DateTime.toDate(DateTime.unsafeNow());
+  return `${pad(local.getHours())}:${pad(local.getMinutes())}:${pad(local.getSeconds())}`;
+};
 
 export const liveMonitorHarness: MonitorHarness = {
   seams: (sessionPath, session) => liveMonitorSeams(sessionPath, session),
@@ -149,14 +155,13 @@ export const monitorStop = (
       yield* render([MONITOR_NOT_RUNNING]);
       return 0;
     }
-    const pid = holder['pid'];
-    if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 1) {
-      return yield* Effect.fail(
+    const pid = field(holder, 'pid');
+    if (!isWholeNumber(pid) || pid <= 1) {
+      return yield*
         playerError(
           'the monitor lock does not name a process to stop; if a monitor is ' +
             'still running, stop it where it was started'
-        )
-      );
+        );
     }
     const outcome = yield* harness.kill(pid);
     if (outcome === 'gone') {
@@ -165,7 +170,7 @@ export const monitorStop = (
       return 0;
     }
     if (outcome === 'forbidden') {
-      return yield* Effect.fail(playerError(`the monitor (pid ${pid}) belongs to another user`));
+      return yield*playerError(`the monitor (pid ${pid}) belongs to another user`);
     }
     const deadline = (yield* harness.clock.monotonic()) + MONITOR_STOP_TIMEOUT_S;
     const stopped = yield* Effect.iterate(
@@ -189,12 +194,11 @@ export const monitorStop = (
       yield* render([monitorStoppedLine(pid)]);
       return 0;
     }
-    return yield* Effect.fail(
+    return yield*
       playerError(
         `the monitor (pid ${pid}) did not stop within 5s; it is mid-request ` +
           'and will exit at the end of it — re-run `just monitor --stop`'
-      )
-    );
+      );
   });
 
 // ---------------------------------------------------------------------------
@@ -242,14 +246,13 @@ export const commandMonitor = (
   Effect.gen(function* () {
     const exitCode = Math.trunc(options.exitCode || 0);
     if (!(exitCode >= 0 && exitCode <= V2_MONITOR_MAX_EXIT_CODE)) {
-      return yield* Effect.fail(
-        playerError(`--exit-code must be in [0, ${V2_MONITOR_MAX_EXIT_CODE}]`)
-      );
+      return yield*
+        playerError(`--exit-code must be in [0, ${V2_MONITOR_MAX_EXIT_CODE}]`);
     }
     const hook = options.exec.trim();
     const refused = hook === '' ? '' : monitorExecRefusal(hook);
     if (refused !== '') {
-      return yield* Effect.fail(playerError(monitorExecRefusalMessage(refused)));
+      return yield*playerError(monitorExecRefusalMessage(refused));
     }
 
     const store = yield* SessionStore;
@@ -379,7 +382,10 @@ export const monitorCommandWith = (harness: MonitorHarness) =>
           harness
         );
         if (status === 0) return;
-        if (isExitCode(status)) return yield* Effect.fail(exitWith(status));
+        if (isExitCode(status)) {
+          yield* Effect.asVoid(exitWith(status));
+          return;
+        }
         // `--exit-code N` promises "exit with this status", `N ∈ [0, 255]`, and
         // CPython's `sys.exit(int(handler(args)))` hands it to the process
         // verbatim.  The CLI's own channel is `ExitCodeSignal`, typed
@@ -389,7 +395,7 @@ export const monitorCommandWith = (harness: MonitorHarness) =>
         // opened, which is exactly the incident the flag exists to prevent.  So
         // the out-of-contract statuses leave here rather than through
         // `cli-main`; NOTES.md §18.2 has the core-side fix that retires this.
-        return yield* harness.exitProcess(status);
+        yield* Effect.asVoid(harness.exitProcess(status));
       })
   );
 

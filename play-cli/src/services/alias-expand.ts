@@ -52,13 +52,13 @@ const byCodePoint = (left: string, right: string): number =>
 export const closestAliases = (known: ReadonlyArray<string>, wanted: string): string => {
   if (known.length === 0) return 'none are known yet';
   const index = aliasNumber(wanted);
-  const nearest = [...known].sort((left, right) => {
+  const nearest = [...known].toSorted((left, right) => {
     const distance = Math.abs(aliasNumber(left) - index) - Math.abs(aliasNumber(right) - index);
     return distance !== 0 ? distance : byCodePoint(left, right);
   });
   const shown = nearest
     .slice(0, 8)
-    .sort((left, right) => aliasNumber(left) - aliasNumber(right))
+    .toSorted((left, right) => aliasNumber(left) - aliasNumber(right))
     .join(' ');
   return shown + (nearest.length > 8 ? ' …' : '');
 };
@@ -79,10 +79,10 @@ export const aliasRefreshCommand = (
 ): Effect.Effect<string, never, SessionStore> =>
   Effect.gen(function* () {
     const store = yield* SessionStore;
-    const ambiguous = yield* Effect.match(store.sessionPath(''), {
-      onFailure: () => true,
-      onSuccess: (resolved) => resolveExisting(resolved) !== resolveExisting(sessionPath),
-    });
+    const resolved = yield* Effect.either(store.sessionPath(''));
+    const ambiguous = resolved._tag === 'Left'
+      ? true
+      : (yield* resolveExisting(resolved.right)) !== (yield* resolveExisting(sessionPath));
     const suffix = actorId === '' ? '' : ` --actor_id ${actorId} --all`;
     return `just legal${ambiguous ? ` --session ${sessionPath}` : ''}${suffix}`;
   });
@@ -114,28 +114,25 @@ export const expandActionAlias = (
       const known = Object.keys(table.by_alias);
       if (known.length === 0) {
         const remedy = yield* aliasRefreshCommand(sessionPath, '');
-        return yield* Effect.fail(
+        return yield*
           playerError(
             `unknown action alias ${alias}: no legal-action catalog has ` +
               `been read yet; run \`${remedy}\``
-          )
-        );
+          );
       }
       const nearest = closestAliases(known, alias);
       if (stale && recorded !== null) {
         const remedy = yield* aliasRefreshCommand(sessionPath, '');
-        return yield* Effect.fail(
+        return yield*
           playerError(
             `unknown action alias ${alias}: it was never enumerated, and ` +
               `the aliases that were (${nearest}) died with ` +
               `${revisionLabel(recorded)}; re-enumerate ` +
               `with \`${remedy}\``
-          )
-        );
+          );
       }
-      return yield* Effect.fail(
-        playerError(`unknown action alias ${alias}; this revision enumerated ${nearest}`)
-      );
+      return yield*
+        playerError(`unknown action alias ${alias}; this revision enumerated ${nearest}`);
     }
     if (stale && recorded !== null) {
       const entities = yield* parseEntityAliases(state.entity_aliases);
@@ -144,15 +141,14 @@ export const expandActionAlias = (
       );
       const scope = byIdentifier.get(entry.actor_id) ?? entry.actor_id;
       const remedy = yield* aliasRefreshCommand(sessionPath, scope);
-      return yield* Effect.fail(
+      return yield*
         playerError(
           `action alias ${alias} was enumerated at ` +
             `${revisionLabel(recorded)} but this seat now ` +
             `knows ${current === null ? 'no revision' : revisionLabel(current)}` +
             '; action aliases die with their revision. Re-enumerate with ' +
             `\`${remedy}\` and use the new a1..aN`
-        )
-      );
+        );
     }
     return entry.action_id;
   });
@@ -171,14 +167,13 @@ export const expandEntityAlias = (
     const identifier = entities[alias];
     if (identifier !== undefined) return identifier;
     const prefix = alias.slice(0, 1);
-    const kind = ALIAS_ENTITY_TYPES[prefix] ?? prefix;
+    const kind = ALIAS_ENTITY_TYPES.get(prefix) ?? prefix;
     const known = Object.keys(entities).filter((candidate) => candidate.startsWith(prefix));
-    return yield* Effect.fail(
+    return yield*
       playerError(
         `unknown ${kind} alias ${alias}; known ${kind} aliases: ` +
           closestAliases(known, alias)
-      )
-    );
+      );
   });
 
 // ---------------------------------------------------------------------------
@@ -200,19 +195,18 @@ export const expandTileAlias = (
       return Math.abs(Number.parseInt(left, 10) - x) + Math.abs(Number.parseInt(right, 10) - y);
     };
     const known = Object.keys(tiles)
-      .sort((left, right) => {
+      .toSorted((left, right) => {
         const spread = distance(left) - distance(right);
         return spread !== 0 ? spread : byCodePoint(left, right);
       })
       .slice(0, 6);
     const nearest =
       known.length === 0 ? 'none are cached yet' : known.map((key) => `T(${key})`).join(' ');
-    return yield* Effect.fail(
+    return yield*
       playerError(
         `unknown tile T(${x},${y}): no page this seat has read named that ` +
           `coordinate. Nearest cached tiles: ${nearest}`
-      )
-    );
+      );
   });
 
 // ---------------------------------------------------------------------------

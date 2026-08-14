@@ -16,7 +16,12 @@
  */
 import { Effect } from 'effect';
 import { type PlayerError } from 'src/errors';
-import { isJsonObject } from 'src/schema/primitives';
+import {
+  isJsonObject,
+  isWholeNumber,
+  type JsonValue,
+  type JsonValueInput,
+} from 'src/schema/primitives';
 import {
   MISSING,
   cell,
@@ -24,6 +29,7 @@ import {
   mirrorError,
   pair,
   type MirrorAliases,
+  type MirrorCellValue,
 } from 'src/services/mirror';
 import type { RenderedSection } from 'src/render/mirror/section';
 
@@ -39,19 +45,18 @@ const COUNT_NAMES: ReadonlyArray<string> = [
 ];
 
 /** CPython truthiness, for `score.components`' `if value` filter. */
-const truthy = (value: unknown): boolean => {
+const truthy = (value: JsonValue): boolean => {
   if (Array.isArray(value)) return value.length > 0;
   if (isJsonObject(value)) return Object.keys(value).length > 0;
   return Boolean(value);
 };
 
 /** `isinstance(value, int) and not isinstance(value, bool)`. */
-const isInteger = (value: unknown): value is number =>
-  typeof value === 'number' && Number.isInteger(value);
+const isInteger = isWholeNumber;
 
 /** `_render_overview` — project the overview item into `fact`/`value` rows. */
 export const renderOverview = (
-  items: ReadonlyArray<unknown>,
+  items: ReadonlyArray<JsonValueInput>,
   _aliases?: MirrorAliases | null
 ): Effect.Effect<RenderedSection, PlayerError> => {
   const item = items[0];
@@ -62,7 +67,7 @@ export const renderOverview = (
     return Effect.fail(mirrorError('overview item is not an object'));
   }
   const rows: Array<ReadonlyArray<string>> = [];
-  const add = (name: string, value: unknown): void => {
+  const add = (name: string, value: MirrorCellValue): void => {
     if (value !== MISSING) rows.push([name, cell(value)]);
   };
 

@@ -15,15 +15,14 @@
  * empty-state shape belong to U03 and arrive through {@link V2StateSchema}, so
  * this file never reaches into a unit.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import { Context, Effect, Layer, Option } from 'effect';
+import type { FileSystem } from '@effect/platform';
+import { fileSystem, path } from 'src/services/platform';
+import { Context, DateTime, Effect, Either, Layer, Option, Schema } from 'effect';
 import {
-  LockTimeoutError,
-  PlayerError,
+  type LockTimeoutError,
+  type PlayerError,
   SessionMissingError,
   playerError,
-  attemptOr,
 } from 'src/errors';
 import {
   CONTROLLER_RE,
@@ -35,7 +34,12 @@ import {
 } from 'src/constants';
 import {
   decodeEvaluationContext,
+  field,
+  hasField,
+  isJsonNumber,
   isJsonObject,
+  isJsonString,
+  JsonValueSchema,
   type EvaluationContext,
   type JsonObject,
   type JsonValue,
@@ -127,7 +131,7 @@ export const credentialsOf = (session: Session): V2Credentials => ({
  */
 export interface V2StateSchemaApi {
   readonly empty: (session: Session) => V2ClientState;
-  readonly validate: (state: V2ClientState) => Effect.Effect<void, PlayerError>;
+  readonly validate: (state: JsonObject) => Effect.Effect<void, PlayerError>;
   /** `_cursor_expired` — a pending catalog whose cursor has retired. */
   readonly cursorExpired: (expiresAt: string | null) => boolean;
 }
@@ -164,7 +168,9 @@ export const V2StateSchemaDefault: Layer.Layer<V2StateSchema> = Layer.succeed(V2
   empty: emptyV2ClientState,
   validate: () => Effect.void,
   cursorExpired: (expiresAt) =>
-    expiresAt === null ? false : Date.parse(expiresAt) <= Date.now(),
+    expiresAt === null
+      ? false
+      : Date.parse(expiresAt) <= DateTime.toEpochMillis(DateTime.unsafeNow()),
 });
 
 // ---------------------------------------------------------------------------
@@ -207,13 +213,13 @@ export const sessionKey = (controller: string): string => {
 // ---------------------------------------------------------------------------
 
 const readNumber = (raw: JsonObject, key: string): number | null => {
-  const value = raw[key];
-  return typeof value === 'number' ? value : null;
+  const value = field(raw, key);
+  return isJsonNumber(value) ? value : null;
 };
 
 const readString = (raw: JsonObject, key: string): string | null => {
-  const value = raw[key];
-  return typeof value === 'string' ? value : null;
+  const value = field(raw, key);
+  return isJsonString(value) ? value : null;
 };
 
 const decodeSession = (raw: JsonObject, url: string): Session => ({
@@ -307,6 +313,14 @@ const sameKeys = (value: JsonObject, expected: ReadonlySet<string>): boolean => 
   return present.length === expected.size && present.every((key) => expected.has(key));
 };
 
+const realFileInfo = (target: string): Effect.Effect<FileSystem.File.Info | null> =>
+  Effect.gen(function* () {
+    const link = yield* Effect.either(fileSystem.readLink(target));
+    if (Either.isRight(link)) return null;
+    const info = yield* Effect.either(fileSystem.stat(target));
+    return Either.isRight(info) ? info.right : null;
+  });
+
 const makeApi = (
   workspace: WorkspacePaths,
   files: PrivateFsApi,
@@ -327,91 +341,81 @@ const makeApi = (
   const listSessions = (
     game = ''
   ): Effect.Effect<ReadonlyArray<string>, PlayerError> =>
-    Effect.sync(() => {
-      const directories = ((): ReadonlyArray<string> => {
-        if (game !== '') return [game];
-        return attemptOr(
-          (): ReadonlyArray<string> =>
-            fs
-              .readdirSync(workspace.stateRoot, { withFileTypes: true })
-              .filter((entry) => entry.isDirectory() && entry.name.startsWith('game_'))
-              .map((entry) => entry.name),
+    Effect.gen(function* () {
+      const directories: string[] = [];
+      if (game !== '') {
+        directories.push(game);
+      } else {
+        const names = yield* Effect.orElseSucceed(
+          fileSystem.readDirectory(workspace.stateRoot),
           (): ReadonlyArray<string> => []
         );
-      })();
-      const found = directories.flatMap((directory) => {
+        for (const name of names) {
+          if (!name.startsWith('game_')) continue;
+          const info = yield* realFileInfo(path.join(workspace.stateRoot, name));
+          if (info?.type === 'Directory') directories.push(name);
+        }
+      }
+      const found: string[] = [];
+      for (const directory of directories) {
         const absolute = path.join(workspace.stateRoot, directory);
-        const names = attemptOr(
-          (): ReadonlyArray<string> => fs.readdirSync(absolute),
+        const names = yield* Effect.orElseSucceed(
+          fileSystem.readDirectory(absolute),
           (): ReadonlyArray<string> => []
         );
-        return names
-          .filter((name) => name.endsWith('.json'))
-          .map((name) => path.join(absolute, name))
-          .filter((candidate) =>
-            attemptOr(
-              () => {
-                const stat = fs.lstatSync(candidate);
-                return stat.isFile() && (stat.mode & 0o777) === 0o600;
-              },
-              // A session that vanished mid-scan is simply not a session.
-              () => false
-            )
-          );
-      });
-      return [...found].sort();
+        for (const name of names) {
+          if (!name.endsWith('.json')) continue;
+          const candidate = path.join(absolute, name);
+          const info = yield* realFileInfo(candidate);
+          if (info?.type === 'File' && (info.mode & 0o777) === 0o600) found.push(candidate);
+        }
+      }
+      return found.toSorted();
     });
 
   const readSeatBinding = (): Effect.Effect<Option.Option<SeatBinding>, PlayerError> =>
     Effect.gen(function* () {
       const present = yield* files.exists(seatBindingPath);
       if (!present) return Option.none<SeatBinding>();
-      const value = yield* Effect.catchAll(
+      const value = yield* Effect.mapError(
         files.loadObject(seatBindingPath, 'workspace seat binding'),
-        (error) => Effect.fail(playerError(`${error.message}. ${SEAT_BINDING_MALFORMED}`))
+        (error) =>playerError(`${error.message}. ${SEAT_BINDING_MALFORMED}`)
       );
-      const game = value['game_id'];
-      const relative = value['session'];
-      if (
-        typeof game !== 'string' ||
-        !GAME_ID_RE.test(game) ||
-        typeof relative !== 'string' ||
-        relative === ''
-      ) {
-        return yield* Effect.fail(playerError(SEAT_BINDING_MALFORMED));
+      const game = field(value, 'game_id');
+      const relative = field(value, 'session');
+      if (!isJsonString(game) || !GAME_ID_RE.test(game) || !isJsonString(relative) || relative === '') {
+        return yield*playerError(SEAT_BINDING_MALFORMED);
       }
       const parts = relative.split(/[\\/]/);
       if (path.isAbsolute(relative) || parts.includes('..')) {
-        return yield* Effect.fail(playerError(SEAT_BINDING_MALFORMED));
+        return yield*playerError(SEAT_BINDING_MALFORMED);
       }
-      const resolved = yield* Effect.catchAll(
+      const resolved = yield* Effect.mapError(
         files.resolve(path.join(workspace.stateRoot, relative)),
-        () => Effect.fail(playerError(SEAT_BINDING_MALFORMED))
+        () =>playerError(SEAT_BINDING_MALFORMED)
       );
-      const boundAt = value['bound_at'];
+      const boundAt = field(value, 'bound_at');
       return Option.some({
         gameId: game,
         session: resolved.destination,
         relative,
-        boundAt: typeof boundAt === 'string' ? boundAt : '',
+        boundAt: isJsonString(boundAt) ? boundAt : '',
       });
     });
 
   const preconfiguredGameId = (): Effect.Effect<Option.Option<string>> =>
-    Effect.sync(() =>
-      attemptOr(
-        () => {
-          const raw: unknown = JSON.parse(
-            fs.readFileSync(path.join(workspace.root, '.playconfig.json'), 'utf8')
-          );
-          const value = isJsonObject(raw) ? raw['game_id'] : null;
-          return typeof value === 'string' && GAME_ID_RE.test(value)
-            ? Option.some(value)
-            : Option.none<string>();
-        },
-        () => Option.none<string>()
-      )
-    );
+    Effect.gen(function* () {
+      const text = yield* Effect.either(
+        fileSystem.readFileString(path.join(workspace.root, '.playconfig.json'))
+      );
+      if (Either.isLeft(text)) return Option.none<string>();
+      const decoded = Schema.decodeUnknownEither(Schema.parseJson(JsonValueSchema))(text.right);
+      if (Either.isLeft(decoded) || !isJsonObject(decoded.right)) return Option.none<string>();
+      const value = field(decoded.right, 'game_id');
+      return isJsonString(value) && GAME_ID_RE.test(value)
+        ? Option.some(value)
+        : Option.none<string>();
+    });
 
   const noSessionError = (): Effect.Effect<never, SessionMissingError> =>
     Effect.flatMap(preconfiguredGameId(), (game) =>
@@ -445,18 +449,15 @@ const makeApi = (
       }
       const sessions = yield* listSessions();
       if (sessions.length > 1) {
-        return yield* Effect.fail(playerError(MULTIPLE_SESSIONS));
+        return yield*playerError(MULTIPLE_SESSIONS);
       }
-      if (sessions.length === 1) return sessions[0] as string;
-      const pointer = yield* Effect.sync(() => {
-        return attemptOr(
-            () => fs.readFileSync(currentPointerPath, 'utf8').trim(),
-            () => null
-        );
-      });
+      const onlySession = sessions.length === 1 ? sessions.at(0) : undefined;
+      if (onlySession !== undefined) return onlySession;
+      const pointerText = yield* Effect.either(fileSystem.readFileString(currentPointerPath));
+      const pointer = Either.isRight(pointerText) ? pointerText.right.trim() : null;
       if (pointer === null) return yield* noSessionError();
       if (path.isAbsolute(pointer) || pointer.split(/[\\/]/).includes('..')) {
-        return yield* Effect.fail(playerError('the current-session pointer is invalid'));
+        return yield*playerError('the current-session pointer is invalid');
       }
       const resolved = yield* files.resolve(path.join(workspace.stateRoot, pointer));
       return resolved.destination;
@@ -467,15 +468,13 @@ const makeApi = (
       const raw = yield* files.loadObject(target, 'session');
       const required = ['game_id', 'agent_id', 'agent_token', 'service_url'] as const;
       if (
-        required.some((name) => !(name in raw)) ||
-        typeof raw['agent_token'] !== 'string'
+        required.some((name) => !hasField(raw, name)) ||
+        !isJsonString(field(raw, 'agent_token'))
       ) {
-        return yield* Effect.fail(playerError(`session ${target} is incomplete`));
+        return yield*playerError(`session ${target} is incomplete`);
       }
-      const url = yield* serviceUrl(
-        typeof raw['service_url'] === 'string' ? raw['service_url'] : undefined,
-        environment
-      );
+      const service = field(raw, 'service_url');
+      const url = yield* serviceUrl(isJsonString(service) ? service : undefined, environment);
       return decodeSession(raw, url);
     });
 
@@ -494,10 +493,10 @@ const makeApi = (
       const loaded = yield* resolve(explicit);
       const raw = loaded.session.raw;
       if (loaded.session.controlProtocol !== FULL_CONTROL_V2) {
-        return yield* Effect.fail(playerError('this command is full-control-v2 only'));
+        return yield*playerError('this command is full-control-v2 only');
       }
       if (raw['schema_version'] !== 1) {
-        return yield* Effect.fail(playerError('the private session has an unsupported schema'));
+        return yield*playerError('the private session has an unsupported schema');
       }
       const session = loaded.session;
       if (
@@ -506,9 +505,8 @@ const makeApi = (
         session.agentToken === '' ||
         session.controllerLabel === ''
       ) {
-        return yield* Effect.fail(
-          playerError('the private full-control-v2 session is incomplete')
-        );
+        return yield*
+          playerError('the private full-control-v2 session is incomplete');
       }
       const evaluation = yield* Effect.mapError(
         decodeEvaluationContext(raw, 'private v2 session'),
@@ -521,16 +519,12 @@ const makeApi = (
   // .v2-state
   // -------------------------------------------------------------------------
 
-  const statePath = (target: string): string => v2StatePath(target);
-
-  const asState = (value: JsonObject): V2ClientState => value as unknown as V2ClientState;
-
   const readStateUnlocked = (
     target: string,
     session: Session
   ): Effect.Effect<V2ClientState, PlayerError> =>
     Effect.gen(function* () {
-      const file = statePath(target);
+      const file = v2StatePath(target);
       const present = yield* files.exists(file);
       if (!present) return schema.empty(session);
       const value = yield* files.loadObject(file, 'v2 client state');
@@ -560,18 +554,20 @@ const makeApi = (
         !isJsonObject(value['receipts']) ||
         ((staged || aliased || drained || current) && !isJsonObject(value['pending_catalogs']))
       ) {
-        return yield* Effect.fail(invalidState);
+        return yield*invalidState;
       }
-      if (value['last_revision'] !== null) {
-        yield* Effect.mapError(decodeRevision(value['last_revision']), () => invalidState);
-      }
+      const lastRevision = field(value, 'last_revision');
+      const decodedLastRevision =
+        lastRevision === null
+          ? null
+          : yield* Effect.mapError(decodeRevision(lastRevision), () => invalidState);
       // Persisted request bodies are strings specifically so retry can send the
       // exact bytes written before the first POST.
       const batches = value['batches'];
       const badBatch = Object.entries(batches).some(
-        ([batchId, body]) => !OPAQUE_ID_RE.test(batchId) || typeof body !== 'string'
+        ([batchId, body]) => !OPAQUE_ID_RE.test(batchId) || !isJsonString(body)
       );
-      if (badBatch) return yield* Effect.fail(invalidState);
+      if (badBatch) return yield*invalidState;
 
       if (legacy) {
         // A v1 cache cannot prove whether a scoped descriptor came from a
@@ -579,7 +575,7 @@ const makeApi = (
         // fail closed by dropping every executable action during migration.
         const migrated: V2ClientState = {
           ...schema.empty(session),
-          last_revision: (value['last_revision'] ?? null) as Revision | null,
+          last_revision: decodedLastRevision,
           batches: { ...batches },
           receipts: { ...(value['receipts']) },
         };
@@ -592,7 +588,8 @@ const makeApi = (
         // A v2 cache predates the alias dialect, a v3 cache predates the
         // drained-catalog record, and a v4 cache numbered its aliases without
         // recording what each one *means*.  None holds anything unsound.
-        const next: Record<string, JsonValue> = { ...value, schema_version: 5 };
+        const next: Record<string, JsonValue> = Object.fromEntries(Object.entries(value));
+        next['schema_version'] = 5;
         if (staged) {
           next['action_aliases'] = emptyActionAliases();
           next['entity_aliases'] = {};
@@ -608,7 +605,7 @@ const makeApi = (
             const byAlias = table['by_alias'];
             const rebuilt: Record<string, JsonValue> = {};
             for (const [alias, entry] of Object.entries(byAlias)) {
-              rebuilt[alias] = { semantics: '', ...(entry as JsonObject) };
+              if (isJsonObject(entry)) rebuilt[alias] = { semantics: '', ...entry };
             }
             next['action_aliases'] = {
               state_revision: table['state_revision'] ?? null,
@@ -623,18 +620,51 @@ const makeApi = (
         yield* files.writeJson(file, upgraded);
       }
 
-      const state = asState(upgraded);
-      yield* schema.validate(state);
+      yield* schema.validate(upgraded);
+      const actions = field(upgraded, 'actions');
+      const pending = field(upgraded, 'pending_catalogs');
+      const upgradedBatches = field(upgraded, 'batches');
+      const receipts = field(upgraded, 'receipts');
+      const actionAliases = field(upgraded, 'action_aliases');
+      const entityAliases = field(upgraded, 'entity_aliases');
+      const tileAliases = field(upgraded, 'tile_aliases');
+      const drainedActors = field(upgraded, 'drained_actors');
+      if (
+        !isJsonObject(actions) ||
+        !isJsonObject(pending) ||
+        !isJsonObject(upgradedBatches) ||
+        !isJsonObject(receipts) ||
+        !isJsonObject(actionAliases) ||
+        !isJsonObject(entityAliases) ||
+        !isJsonObject(tileAliases) ||
+        !Array.isArray(drainedActors)
+      ) {
+        return yield* invalidState;
+      }
+      const state: V2ClientState = {
+        schema_version: 5,
+        game_id: session.gameId,
+        agent_id: session.agentId,
+        last_revision: decodedLastRevision,
+        actions,
+        pending_catalogs: pending,
+        batches: upgradedBatches,
+        receipts,
+        action_aliases: actionAliases,
+        entity_aliases: entityAliases,
+        tile_aliases: tileAliases,
+        drained_actors: drainedActors,
+      };
 
-      const pending = upgraded['pending_catalogs'];
-      if (isJsonObject(pending)) {
-        const expired = Object.entries(pending).filter(([, entry]) => {
+      const pendingEntries = state.pending_catalogs;
+      if (isJsonObject(pendingEntries)) {
+        const expired = Object.entries(pendingEntries).filter(([, entry]) => {
           const expiry = isJsonObject(entry) ? entry['cursor_expires_at'] : null;
-          return schema.cursorExpired(typeof expiry === 'string' ? expiry : null);
+          return schema.cursorExpired(isJsonString(expiry) ? expiry : null);
         });
         if (expired.length > 0) {
           const kept: Record<string, JsonValue> = {};
-          for (const [catalogId, entry] of Object.entries(pending)) {
+          for (const [catalogId, entry] of Object.entries(pendingEntries)) {
             if (!expired.some(([expiredId]) => expiredId === catalogId)) kept[catalogId] = entry;
           }
           const next: V2ClientState = { ...state, pending_catalogs: kept };
@@ -649,7 +679,7 @@ const makeApi = (
     target: string,
     next: V2ClientState
   ): Effect.Effect<void, PlayerError> =>
-    Effect.asVoid(files.writeJson(statePath(target), next));
+    Effect.asVoid(files.writeJson(v2StatePath(target), next));
 
   return {
     workspace,
@@ -672,7 +702,7 @@ const makeApi = (
           schema_version: 1,
           game_id: validated,
           session: relative,
-          bound_at: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
+          bound_at: DateTime.formatIso(DateTime.unsafeNow()).replace(/\.\d{3}Z$/, 'Z'),
         });
         if (Option.isSome(previous) && previous.value.relative === relative) {
           return Option.none<SeatBinding>();
@@ -686,7 +716,7 @@ const makeApi = (
       }),
     preconfiguredGameId,
     writeSession: (target, value) => files.writeJson(target, value),
-    statePath,
+    statePath: v2StatePath,
     readState: (target, session) => runLocked(target, readStateUnlocked(target, session)),
     writeState: (target, next) => runLocked(target, writeStateUnlocked(target, next)),
     withStateLock: (target, session, body) =>
@@ -708,13 +738,14 @@ export const SessionStoreLive: Layer.Layer<
     const workspace = yield* Workspace;
     const files = yield* PrivateFs;
     const schema = yield* V2StateSchema;
-    const provided = Layer.succeed(PrivateFs, files);
     return makeApi(
       workspace,
       files,
       schema,
-      (target, body) => Effect.provide(withV2StateLock(target, body), provided),
-      (target, body) => Effect.provide(withV2RequestLock(target, body), provided),
+      (target, body) =>
+        Effect.provideService(withV2StateLock(target, body), PrivateFs, files),
+      (target, body) =>
+        Effect.provideService(withV2RequestLock(target, body), PrivateFs, files),
       process.env
     );
   })
@@ -726,14 +757,14 @@ export const sessionStoreFor = (
   files: PrivateFsApi,
   schema: V2StateSchemaApi,
   environment: Readonly<Record<string, string | undefined>> = process.env
-): SessionStoreApi => {
-  const provided = Layer.succeed(PrivateFs, files);
-  return makeApi(
+): SessionStoreApi =>
+  makeApi(
     workspace,
     files,
     schema,
-    (target, body) => Effect.provide(withV2StateLock(target, body), provided),
-    (target, body) => Effect.provide(withV2RequestLock(target, body), provided),
+    (target, body) =>
+      Effect.provideService(withV2StateLock(target, body), PrivateFs, files),
+    (target, body) =>
+      Effect.provideService(withV2RequestLock(target, body), PrivateFs, files),
     environment
   );
-};

@@ -37,6 +37,7 @@ import {
   type JsonValue,
 } from 'src/render/primitives';
 import type { PhaseBlock } from 'src/schema/health';
+import { isJsonString } from 'src/schema/primitives';
 import type { Revision } from 'src/schema/revision';
 import type { TurnHealthContext } from 'src/services/health-context';
 
@@ -132,7 +133,7 @@ export const unitStatus = (
   Effect.gen(function* () {
     const activity = field(item, 'activity');
     const activityName = isJsonObject(activity) ? activity['name'] : undefined;
-    let status = typeof activityName === 'string' ? activityName : 'unknown';
+    let status = isJsonString(activityName) ? activityName : 'unknown';
 
     const summary = yield* deps.routeSummary(field(item, 'route'));
     if (summary !== '') status += ` ${summary}`;
@@ -182,7 +183,7 @@ export const briefingUnitLines = (
       const unitType = yield* needText(item, 'type', 'unit');
       const position = (yield* coordinates(item)) ?? '@?';
       const status = yield* unitStatus(item, deps);
-      const key = JSON.stringify([unitType, position, status]);
+      const key = `${unitType}\u0000${position}\u0000${status}`;
       const alias = yield* rowAlias(aliases, item, 'id', 'u', offset + 1);
       const found = groups.get(key);
       if (found === undefined) {
@@ -264,7 +265,7 @@ export const researchableNames = (items: ReadonlyArray<JsonValue>): ReadonlyArra
     if (!isJsonObject(item)) continue;
     if (item['can_target'] !== true) continue;
     const name = item['name'];
-    if (typeof name !== 'string' || name === '') continue;
+    if (!isJsonString(name) || name === '') continue;
     const cost = item['path_cost'] ?? null;
     names.push(cost === null ? name : `${name}/${scalar(cost)}`);
   }
@@ -284,7 +285,7 @@ export const briefingTruncation = (result: TurnReadyResult): ReadonlyArray<strin
     const page = result[section];
     if (!page.truncated) continue;
     const cursor = page.next_cursor;
-    if (typeof cursor !== 'string' || cursor === '') continue;
+    if (!isJsonString(cursor) || cursor === '') continue;
     lines.push(`next: just state --cursor ${cursor}   # rest of ${section}`);
   }
   return lines;
@@ -328,7 +329,7 @@ export const renderTurn = (
 
     const overview = result.overview;
     if (!isJsonObject(overview) || !('turn' in overview)) {
-      return yield* Effect.fail(drift('turn briefing overview'));
+      return yield*drift('turn briefing overview');
     }
     const aliases = options.aliases ?? null;
     const header = [

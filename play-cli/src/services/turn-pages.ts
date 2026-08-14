@@ -21,7 +21,8 @@
 import { Effect } from 'effect';
 import { V2_TURN_PAGE_LIMIT, V2_TURN_SECTIONS } from 'src/constants';
 import type { PlayError } from 'src/errors';
-import { isJsonObject, type JsonValue } from 'src/render/primitives';
+import { isJsonObject, scalar, type JsonValue } from 'src/render/primitives';
+import { isWholeNumber } from 'src/schema/primitives';
 import type { TurnCompactPage } from 'src/render/turn';
 import { decodeHealth, type HealthEnvelope } from 'src/schema/health';
 import { decodePage, type PageEnvelope } from 'src/schema/page';
@@ -32,8 +33,8 @@ import {
   parseTable,
   type MirrorTable,
 } from 'src/services/mirror';
-import { PrivateFs } from 'src/services/private-fs';
-import { SessionStore, credentialsOf, type Session } from 'src/services/session-store';
+import { type PrivateFs } from 'src/services/private-fs';
+import { type SessionStore, credentialsOf, type Session } from 'src/services/session-store';
 import { V2Client } from 'src/services/v2-client';
 
 // ---------------------------------------------------------------------------
@@ -224,8 +225,8 @@ export const mirrorEventCount = (
 export const briefingEventsLine = (overview: JsonValue, seen: number | null): string => {
   const counts = isJsonObject(overview) ? overview['counts'] : undefined;
   const total = isJsonObject(counts) ? counts['chat'] : undefined;
-  if (typeof total !== 'number' || !Number.isInteger(total)) return '';
+  if (!isWholeNumber(total)) return '';
   const fresh = seen === null ? total : total - seen;
   if (fresh <= 0) return '';
-  return `events: ${fresh} new — just state --section chat`;
+  return `events: ${scalar(fresh)} new — just state --section chat`;
 };

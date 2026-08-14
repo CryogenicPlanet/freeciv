@@ -51,7 +51,7 @@
  * never a throw.
  */
 import { attemptOr } from 'src/errors';
-import { Either } from 'effect';
+import { Data, Either } from 'effect';
 import {
   ASCII_CASED_CODE_POINTS,
   CASED_CODE_POINTS,
@@ -132,9 +132,11 @@ const failure = (kind: PyRegexFailure['kind'], message: string): PyRegexFailure 
  * and nothing outside this file can observe the throw: `compilePythonRegex`
  * returns `Either` and never raises.
  */
-class ParseSignal extends Error {
-  constructor(readonly failure: PyRegexFailure) {
-    super(failure.message);
+class ParseSignal extends Data.TaggedError('ParseSignal')<{
+  readonly signalFailure: PyRegexFailure;
+}> {
+  constructor(signalFailure: PyRegexFailure) {
+    super({ signalFailure });
   }
 }
 
@@ -1314,6 +1316,8 @@ const categoryRanges = (
       return ascii ? ASCII_WORD_RANGES : UNICODE_WORD_RANGES;
     case 'notWord':
       return complement(ascii ? ASCII_WORD_RANGES : UNICODE_WORD_RANGES);
+    default:
+      return [];
   }
 };
 
@@ -1327,7 +1331,7 @@ const ignoring = (flags: number): boolean =>
   (flags & PY_IGNORECASE) !== 0 && (flags & PY_LOCALE) === 0;
 
 const normalize = (ranges: ReadonlyArray<CodeRange>): ReadonlyArray<CodeRange> => {
-  const sorted = [...ranges].sort((left, right) => left[0] - right[0] || left[1] - right[1]);
+  const sorted = [...ranges].toSorted((left, right) => left[0] - right[0] || left[1] - right[1]);
   const merged: Array<[number, number]> = [];
   for (const [low, high] of sorted) {
     const last = merged[merged.length - 1];
@@ -1434,6 +1438,8 @@ const atMatcher = (at: AtKind, flags: number): string => {
       return boundaryMatcher(flags, false);
     case 'nonBoundary':
       return boundaryMatcher(flags, true);
+    default:
+      return '(?!)';
   }
 };
 
@@ -1528,13 +1534,13 @@ const emitScoped = (
   flags: number,
   emitter: Emitter,
   keep: boolean
-): { readonly source: string; readonly gained: ReadonlySet<number> } => {
+) => {
   const scoped: Emitter = { helpers: emitter.helpers, guaranteed: new Set(emitter.guaranteed) };
   const source = emitSub(nodes, flags, scoped);
   emitter.helpers = scoped.helpers;
   const gained = scoped.guaranteed;
   if (keep) for (const group of gained) emitter.guaranteed.add(group);
-  return { source, gained };
+  return { source, gained } satisfies { readonly source: string; readonly gained: ReadonlySet<number> };
 };
 
 const emitSub = (nodes: Sub, flags: number, emitter: Emitter): string =>
@@ -1612,6 +1618,8 @@ const emitNode = (node: Node, flags: number, emitter: Emitter): string => {
           'a conditional group reference has no equivalent in this engine'
         )
       );
+    default:
+      return '(?!)';
   }
 };
 
@@ -1667,7 +1675,7 @@ export const compilePythonRegex = (
       return Either.right(new RegExp(CODE_POINT_START + prefilter + emitted, ''));
     },
     (caught) => {
-      if (caught instanceof ParseSignal) return Either.left(caught.failure);
+      if (caught instanceof ParseSignal) return Either.left(caught.signalFailure);
       // Everything that is not a `ParseSignal` comes from the two host calls
       // above — `new RegExp` on the emitted source, and the recursive descent
       // through a deeply nested pattern.  Both fail on *size*, not on syntax:

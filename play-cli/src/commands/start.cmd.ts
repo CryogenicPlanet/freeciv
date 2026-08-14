@@ -17,7 +17,7 @@
  * the same zero-argument command configure the same seat.
  */
 import { Command, Options } from '@effect/cli';
-import { Console, Effect, Layer } from 'effect';
+import { Console, Effect, Random } from 'effect';
 import { playerError, type PlayError } from 'src/errors';
 import { exitWith, type ExitCodeSignal } from 'src/exit';
 import { V2_PROTOCOL_CARD } from 'src/render/join';
@@ -83,14 +83,10 @@ export type StartHooksFor = (
   session: Session
 ) => Effect.Effect<StartHooks, never, PrivateFs | SessionStore | V2Client>;
 
-/** `random.choice` — a uniform draw over the already-sorted catalog. */
-const uniformChoice = (items: ReadonlyArray<PregameItem>): PregameItem => {
-  const picked = items[Math.floor(Math.random() * items.length)];
-  if (picked === undefined) {
-    // `pregameDefaultNation` refuses an empty catalog before it ever draws, so
-    // this is unreachable; it is here because the index type says it is not.
-    throw new Error('the pregame catalog was empty at the draw');
-  }
+/** Choose one catalog row using an injected uniform sample. */
+const uniformChoice = (sample: number, items: ReadonlyArray<PregameItem>): PregameItem => {
+  const picked = items[Math.floor(sample * items.length)];
+  if (picked === undefined) throw new Error('the pregame catalog was empty at the draw');
   return picked;
 };
 
@@ -130,14 +126,15 @@ export const liveStartHooks: StartHooksFor = (sessionPath, session) =>
     const files = yield* PrivateFs;
     const store = yield* SessionStore;
     const client = yield* V2Client;
-    const provided = Layer.mergeAll(
-      Layer.succeed(PrivateFs, files),
-      Layer.succeed(SessionStore, store),
-      Layer.succeed(V2Client, client)
-    );
+    const sample = yield* Random.next;
     const give = <A, E>(
       body: Effect.Effect<A, E, PrivateFs | SessionStore | V2Client>
-    ): Effect.Effect<A, E> => Effect.provide(body, provided);
+    ): Effect.Effect<A, E> =>
+      body.pipe(
+        Effect.provideService(PrivateFs, files),
+        Effect.provideService(SessionStore, store),
+        Effect.provideService(V2Client, client)
+      );
     const legalCtx: LegalCtx = { sessionPath, session };
     // `_resolve_kind_action` (client.py:6675) is U12's, and it is written
     // against a `TurnCtx`; `turn`'s own live seams build one from exactly the
@@ -151,7 +148,7 @@ export const liveStartHooks: StartHooksFor = (sessionPath, session) =>
           PrivateFs,
           files
         ),
-      choose: uniformChoice,
+      choose: (items) => uniformChoice(sample, items),
       receiptOk: orderReceiptOk,
       resolveKindAction: (kind, remedy) =>
         give(
@@ -229,11 +226,9 @@ const resolveStyle = (
     }
     const styleId = chosen.default_style_id ?? '';
     if (styleId === '') {
-      return yield* Effect.fail(
-        playerError(
-          `nation ${chosen.name} carries no default style; pass --style NAME ` +
-            '(see `just state --section pregame_styles`)'
-        )
+      return yield* playerError(
+        `nation ${chosen.name} carries no default style; pass --style NAME ` +
+          '(see `just state --section pregame_styles`)'
       );
     }
     // The id is already what goes on the wire, but the SERVER only honours it
@@ -289,11 +284,9 @@ export const resolveSeat = (
     const style = yield* resolveStyle(ctx, request.style, nation);
     const seat = yield* resolveLeaderAndSex(ctx, request);
     if (seat.leader === '') {
-      return yield* Effect.fail(
-        playerError(
-          'no leader name could be resolved for this seat; pass ' +
-            '`just start --leader NAME`'
-        )
+      return yield* playerError(
+        'no leader name could be resolved for this seat; pass ' +
+          '`just start --leader NAME`'
       );
     }
     return { nation, leader: seat.leader, male: seat.male, ...style };
@@ -384,11 +377,9 @@ const configureAndReady = (
     // is load-bearing rather than decorative (NOTES §16.9 under U18).
     yield* mirrorHealth(ctx.sessionPath, health, 'start', { commands: V2_PROTOCOL_CARD });
     if (health.game_state !== 'lobby') {
-      return yield* Effect.fail(
-        playerError(
-          'just start configures a lobby seat; this game is ' +
-            `${String(health.game_state)} -- run \`just turn\``
-        )
+      return yield* playerError(
+        'just start configures a lobby seat; this game is ' +
+          `${health.game_state} -- run \`just turn\``
       );
     }
     // The lobby's native revision advances in the background, and the server
@@ -433,8 +424,13 @@ const configureAndReady = (
       readonly seat: ResolvedSeat;
       readonly configured: Submitted | null;
     }
+    const initial: Attempt = {
+      attempt: 1,
+      seat: yield* resolveSeat(ctx, request),
+      configured: null,
+    };
     const settled = yield* Effect.iterate(
-      { attempt: 1, seat: yield* resolveSeat(ctx, request), configured: null } satisfies Attempt as Attempt,
+      initial,
       {
         while: (state) =>
           state.configured === null ||
@@ -471,11 +467,9 @@ const configureAndReady = (
     const ready = yield* ctx.hooks.resolveKindAction('pregame.set_ready', READY_REMEDY);
     const readyArguments = readyArgumentsOf(ready);
     if (readyArguments === null) {
-      return yield* Effect.fail(
-        playerError(
-          'the enumerated pregame.set_ready would withdraw readiness rather ' +
-            'than set it; this seat is already ready'
-        )
+      return yield* playerError(
+        'the enumerated pregame.set_ready would withdraw readiness rather ' +
+          'than set it; this seat is already ready'
       );
     }
     const readied = yield* submit(ctx, ready.action_id, readyArguments, READY_INTENT);
@@ -498,9 +492,7 @@ export const runStart = (
     // Both refusals precede the first request: an impossible seat is never
     // half-configured.
     if (options.male && options.female) {
-      return yield* Effect.fail(
-        playerError('just start takes at most one of --male or --female')
-      );
+      return yield* playerError('just start takes at most one of --male or --female');
     }
     const request: StartRequest = {
       nation: options.nation.trim(),
@@ -510,8 +502,8 @@ export const runStart = (
       female: options.female,
     };
     if (utf8Length(request.leader) > V2_LEADER_MAX_BYTES) {
-      return yield* Effect.fail(
-        playerError(`--leader must be at most ${V2_LEADER_MAX_BYTES} UTF-8 bytes`)
+      return yield* playerError(
+        `--leader must be at most ${V2_LEADER_MAX_BYTES} UTF-8 bytes`
       );
     }
     const ctx: PregameCtx = {
@@ -540,9 +532,9 @@ export const runStart = (
     // already printed its own stderr warning, so the port signals it with
     // `exitWith` — which prints nothing — rather than a second `error: …`.
     if (result.exitCode !== 0) {
-      return yield* Effect.fail(exitWith(result.exitCode));
+      return yield* exitWith(result.exitCode);
     }
-    return;
+    return undefined;
   });
 
 // ---------------------------------------------------------------------------

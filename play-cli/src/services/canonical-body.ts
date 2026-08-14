@@ -49,11 +49,15 @@
  *   invariant this file exists to hold.  {@link canonicalText} refuses first, and
  *   the encoder is not exported, so there is no way to reach the substitution.
  */
-import { Effect } from 'effect';
+import { Effect, Schema } from 'effect';
 import type { PlayerError } from 'src/errors';
 import { playerError } from 'src/errors';
 import { formatG } from 'src/render/primitives';
 import { encodeStringAscii } from 'src/services/json-output';
+
+const isBoolean = Schema.is(Schema.Boolean);
+const isNumber = Schema.is(Schema.Number);
+const isString = Schema.is(Schema.String);
 
 // ---------------------------------------------------------------------------
 // The Python JSON value model
@@ -105,11 +109,9 @@ const isPyNumber = (value: PyValue): value is PyNumber =>
   value instanceof PyInt || value instanceof PyFloat;
 
 /** True for a mapping, and never for one of the two numeric wrappers. */
+const PyObjectSchema = Schema.Record({ key: Schema.String, value: Schema.Unknown });
 export const isPyMapping = (value: PyValue): value is PyObject =>
-  typeof value === 'object' &&
-  value !== null &&
-  !Array.isArray(value) &&
-  !isPyNumber(value);
+  Schema.is(PyObjectSchema)(value) && !isPyNumber(value);
 
 // ---------------------------------------------------------------------------
 // repr(float) — CPython's `float.__repr__`, which is what `json.dumps` emits
@@ -178,7 +180,7 @@ const numberText = (value: PyNumber | number): string => {
 // ---------------------------------------------------------------------------
 
 const sortKeysAscii = (keys: ReadonlyArray<string>): ReadonlyArray<string> =>
-  [...keys].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+  [...keys].toSorted((left, right) => (left < right ? -1 : left > right ? 1 : 0));
 
 /**
  * `json.dumps(value, sort_keys=True, separators=(",", ":"))`.
@@ -190,9 +192,9 @@ const sortKeysAscii = (keys: ReadonlyArray<string>): ReadonlyArray<string> =>
  */
 export const pyDumps = (value: PyValue, ensureAscii: boolean): string => {
   if (value === null) return 'null';
-  if (typeof value === 'boolean') return value ? 'true' : 'false';
-  if (typeof value === 'number' || isPyNumber(value)) return numberText(value);
-  if (typeof value === 'string') return encodeStringAscii(value, ensureAscii);
+  if (isBoolean(value)) return value ? 'true' : 'false';
+  if (isNumber(value) || isPyNumber(value)) return numberText(value);
+  if (isString(value)) return encodeStringAscii(value, ensureAscii);
   if (Array.isArray(value)) {
     return `[${value.map((item) => pyDumps(item, ensureAscii)).join(',')}]`;
   }
@@ -210,13 +212,13 @@ export const pyDumps = (value: PyValue, ensureAscii: boolean): string => {
 /** `_scalar` (client.py:3442-3452), over a value that knows its Python type. */
 export const pyScalar = (value: PyValue): string => {
   if (value === null) return '-';
-  if (typeof value === 'boolean') return value ? 'yes' : 'no';
+  if (isBoolean(value)) return value ? 'yes' : 'no';
   if (value instanceof PyFloat) return formatG(value.value);
   if (value instanceof PyInt) return value.value.toString();
-  if (typeof value === 'number') {
+  if (isNumber(value)) {
     return Number.isInteger(value) ? String(value) : formatG(value);
   }
-  if (typeof value === 'string') return value;
+  if (isString(value)) return value;
   return pyDumps(value, true);
 };
 
@@ -530,7 +532,7 @@ export const parsePython = (text: string, options: PyParseOptions = {}): PyParse
     for (;;) {
       const scanned = scanString(end);
       if (failure !== null) return { value: null, end: scanned.end };
-      const key = typeof scanned.value === 'string' ? scanned.value : '';
+      const key = isString(scanned.value) ? scanned.value : '';
       end = skip(scanned.end);
       if (points[end] !== ':') {
         decodeFail("Expecting ':' delimiter", end);
@@ -633,11 +635,11 @@ type PyCheck =
 
 const checked = (value: PyValue, depth: number): PyCheck => {
   if (depth > JSON_MAX_DEPTH) return { ok: false, detail: 'JSON is nested too deeply' };
-  if (value === null || typeof value === 'string' || typeof value === 'boolean') {
+  if (value === null || isString(value) || isBoolean(value)) {
     return { ok: true, value };
   }
   if (value instanceof PyInt) return { ok: true, value };
-  if (value instanceof PyFloat || typeof value === 'number') {
+  if (value instanceof PyFloat || isNumber(value)) {
     const raw = value instanceof PyFloat ? value.value : value;
     return Number.isFinite(raw)
       ? { ok: true, value }
@@ -717,8 +719,7 @@ const nonFiniteRepr = (value: number): string =>
  */
 const firstNonFinite = (value: PyValue): number | null => {
   if (value instanceof PyInt) return null;
-  const raw =
-    value instanceof PyFloat ? value.value : typeof value === 'number' ? value : null;
+  const raw = value instanceof PyFloat ? value.value : isNumber(value) ? value : null;
   if (raw !== null) return Number.isFinite(raw) ? null : raw;
   if (Array.isArray(value)) {
     for (const item of value) {
@@ -788,16 +789,17 @@ const surrogateDetail = (text: string, run: SurrogateRun): string => {
  * encoder reaches it first: `json.dumps` raises while walking the value, and the
  * `.encode("utf-8")` that finds a surrogate only runs on a string it produced.
  */
+const refuseCanonical = (detail: string): Effect.Effect<string, PlayerError> =>
+  Effect.fail(playerError(`command batch is not canonical JSON: ${detail}`));
+
 export const canonicalText = (value: PyValue): Effect.Effect<string, PlayerError> => {
-  const refuse = (detail: string): Effect.Effect<string, PlayerError> =>
-    Effect.fail(playerError(`command batch is not canonical JSON: ${detail}`));
   const nonFinite = firstNonFinite(value);
   if (nonFinite !== null) {
-    return refuse(`${NON_FINITE_DETAIL}: ${nonFiniteRepr(nonFinite)}`);
+    return refuseCanonical(`${NON_FINITE_DETAIL}: ${nonFiniteRepr(nonFinite)}`);
   }
   const text = pyDumps(value, false);
   const run = surrogateRun(text);
-  return run === null ? Effect.succeed(text) : refuse(surrogateDetail(text, run));
+  return run === null ? Effect.succeed(text) : refuseCanonical(surrogateDetail(text, run));
 };
 
 /**

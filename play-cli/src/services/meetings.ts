@@ -14,10 +14,11 @@
 import { Effect } from 'effect';
 import { ENTITY_ALIAS_RE } from 'src/constants';
 import { isJsonObject, type AliasMap, type JsonValue } from 'src/render/primitives';
+import { isJsonString } from 'src/schema/primitives';
 import type { CompactAction } from 'src/services/legal-compact';
 import { kindHead } from 'src/services/orders';
 import { mirrorCell, mirrorFile, mirrorNumber, mirrorTable } from 'src/services/turn-pages';
-import { PrivateFs } from 'src/services/private-fs';
+import { type PrivateFs } from 'src/services/private-fs';
 
 /** The one page a meeting row is missing when only the mirror knows about it. */
 export const V2_DIPLOMACY_READ = 'just state --section diplomacy --limit 16';
@@ -67,7 +68,7 @@ export const meetingRemedy = (
     first === undefined ? undefined : objectField(first['subject'] ?? null, 'actor');
   const actorId = objectField(actor, 'id');
   const actorName =
-    typeof actorId === 'string'
+    isJsonString(actorId)
       ? (aliasGet(aliases, actorId) ?? actorId)
       : player !== ''
         ? player
@@ -76,7 +77,7 @@ export const meetingRemedy = (
   const targetId = objectField(target, 'id');
   const targetName = isEntityAlias(name)
     ? name
-    : typeof targetId === 'string'
+    : isJsonString(targetId)
       ? targetId
       : 'RELATION_ID';
   return `just legal --actor_id ${actorName} --target_id ${targetName} --all`;
@@ -141,10 +142,10 @@ export const meetingGroups = (
   const groups = new Map<string, CompactAction[]>();
   for (const compact of pool) {
     const kind = compact['kind'];
-    if (typeof kind !== 'string' || kindHead(kind) !== 'diplomacy') continue;
+    if (!isJsonString(kind) || kindHead(kind) !== 'diplomacy') continue;
     const target = compact['target'] ?? null;
     const identifier = objectField(target, 'id');
-    const name = typeof identifier === 'string' ? (aliasGet(aliases, identifier) ?? '') : '';
+    const name = isJsonString(identifier) ? (aliasGet(aliases, identifier) ?? '') : '';
     const key = name === '' ? 'diplomacy' : name;
     const found = groups.get(key);
     if (found === undefined) groups.set(key, [compact]);

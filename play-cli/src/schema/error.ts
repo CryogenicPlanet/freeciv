@@ -6,15 +6,18 @@
  * decoder shares.
  */
 import { Effect } from 'effect';
-import { DriftError, invalid } from 'src/errors';
+import { type DriftError, invalid } from 'src/errors';
 import { FULL_CONTROL_V2, V2_ERROR_CODES } from 'src/constants';
 import {
   exact,
   field,
   hasField,
+  isJsonBoolean,
   isJsonObject,
+  isJsonString,
   jsonObject,
   type JsonObject,
+  type JsonValue,
   type SessionIdentity,
 } from 'src/schema/primitives';
 import { decodeRevision, type Revision } from 'src/schema/revision';
@@ -56,7 +59,7 @@ const MESSAGE_MAX = 500;
  * every present-if-optional field it tolerates.
  */
 export const decodeV2Header = (
-  value: unknown,
+  value: JsonValue,
   session: SessionIdentity,
   fields: ReadonlySet<string>,
   label: string
@@ -64,25 +67,25 @@ export const decodeV2Header = (
   Effect.gen(function* () {
     const raw = yield* exact(value, fields, label);
     if (field(raw, 'schema_version') !== 2 || field(raw, 'control_protocol') !== FULL_CONTROL_V2) {
-      return yield* Effect.fail(invalid(label, 'protocol mismatch'));
+      return yield*invalid(label, 'protocol mismatch');
     }
     if (field(raw, 'game_id') !== session.gameId) {
-      return yield* Effect.fail(invalid(label, 'response belongs to another game'));
+      return yield*invalid(label, 'response belongs to another game');
     }
     if (hasField(raw, 'agent_id') && field(raw, 'agent_id') !== session.agentId) {
-      return yield* Effect.fail(invalid(label, 'response belongs to another agent'));
+      return yield*invalid(label, 'response belongs to another agent');
     }
     return raw;
   });
 
-export const decodeError = (value: unknown): Effect.Effect<StructuredError, DriftError> =>
+export const decodeError = (value: JsonValue): Effect.Effect<StructuredError, DriftError> =>
   Effect.gen(function* () {
     const raw = yield* exact(value, ENVELOPE_FIELDS, 'v2 error response');
     if (
       field(raw, 'schema_version') !== 2 ||
       field(raw, 'control_protocol') !== FULL_CONTROL_V2
     ) {
-      return yield* Effect.fail(invalid('v2 error response', 'protocol mismatch'));
+      return yield*invalid('v2 error response', 'protocol mismatch');
     }
     const error = yield* exact(field(raw, 'error'), ERROR_FIELDS, 'v2 error');
     const code = field(error, 'code');
@@ -90,15 +93,15 @@ export const decodeError = (value: unknown): Effect.Effect<StructuredError, Drif
     const retryable = field(error, 'retryable');
     const details = field(error, 'details');
     if (
-      typeof code !== 'string' ||
+      !isJsonString(code) ||
       !V2_ERROR_CODES.has(code) ||
-      typeof message !== 'string' ||
+      !isJsonString(message) ||
       message.trim().length === 0 ||
       message.length > MESSAGE_MAX ||
-      typeof retryable !== 'boolean' ||
+      !isJsonBoolean(retryable) ||
       !isJsonObject(details)
     ) {
-      return yield* Effect.fail(invalid('v2 error response'));
+      return yield*invalid('v2 error response');
     }
     const cleanDetails = yield* jsonObject(details, 'error details');
     const rawRevision = field(raw, 'state_revision');

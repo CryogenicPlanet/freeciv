@@ -11,11 +11,13 @@
  * drift from the one health and the session loader use.
  */
 import { Effect } from 'effect';
-import { PlayerError, playerError } from 'src/errors';
+import { type PlayerError, playerError } from 'src/errors';
 import {
   decodeEvaluationContext,
+  jsonValue,
   type EvaluationContext,
   type EvaluationOptions,
+  type JsonValueInput,
 } from 'src/schema/primitives';
 
 export type { EvaluationContext, EvaluationOptions };
@@ -26,11 +28,13 @@ export type { EvaluationContext, EvaluationOptions };
  * that contradict what was agreed at join time.
  */
 export const validateEvaluationContext = (
-  value: unknown,
+  value: JsonValueInput,
   label: string,
   options: EvaluationOptions = {}
 ): Effect.Effect<EvaluationContext | null, PlayerError> =>
   Effect.mapError(
-    decodeEvaluationContext(value, label, options),
+    Effect.flatMap(jsonValue(value, label), (decoded) =>
+      decodeEvaluationContext(decoded, label, options)
+    ),
     (error): PlayerError => playerError(error.message)
   );

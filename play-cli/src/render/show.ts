@@ -17,8 +17,7 @@
  * rewriting a projection to say it is old would change the very stamp being
  * judged.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
+import { fileSystem, path } from 'src/services/platform';
 import { Effect, Either } from 'effect';
 import { ENTITY_ALIAS_RE } from 'src/constants';
 import { PY_IGNORECASE, compilePythonRegex } from 'src/render/show-regex';
@@ -122,13 +121,13 @@ export const showOptionFiles = (
       const dir = yield* mirrorDir(sessionPath);
       const { relative } = yield* files.resolve(path.join(dir, STATE_DIR, OPTIONS_DIR));
       const opened = yield* files.openDirectory(relative, { create: false });
-      const names = yield* Effect.try({
-        try: () => fs.readdirSync(opened),
-        catch: () => playerError('the options directory is not readable'),
-      });
+      const names = yield* Effect.mapError(
+        fileSystem.readDirectory(opened),
+        () => playerError('the options directory is not readable')
+      );
       return names
         .filter((name) => name.endsWith('.txt') && !name.startsWith('.'))
-        .sort(codePointSort);
+        .toSorted(codePointSort);
     }),
     (): ReadonlyArray<string> => []
   );
@@ -333,7 +332,7 @@ const unknownName = (name: string): PlayerError =>
       )
     : playerError(
         `${name} is not a mirror file or an entity alias; the file names are ` +
-          `${[...V2_SHOW_FILES.keys()].sort(codePointSort).join(' ')}, an alias ` +
+          `${[...V2_SHOW_FILES.keys()].toSorted(codePointSort).join(' ')}, an alias ` +
           'looks like u1 or c1, and `just show` lists what this seat has written'
       );
 
@@ -343,11 +342,11 @@ export const showNamed = (
   name: string
 ): Effect.Effect<ReadonlyArray<string>, PlayerError, PrivateFs> =>
   Effect.gen(function* () {
-    if (!SHOW_NAME_RE.test(name)) return yield* Effect.fail(NAME_REFUSAL);
+    if (!SHOW_NAME_RE.test(name)) return yield*NAME_REFUSAL;
     const parts = V2_SHOW_FILES.get(name);
     if (parts !== undefined) {
       const text = yield* mirrorText(sessionPath, parts);
-      if (text === null) return yield* Effect.fail(missingProjection(name));
+      if (text === null) return yield*missingProjection(name);
       return splitLines(text);
     }
     const options = yield* mirrorText(sessionPath, [STATE_DIR, OPTIONS_DIR, `${name}.txt`]);
@@ -356,7 +355,7 @@ export const showNamed = (
       options === null
         ? [...rows]
         : [...rows, ...(rows.length > 0 ? [''] : []), ...splitLines(options)];
-    if (lines.length === 0) return yield* Effect.fail(unknownName(name));
+    if (lines.length === 0) return yield*unknownName(name);
     return lines;
   });
 
@@ -504,7 +503,7 @@ export const showGrep = (
 ): Effect.Effect<ReadonlyArray<string>, PlayerError, PrivateFs> =>
   Effect.gen(function* () {
     // `len(pattern)` counts code points, so an astral character is one.
-    if ([...pattern].length > 200) return yield* Effect.fail(TOO_LONG);
+    if ([...pattern].length > 200) return yield*TOO_LONG;
     const clock = options.clock ?? monotonicSeconds;
     const expression = options.regex ? yield* compileGrep(pattern) : null;
     // `casefold`, not `toLowerCase`: CPython folds `Große` onto `grosse` and
@@ -521,7 +520,7 @@ export const showGrep = (
           (line) => expression.test(line),
       expression === null ? () => null : () => (clock() > deadline ? budgetSpent(pattern) : null)
     );
-    if (outcome instanceof PlayerError) return yield* Effect.fail(outcome);
+    if (outcome instanceof PlayerError) return yield*outcome;
     if (outcome.length === 0) return [`no mirror line matches ${pyRepr(pattern)}`];
     return outcome.length > V2_SHOW_MAX_MATCHES
       ? [

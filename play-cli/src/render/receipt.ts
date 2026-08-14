@@ -79,7 +79,5 @@ export const renderDisposition = (
     disposition.error === null
       ? 'outcome unknown'
       : `not accepted: ${errorText(disposition.error)}`;
-  return [
-    `${intent} → ${outcome} next=${disposition.disposition}` + `  ${disposition.batch_id}`,
-  ];
+  return [`${intent} → ${outcome} next=${disposition.disposition}  ${disposition.batch_id}`];
 };

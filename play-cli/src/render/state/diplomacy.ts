@@ -20,13 +20,14 @@ import {
   type AliasMap,
   type JsonValue,
 } from 'src/render/primitives';
+import { isJsonString, isWholeNumber } from 'src/schema/primitives';
 
 /** Say what an open meeting is waiting on, in the words the seat needs. */
 export const meetingSummary = (meeting: JsonValue): string => {
   if (!isJsonObject(meeting)) return '';
   let text = '!meeting open';
   const count = meeting['clause_count'] ?? null;
-  if (typeof count === 'number' && Number.isInteger(count)) text += ` ${count} clauses`;
+  if (isWholeNumber(count)) text += ` ${count} clauses`;
   const accepted = (
     [
       ['you', 'self_accepted'],
@@ -52,11 +53,11 @@ export const renderDiplomacy = (
       const alias = yield* rowAlias(aliases, item, 'relation_id', 'r', index + 1);
       const detail: string[] = [];
       const nation = fields['nation'] ?? null;
-      if (typeof nation === 'string' && nation !== '') detail.push(`(${nation})`);
+      if (isJsonString(nation) && nation !== '') detail.push(`(${nation})`);
       detail.push(scalar(fields['state'] ?? null));
       if (fields['has_embassy'] === true) detail.push('embassy');
       const turns = fields['treaty_turns_left'] ?? null;
-      if (typeof turns === 'number' && Number.isInteger(turns)) detail.push(`${turns}t left`);
+      if (isWholeNumber(turns)) detail.push(`${turns}t left`);
       if (fields['alive'] === false) detail.push('!dead');
       const summary = meetingSummary(fields['meeting'] ?? null);
       if (summary !== '') detail.push(`· ${summary}`);

@@ -11,8 +11,17 @@
  * serializer below reproduces CPython's escaping, key ordering and separators
  * exactly.  See NOTES.md §2 for the one case it cannot reproduce.
  */
-import { Console, Effect } from 'effect';
+import { Console, type Effect } from 'effect';
 import { V2_JSON_ENVIRONMENT, V2_JSON_ONLY_COMMANDS, V2_TRUE_STRINGS } from 'src/constants';
+import {
+  field,
+  isJsonArray,
+  isJsonBoolean,
+  isJsonNumber,
+  isJsonObject,
+  isJsonString,
+  type JsonValueInput,
+} from 'src/schema/primitives';
 
 // ---------------------------------------------------------------------------
 // CPython-compatible json.dumps
@@ -74,7 +83,7 @@ const numberText = (value: number): string => {
 };
 
 const sortKeysAscii = (keys: ReadonlyArray<string>): ReadonlyArray<string> =>
-  [...keys].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+  [...keys].toSorted((left, right) => (left < right ? -1 : left > right ? 1 : 0));
 
 interface DumpContext {
   readonly itemSeparator: string;
@@ -84,29 +93,28 @@ interface DumpContext {
   readonly ensureAscii: boolean;
 }
 
-const dump = (value: unknown, context: DumpContext, depth: number): string => {
+const dump = (value: JsonValueInput, context: DumpContext, depth: number): string => {
   if (value === null || value === undefined) return 'null';
-  if (typeof value === 'boolean') return value ? 'true' : 'false';
-  if (typeof value === 'number') return numberText(value);
-  if (typeof value === 'string') return encodeStringAscii(value, context.ensureAscii);
+  if (isJsonBoolean(value)) return value ? 'true' : 'false';
+  if (isJsonNumber(value)) return numberText(value);
+  if (isJsonString(value)) return encodeStringAscii(value, context.ensureAscii);
   const { indent, itemSeparator, keySeparator } = context;
   const newlineOuter = indent === null ? '' : `\n${indent.repeat(depth)}`;
   const newlineInner = indent === null ? '' : `\n${indent.repeat(depth + 1)}`;
   const separator = itemSeparator + newlineInner;
-  if (Array.isArray(value)) {
+  if (isJsonArray(value)) {
     if (value.length === 0) return '[]';
     const parts = value.map((item) => dump(item, context, depth + 1));
     return `[${newlineInner}${parts.join(separator)}${newlineOuter}]`;
   }
-  if (typeof value === 'object') {
-    const record = value as Record<string, unknown>;
-    const own = Object.keys(record);
+  if (isJsonObject(value)) {
+    const own = Object.keys(value);
     const keys = context.sortKeys ? sortKeysAscii(own) : own;
     if (keys.length === 0) return '{}';
     const parts = keys.map(
       (key) =>
         `${encodeStringAscii(key, context.ensureAscii)}${keySeparator}${dump(
-          record[key],
+          field(value, key),
           context,
           depth + 1
         )}`
@@ -117,7 +125,7 @@ const dump = (value: unknown, context: DumpContext, depth: number): string => {
 };
 
 /** CPython's `json.dumps`, restricted to the value domain the wire carries. */
-export const pyJsonDumps = (value: unknown, options: DumpsOptions = {}): string => {
+export const pyJsonDumps = (value: JsonValueInput, options: DumpsOptions = {}): string => {
   const indentSize = options.indent ?? null;
   const indent = indentSize === null ? null : ' '.repeat(indentSize);
   const defaults: readonly [string, string] = indent === null ? [', ', ': '] : [',', ': '];
@@ -136,11 +144,11 @@ export const pyJsonDumps = (value: unknown, options: DumpsOptions = {}): string 
 };
 
 /** `json.dumps(value, sort_keys=True, separators=(",", ":"))`. */
-export const compactJson = (value: unknown): string =>
+export const compactJson = (value: JsonValueInput): string =>
   pyJsonDumps(value, { sortKeys: true, separators: [',', ':'] });
 
 /** `json.dumps(value, indent=2, sort_keys=True)`. */
-export const indentedJson = (value: unknown): string =>
+export const indentedJson = (value: JsonValueInput): string =>
   pyJsonDumps(value, { sortKeys: true, indent: 2 });
 
 /**
@@ -149,7 +157,7 @@ export const indentedJson = (value: unknown): string =>
  * must hash to the same bytes on every retry, which it only does when the
  * escape policy never changes.
  */
-export const canonicalJson = (value: unknown): string =>
+export const canonicalJson = (value: JsonValueInput): string =>
   pyJsonDumps(value, { sortKeys: true, separators: [',', ':'], ensureAscii: false });
 
 // ---------------------------------------------------------------------------
@@ -157,11 +165,11 @@ export const canonicalJson = (value: unknown): string =>
 // ---------------------------------------------------------------------------
 
 /** `_print_v2_json` — one compact, key-sorted line. */
-export const printV2Json = (value: unknown): Effect.Effect<void> =>
+export const printV2Json = (value: JsonValueInput): Effect.Effect<void> =>
   Console.log(compactJson(value));
 
 /** `_print_json` — the strategic-v1 shape: two-space indent, keys sorted. */
-export const printJson = (value: unknown): Effect.Effect<void> =>
+export const printJson = (value: JsonValueInput): Effect.Effect<void> =>
   Console.log(indentedJson(value));
 
 // ---------------------------------------------------------------------------

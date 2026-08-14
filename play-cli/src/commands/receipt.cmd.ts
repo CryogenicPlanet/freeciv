@@ -24,7 +24,7 @@ import { renderReceipt } from 'src/render/receipt';
 import { opaque } from 'src/schema/primitives';
 import { decodeReceipt, type CommandReceipt } from 'src/schema/receipt';
 import { jsonRequested, printV2Json } from 'src/services/json-output';
-import { PrivateFs } from 'src/services/private-fs';
+import { type PrivateFs } from 'src/services/private-fs';
 import {
   AMBIGUOUS_IS_TERMINAL,
   getReceiptResponse,
@@ -85,6 +85,7 @@ export const runReceipt = (
       yield* render(renderReceipt(receipt, intent));
     }
     yield* warnIfAmbiguous(receipt);
+    return undefined;
   });
 
 // ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@ import { named } from 'src/render/primitives';
 import {
   field,
   isJsonObject,
+  isJsonString,
   type JsonObject,
 } from 'src/schema/primitives';
 import { actionTargetKey } from 'src/services/aliases';
@@ -93,7 +94,7 @@ export const LEGAL_SUBJECT_RESERVED: ReadonlySet<string> = new Set([
 /** Read one string field off a compact action, or `""`. */
 export const compactText = (compact: JsonObject, key: string): string => {
   const value = field(compact, key);
-  return typeof value === 'string' ? value : '';
+  return isJsonString(value) ? value : '';
 };
 
 // ---------------------------------------------------------------------------
@@ -116,14 +117,14 @@ export const orderActor = (compact: JsonObject): string => {
   const subject = field(compact, 'subject');
   const actor = isJsonObject(subject) ? field(subject, 'actor') : null;
   const identifier = isJsonObject(actor) ? field(actor, 'id') : null;
-  return typeof identifier === 'string' ? identifier : '';
+  return isJsonString(identifier) ? identifier : '';
 };
 
 /** Name the operation this compact action performs, or `""`. */
 export const orderOperation = (compact: JsonObject): string => {
   const subject = field(compact, 'subject');
   const operation = isJsonObject(subject) ? field(subject, 'operation') : null;
-  return typeof operation === 'string' ? operation : '';
+  return isJsonString(operation) ? operation : '';
 };
 
 /** CPython `kind.split(".", 1)[-1]` — everything after the first dot. */
@@ -191,7 +192,7 @@ export const orderDiscriminators = (
     if (targetKey !== '') words.add(casefold(targetKey));
     if (isJsonObject(target)) {
       const name = field(target, 'name');
-      if (typeof name === 'string' && name !== '') words.add(casefold(name));
+      if (isJsonString(name) && name !== '') words.add(casefold(name));
     }
     const subject = field(compact, 'subject');
     if (isJsonObject(subject)) {

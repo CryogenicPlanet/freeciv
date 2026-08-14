@@ -5,7 +5,7 @@
  */
 import { Effect } from 'effect';
 import type { PlayerError } from 'src/errors';
-import { isJsonObject } from 'src/schema/primitives';
+import { isJsonObject, type JsonValueInput } from 'src/schema/primitives';
 import { cell, dig, mirrorError, type MirrorAliases } from 'src/services/mirror';
 import type { RenderedSection } from 'src/render/mirror/section';
 
@@ -13,7 +13,7 @@ export const STYLE_COLUMNS: ReadonlyArray<string> = ['id', 'style'];
 
 /** `_render_styles` — project a `pregame_styles` page. */
 export const renderStyles = (
-  items: ReadonlyArray<unknown>,
+  items: ReadonlyArray<JsonValueInput>,
   _aliases?: MirrorAliases | null
 ): Effect.Effect<RenderedSection, PlayerError> => {
   const rows: Array<ReadonlyArray<string>> = [];

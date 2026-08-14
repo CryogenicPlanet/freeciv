@@ -15,7 +15,13 @@ import { Option } from 'effect';
 import { FULL_CONTROL_V2 } from 'src/constants';
 import { formatG, scalar } from 'src/render/primitives';
 import { pyFloatRepr } from 'src/services/canonical-body';
-import type { JsonObject, JsonValue } from 'src/schema/primitives';
+import {
+  field,
+  isJsonNumber,
+  isJsonString,
+  type JsonObject,
+  type JsonValue,
+} from 'src/schema/primitives';
 import type { SeatBinding } from 'src/services/session-store';
 
 // ---------------------------------------------------------------------------
@@ -100,9 +106,9 @@ const at = (value: JsonObject, key: string): JsonValue => {
   return found === undefined ? null : found;
 };
 
-const text = (value: JsonObject, key: string): string => {
-  const found = value[key];
-  return typeof found === 'string' ? found : '';
+const textField = (value: JsonObject, key: string): string => {
+  const found = field(value, key);
+  return isJsonString(found) ? found : '';
 };
 
 /**
@@ -122,10 +128,10 @@ export const renderJoin = (
   const timing =
     `timing ${scalar(at(session, 'timing_mode'))}` +
     (timeout === null ? ' no deadline' : ` ${scalar(timeout)}s per turn`);
-  const protocol = text(session, 'control_protocol');
-  const gameId = text(session, 'game_id');
+  const protocol = textField(session, 'control_protocol');
+  const gameId = textField(session, 'game_id');
   const head =
-    `joined ${gameId} as ${text(session, 'controller_label')} | ` +
+    `joined ${gameId} as ${textField(session, 'controller_label')} | ` +
     `seat ${scalar(at(session, 'place'))} ` +
     `${scalar(at(session, 'player_name'))} | proto ${protocol} | ` +
     `state ${scalar(at(result, 'state'))} | ${timing}`;
@@ -160,7 +166,7 @@ export const renderJoin = (
 /** `f"{action_timeout_s:g} seconds per agent turn"`, or why there is none. */
 export const deadlineText = (actionTimeoutS: JsonValue): string => {
   if (actionTimeoutS === null) return 'no agent deadline';
-  if (typeof actionTimeoutS === 'number' && Number.isFinite(actionTimeoutS)) {
+  if (isJsonNumber(actionTimeoutS)) {
     return `${formatG(actionTimeoutS)} seconds per agent turn`;
   }
   return 'deadline unavailable';
@@ -182,8 +188,8 @@ const capitalized = (line: string): string => line.charAt(0).toUpperCase() + lin
 const pyTruthy = (value: JsonValue): boolean => {
   if (value === null || value === false) return false;
   if (value === true) return true;
-  if (typeof value === 'number') return value !== 0;
-  if (typeof value === 'string') return value !== '';
+  if (isJsonNumber(value)) return value !== 0;
+  if (isJsonString(value)) return value !== '';
   if (Array.isArray(value)) return value.length > 0;
   return Object.keys(value).length > 0;
 };
@@ -212,10 +218,10 @@ const pyRepr = (value: JsonValue): string => {
   if (value === null) return 'None';
   if (value === true) return 'True';
   if (value === false) return 'False';
-  if (typeof value === 'number') {
+  if (isJsonNumber(value)) {
     return Number.isInteger(value) ? String(value) : pyFloatRepr(value);
   }
-  if (typeof value === 'string') return reprString(value);
+  if (isJsonString(value)) return reprString(value);
   if (Array.isArray(value)) return `[${value.map((item) => pyRepr(item)).join(', ')}]`;
   return `{${Object.entries(value)
     .map(([key, item]) => `${reprString(key)}: ${pyRepr(item)}`)
@@ -224,7 +230,7 @@ const pyRepr = (value: JsonValue): string => {
 
 /** CPython's `str(value)`: a `str` is itself, everything else is its `repr()`. */
 const pyStr = (value: JsonValue): string =>
-  typeof value === 'string' ? value : pyRepr(value);
+  isJsonString(value) ? value : pyRepr(value);
 
 /**
  * `str(result.get("timing_mode") or "unknown")`.
@@ -252,7 +258,7 @@ export const joinGuidance = (
 ): string => {
   const timingMode = timingModeText(result);
   const deadline = deadlineText(at(result, 'action_timeout_s'));
-  if (text(session, 'control_protocol') !== FULL_CONTROL_V2) {
+  if (textField(session, 'control_protocol') !== FULL_CONTROL_V2) {
     return (
       `\nJoined in ${timingMode} timing mode: ${deadline}.\n` +
       'You—the assigned harness/model—must inspect each observation and ' +

@@ -17,15 +17,20 @@
 import { createHash } from 'node:crypto';
 import { Effect } from 'effect';
 import { OPAQUE_ID_RE, V2_LEGAL_DRAIN_MAX_PAGES } from 'src/constants';
-import { PlayerError, playerError, type PlayError } from 'src/errors';
+import { type PlayerError, playerError, type PlayError } from 'src/errors';
 import { ambiguousChoiceRefusal, unknownChoiceRefusal } from 'src/render/pregame';
 import type { BatchDisposition } from 'src/schema/batch';
 import { decodePage, type PageEnvelope } from 'src/schema/index';
-import { isJsonObject, type JsonObject, type JsonValue } from 'src/schema/primitives';
+import {
+  isJsonObject,
+  isJsonString,
+  type JsonObject,
+  type JsonValue,
+} from 'src/schema/primitives';
 import { aliasMap, rememberPage } from 'src/services/aliases';
 import { CACHE_DIR, cachedPhaseNote, mirrorText, splitLines } from 'src/services/mirror';
-import { PrivateFs } from 'src/services/private-fs';
-import { SessionStore, credentialsOf, type Session } from 'src/services/session-store';
+import { type PrivateFs } from 'src/services/private-fs';
+import { type SessionStore, credentialsOf, type Session } from 'src/services/session-store';
 import { V2Client } from 'src/services/v2-client';
 
 // ---------------------------------------------------------------------------
@@ -82,6 +87,12 @@ export interface PregameItem {
   readonly id: string;
   readonly name: string;
   readonly default_style_id?: string;
+}
+
+interface PregameItemDraft {
+  id: string;
+  name: string;
+  default_style_id?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -162,13 +173,14 @@ export const mirrorPregameCatalog = (
         return [];
       }
       const defaultStyle = named.get('default_style_id') ?? '';
-      items.push({
+      const item: PregameItemDraft = {
         id: identifier,
         name: named.get(specification.column) ?? '',
-        ...(defaultStyle.startsWith('style_') && defaultStyle.length < 64
-          ? { default_style_id: defaultStyle }
-          : {}),
-      });
+      };
+      if (defaultStyle.startsWith('style_') && defaultStyle.length < 64) {
+        item.default_style_id = defaultStyle;
+      }
+      items.push(item);
     }
     return items;
   });
@@ -283,9 +295,8 @@ export const fetchStateSection = (
       if (value.page.next_cursor === null) return items;
       query = new URLSearchParams({ cursor: value.page.next_cursor }).toString();
     }
-    return yield* Effect.fail(
-      playerError(`the ${section} catalog exceeded the safe drain limit`)
-    );
+    return yield*
+      playerError(`the ${section} catalog exceeded the safe drain limit`);
   });
 
 /**
@@ -310,15 +321,16 @@ export const pregameCatalog = (
     // list, so it never becomes a `PregameItem`.  A non-string id survives as
     // `''`, which is exactly as unmatchable and as undrawable.
     return items.filter(isJsonObject).flatMap((item): ReadonlyArray<PregameItem> => {
-      if (typeof item['name'] !== 'string') return [];
+      const name = item['name'];
+      if (!isJsonString(name)) return [];
+      const identifier = item['id'];
       const style = item['default_style_id'];
-      return [
-        {
-          id: typeof item['id'] === 'string' ? item['id'] : '',
-          name: item['name'],
-          ...(typeof style === 'string' && style !== '' ? { default_style_id: style } : {}),
-        },
-      ];
+      const decoded: PregameItemDraft = {
+        id: isJsonString(identifier) ? identifier : '',
+        name,
+      };
+      if (isJsonString(style) && style !== '') decoded.default_style_id = style;
+      return [decoded];
     });
   });
 
@@ -336,7 +348,7 @@ export const pregameChoice = (
   const matches = items.filter((item) => item.name.toLowerCase() === folded && item.id !== '');
   const only = matches[0];
   if (matches.length === 1 && only !== undefined) return Effect.succeed(only);
-  const known = items.map((item) => item.name).sort(compareStrings);
+  const known = items.map((item) => item.name).toSorted(compareStrings);
   const near = known.filter((name) => name.toLowerCase().includes(folded));
   return Effect.fail(
     matches.length > 1
@@ -360,9 +372,14 @@ const compareStrings = (left: string, right: string): number =>
  * against it and U15 has not landed.  See the PORT_MAP amendment: when
  * `src/services/orders/arguments.ts` exists the integrator collapses the two.
  */
+export interface PregameOrderProperties {
+  readonly properties: JsonObject;
+  readonly required: ReadonlyArray<string>;
+}
+
 export const orderProperties = (
   action: PregameAction
-): { readonly properties: JsonObject; readonly required: ReadonlyArray<string> } => {
+): PregameOrderProperties => {
   const schema = action.argument_schema;
   const properties = isJsonObject(schema) ? schema['properties'] : undefined;
   if (!isJsonObject(properties) || Object.keys(properties).length === 0) {
@@ -370,7 +387,7 @@ export const orderProperties = (
   }
   const declared = isJsonObject(schema) ? schema['required'] : undefined;
   const required = (Array.isArray(declared) ? declared : []).filter(
-    (name): name is string => typeof name === 'string' && name in properties
+    (name): name is string => isJsonString(name) && name in properties
   );
   return { properties, required };
 };
@@ -385,8 +402,9 @@ export const defaultArguments = (action: PregameAction): JsonObject | null => {
   for (const name of required) {
     const specification = properties[name];
     const choices = isJsonObject(specification) ? specification['enum'] : undefined;
-    if (!Array.isArray(choices) || choices.length !== 1) return null;
-    filled[name] = choices[0] as JsonValue;
+    const only = Array.isArray(choices) && choices.length === 1 ? choices.at(0) : undefined;
+    if (only === undefined) return null;
+    filled[name] = only;
   }
   return filled;
 };
@@ -470,7 +488,7 @@ export const pregameDefaultNation = (
   const choices = items
     .filter((item) => item.id !== '' && item.name !== '')
     .map((item, index) => ({ item, index }))
-    .sort((left, right) => compareStrings(left.item.name, right.item.name) || left.index - right.index)
+    .toSorted((left, right) => compareStrings(left.item.name, right.item.name) || left.index - right.index)
     .map((entry) => entry.item);
   return choices.length === 0
     ? Effect.fail(
@@ -509,7 +527,7 @@ export const pregameSeatDefaults = (
     const leader = player['leader_name'];
     const sex = player['sex'];
     return {
-      leader: typeof leader === 'string' ? leader : '',
+      leader: isJsonString(leader) ? leader : '',
       sex: sex === 'male' || sex === 'female' ? sex : '',
     };
   });

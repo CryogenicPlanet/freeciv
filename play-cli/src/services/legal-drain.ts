@@ -34,7 +34,7 @@ import {
 } from 'src/constants';
 import { revisionLabel, scalar, scopeText } from 'src/render/primitives';
 import { revisionsEqual, type Revision } from 'src/schema/revision';
-import { field, isJsonObject, sortedNames, type JsonObject } from 'src/schema/primitives';
+import { field, isJsonObject, isJsonString, sortedNames, type JsonObject } from 'src/schema/primitives';
 import type { PageScope } from 'src/schema/page';
 import { aliasMap } from 'src/services/aliases';
 import {
@@ -43,7 +43,7 @@ import {
   kindList,
 } from 'src/services/catalog-cache';
 import type { LegalPageFetcher } from 'src/services/alias-refresh';
-import { PrivateFs } from 'src/services/private-fs';
+import { type PrivateFs } from 'src/services/private-fs';
 import { SessionStore, type V2ClientState } from 'src/services/session-store';
 import { V2Client, type V2ClientApi } from 'src/services/v2-client';
 import { descriptorKindKey, kindSelectorMatches } from 'src/render/legal/kinds';
@@ -126,7 +126,7 @@ export const drainLegal = (
     const turnPage = (state: Drain) =>
       Effect.gen(function* () {
         if (state.page >= V2_LEGAL_DRAIN_MAX_PAGES) {
-          return yield* Effect.fail(playerError(DRAIN_LIMIT));
+          return yield*playerError(DRAIN_LIMIT);
         }
         const value = yield* readLegalPage(ctx, {
           query: state.query,
@@ -141,7 +141,7 @@ export const drainLegal = (
         if (cursor === '') {
           return { ...state, done: { revision: value.state_revision, actions } };
         }
-        if (seen.has(cursor)) return yield* Effect.fail(playerError(REPEATED_CURSOR));
+        if (seen.has(cursor)) return yield*playerError(REPEATED_CURSOR);
         seen.add(cursor);
         return { query: cursorQuery(cursor), cursor, page: state.page + 1, done: null };
       });
@@ -151,7 +151,7 @@ export const drainLegal = (
         cursor: '',
         page: 0,
         done: null,
-      } satisfies Drain as Drain,
+      } satisfies Drain,
       { while: (state) => state.done === null, body: turnPage }
     );
     return drained.done ?? (yield* Effect.dieMessage('unreachable: drain settled without a catalog'));
@@ -234,6 +234,11 @@ export interface DrainAllOutcome {
   readonly matchedNothing: boolean;
 }
 
+const incrementHidden = (
+  hidden: ReadonlyMap<string, number>,
+  name: string
+): ReadonlyMap<string, number> => new Map(hidden).set(name, (hidden.get(name) ?? 0) + 1);
+
 /**
  * Drain one catalog completely and compact it once.
  *
@@ -249,7 +254,7 @@ export const drainLegalAll = (
 ): Effect.Effect<DrainAllOutcome, DrainError, SessionStore | PrivateFs | V2Client> =>
   Effect.gen(function* () {
     if (args.cursor.trim() !== '') {
-      return yield* Effect.fail(playerError('legal --all starts a catalog; omit --cursor'));
+      return yield*playerError('legal --all starts a catalog; omit --cursor');
     }
     const offset = yield* compactLegalOffset(args.offset);
     // `--kind` is a filtered window over every actor, so 64 matches is a
@@ -285,8 +290,6 @@ export const drainLegalAll = (
       readonly exhausted: boolean;
       readonly done: boolean;
     }
-    const hide = (hidden: ReadonlyMap<string, number>, name: string): ReadonlyMap<string, number> =>
-      new Map(hidden).set(name, (hidden.get(name) ?? 0) + 1);
     const takeItem = (
       state: Scan,
       descriptor: JsonObject
@@ -302,17 +305,27 @@ export const drainLegalAll = (
         const matchOffset = state.matched;
         const matched = state.matched + 1;
         if (matchOffset < offset || state.byteLimited) {
-          return { ...state, present, matched, hidden: hide(state.hidden, presentKind) };
+          return {
+            ...state,
+            present,
+            matched,
+            hidden: incrementHidden(state.hidden, presentKind),
+          };
         }
         if (state.compactActions.length >= compactLimit) {
-          return { ...state, present, matched, hidden: hide(state.hidden, presentKind) };
+          return {
+            ...state,
+            present,
+            matched,
+            hidden: incrementHidden(state.hidden, presentKind),
+          };
         }
         const compact = yield* compactLegalAction(descriptor);
         const encodedSize = compactActionBytes(compact);
         if (state.compactBytes + encodedSize > V2_LEGAL_COMPACT_MAX_BYTES) {
           if (state.compactActions.length === 0) {
             if (encodedSize > V2_LEGAL_SINGLE_ACTION_MAX_BYTES) {
-              return yield* Effect.fail(playerError(OVERSIZED_SINGLE));
+              return yield*playerError(OVERSIZED_SINGLE);
             }
             // The bounded fallback printed it after all, so it is not one of
             // the rows this window kept back.
@@ -331,7 +344,7 @@ export const drainLegalAll = (
             present,
             matched,
             byteLimited: true,
-            hidden: hide(state.hidden, presentKind),
+            hidden: incrementHidden(state.hidden, presentKind),
           };
         }
         return {
@@ -349,7 +362,7 @@ export const drainLegalAll = (
     ): Effect.Effect<Scan, DrainError, SessionStore | PrivateFs | V2Client> =>
       Effect.gen(function* () {
         if (state.pagesRead >= V2_LEGAL_DRAIN_MAX_PAGES) {
-          return yield* Effect.fail(playerError(DRAIN_LIMIT));
+          return yield*playerError(DRAIN_LIMIT);
         }
         const request: LegalQuery = {
           query: state.query,
@@ -364,7 +377,7 @@ export const drainLegalAll = (
           (!revisionsEqual(value.state_revision, state.revision) ||
             value.page.total_items !== state.catalogTotal)
         ) {
-          return yield* Effect.fail(playerError(CATALOG_CHANGED));
+          return yield*playerError(CATALOG_CHANGED);
         }
         const paged: Scan = {
           ...state,
@@ -380,7 +393,7 @@ export const drainLegalAll = (
         const nextCursor = value.page.next_cursor ?? '';
         if (nextCursor === '') return { ...scanned, exhausted: false, done: true };
         if (seenCursors.has(nextCursor)) {
-          return yield* Effect.fail(playerError(REPEATED_CURSOR));
+          return yield*playerError(REPEATED_CURSOR);
         }
         seenCursors.add(nextCursor);
         return { ...scanned, query: cursorQuery(nextCursor), cursor: nextCursor };
@@ -402,7 +415,7 @@ export const drainLegalAll = (
         hidden: new Map<string, number>(),
         exhausted: true,
         done: false,
-      } satisfies Scan as Scan,
+      } satisfies Scan,
       { while: (state) => !state.done, body: takePage }
     );
     const {
@@ -467,7 +480,7 @@ export const playerScopeAlias = (
       const subject = field(descriptor, 'subject');
       const actor = isJsonObject(subject) ? field(subject, 'actor') : null;
       const actorId = isJsonObject(actor) ? field(actor, 'id') : null;
-      if (typeof actorId === 'string' && actorId.startsWith('player_')) {
+      if (isJsonString(actorId) && actorId.startsWith('player_')) {
         return aliases[actorId] ?? actorId;
       }
     }

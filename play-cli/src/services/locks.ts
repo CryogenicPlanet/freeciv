@@ -19,10 +19,11 @@
  * it with a liveness probe — the exact bookkeeping the Python was avoiding, and
  * a divergence recorded in NOTES.md §4.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import { Effect } from 'effect';
-import { LockTimeoutError, PlayerError, playerError, attemptOr } from 'src/errors';
+import type * as Scope from 'effect/Scope';
+import { fileSystem, path } from 'src/services/platform';
+import { dlopen, FFIType } from 'bun:ffi';
+import { Clock, Effect, Either } from 'effect';
+import { LockTimeoutError, type PlayerError, playerError, attemptOr } from 'src/errors';
 import { V2_REQUEST_LOCK_TIMEOUT_S, V2_STATE_LOCK_TIMEOUT_S } from 'src/constants';
 import { PrivateFs, type PrivateFsApi } from 'src/services/private-fs';
 
@@ -37,28 +38,24 @@ type FlockFn = (descriptor: number, operation: number) => number;
 
 const LIBC_CANDIDATES = ['libc.dylib', 'libc.so.6', 'libc.so', 'libSystem.dylib'] as const;
 
+interface FlockCache {
+  resolved: boolean;
+  value: FlockFn | null;
+}
+
 /** Bind `flock(2)` once per process; `null` means "no binding on this platform". */
 const flockBinding = ((): (() => FlockFn | null) => {
-  const cache: { resolved: boolean; value: FlockFn | null } = { resolved: false, value: null };
+  const cache: FlockCache = { resolved: false, value: null };
   return () => {
     if (cache.resolved) return cache.value;
     cache.resolved = true;
     const bound = LIBC_CANDIDATES.flatMap((candidate) =>
       attemptOr(
         (): ReadonlyArray<FlockFn> => {
-          // eslint-disable-next-line @typescript-eslint/no-require-imports -- bun:ffi is a builtin
-          const ffi = require('bun:ffi') as {
-            readonly dlopen: (
-              name: string,
-              symbols: Record<string, { args: ReadonlyArray<unknown>; returns: unknown }>
-            ) => { readonly symbols: Record<string, FlockFn> };
-            readonly FFIType: Record<string, unknown>;
-          };
-          const library = ffi.dlopen(candidate, {
-            flock: { args: [ffi.FFIType['i32'], ffi.FFIType['i32']], returns: ffi.FFIType['i32'] },
+          const library = dlopen(candidate, {
+            flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
           });
-          const symbol = library.symbols['flock'];
-          return typeof symbol === 'function' ? [symbol] : [];
+          return [library.symbols.flock];
         },
         (): ReadonlyArray<FlockFn> => [] /* this libc spelling is absent here */
       )
@@ -72,129 +69,120 @@ const flockBinding = ((): (() => FlockFn | null) => {
 /** Report whether the real `flock(2)` is available. Tests assert this is true. */
 export const hasNativeFlock = (): boolean => flockBinding() !== null;
 
-const openFlag = (name: string): number => {
-  const table = fs.constants as unknown as Readonly<Record<string, number | undefined>>;
-  return table[name] ?? 0;
-};
-
-const NOFOLLOW = openFlag('O_NOFOLLOW');
-const CLOEXEC = openFlag('O_CLOEXEC');
-
-const sleepMillis = (millis: number): void => {
-  // A busy-wait would spin a core for up to 45s; `Atomics.wait` blocks this
-  // thread exactly as CPython's `time.sleep` did inside the retry loop.
-  const buffer = new Int32Array(new SharedArrayBuffer(4));
-  Atomics.wait(buffer, 0, 0, millis);
-};
-
 const POLL_MILLIS = 50;
 
-interface HeldLock {
-  readonly descriptor: number;
-  readonly release: () => void;
-}
+const refuseSymbolicLink = (target: string): Effect.Effect<void, PlayerError> =>
+  Effect.flatMap(Effect.either(fileSystem.readLink(target)), (link) =>
+    Either.isRight(link)
+      ? Effect.fail(playerError('private state lock must be a mode-0600 file'))
+      : Effect.void
+  );
 
-const acquireNative = (
+const runNative = <A, E, R>(
   flock: FlockFn,
   file: string,
-  timeoutS: number
-): Effect.Effect<HeldLock, PlayerError | LockTimeoutError> =>
-  Effect.suspend<HeldLock, PlayerError | LockTimeoutError, never>(() => {
-    const descriptor = attemptOr(
-      (): number | PlayerError =>
-        fs.openSync(file, fs.constants.O_RDWR | fs.constants.O_CREAT | NOFOLLOW | CLOEXEC, 0o600),
+  timeoutS: number,
+  body: Effect.Effect<A, E, R>
+): Effect.Effect<A, E | PlayerError | LockTimeoutError, R | Scope.Scope> =>
+  Effect.gen(function* () {
+    yield* refuseSymbolicLink(file);
+    const existing = yield* Effect.either(fileSystem.stat(file));
+    if (Either.isLeft(existing)) {
+      yield* Effect.ignore(
+        fileSystem.writeFile(file, new Uint8Array(), { flag: 'wx', mode: 0o600 })
+      );
+    }
+    yield* refuseSymbolicLink(file);
+    const opened = yield* Effect.mapError(
+      fileSystem.open(file, { flag: 'r+' }),
       () => playerError('cannot safely lock private player state')
     );
-    if (typeof descriptor !== 'number') return Effect.fail(descriptor);
-    const stat = fs.fstatSync(descriptor);
-    if (!stat.isFile() || (stat.mode & 0o777) !== 0o600) {
-      fs.closeSync(descriptor);
-      return Effect.fail(playerError('private state lock must be a mode-0600 file'));
+    const info = yield* Effect.mapError(
+      opened.stat,
+      () => playerError('cannot safely lock private player state')
+    );
+    if (info.type !== 'File' || (info.mode & 0o777) !== 0o600) {
+      return yield* playerError('private state lock must be a mode-0600 file');
     }
-    const deadline = Date.now() + timeoutS * 1000;
-    const poll = (): Effect.Effect<HeldLock, LockTimeoutError> => {
-      if (flock(descriptor, LOCK_EX | LOCK_NB) === 0) {
-        return Effect.succeed({
-          descriptor,
-          release: () => {
-            attemptOr(
-              () => flock(descriptor, LOCK_UN),
-              () => 0 /* the kernel releases on close anyway */
-            );
-            fs.closeSync(descriptor);
-          },
-        });
-      }
-      if (Date.now() >= deadline) {
-        fs.closeSync(descriptor);
-        return Effect.fail(new LockTimeoutError({ message: LOCK_BUSY_MESSAGE, path: file }));
-      }
-      sleepMillis(POLL_MILLIS);
-      return Effect.suspend(poll);
-    };
-    return poll();
+    const descriptor = Number(opened.fd);
+    const deadline = (yield* Clock.currentTimeMillis) + timeoutS * 1000;
+    const poll = (): Effect.Effect<void, LockTimeoutError> =>
+      Effect.gen(function* () {
+        if (flock(descriptor, LOCK_EX | LOCK_NB) === 0) return undefined;
+        if ((yield* Clock.currentTimeMillis) >= deadline) {
+          return yield* new LockTimeoutError({ message: LOCK_BUSY_MESSAGE, path: file });
+        }
+        yield* Effect.sleep(POLL_MILLIS);
+        yield* poll();
+        return undefined;
+      });
+    yield* poll();
+    return yield* Effect.ensuring(
+      body,
+      Effect.sync(() => {
+        attemptOr(
+          () => flock(descriptor, LOCK_UN),
+          () => 0 /* the scoped file close releases the kernel lock too */
+        );
+      })
+    );
   });
 
-const acquireSentinel = (
+const runSentinel = <A, E, R>(
   file: string,
-  timeoutS: number
-): Effect.Effect<HeldLock, PlayerError | LockTimeoutError> =>
-  Effect.suspend<HeldLock, PlayerError | LockTimeoutError, never>(() => {
+  timeoutS: number,
+  body: Effect.Effect<A, E, R>
+): Effect.Effect<A, E | LockTimeoutError, R | Scope.Scope> =>
+  Effect.gen(function* () {
     const sentinel = `${file}.held`;
-    const deadline = Date.now() + timeoutS * 1000;
-    const claim = (): HeldLock | null =>
-      attemptOr(
-        (): HeldLock => {
-          const descriptor = fs.openSync(
-            sentinel,
-            fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NOFOLLOW | CLOEXEC,
-            0o600
+    const deadline = (yield* Clock.currentTimeMillis) + timeoutS * 1000;
+    const claim = () =>
+      Effect.orElseSucceed(
+        Effect.gen(function* () {
+          const opened = yield* fileSystem.open(sentinel, { flag: 'wx', mode: 0o600 });
+          return yield* Effect.onError(
+            Effect.as(opened.writeAll(new TextEncoder().encode(`${process.pid}\n`)), opened),
+            () => Effect.ignore(fileSystem.remove(sentinel, { force: true }))
           );
-          fs.writeSync(descriptor, Buffer.from(`${process.pid}\n`, 'utf8'));
-          return {
-            descriptor,
-            release: () => {
-              fs.closeSync(descriptor);
-              attemptOr(
-                () => fs.unlinkSync(sentinel),
-                () => undefined /* already gone */
-              );
-            },
-          };
-        },
+        }),
         () => null
       );
-    // A sentinel whose writer is gone is stale; the liveness probe is the
-    // bookkeeping `flock` would have made unnecessary.
-    const reapedStale = (): boolean =>
-      attemptOr(
-        () => {
-          const holder = Number.parseInt(fs.readFileSync(sentinel, 'utf8').trim(), 10);
-          if (!Number.isInteger(holder)) return false;
-          const alive = attemptOr(
-            () => {
-              process.kill(holder, 0);
-              return true;
-            },
-            () => false
-          );
-          if (alive) return false;
-          fs.unlinkSync(sentinel);
-          return true;
-        },
-        () => false /* the sentinel vanished between open and read */
-      );
-    const poll = (): Effect.Effect<HeldLock, LockTimeoutError> => {
-      const held = claim();
-      if (held !== null) return Effect.succeed(held);
-      if (reapedStale()) return Effect.suspend(poll);
-      if (Date.now() >= deadline) {
-        return Effect.fail(new LockTimeoutError({ message: LOCK_BUSY_MESSAGE, path: file }));
-      }
-      sleepMillis(POLL_MILLIS);
-      return Effect.suspend(poll);
-    };
-    return poll();
+    const reapedStale = (): Effect.Effect<boolean> =>
+      Effect.gen(function* () {
+        const content = yield* Effect.either(fileSystem.readFileString(sentinel));
+        if (Either.isLeft(content)) return false;
+        const holder = Number.parseInt(content.right.trim(), 10);
+        if (!Number.isInteger(holder)) return false;
+        const alive = attemptOr(
+          () => {
+            process.kill(holder, 0);
+            return true;
+          },
+          () => false
+        );
+        if (alive) return false;
+        return Either.isRight(yield* Effect.either(fileSystem.remove(sentinel)));
+      });
+    const poll = (): Effect.Effect<void, LockTimeoutError, Scope.Scope> =>
+      Effect.gen(function* () {
+        const held = yield* claim();
+        if (held !== null) return undefined;
+        if (yield* reapedStale()) {
+          yield* poll();
+          return undefined;
+        }
+        if ((yield* Clock.currentTimeMillis) >= deadline) {
+          return yield* new LockTimeoutError({ message: LOCK_BUSY_MESSAGE, path: file });
+        }
+        yield* Effect.sleep(POLL_MILLIS);
+        yield* poll();
+        return undefined;
+      });
+    yield* poll();
+    return yield* Effect.ensuring(
+      body,
+      Effect.ignore(fileSystem.remove(sentinel, { force: true }))
+    );
   });
 
 /**
@@ -213,13 +201,14 @@ export const withAdvisoryLock = <A, E, R>(
     const files = yield* PrivateFs;
     const { relative } = yield* files.resolve(target);
     const parent = yield* files.openDirectory(relative.slice(0, -1), { create: true });
-    const file = path.join(parent, relative[relative.length - 1] as string);
+    const leaf = relative.at(-1);
+    if (leaf === undefined) return yield* playerError('private state lock path is invalid');
+    const file = path.join(parent, leaf);
     const flock = flockBinding();
-    const acquire = flock === null ? acquireSentinel(file, timeoutS) : acquireNative(flock, file, timeoutS);
-    return yield* Effect.acquireUseRelease(
-      acquire,
-      () => body,
-      (held) => Effect.sync(held.release)
+    return yield* Effect.scoped(
+      flock === null
+        ? runSentinel(file, timeoutS, body)
+        : runNative(flock, file, timeoutS, body)
     );
   });
 
@@ -264,5 +253,7 @@ export const lockFilePath = (
   Effect.gen(function* () {
     const { relative } = yield* files.resolve(target);
     const parent = yield* files.openDirectory(relative.slice(0, -1), { create: true });
-    return path.join(parent, relative[relative.length - 1] as string);
+    const leaf = relative.at(-1);
+    if (leaf === undefined) return yield* playerError('private state lock path is invalid');
+    return path.join(parent, leaf);
   });

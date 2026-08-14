@@ -37,7 +37,7 @@ import type { PageEnvelope } from 'src/schema/page';
 import { revisionsEqual } from 'src/schema/revision';
 import type { WaitEnvelope } from 'src/schema/wait';
 import { aliasMap } from 'src/services/aliases';
-import { compositeJson } from 'src/services/composite-json';
+import { compositeJson, type CompositeJson } from 'src/services/composite-json';
 import { briefingDecisionLines, type DecisionDeps } from 'src/services/decisions';
 import type { CompactAction } from 'src/services/legal-compact';
 import { compactText } from 'src/services/orders';
@@ -45,7 +45,7 @@ import { turnHealthContext, turnHealthEpoch, turnHealthEpochsEqual } from 'src/s
 import { pyDumps } from 'src/services/canonical-body';
 import { healthFloatPathsUnder, pyValueWithFloats } from 'src/services/health-json';
 import { mirrorHealth } from 'src/services/mirror';
-import { PrivateFs } from 'src/services/private-fs';
+import { type PrivateFs } from 'src/services/private-fs';
 import { SessionStore, type Session, type V2ClientState } from 'src/services/session-store';
 import {
   briefingEventsLine,
@@ -56,7 +56,7 @@ import {
   turnPage,
   type TurnHooks,
 } from 'src/services/turn-pages';
-import { V2Client } from 'src/services/v2-client';
+import { type V2Client } from 'src/services/v2-client';
 import {
   waitArgs,
   waitUntilTurn,
@@ -167,9 +167,8 @@ export const resolveKindAction = (
         ? cached
         : yield* Effect.zipRight(ctx.phaseEnd.drainLegal, lookup);
     if (found.compact === null) {
-      return yield* Effect.fail(
-        playerError(`no ${kind} action is enumerable for this seat right now; ${remedy}`)
-      );
+      return yield*
+        playerError(`no ${kind} action is enumerable for this seat right now; ${remedy}`);
     }
     return { compact: found.compact, state: found.state };
   });
@@ -197,13 +196,12 @@ export const phaseEnd = (ctx: TurnCtx): TurnEffect<PhaseEndResult> =>
     const { compact } = yield* resolveKindAction(ctx, 'phase.end', PHASE_END_REMEDY);
     const args = ctx.phaseEnd.defaultArguments(compact);
     if (args === null) {
-      return yield* Effect.fail(
+      return yield*
         playerError(
           'this phase.end action takes arguments; run ' +
             '`just legal --kind phase.end --all` and submit it with ' +
             '`just batch`'
-        )
-      );
+        );
     }
     const batchId = yield* ctx.phaseEnd.persistBatchForAction(compactText(compact, 'action_id'), args);
     const outcome = yield* ctx.phaseEnd.submitPersistedBatch(batchId);
@@ -297,7 +295,7 @@ export const turnBriefingLocked = (ctx: TurnCtx): TurnEffect<TurnBriefing> =>
       }
       const finalHealth = yield* turnHealth(ctx.session);
       const first = pages[V2_TURN_SECTIONS[0]];
-      if (first === undefined) return yield* Effect.fail(playerError('the turn briefing lost a page'));
+      if (first === undefined) return yield*playerError('the turn briefing lost a page');
       const baseline = first.state_revision;
       const finalPhase = finalHealth.phase;
       const consistent =
@@ -309,11 +307,10 @@ export const turnBriefingLocked = (ctx: TurnCtx): TurnEffect<TurnBriefing> =>
         (finalPhase === null || finalPhase.turn === null || finalPhase.turn === baseline.turn);
       if (!consistent) {
         if (attempt === 0) return null;
-        return yield* Effect.fail(
+        return yield*
           playerError(
             'the game changed twice while building the turn briefing; run `just turn` again'
-          )
-        );
+          );
       }
 
       // Read before the mirror is overwritten: the event total it still holds
@@ -335,11 +332,11 @@ export const turnBriefingLocked = (ctx: TurnCtx): TurnEffect<TurnBriefing> =>
       const overviewPage = pages['overview'];
       const overviewItems = overviewPage === undefined ? [] : overviewPage.page.items;
       if (overviewItems.length !== 1) {
-        return yield* Effect.fail(playerError('the turn briefing has no current overview'));
+        return yield*playerError('the turn briefing has no current overview');
       }
       const overview = overviewItems[0];
       if (overview === undefined) {
-        return yield* Effect.fail(playerError('the turn briefing has no current overview'));
+        return yield*playerError('the turn briefing has no current overview');
       }
       const compact = (section: string): TurnCompactPage => {
         const page = pages[section];
@@ -369,7 +366,7 @@ export const turnBriefingLocked = (ctx: TurnCtx): TurnEffect<TurnBriefing> =>
     });
     const first = yield* attemptBriefing(0);
     return first ?? (yield* attemptBriefing(1)) ??
-      (yield* Effect.fail(playerError('unreachable turn briefing state')));
+      (yield*playerError('unreachable turn briefing state'));
   });
 
 // ---------------------------------------------------------------------------
@@ -442,10 +439,7 @@ export const awaitAndBrief = (
         hooks: ctx.waitHooks,
       }),
       waitArgs(options.wait ?? {}),
-      {
-        forTurn: false,
-        ...(prelude === null ? {} : { echo: tick }),
-      }
+      { forTurn: false, echo: prelude === null ? undefined : tick }
     );
     const lines: string[] = [awaitLine(wait, options.brief ? '' : 'just turn')];
     if (!options.brief) return { wait, briefing: null, briefError: '', lines };
@@ -498,6 +492,15 @@ export interface TurnEndOutcome {
   readonly exitCode: number;
 }
 
+export interface TurnEndedJson {
+  readonly schema_version: 1;
+  readonly command: 'turn';
+  readonly status: 'ended';
+  readonly disposition: BatchDisposition;
+  readonly wait: WaitEnvelope | null;
+  readonly turn_error?: never;
+}
+
 /** The `--json` payloads `_command_turn_end` prints, kept where they are read. */
 export const turnEndJson = (
   brief: boolean,
@@ -505,7 +508,7 @@ export const turnEndJson = (
   wait: WaitEnvelope | null,
   briefing: TurnResult | null,
   briefError: string
-): Readonly<Record<string, unknown>> =>
+): CompositeJson | TurnEndedJson =>
   brief
     ? compositeJson('turn', {
         end: disposition,
@@ -563,14 +566,14 @@ export const commandTurnEnd = (
         awaitAndBrief(ctx, {
           brief,
           prelude: options.json ? null : lines,
-          ...(options.wait === undefined ? {} : { wait: options.wait }),
+          wait: options.wait,
         })
       );
       if (woke._tag === 'Left') {
         // The end already applied; a wait/brief failure must never swallow
         // that receipt (a validation error here once hid three consecutive
         // applied phase-ends from a live agent).
-        if (options.json) return yield* Effect.fail(woke.left);
+        if (options.json) return yield*woke.left;
         lines.push(
           'phase ended: the receipt above is authoritative',
           `await failed: ${woke.left.message}`,

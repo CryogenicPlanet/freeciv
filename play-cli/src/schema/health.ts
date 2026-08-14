@@ -10,7 +10,7 @@
  * added here rather than by loosening `exact`.
  */
 import { Effect } from 'effect';
-import { DriftError, drifted, invalid } from 'src/errors';
+import { type DriftError, drifted, invalid } from 'src/errors';
 import {
   FULL_CONTROL_V2,
   PLAYER_COLOR_RE,
@@ -28,17 +28,24 @@ import {
   exact,
   field,
   hasField,
+  isJsonBoolean,
+  isJsonNumber,
   isJsonObject,
+  isJsonScalar,
+  isJsonString,
   isWholeNumber,
   jsonObject,
+  jsonValue,
   safeNumber,
   sortedNames,
   type EvaluationContext,
   type JsonObject,
   type JsonValue,
+  type JsonValueInput,
   type SessionIdentity,
 } from 'src/schema/primitives';
 import { decodeV2Header } from 'src/schema/error';
+import { compactJson } from 'src/services/json-output';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -128,6 +135,17 @@ export interface PhaseEndEvent extends JsonObject {
 
 export type RecoveryEvent = JsonObject;
 
+interface PhaseEndEventDraft extends PhaseEndEvent {
+  incarnation?: number;
+  orders_submitted?: number | null;
+}
+
+interface PhaseBlockDraft extends PhaseBlock {
+  waiting_on?: WaitingOn | null;
+  auto_end?: AutoEnd | null;
+  prior_end?: PriorEnd | null;
+}
+
 export interface HealthEnvelope {
   readonly schema_version: 2;
   readonly control_protocol: typeof FULL_CONTROL_V2;
@@ -172,7 +190,7 @@ const PHASE_END_SOURCES: ReadonlySet<string> = new Set(['agent', 'timeout', 'aut
 const PHASE_END_RESOLUTIONS: ReadonlySet<string> = new Set(['advanced', 'terminal', 'failed']);
 
 export const decodePhaseEndEvent = (
-  value: unknown,
+  value: JsonValue,
   session: SessionIdentity,
   seat: HealthSeat
 ): Effect.Effect<PhaseEndEvent, DriftError> =>
@@ -191,13 +209,13 @@ export const decodePhaseEndEvent = (
     const orders = field(raw, 'orders_submitted');
     if (hasField(raw, 'orders_submitted') && orders !== null) {
       if (!isWholeNumber(orders) || orders < 0) {
-        return yield* Effect.fail(invalid('v2 health last phase end orders_submitted'));
+        return yield*invalid('v2 health last phase end orders_submitted');
       }
     }
     if (hasField(raw, 'incarnation')) {
       const incarnation = field(raw, 'incarnation');
       if (!isWholeNumber(incarnation) || incarnation < 0) {
-        return yield* Effect.fail(invalid('v2 health last phase end incarnation'));
+        return yield*invalid('v2 health last phase end incarnation');
       }
     }
 
@@ -211,39 +229,80 @@ export const decodePhaseEndEvent = (
       const own = field(raw, name);
       return !isWholeNumber(own) || own < minimum;
     });
+    const sequence = field(raw, 'sequence');
+    const turn = field(raw, 'turn');
+    const phase = field(raw, 'phase');
+    const place = field(raw, 'place');
+    const seatId = field(raw, 'seat_id');
+    const playerName = field(raw, 'player_name');
     const color = field(raw, 'player_color');
+    const controllerLabel = field(raw, 'controller_label');
+    const controllerType = field(raw, 'controller_type');
     const receiptState = field(raw, 'receipt_state');
     const resolution = field(raw, 'resolution');
     const source = field(raw, 'source');
     if (
       badCounter ||
-      field(raw, 'place') !== seat.place ||
-      field(raw, 'seat_id') !== seat.seat_id ||
-      field(raw, 'player_name') !== seat.player_name ||
-      typeof color !== 'string' ||
+      !isWholeNumber(sequence) ||
+      !isWholeNumber(turn) ||
+      !isWholeNumber(phase) ||
+      !isWholeNumber(place) ||
+      place !== seat.place ||
+      !isJsonString(seatId) ||
+      seatId !== seat.seat_id ||
+      !isJsonString(playerName) ||
+      playerName !== seat.player_name ||
+      !isJsonString(color) ||
       !PLAYER_COLOR_RE.test(color) ||
-      field(raw, 'controller_label') !== session.controllerLabel ||
-      field(raw, 'controller_type') !== 'external' ||
-      typeof source !== 'string' ||
+      !isJsonString(controllerLabel) ||
+      controllerLabel !== session.controllerLabel ||
+      controllerType !== 'external' ||
+      !isJsonString(source) ||
       !PHASE_END_SOURCES.has(source) ||
-      typeof receiptState !== 'string' ||
+      !isJsonString(receiptState) ||
       !V2_TERMINAL_RECEIPTS.has(receiptState) ||
-      typeof resolution !== 'string' ||
+      !isJsonString(resolution) ||
       !PHASE_END_RESOLUTIONS.has(resolution) ||
       (receiptState === 'rejected' && resolution !== 'failed')
     ) {
-      return yield* Effect.fail(invalid('v2 health last phase end'));
+      return yield*invalid('v2 health last phase end');
     }
 
-    for (const name of ['deadline_started_at', 'ended_at', 'elapsed_s'] as const) {
-      yield* safeNumber(field(raw, name), `health last phase end ${name}`);
+    const deadlineStartedAt = yield* safeNumber(
+      field(raw, 'deadline_started_at'),
+      'health last phase end deadline_started_at'
+    );
+    const endedAt = yield* safeNumber(field(raw, 'ended_at'), 'health last phase end ended_at');
+    const elapsed = yield* safeNumber(field(raw, 'elapsed_s'), 'health last phase end elapsed_s');
+    if (endedAt < deadlineStartedAt) {
+      return yield*invalid('v2 health last phase end timing');
     }
-    const endedAt = field(raw, 'ended_at');
-    const startedAt = field(raw, 'deadline_started_at');
-    if (typeof endedAt === 'number' && typeof startedAt === 'number' && endedAt < startedAt) {
-      return yield* Effect.fail(invalid('v2 health last phase end timing'));
+    const decoded: PhaseEndEventDraft = {
+      sequence,
+      turn,
+      phase,
+      place,
+      seat_id: seatId,
+      player_name: playerName,
+      player_color: color,
+      controller_label: controllerLabel,
+      controller_type: controllerType,
+      source,
+      receipt_state: receiptState,
+      resolution,
+      deadline_started_at: deadlineStartedAt,
+      ended_at: endedAt,
+      elapsed_s: elapsed,
+    };
+    if (hasField(raw, 'incarnation')) {
+      const incarnation = field(raw, 'incarnation');
+      if (isWholeNumber(incarnation)) decoded.incarnation = incarnation;
     }
-    return raw as PhaseEndEvent;
+    if (hasField(raw, 'orders_submitted')) {
+      const submitted = field(raw, 'orders_submitted');
+      if (submitted === null || isWholeNumber(submitted)) decoded.orders_submitted = submitted;
+    }
+    return decoded;
   });
 
 // ---------------------------------------------------------------------------
@@ -251,7 +310,7 @@ export const decodePhaseEndEvent = (
 // ---------------------------------------------------------------------------
 
 export const decodeRecoveryEvent = (
-  value: unknown,
+  value: JsonValue,
   session: SessionIdentity,
   seat: HealthSeat
 ): Effect.Effect<RecoveryEvent, DriftError> =>
@@ -262,7 +321,7 @@ export const decodeRecoveryEvent = (
       field(raw, 'seat_id') !== seat.seat_id ||
       field(raw, 'place') !== seat.place
     ) {
-      return yield* Effect.fail(invalid('v2 health last recovery seat'));
+      return yield*invalid('v2 health last recovery seat');
     }
     const kind = field(raw, 'kind');
     const outcome = field(raw, 'outcome');
@@ -270,17 +329,17 @@ export const decodeRecoveryEvent = (
     const rewound = field(raw, 'rewound_applied_actions');
     const timestamp = field(raw, 'timestamp');
     if (
-      typeof kind !== 'string' ||
+      !isJsonString(kind) ||
       !V2_RECOVERY_KINDS.has(kind) ||
-      typeof outcome !== 'string' ||
+      !isJsonString(outcome) ||
       !V2_RECOVERY_OUTCOMES.has(outcome) ||
-      typeof trigger !== 'string' ||
+      !isJsonString(trigger) ||
       trigger.length === 0 ||
-      typeof rewound !== 'boolean' ||
-      typeof timestamp !== 'string' ||
+      !isJsonBoolean(rewound) ||
+      !isJsonString(timestamp) ||
       timestamp.length === 0
     ) {
-      return yield* Effect.fail(invalid('v2 health last recovery'));
+      return yield*invalid('v2 health last recovery');
     }
     return yield* jsonObject(raw, 'v2 health last recovery');
   });
@@ -384,9 +443,9 @@ const STALE_CLIENT_TAIL =
 /** CPython's `repr()` for the scalars a drifted `waiting_on.kind` can hold. */
 const pyRepr = (value: JsonValue): string => {
   if (value === null) return 'None';
-  if (typeof value === 'boolean') return value ? 'True' : 'False';
-  if (typeof value === 'number') return String(value);
-  if (typeof value !== 'string') return JSON.stringify(value);
+  if (isJsonBoolean(value)) return value ? 'True' : 'False';
+  if (isJsonNumber(value)) return String(value);
+  if (!isJsonString(value)) return compactJson(value);
   const quote = value.includes("'") && !value.includes('"') ? '"' : "'";
   const escaped = value
     .replace(/\\/g, '\\\\')
@@ -401,8 +460,8 @@ const decodeAutoEnd = (value: JsonValue): Effect.Effect<AutoEnd, DriftError> =>
     const raw = yield* exact(value, AUTO_END_FIELDS, 'health phase auto_end');
     const enabled = field(raw, 'enabled');
     const armed = field(raw, 'armed');
-    if (typeof enabled !== 'boolean' || typeof armed !== 'boolean') {
-      return yield* Effect.fail(invalid('v2 health phase auto_end'));
+    if (!isJsonBoolean(enabled) || !isJsonBoolean(armed)) {
+      return yield*invalid('v2 health phase auto_end');
     }
     const grace = yield* safeNumber(field(raw, 'grace_s'), 'health phase auto_end grace_s', {
       nullable: true,
@@ -438,33 +497,39 @@ const decodePriorEnd = (
     const controllerLabel = field(raw, 'controller_label');
     const orders = field(raw, 'orders_submitted');
     if (
-      typeof source !== 'string' ||
+      !isJsonString(source) ||
       !PHASE_END_SOURCES.has(source) ||
-      typeof receiptState !== 'string' ||
+      !isJsonString(receiptState) ||
       !V2_TERMINAL_RECEIPTS.has(receiptState) ||
-      typeof resolution !== 'string' ||
+      !isJsonString(resolution) ||
       !PHASE_END_RESOLUTIONS.has(resolution) ||
       badCounter ||
       field(raw, 'place') === seat.place ||
-      typeof playerName !== 'string' ||
-      typeof seatId !== 'string' ||
-      (controllerLabel !== null && typeof controllerLabel !== 'string') ||
+      !isJsonString(playerName) ||
+      !isJsonString(seatId) ||
+      (controllerLabel !== null && !isJsonString(controllerLabel)) ||
       (orders !== null && (!isWholeNumber(orders) || orders < 0))
     ) {
-      return yield* Effect.fail(invalid('v2 health phase prior_end'));
+      return yield*invalid('v2 health phase prior_end');
+    }
+    const place = field(raw, 'place');
+    const turn = field(raw, 'turn');
+    const phase = field(raw, 'phase');
+    if (!isWholeNumber(place) || !isWholeNumber(turn) || !isWholeNumber(phase)) {
+      return yield* invalid('v2 health phase prior_end');
     }
     const elapsed = yield* safeNumber(field(raw, 'elapsed_s'), 'health prior_end elapsed_s');
     return {
-      place: field(raw, 'place') as number,
+      place,
       seat_id: seatId,
       player_name: playerName,
       controller_label: controllerLabel,
-      turn: field(raw, 'turn') as number,
-      phase: field(raw, 'phase') as number,
+      turn,
+      phase,
       source,
       receipt_state: receiptState,
       resolution,
-      elapsed_s: elapsed as number,
+      elapsed_s: elapsed,
       orders_submitted: orders,
     };
   });
@@ -473,17 +538,16 @@ const decodeWaitingOn = (value: JsonValue): Effect.Effect<WaitingOn, DriftError>
   Effect.gen(function* () {
     const raw = yield* exact(value, WAITING_ON_FIELDS, 'health phase waiting_on');
     const kind = field(raw, 'kind');
-    if (typeof kind !== 'string' || !WAITING_ON_KINDS.has(kind)) {
-      return yield* Effect.fail(
+    if (!isJsonString(kind) || !WAITING_ON_KINDS.has(kind)) {
+      return yield*
         drifted(
           'v2 health',
           `invalid v2 health: unknown waiting_on kind ${pyRepr(kind)}${STALE_CLIENT_TAIL}`
-        )
-      );
+        );
     }
     const summary = field(raw, 'summary');
-    if (typeof summary !== 'string' || summary.length === 0) {
-      return yield* Effect.fail(invalid('v2 health phase waiting_on'));
+    if (!isJsonString(summary) || summary.length === 0) {
+      return yield*invalid('v2 health phase waiting_on');
     }
     const waitingS = yield* safeNumber(
       field(raw, 'waiting_s'),
@@ -492,7 +556,7 @@ const decodeWaitingOn = (value: JsonValue): Effect.Effect<WaitingOn, DriftError>
     );
     const seats = field(raw, 'seats');
     if (!Array.isArray(seats)) {
-      return yield* Effect.fail(invalid('v2 health waiting_on seats'));
+      return yield*invalid('v2 health waiting_on seats');
     }
     const rows: WaitingOnSeat[] = [];
     for (const row of seats) {
@@ -544,19 +608,19 @@ const decodePhaseBlock = (
     const phaseNumber = field(phase, 'phase');
     const active = field(phase, 'active');
     if (
-      typeof state !== 'string' ||
+      !isJsonString(state) ||
       !V2_PHASE_STATES.has(state) ||
       (turn !== null && (!isWholeNumber(turn) || turn < 0)) ||
       (phaseNumber !== null && (!isWholeNumber(phaseNumber) || phaseNumber < 0)) ||
-      typeof active !== 'boolean'
+      !isJsonBoolean(active)
     ) {
-      return yield* Effect.fail(invalid('v2 health phase'));
+      return yield*invalid('v2 health phase');
     }
 
     const timing = yield* exact(field(phase, 'timing'), TIMING_FIELDS, 'health phase timing');
     const mode = field(timing, 'mode');
-    if (typeof mode !== 'string' || !TIMING_MODES.has(mode)) {
-      return yield* Effect.fail(invalid('v2 health timing mode'));
+    if (!isJsonString(mode) || !TIMING_MODES.has(mode)) {
+      return yield*invalid('v2 health timing mode');
     }
     const timeouts: Record<string, number | null> = {};
     for (const name of [
@@ -571,7 +635,7 @@ const decodePhaseBlock = (
       });
     }
 
-    const block: { -readonly [K in keyof PhaseBlock]: PhaseBlock[K] } = {
+    const block: PhaseBlockDraft = {
       state,
       turn: turn,
       phase: phaseNumber,
@@ -591,32 +655,40 @@ const decodePhaseBlock = (
     return block;
   });
 
+interface HealthEnvelopeDraft extends HealthEnvelope {
+  last_recovery?: RecoveryEvent | null;
+  objective?: string;
+  max_turns?: number;
+  turns_remaining?: number | null;
+}
+
 export const decodeHealth = (
-  value: unknown,
+  value: JsonValueInput,
   session: SessionIdentity
 ): Effect.Effect<HealthEnvelope, DriftError> =>
   Effect.gen(function* () {
+    const payload = yield* jsonValue(value, 'v2 health');
     const baseFields = new Set<string>(HEALTH_BASE);
     // A supervisor that reports rollbacks and one that does not are both valid
     // peers, and an additive server field must never take the play surface down.
-    if (isJsonObject(value) && hasField(value, 'last_recovery')) {
+    if (isJsonObject(payload) && hasField(payload, 'last_recovery')) {
       baseFields.add('last_recovery');
     }
-    const present = isJsonObject(value)
-      ? Object.keys(value).filter((key) => V2_EVALUATION_FIELDS.has(key))
+    const present = isJsonObject(payload)
+      ? Object.keys(payload).filter((key) => V2_EVALUATION_FIELDS.has(key))
       : [];
     const sessionContext: EvaluationContext | null = session.evaluation;
     if (present.length > 0 && present.length !== V2_EVALUATION_FIELDS.size) {
-      return yield* Effect.fail(invalid('v2 health', 'evaluation context is incomplete'));
+      return yield*invalid('v2 health', 'evaluation context is incomplete');
     }
     if (sessionContext !== null && present.length === 0) {
-      return yield* Effect.fail(invalid('v2 health', 'evaluation context is missing'));
+      return yield*invalid('v2 health', 'evaluation context is missing');
     }
     const fields = new Set<string>(baseFields);
     if (present.length > 0) {
       for (const name of V2_EVALUATION_FIELDS) fields.add(name);
     }
-    const raw = yield* decodeV2Header(value, session, fields, 'v2 health');
+    const raw = yield* decodeV2Header(payload, session, fields, 'v2 health');
     const evaluation = yield* decodeEvaluationContext(raw, 'v2 health', {
       expected: sessionContext,
       required: sessionContext !== null,
@@ -626,11 +698,11 @@ export const decodeHealth = (
     const controllerLabel = field(agent, 'controller_label');
     if (
       field(agent, 'agent_id') !== session.agentId ||
-      typeof controllerLabel !== 'string' ||
+      !isJsonString(controllerLabel) ||
       controllerLabel.length === 0 ||
       controllerLabel !== session.controllerLabel
     ) {
-      return yield* Effect.fail(invalid('v2 health agent identity'));
+      return yield*invalid('v2 health agent identity');
     }
 
     const seatFields = new Set<string>(SEAT_BASE);
@@ -638,8 +710,14 @@ export const decodeHealth = (
     if (isJsonObject(rawSeat) && hasField(rawSeat, 'standing')) seatFields.add('standing');
     const seatRaw = yield* exact(rawSeat, seatFields, 'health seat');
     const standing = field(seatRaw, 'standing');
-    if (hasField(seatRaw, 'standing') && (typeof standing !== 'string' || !SEAT_STANDINGS.has(standing))) {
-      return yield* Effect.fail(invalid('v2 health seat standing'));
+    const cleanStanding = hasField(seatRaw, 'standing') && isJsonString(standing)
+      ? standing
+      : undefined;
+    if (
+      hasField(seatRaw, 'standing') &&
+      (cleanStanding === undefined || !SEAT_STANDINGS.has(cleanStanding))
+    ) {
+      return yield* invalid('v2 health seat standing');
     }
     const expectations: ReadonlyArray<readonly [string, string | number | null]> = [
       ['place', session.place],
@@ -648,7 +726,7 @@ export const decodeHealth = (
     ];
     for (const [name, expected] of expectations) {
       if (expected !== null && field(seatRaw, name) !== expected) {
-        return yield* Effect.fail(invalid(`v2 health seat ${name}`));
+        return yield*invalid(`v2 health seat ${name}`);
       }
     }
     const place = field(seatRaw, 'place');
@@ -661,43 +739,36 @@ export const decodeHealth = (
     if (
       !isWholeNumber(place) ||
       place < 1 ||
-      typeof seatId !== 'string' ||
+      !isJsonString(seatId) ||
       seatId.length === 0 ||
-      typeof playerName !== 'string' ||
+      !isJsonString(playerName) ||
       playerName.length === 0 ||
-      typeof gameState !== 'string' ||
+      !isJsonString(gameState) ||
       !GAME_STATES.has(gameState) ||
       !isJsonObject(sidecar) ||
       !hasField(sidecar, 'state') ||
       !hasField(sidecar, 'generation') ||
-      Object.values(sidecar).some(
-        (item) =>
-          item !== null &&
-          typeof item !== 'string' &&
-          typeof item !== 'number' &&
-          typeof item !== 'boolean'
-      ) ||
-      typeof observationAvailable !== 'boolean' ||
-      typeof legalActionsAvailable !== 'boolean'
+      Object.values(sidecar).some((item) => !isJsonScalar(item)) ||
+      !isJsonBoolean(observationAvailable) ||
+      !isJsonBoolean(legalActionsAvailable)
     ) {
-      return yield* Effect.fail(invalid('v2 health response'));
+      return yield*invalid('v2 health response');
     }
     const unexpectedSidecar = sortedNames(
       Object.keys(sidecar).filter((key) => !V2_SIDECAR_FIELDS.has(key))
     );
     if (unexpectedSidecar.length > 0) {
-      return yield* Effect.fail(
+      return yield*
         drifted(
           'v2 health',
           `invalid v2 health: unexpected sidecar field(s) ${unexpectedSidecar.join(', ')}` +
             STALE_CLIENT_TAIL
-        )
-      );
+        );
     }
 
-    const seat: HealthSeat = hasField(seatRaw, 'standing')
-      ? { place, seat_id: seatId, player_name: playerName, standing: standing as string }
-      : { place, seat_id: seatId, player_name: playerName };
+    const seat: HealthSeat = cleanStanding === undefined
+      ? { place, seat_id: seatId, player_name: playerName }
+      : { place, seat_id: seatId, player_name: playerName, standing: cleanStanding };
 
     const rawPhase = field(raw, 'phase');
     let cleanPhase: PhaseBlock | null = null;
@@ -706,7 +777,7 @@ export const decodeHealth = (
       // classifies its terminal result.  No stale actionable phase may survive.
       cleanPhase = null;
     } else if (TERMINAL_STATES.has(gameState)) {
-      return yield* Effect.fail(drifted('v2 health', 'terminal v2 health retained stale phase state'));
+      return yield*drifted('v2 health', 'terminal v2 health retained stale phase state');
     } else {
       cleanPhase = yield* decodePhaseBlock(rawPhase, seat);
     }
@@ -717,14 +788,14 @@ export const decodeHealth = (
       cleanPhase.turn !== null &&
       evaluation.turns_remaining !== Math.max(0, evaluation.max_turns - cleanPhase.turn)
     ) {
-      return yield* Effect.fail(invalid('v2 health', 'turns_remaining is inconsistent'));
+      return yield*invalid('v2 health', 'turns_remaining is inconsistent');
     }
 
     const rawLastPhaseEnd = field(raw, 'last_phase_end');
     const lastPhaseEnd =
       rawLastPhaseEnd === null ? null : yield* decodePhaseEndEvent(rawLastPhaseEnd, session, seat);
 
-    const result: { -readonly [K in keyof HealthEnvelope]: HealthEnvelope[K] } = {
+    const result: HealthEnvelopeDraft = {
       schema_version: 2,
       control_protocol: FULL_CONTROL_V2,
       game_id: session.gameId,

@@ -5,8 +5,8 @@
  * (client.py:2408-2409).
  */
 import { Effect } from 'effect';
-import { DriftError, invalid } from 'src/errors';
-import { exact, field, isWholeNumber, opaque } from 'src/schema/primitives';
+import { type DriftError, invalid } from 'src/errors';
+import { exact, field, isWholeNumber, opaque, type JsonValue } from 'src/schema/primitives';
 
 export interface Revision {
   readonly turn: number;
@@ -16,13 +16,13 @@ export interface Revision {
 
 const REVISION_FIELDS: ReadonlySet<string> = new Set(['turn', 'revision', 'state_token']);
 
-export const decodeRevision = (value: unknown): Effect.Effect<Revision, DriftError> =>
+export const decodeRevision = (value: JsonValue): Effect.Effect<Revision, DriftError> =>
   Effect.gen(function* () {
     const raw = yield* exact(value, REVISION_FIELDS, 'state revision');
     const turn = field(raw, 'turn');
     const revision = field(raw, 'revision');
     if (!isWholeNumber(turn) || turn < 0 || !isWholeNumber(revision) || revision < 0) {
-      return yield* Effect.fail(invalid('state revision counters'));
+      return yield*invalid('state revision counters');
     }
     const token = yield* opaque(field(raw, 'state_token'), 'state token');
     return { turn, revision, state_token: token };

@@ -13,11 +13,16 @@
  * the one line that is always correct.
  */
 import { Context, Layer } from 'effect';
-import { isJsonObject } from 'src/schema/primitives';
+import {
+  field,
+  isJsonObject,
+  isJsonString,
+  type JsonValueInput,
+} from 'src/schema/primitives';
 
 export interface RefusalRenderApi {
   /** `_render_error_payload` — the refusal body, printed on stdout. */
-  readonly renderErrorPayload: (payload: unknown) => ReadonlyArray<string>;
+  readonly renderErrorPayload: (payload: JsonValueInput) => ReadonlyArray<string>;
 }
 
 export class RefusalRender extends Context.Tag('RefusalRender')<
@@ -26,12 +31,14 @@ export class RefusalRender extends Context.Tag('RefusalRender')<
 >() {}
 
 /** `_error_text` — `"{code}: {message}"`. */
-export const errorText = (payload: unknown): string => {
+export const errorText = (payload: JsonValueInput): string => {
   if (!isJsonObject(payload)) return 'invalid_request: the supervisor refused this command';
   const body = payload['error'];
   if (!isJsonObject(body)) return 'invalid_request: the supervisor refused this command';
-  const code = typeof body['code'] === 'string' ? body['code'] : 'invalid_request';
-  const message = typeof body['message'] === 'string' ? body['message'] : '';
+  const rawCode = field(body, 'code');
+  const rawMessage = field(body, 'message');
+  const code = isJsonString(rawCode) ? rawCode : 'invalid_request';
+  const message = isJsonString(rawMessage) ? rawMessage : '';
   return `${code}: ${message}`;
 };
 

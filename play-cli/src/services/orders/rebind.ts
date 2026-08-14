@@ -26,9 +26,9 @@ import type { Revision } from 'src/schema/revision';
 import { actionTargetKey } from 'src/services/aliases';
 import { expandActionAlias } from 'src/services/alias-expand';
 import { refreshStaleAlias, type RefreshError } from 'src/services/alias-refresh';
-import { PrivateFs } from 'src/services/private-fs';
+import { type PrivateFs } from 'src/services/private-fs';
 import {
-  SessionStore,
+  type SessionStore,
   type Session,
   type V2ClientState,
 } from 'src/services/session-store';
@@ -177,14 +177,13 @@ export const drainLegalUnlocked = (
       cursor = value.page.next_cursor ?? '';
       if (cursor === '') return revision;
       if (seen.has(cursor)) {
-        return yield* Effect.fail(playerError('the legal catalog repeated a cursor'));
+        return yield*playerError('the legal catalog repeated a cursor');
       }
       seen.add(cursor);
       query = urlEncode('cursor', cursor);
     }
-    return yield* Effect.fail(
-      playerError('the legal catalog exceeded the safe 512-page drain limit')
-    );
+    return yield*
+      playerError('the legal catalog exceeded the safe 512-page drain limit');
   });
 
 // ---------------------------------------------------------------------------

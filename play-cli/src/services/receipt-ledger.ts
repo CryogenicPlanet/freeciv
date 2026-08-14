@@ -25,7 +25,7 @@
  * reads; this is the authority a supervisor reads afterwards.
  */
 import { attemptOr } from 'src/errors';
-import { Effect } from 'effect';
+import { DateTime, Effect } from 'effect';
 import type { PlayerError } from 'src/errors';
 import type { BatchDisposition, Disposition } from 'src/schema/batch';
 import { isJsonObject, type JsonObject, type JsonValue } from 'src/schema/primitives';
@@ -129,10 +129,11 @@ const record = (entry: LedgerEntry, at: Date, withArguments: boolean): JsonValue
  * fit.  Truncating the *text* instead would produce a line that parses as
  * nothing, which is the one outcome a crash-recovery reader cannot tolerate.
  */
-export const ledgerLine = (entry: LedgerEntry, at: Date = new Date()): string => {
-  const full = `${compactJson(record(entry, at, true))}\n`;
+export const ledgerLine = (entry: LedgerEntry, at?: Date): string => {
+  const timestamp = at ?? DateTime.toDate(DateTime.unsafeNow());
+  const full = `${compactJson(record(entry, timestamp, true))}\n`;
   if (Buffer.byteLength(full, 'utf8') <= MAX_LEDGER_LINE) return full;
-  return `${compactJson(record(entry, at, false))}\n`;
+  return `${compactJson(record(entry, timestamp, false))}\n`;
 };
 
 // ---------------------------------------------------------------------------
@@ -151,7 +152,10 @@ export const appendLedgerEntry = (
   entry: LedgerEntry,
   at?: Date
 ): Effect.Effect<string, PlayerError, PrivateFs> =>
-  Effect.suspend(() => appendLedgerLine(dir, ledgerLine(entry, at ?? new Date())));
+  Effect.gen(function* () {
+    const timestamp = at ?? DateTime.toDate(yield* DateTime.now);
+    return yield* appendLedgerLine(dir, ledgerLine(entry, timestamp));
+  });
 
 /**
  * Swallow *everything* a ledger write can end in, defects included.
@@ -215,7 +219,7 @@ export const readLedger = (
       const rows: Array<JsonObject> = [];
       for (const line of text.split('\n')) {
         if (line.trim() === '') continue;
-        const value = attemptOr((): unknown => JSON.parse(line), () => null);
+        const value = attemptOr(() => JSON.parse(line), () => null);
         if (isJsonObject(value)) rows.push(value);
       }
       return rows;

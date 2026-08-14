@@ -22,9 +22,8 @@
 import { Effect } from 'effect';
 import { FULL_CONTROL_V2 } from 'src/constants';
 import { playerError, type LockTimeoutError, type PlayerError } from 'src/errors';
-import { revisionsEqual, type Revision } from 'src/schema/revision';
-import { decodeRevision } from 'src/schema/revision';
-import { isJsonObject, type MutableJsonObject } from 'src/schema/primitives';
+import { decodeRevision, revisionsEqual, type Revision } from 'src/schema/revision';
+import { isJsonObject, isJsonString, type MutableJsonObject } from 'src/schema/primitives';
 import { aliasMap } from 'src/services/aliases';
 import { canonicalText, type PyObject, type PyValue } from 'src/services/canonical-body';
 import { PrivateFs } from 'src/services/private-fs';
@@ -68,7 +67,7 @@ const stagedScope = (state: V2ClientState, actionId: string): string | null => {
     }
     const scope = entry['scope'];
     const actor = isJsonObject(scope) ? scope['actor_id'] : null;
-    return typeof actor === 'string' ? actor : '';
+    return isJsonString(actor) ? actor : '';
   }
   return null;
 };
@@ -106,15 +105,14 @@ export const persistBatchForAction = (
           if (scopeId !== null) {
             const aliases = yield* aliasMap(state);
             const named = aliases[scopeId] ?? scopeId;
-            return yield* Effect.fail(
+            return yield*
               playerError(
                 'unknown or expired action ID: this action came from a catalog ' +
                   'page that is still incomplete, and only a complete catalog is ' +
                   `executable; run \`just legal --actor_id ${named} --all\``
-              )
-            );
+              );
           }
-          return yield* Effect.fail(playerError(UNKNOWN_ACTION));
+          return yield*playerError(UNKNOWN_ACTION);
         }
         const revision: Revision = yield* Effect.mapError(
           decodeRevision(descriptor['state_revision'] ?? null),
@@ -122,9 +120,8 @@ export const persistBatchForAction = (
         );
         const last = state.last_revision;
         if (last === null || !revisionsEqual(last, revision)) {
-          return yield* Effect.fail(
-            playerError('the cached action is not from the latest revision')
-          );
+          return yield*
+            playerError('the cached action is not from the latest revision');
         }
         const batchId = yield* Effect.sync(() => {
           let candidate = `batch_${token()}`;
@@ -138,7 +135,7 @@ export const persistBatchForAction = (
           return candidate;
         });
         if (batchId in state.batches) {
-          return yield* Effect.fail(playerError('could not mint a fresh command batch ID'));
+          return yield*playerError('could not mint a fresh command batch ID');
         }
         const body: PyValue = {
           schema_version: 2,

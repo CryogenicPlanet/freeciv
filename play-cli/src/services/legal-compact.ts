@@ -139,23 +139,23 @@ export const compactLegalAction = (
       compactSubject[key] = isWithheldKey(key) ? V2_WITHHELD : value;
     }
     const target = field(subject, 'target');
-    const result: Record<string, JsonValue> = {
-      action_id: field(descriptor, 'action_id'),
-      kind: field(descriptor, 'kind'),
-      label: field(descriptor, 'label'),
-      subject: compactSubject,
-      target,
-      argument_schema: schema,
-    };
+    const result = new Map<string, JsonValue>([
+      ['action_id', field(descriptor, 'action_id')],
+      ['kind', field(descriptor, 'kind')],
+      ['label', field(descriptor, 'label')],
+      ['subject', compactSubject],
+      ['target', target],
+      ['argument_schema', schema],
+    ]);
     // Omit-when-default, never omit-by-type.
     const probability = field(subject, 'probability');
     if (hasField(subject, 'probability') && !jsonEquals(probability, CERTAIN_PROBABILITY)) {
-      result['probability'] = probability;
+      result.set('probability', probability);
     }
     const declaredGold = field(subject, 'gold_cost');
     const targetGold = isJsonObject(target) ? field(target, 'gold_cost') : null;
     const goldCost = declaredGold === null ? targetGold : declaredGold;
-    if (goldCost !== null) result['gold_cost'] = goldCost;
+    if (goldCost !== null) result.set('gold_cost', goldCost);
     const properties = field(schema, 'properties');
     const gold = isJsonObject(properties) ? field(properties, 'gold') : null;
     if (isJsonObject(gold)) {
@@ -163,9 +163,9 @@ export const compactLegalAction = (
       for (const bound of ['minimum', 'maximum'] as const) {
         if (hasField(gold, bound)) range[bound] = field(gold, bound);
       }
-      result['gold_range'] = range;
+      result.set('gold_range', range);
     }
-    return Effect.succeed(result);
+    return Effect.succeed(Object.fromEntries(result));
   });
 
 /** The byte budget one compacted action spends: `json.dumps(...).encode()`. */

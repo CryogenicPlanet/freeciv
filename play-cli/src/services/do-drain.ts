@@ -25,6 +25,7 @@ import { Cause, Chunk, Deferred, Effect, Option } from 'effect';
 import type { PlayError } from 'src/errors';
 import type { Revision } from 'src/schema/revision';
 import type { JsonValue } from 'src/schema/primitives';
+import { isJsonString } from 'src/schema/primitives';
 
 /**
  * PLAN.md fixes this at 4.
@@ -74,10 +75,10 @@ export const distinctActors = (ids: Iterable<string>): ReadonlyArray<string> => 
 /** `{identifier: alias}` — `_resolve_orders_fetching`'s inverted alias table. */
 export const actorAliases = (
   entityAliases: Readonly<Record<string, JsonValue>>
-): Readonly<Record<string, string>> => {
+) => {
   const out: Record<string, string> = {};
   for (const [alias, identifier] of Object.entries(entityAliases)) {
-    if (typeof identifier === 'string') out[identifier] = alias;
+    if (isJsonString(identifier)) out[identifier] = alias;
   }
   return out;
 };

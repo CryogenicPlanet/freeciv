@@ -21,8 +21,8 @@ import { revisionLabel } from 'src/render/primitives';
 import { aliasMap } from 'src/services/aliases';
 import { aliasRefreshCommand } from 'src/services/alias-expand';
 import { cachedPhaseNote } from 'src/services/mirror/store';
-import { PrivateFs } from 'src/services/private-fs';
-import { SessionStore, type V2ClientState } from 'src/services/session-store';
+import { type PrivateFs } from 'src/services/private-fs';
+import { type SessionStore, type V2ClientState } from 'src/services/session-store';
 import type { OrderOutcome } from 'src/services/orders/match';
 
 // ---------------------------------------------------------------------------

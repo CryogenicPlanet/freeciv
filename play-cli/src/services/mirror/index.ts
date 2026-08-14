@@ -12,7 +12,6 @@
  */
 export {
   CACHE_DIR,
-  CONTROL_RE,
   DEFAULT_COMMAND_CARD,
   DEFAULT_PROBABILITY,
   DELTA_FILE,
@@ -62,6 +61,7 @@ export {
   pair,
   position,
   readMirror,
+  replaceControlCharacters,
   revLine,
   revisionPair,
   rstrip,
@@ -72,6 +72,7 @@ export {
   textValue,
   writeMirror,
   type MirrorAliases,
+  type MirrorCellValue,
   type MirrorRevision,
   type Missing,
 } from 'src/services/mirror/store';

@@ -20,6 +20,7 @@ import {
   type AliasMap,
   type JsonValue,
 } from 'src/render/primitives';
+import { isJsonString } from 'src/schema/primitives';
 
 /**
  * Summarize a unit's standing route from fields already ingested.
@@ -87,7 +88,7 @@ export const unitRow = (
       }
     }
     const scope = fields['scope'] ?? null;
-    if (typeof scope === 'string' && scope !== 'own') detail.push(`scope=${scope}`);
+    if (isJsonString(scope) && scope !== 'own') detail.push(`scope=${scalar(scope)}`);
     const row = [alias, yield* needText(item, 'type', 'unit'), detail.join(' ')];
     if (showId) row.push(yield* needText(item, 'id', 'unit'));
     return row;

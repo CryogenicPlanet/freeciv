@@ -23,8 +23,9 @@ import {
   type AliasMap,
   type JsonValue,
 } from 'src/render/primitives';
+import { isJsonString, isWholeNumber } from 'src/schema/primitives';
 import type { Revision } from 'src/schema/revision';
-import { PrivateFs } from 'src/services/private-fs';
+import { type PrivateFs } from 'src/services/private-fs';
 import { mirrorText, parseTable } from 'src/services/mirror';
 
 /**
@@ -79,7 +80,7 @@ export const cityBuildStock = (
     if (sessionPath === null || aliases === null) return null;
     const head = items[0];
     const cityId = isJsonObject(head) ? (head['city_id'] ?? null) : null;
-    if (typeof cityId !== 'string' || cityId === '') return null;
+    if (!isJsonString(cityId) || cityId === '') return null;
     if (items.some((item) => !isJsonObject(item) || item['city_id'] !== cityId)) return null;
     const alias = aliases[cityId];
     if (alias === undefined || alias === '') return null;
@@ -104,7 +105,7 @@ export const buildChoiceNote = (
 ): string => {
   const fields = isJsonObject(item) ? item : {};
   const keep = isJsonObject(cost) ? (cost['shield_stock_after_change'] ?? null) : null;
-  const integral = typeof keep === 'number' && Number.isInteger(keep);
+  const integral = isWholeNumber(keep);
   const parts: string[] = [];
   if (integral && stock !== null && stock > (keep)) {
     parts.push(`!forfeits ${stock - (keep)} of ${stock} shields`);
@@ -115,13 +116,13 @@ export const buildChoiceNote = (
   const upkeep = fields['upkeep'] ?? null;
   if (isJsonObject(upkeep)) {
     for (const [key, number] of Object.entries(upkeep)) {
-      if (typeof number === 'number' && Number.isInteger(number) && number !== 0) {
+      if (isWholeNumber(number) && number !== 0) {
         parts.push(`!upkeep ${key} ${scalar(number)}`);
       }
     }
   }
   const unhappy = fields['happy_cost'] ?? null;
-  if (typeof unhappy === 'number' && Number.isInteger(unhappy) && unhappy !== 0) {
+  if (isWholeNumber(unhappy) && unhappy !== 0) {
     parts.push(`!unhappy ${unhappy}`);
   }
   return parts.join(' ');
@@ -146,7 +147,7 @@ export const renderCityBuildChoices = (
     for (const [index, item] of items.entries()) {
       const fields = isJsonObject(item) ? item : {};
       const cost = fields['cost'] ?? null;
-      if (!isJsonObject(cost)) return yield* Effect.fail(drift('city build choice cost'));
+      if (!isJsonObject(cost)) return yield*drift('city build choice cost');
       rows.push([
         String(index + 1),
         yield* needText(item, 'name', 'city build choice'),

@@ -47,9 +47,16 @@
  * {@link HEALTH_FLOAT_PATHS}, {@link healthFloatPathsUnder},
  * {@link pyValueWithFloats}, {@link turnHealthContextPyValue}.
  */
-import { Console, Effect } from 'effect';
+import { Console, type Effect } from 'effect';
 import { pyDumps, pyFloat, type PyValue } from 'src/services/canonical-body';
-import { isJsonObject, type HealthEnvelope } from 'src/schema/index';
+import { type HealthEnvelope } from 'src/schema/index';
+import {
+  isJsonBoolean,
+  isJsonNumber,
+  isJsonObject,
+  isJsonString,
+  type JsonValueInput,
+} from 'src/schema/primitives';
 import type { TurnHealthContext } from 'src/services/health-context';
 
 /**
@@ -108,22 +115,22 @@ export const healthFloatPathsUnder = (
     )
   );
 
-const annotate = (value: unknown, path: string, floatPaths: ReadonlySet<string>): PyValue => {
+const annotate = (value: JsonValueInput, path: string, floatPaths: ReadonlySet<string>): PyValue => {
   if (value === null || value === undefined) return null;
-  if (typeof value === 'boolean' || typeof value === 'string') return value;
+  if (isJsonBoolean(value) || isJsonString(value)) return value;
   // An unmarked number is left plain: `pyDumps` prints an exact integer as an
   // int and anything fractional through `repr`, which is right either way.
-  if (typeof value === 'number') return floatPaths.has(path) ? pyFloat(value) : value;
+  if (isJsonNumber(value)) return floatPaths.has(path) ? pyFloat(value) : value;
   if (Array.isArray(value)) {
-    const items: ReadonlyArray<unknown> = value;
-    return items.map((item) => annotate(item, `${path}[]`, floatPaths));
+    return value.map((item) => annotate(item, `${path}[]`, floatPaths));
   }
   if (isJsonObject(value)) {
-    const out: Record<string, PyValue> = {};
-    for (const [key, item] of Object.entries(value)) {
-      out[key] = annotate(item, path === '' ? key : `${path}.${key}`, floatPaths);
-    }
-    return out;
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [
+        key,
+        annotate(item, path === '' ? key : `${path}.${key}`, floatPaths),
+      ])
+    );
   }
   return null;
 };
@@ -137,7 +144,7 @@ const annotate = (value: unknown, path: string, floatPaths: ReadonlySet<string>)
  * with `pyDumps` instead of core's `printV2Json`.  Doing it any other way
  * prints `"timeout_s":600` where CPython prints `"timeout_s":600.0`.
  */
-export const pyValueWithFloats = (value: unknown, floatPaths: ReadonlySet<string>): PyValue =>
+export const pyValueWithFloats = (value: JsonValueInput, floatPaths: ReadonlySet<string>): PyValue =>
   annotate(value, '', floatPaths);
 
 /**

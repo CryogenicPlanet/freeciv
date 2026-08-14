@@ -17,6 +17,7 @@ import {
   type AliasMap,
   type JsonValue,
 } from 'src/render/primitives';
+import { isWholeNumber } from 'src/schema/primitives';
 
 export const renderResearch = (
   items: ReadonlyArray<JsonValue>,
@@ -31,9 +32,9 @@ export const renderResearch = (
         if (cost !== null) detail.push(`path${scalar(cost)}`);
         if (fields['can_target'] === true) detail.push('targetable');
         if (fields['can_goal'] === true) detail.push('goalable');
-        const unknown = fields['unknown_prerequisite_count'] ?? null;
-        if (typeof unknown === 'number' && Number.isInteger(unknown) && unknown !== 0) {
-          detail.push(`needs${unknown}`);
+        const prereqCount = fields['unknown_prerequisite_count'] ?? null;
+        if (isWholeNumber(prereqCount) && prereqCount !== 0) {
+          detail.push(`needs${scalar(prereqCount)}`);
         }
         const row = [
           yield* needText(item, 'name', 'research'),

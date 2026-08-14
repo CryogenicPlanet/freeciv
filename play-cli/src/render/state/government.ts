@@ -13,6 +13,7 @@
 import { Effect } from 'effect';
 import type { PlayerError } from 'src/errors';
 import { isJsonObject, type JsonValue } from 'src/render/primitives';
+import { isJsonString } from 'src/schema/primitives';
 import { aliasMap } from 'src/services/aliases';
 import { cachedDescriptors } from 'src/services/catalog-cache';
 import type { V2ClientState } from 'src/services/session-store';
@@ -34,7 +35,7 @@ export const playerScopeAlias = (
       const subject = descriptor['subject'] ?? null;
       const actor = isJsonObject(subject) ? (subject['actor'] ?? null) : null;
       const actorId = isJsonObject(actor) ? (actor['id'] ?? null) : null;
-      if (typeof actorId === 'string' && actorId.startsWith('player_')) {
+      if (isJsonString(actorId) && actorId.startsWith('player_')) {
         return aliases[actorId] ?? actorId;
       }
     }

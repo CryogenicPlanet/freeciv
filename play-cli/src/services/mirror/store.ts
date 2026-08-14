@@ -17,12 +17,22 @@
  * * **Sanitization.** `cell` strips control characters and caps length, so a
  *   server-supplied name can never forge a `# rev` header line or a table row.
  */
-import * as path from 'node:path';
 import { Console, Effect } from 'effect';
-import { PlayerError, playerError } from 'src/errors';
-import { isJsonObject } from 'src/schema/primitives';
+import { playerError, type PlayerError } from 'src/errors';
+import {
+  isJsonBoolean,
+  isJsonNumber,
+  isJsonObject,
+  isJsonString,
+  isJsonValue,
+  isWholeNumber,
+  type JsonValue,
+  type JsonValueInput,
+} from 'src/schema/primitives';
 import { PrivateFs } from 'src/services/private-fs';
+import { compactJson } from 'src/services/json-output';
 import { rewriteProgMentions } from 'src/services/prog-prefix';
+import { path } from 'src/services/platform';
 
 // ---------------------------------------------------------------------------
 // Constants — the mirror's directory layout and cell limits
@@ -33,9 +43,12 @@ export const MAX_DELTA_LINES = 12;
 export const MAX_ROWS = 4096;
 export const MAX_LOG_LINE = 512;
 
-/** `_CONTROL_RE` — what may never reach a projection file. */
-// oxlint-disable-next-line no-control-regex -- control characters are exactly what this strips
-export const CONTROL_RE = /[\x00-\x1f\x7f]/g;
+/** Replace the C0 controls and DEL that may never reach a projection file. */
+export const replaceControlCharacters = (text: string): string =>
+  Array.from(text, (character) => {
+    const code = character.codePointAt(0);
+    return code !== undefined && (code <= 0x1f || code === 0x7f) ? ' ' : character;
+  }).join('');
 
 /** `_HANDLE_WIDTHS` — the id-suffix widths a fallback handle tries in order. */
 export const HANDLE_WIDTHS: ReadonlyArray<number> = [6, 10, 32];
@@ -94,12 +107,19 @@ export const SECTION_TITLES: ReadonlyMap<string, string> = new Map([
 /** `_REPLACE_ONLY` — sections a page always replaces rather than merges into. */
 export const REPLACE_ONLY: ReadonlySet<string> = new Set(['overview']);
 
+/** The exact-success probability omitted from an options file. */
+export interface DefaultProbability {
+  readonly kind: 'exact';
+  readonly minimum_percent: 100;
+  readonly maximum_percent: 100;
+}
+
 /** `_DEFAULT_PROBABILITY` — the probability an options file never prints. */
-export const DEFAULT_PROBABILITY: Readonly<Record<string, unknown>> = {
+export const DEFAULT_PROBABILITY = {
   kind: 'exact',
   minimum_percent: 100,
   maximum_percent: 100,
-};
+} satisfies DefaultProbability;
 
 /** `_DEFAULT_COMMAND_CARD` — the header card when the caller supplies none. */
 export const DEFAULT_COMMAND_CARD: ReadonlyArray<string> = [
@@ -141,7 +161,9 @@ export interface MirrorRevision {
 }
 
 /** `_revision_pair` — refuse a payload that carries no state revision counters. */
-export const revisionPair = (revision: unknown): Effect.Effect<MirrorRevision, PlayerError> => {
+export const revisionPair = (
+  revision: JsonValueInput
+): Effect.Effect<MirrorRevision, PlayerError> => {
   const turn = dig(revision, 'turn');
   const number = dig(revision, 'revision');
   return isExactInteger(turn) && isExactInteger(number)
@@ -149,8 +171,8 @@ export const revisionPair = (revision: unknown): Effect.Effect<MirrorRevision, P
     : Effect.fail(mirrorError('payload carries no state revision counters'));
 };
 
-const isExactInteger = (value: unknown): value is number =>
-  typeof value === 'number' && Number.isInteger(value);
+const isExactInteger = (value: JsonValue | Missing): value is number =>
+  value !== MISSING && isWholeNumber(value);
 
 /** `_rev_line` — the stamp every projection file opens with. */
 export const revLine = (revision: MirrorRevision | null): string =>
@@ -198,10 +220,13 @@ export const isBehind = (rendered: MirrorRevision, now: MirrorRevision): boolean
 // ---------------------------------------------------------------------------
 
 /** `_dig` — walk a payload, returning {@link MISSING} at the first absent key. */
-export const dig = (value: unknown, ...keys: ReadonlyArray<string>): unknown => {
-  const walk = (current: unknown, remaining: ReadonlyArray<string>): unknown => {
+export const dig = (
+  value: JsonValueInput,
+  ...keys: ReadonlyArray<string>
+): JsonValue | Missing => {
+  const walk = (current: JsonValueInput, remaining: ReadonlyArray<string>): JsonValue | Missing => {
     const [key, ...rest] = remaining;
-    if (key === undefined) return current;
+    if (key === undefined) return isJsonValue(current) ? current : MISSING;
     if (!isJsonObject(current) || !Object.hasOwn(current, key)) return MISSING;
     return walk(current[key], rest);
   };
@@ -213,15 +238,13 @@ export const dig = (value: unknown, ...keys: ReadonlyArray<string>): unknown => 
  * one number type in JavaScript, which matches `_cell`'s own
  * integral-float-to-int conversion; see NOTES.md §2 for the residue.
  */
-const pyStr = (value: unknown): string => {
-  if (typeof value === 'string') return value;
-  if (typeof value === 'number') return String(value);
-  if (typeof value === 'bigint') return value.toString();
-  if (value === null) return 'None';
-  if (value === undefined) return 'None';
+const pyStr = (value: MirrorCellValue): string => {
+  if (value === MISSING || value === null || value === undefined) return 'None';
+  if (isJsonString(value)) return value;
+  if (isJsonNumber(value)) return String(value);
   // Containers never reach `_cell` on any tested path; JSON is the closest
   // stable rendering, and it stays sanitized by the caller below.
-  return JSON.stringify(value) ?? '[unserializable]';
+  return isJsonValue(value) ? compactJson(value) : '[unserializable]';
 };
 
 /**
@@ -276,11 +299,12 @@ const rstrip = (text: string): string => text.replace(PY_RSTRIP_RE, '');
 const strip = (text: string): string => rstrip(text).replace(PY_LSTRIP_RE, '');
 
 /** `_cell` — render one table cell: sanitized, capped, never empty. */
-export const cell = (value: unknown): string => {
+export type MirrorCellValue = JsonValue | Missing | undefined;
+
+export const cell = (value: MirrorCellValue): string => {
   if (value === MISSING || value === null || value === undefined) return '-';
-  if (value === true) return 'yes';
-  if (value === false) return 'no';
-  const collapsed = strip(pyStr(value).replace(CONTROL_RE, ' ')).replace(PY_RUN_RE, ' ');
+  if (isJsonBoolean(value)) return value ? 'yes' : 'no';
+  const collapsed = strip(replaceControlCharacters(pyStr(value))).replace(PY_RUN_RE, ' ');
   const capped =
     codeLength(collapsed) > MAX_CELL
       ? `${codeSlice(collapsed, 0, MAX_CELL - 1)}~`
@@ -289,14 +313,14 @@ export const cell = (value: unknown): string => {
 };
 
 /** `_pair` — two cells joined, or `-` when either side is absent. */
-export const pair = (first: unknown, second: unknown, separator = '/'): string =>
+export const pair = (first: MirrorCellValue, second: MirrorCellValue, separator = '/'): string =>
   first === MISSING || second === MISSING ? '-' : `${cell(first)}${separator}${cell(second)}`;
 
 /** `_position` — the `x,y` cell. */
-export const position = (item: unknown): string => pair(dig(item, 'x'), dig(item, 'y'), ',');
+export const position = (item: JsonValue): string => pair(dig(item, 'x'), dig(item, 'y'), ',');
 
 /** `_handle` — the fallback display key (`u.3f9a2c`) for an unaliased entity. */
-export const handle = (kind: string, identifier: unknown, width: number): string => {
+export const handle = (kind: string, identifier: MirrorCellValue, width: number): string => {
   const text = cell(identifier);
   const digits = text.replace(/^[a-z_]+_/, '');
   return digits === '' ? text : `${kind}.${codeSlice(digits, 0, width)}`;
@@ -312,7 +336,7 @@ export type MirrorAliases = Readonly<Record<string, string>>;
  */
 export const aliasMap = (
   kind: string,
-  identifiers: ReadonlyArray<unknown>,
+  identifiers: ReadonlyArray<MirrorCellValue>,
   aliases: MirrorAliases | null | undefined
 ): ReadonlyMap<string, string> => {
   const resolved = new Map<string, string>();
@@ -580,21 +604,39 @@ export const cachedPhaseNote = (
  * hand) can carry them, and treating one as ordinary text merges two rows of
  * `state/units.tsv` into a single row on read, which then rewrites the file.
  */
+const isLineBoundary = (code: number): boolean =>
+  code === 0x0a ||
+  code === 0x0b ||
+  code === 0x0c ||
+  code === 0x0d ||
+  (code >= 0x1c && code <= 0x1e) ||
+  code === 0x85 ||
+  code === 0x2028 ||
+  code === 0x2029;
+
 export const splitLines = (text: string): ReadonlyArray<string> => {
-  // oxlint-disable-next-line no-control-regex -- CPython splitlines() boundary set includes FS/GS/RS
-  const parts = text.split(/\r\n|[\n\r\v\f\x1c\x1d\x1e\u0085\u2028\u2029]/u);
-  return parts.length > 0 && parts[parts.length - 1] === '' ? parts.slice(0, -1) : parts;
+  const parts: string[] = [];
+  let start = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    if (!isLineBoundary(code)) continue;
+    parts.push(text.slice(start, index));
+    if (code === 0x0d && text.charCodeAt(index + 1) === 0x0a) index += 1;
+    start = index + 1;
+  }
+  if (start < text.length) parts.push(text.slice(start));
+  return parts;
 };
 
 export { rstrip, strip };
 
 /** `_number` — a real number, never a bool, else nothing. */
-export const numberValue = (value: unknown): number | null =>
-  typeof value === 'number' && Number.isFinite(value) ? value : null;
+export const numberValue = (value: JsonValueInput): number | null =>
+  value !== MISSING && isJsonNumber(value) ? value : null;
 
 /** `_text` — a sanitized string, or nothing when it sanitizes to `-`. */
-export const textValue = (value: unknown): string | null => {
-  if (typeof value !== 'string') return null;
+export const textValue = (value: JsonValueInput): string | null => {
+  if (value === MISSING || !isJsonString(value)) return null;
   const rendered = cell(value);
   return rendered === '-' ? null : rendered;
 };

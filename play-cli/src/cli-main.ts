@@ -14,18 +14,18 @@ import { Command, ValidationError } from '@effect/cli';
 import { BunContext, BunRuntime } from '@effect/platform-bun';
 import { Cause, Console, Effect, Exit, Layer } from 'effect';
 import {
-  AliasStaleError,
-  DriftError,
-  LockTimeoutError,
-  PlayerError,
-  SessionMissingError,
-  V2ResponseError,
+  type AliasStaleError,
+  type DriftError,
+  type LockTimeoutError,
+  type PlayerError,
+  type SessionMissingError,
+  type V2ResponseError,
   playerError,
 } from 'src/errors';
 import {
   EXIT_OK,
   EXIT_REFUSED,
-  ExitCodeSignal,
+  type ExitCodeSignal,
   passThroughExit,
   type ExitCode,
 } from 'src/exit';
@@ -281,18 +281,25 @@ export const handleError = (
 
 export const runCli = (
   argv: ReadonlyArray<string> = process.argv
-): Effect.Effect<ExitCode, never> =>
-  Command.run(rootCommand, {
+): Effect.Effect<ExitCode> => {
+  const command = Command.run(rootCommand, {
     name: 'play',
     version: '0.1.0',
   })(argv).pipe(
     Effect.map((): ExitCode => EXIT_OK),
-    Effect.catchAll((error) => handleError(error, argv)),
-    Effect.provide(AppLayer),
+    Effect.catchAll((error) => handleError(error, argv))
+  );
+  return Effect.scoped(
+    Effect.flatMap(
+      Layer.build(Layer.provide(AppLayer, BunContext.layer)),
+      (services) => Effect.provide(command, services)
+    )
+  ).pipe(
     Effect.catchAllCause((cause): Effect.Effect<ExitCode> =>
       Effect.map(stderr(`error: ${Cause.pretty(cause)}`), (): ExitCode => EXIT_REFUSED)
     )
   );
+};
 
 export const main = (argv: ReadonlyArray<string> = process.argv): Effect.Effect<void> =>
   Effect.flatMap(runCli(argv), (code) =>
