@@ -13,16 +13,21 @@
  * every file here the write is atomic, so a watcher polling it never reads a
  * half-written object.
  */
-import { attemptOr } from 'src/errors';
-import { Effect } from 'effect';
+import { DateTime, Effect, Either, Schema } from 'effect';
 import type { PlayerError } from 'src/errors';
-import { isJsonObject, type JsonObject } from 'src/schema/primitives';
+import {
+  JsonObjectSchema,
+  field,
+  isJsonObject,
+  isWholeNumber,
+  type JsonObject,
+  type JsonValueInput,
+} from 'src/schema/primitives';
 import { indentedJson } from 'src/services/json-output';
 import type { PrivateFs } from 'src/services/private-fs';
 import {
   DELTA_FILE,
   DEFAULT_COMMAND_CARD,
-  CONTROL_RE,
   HEADER_FILE,
   MAP_FILE,
   MISSING,
@@ -36,6 +41,7 @@ import {
   mirrorGuard,
   numberValue,
   readMirror,
+  replaceControlCharacters,
   revLine,
   revisionPair,
   textValue,
@@ -48,28 +54,28 @@ import { parseTable } from 'src/services/mirror/table';
 export type Announced = ReadonlyArray<number>;
 
 /** `_announced` — accept only a well-formed triple, else nothing. */
-export const announcedTuple = (value: unknown): ReadonlyArray<number> | null => {
+export const announcedTuple = (value: JsonValueInput): ReadonlyArray<number> | null => {
   if (!Array.isArray(value) || value.length !== 3) return null;
-  const items: ReadonlyArray<unknown> = value;
-  return items.every(
-    (item) => typeof item === 'number' && Number.isInteger(item) && item >= 0
-  )
-    ? (items as ReadonlyArray<number>)
-    : null;
+  const announced: number[] = [];
+  for (const item of value) {
+    if (!isWholeNumber(item) || item < 0) return null;
+    announced.push(item);
+  }
+  return announced;
 };
 
 /** The clock `_phase_marker` stamps `updated_at` with. Injectable for tests. */
 export type MirrorClock = () => number;
 
-const systemClock: MirrorClock = () => Date.now() / 1000;
+const systemClock: MirrorClock = () => DateTime.toEpochMillis(DateTime.unsafeNow()) / 1000;
 
-const holderOf = (phase: unknown): JsonObject | null => {
+const holderOf = (phase: JsonValueInput): JsonObject | null => {
   if (!isJsonObject(phase)) return null;
   const waiting = dig(phase, 'waiting_on');
-  const seats = isJsonObject(waiting) ? waiting['seats'] : undefined;
-  const rows: ReadonlyArray<unknown> = Array.isArray(seats) ? seats : [];
+  const seats = isJsonObject(waiting) ? field(waiting, 'seats') : null;
+  const rows = Array.isArray(seats) ? seats : [];
   const others = rows.filter((row) => isJsonObject(row) && row['is_self'] === false);
-  const row = others[0];
+  const row = others.at(0);
   if (others.length !== 1 || phase['active'] === true || !isJsonObject(row)) return null;
   return {
     place: numberValue(row['place']),
@@ -88,8 +94,8 @@ const holderOf = (phase: unknown): JsonObject | null => {
  * not.
  */
 export const phaseMarker = (
-  health: unknown,
-  announced?: unknown,
+  health: JsonValueInput,
+  announced?: JsonValueInput,
   clock: MirrorClock = systemClock
 ): string => {
   const phase = dig(health, 'phase');
@@ -122,14 +128,9 @@ export const readPhaseMarker = (
 ): Effect.Effect<JsonObject | null, never, PrivateFs> =>
   Effect.map(readMirror(dir, PHASE_FILE), (text) => {
     if (text === null) return null;
-    const parsed = ((): unknown => {
-      return attemptOr(
-          () => JSON.parse(text) as unknown,
-          () => null
-      );
-    })();
-    return isJsonObject(parsed) && parsed['schema_version'] === PHASE_SCHEMA_VERSION
-      ? parsed
+    const parsed = Schema.decodeUnknownEither(Schema.parseJson(JsonObjectSchema))(text);
+    return Either.isRight(parsed) && parsed.right['schema_version'] === PHASE_SCHEMA_VERSION
+      ? parsed.right
       : null;
   });
 
@@ -141,8 +142,8 @@ export const readPhaseMarker = (
  */
 export const updatePhaseMarker = (
   dir: string,
-  health: unknown,
-  options?: { readonly announced?: unknown; readonly clock?: MirrorClock }
+  health: JsonValueInput,
+  options?: { readonly announced?: JsonValueInput; readonly clock?: MirrorClock }
 ): Effect.Effect<ReadonlyArray<string>, PlayerError, PrivateFs> =>
   Effect.gen(function* () {
     const supplied = options?.announced;
@@ -164,7 +165,7 @@ export const updatePhaseMarker = (
 
 export interface HealthMirrorOptions {
   /** The page revision the same command observed, when one is known. */
-  readonly revision?: unknown;
+  readonly revision?: JsonValueInput;
   /** The command card the header prints. `_DEFAULT_COMMAND_CARD` when absent. */
   readonly commands?: ReadonlyArray<string>;
   readonly clock?: MirrorClock;
@@ -179,8 +180,8 @@ export interface HealthMirrorOptions {
  */
 export const updateFromHealth = (
   dir: string,
-  command: string,
-  health: unknown,
+  _command: string,
+  health: JsonValueInput,
   options?: HealthMirrorOptions
 ): Effect.Effect<ReadonlyArray<string>, PlayerError, PrivateFs> =>
   Effect.gen(function* () {
@@ -251,7 +252,7 @@ export const updateFromHealth = (
     );
     lines.push('');
     for (const entry of options?.commands ?? DEFAULT_COMMAND_CARD) {
-      lines.push(String(entry).replace(CONTROL_RE, ' '));
+      lines.push(replaceControlCharacters(entry));
     }
     // The marker is a read-modify-write like every other file here: the
     // monitor's `announced` tuple must survive an unrelated `just health`, or a
@@ -266,16 +267,17 @@ export const updateFromHealth = (
     return [header, marker];
   });
 
-const newestStamp = (dir: string): Effect.Effect<MirrorRevision | null, never, PrivateFs> =>
-  Effect.reduce(
+const newestStamp = (dir: string): Effect.Effect<MirrorRevision | null, never, PrivateFs> => {
+  return Effect.reduce<ReadonlyArray<string>, MirrorRevision | null, never, PrivateFs>(
     [OVERVIEW_FILE, MAP_FILE, DELTA_FILE],
-    null as MirrorRevision | null,
+    null,
     (stamp, target) =>
       Effect.map(readMirror(dir, target), (text) => {
         const found = parseTable(text).revision;
         return found !== null && isNewer(found, stamp) ? found : stamp;
       })
   );
+};
 
 // ---------------------------------------------------------------------------
 // The client.py bridge
@@ -284,7 +286,7 @@ const newestStamp = (dir: string): Effect.Effect<MirrorRevision | null, never, P
 /** `_mirror_health` — project one health payload, warning instead of failing. */
 export const mirrorHealth = (
   sessionPath: string,
-  health: unknown,
+  health: JsonValueInput,
   command: string,
   options?: HealthMirrorOptions
 ): Effect.Effect<void, never, PrivateFs> =>
@@ -297,8 +299,8 @@ export const mirrorHealth = (
 /** `_monitor_mirror` — the monitor's only write: `state/phase.json`, nothing else. */
 export const mirrorPhaseMarker = (
   sessionPath: string,
-  health: unknown,
-  announced?: unknown
+  health: JsonValueInput,
+  announced?: JsonValueInput
 ): Effect.Effect<void, never, PrivateFs> =>
   mirrorGuard(
     Effect.flatMap(mirrorDir(sessionPath), (dir) =>

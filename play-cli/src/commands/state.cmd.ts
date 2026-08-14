@@ -29,7 +29,7 @@ import { resolveAliasArguments } from 'src/services/alias-refresh';
 import { jsonRequested, printV2Json } from 'src/services/json-output';
 import { mirrorPage } from 'src/services/mirror/update-page';
 import { dropPendingForCursor } from 'src/services/pending-catalogs';
-import { PrivateFs } from 'src/services/private-fs';
+import { type PrivateFs } from 'src/services/private-fs';
 import { SessionStore, credentialsOf, type Session } from 'src/services/session-store';
 import { stateQuery } from 'src/services/state-query';
 import { V2Client } from 'src/services/v2-client';

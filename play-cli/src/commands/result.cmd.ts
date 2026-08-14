@@ -17,7 +17,7 @@
 import { Args, Command } from '@effect/cli';
 import { Effect, Option } from 'effect';
 import { GAME_ID_RE } from 'src/constants';
-import { PlayerError, playerError } from 'src/errors';
+import { type PlayerError, playerError } from 'src/errors';
 import { dualText, resolveDual } from 'src/options';
 import { printPyJson, v1Json } from 'src/services/v1-json';
 import { serviceUrl } from 'src/services/http';
@@ -39,7 +39,7 @@ export const resultCommand = Command.make(
       const positional = Option.getOrElse(gameIdPositional, () => '').trim();
       const option = (yield* resolveDual('game-id', gameId, '')).trim();
       if (positional !== '' && option !== '' && positional !== option) {
-        return yield* Effect.fail(playerError('result received two different game IDs'));
+        return yield*playerError('result received two different game IDs');
       }
       const game = yield* validGameId(option || positional);
       const http = yield* v1Json;
@@ -48,5 +48,6 @@ export const resultCommand = Command.make(
         timeout: 10,
       });
       yield* printPyJson(value);
+      return undefined;
     })
 );

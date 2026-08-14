@@ -12,9 +12,8 @@
  * decision: rebind by meaning, refuse when the meaning vanished, refuse when it
  * became ambiguous, and never spend a request under `--no-refresh`.
  */
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
-import { Effect, Either, Layer, Option } from 'effect';
+import { Effect, Either, Layer, Option, Schema } from 'effect';
 import { FULL_CONTROL_V2 } from 'src/constants';
 import { playerError } from 'src/errors';
 import { decodeLegalPage, decodePage } from 'src/schema/page';
@@ -36,15 +35,20 @@ import {
   type LegalPageFetcher,
 } from 'src/services/alias-refresh';
 import { FIXTURE_GAME_ID, scratchWorkspace, sessionFile, type Scratch } from 'test/_fixtures';
+import { effectTest, provideTestLayer } from 'test/_effect-test';
+import { fixtureString } from 'test/_expect';
+import { path } from 'test/_test-platform';
 
 // ---------------------------------------------------------------------------
 // Fixture
 // ---------------------------------------------------------------------------
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() =>
+  Effect.runPromise(
+    Effect.forEach(scratches.splice(0), (scratch) => scratch.cleanup, { discard: true })
+  )
+);
 
 interface TestRevision {
   readonly turn: number;
@@ -59,29 +63,30 @@ interface Fixture {
   readonly session: Session;
   readonly run: <A, E>(
     effect: Effect.Effect<A, E, SessionStore | PrivateFs>
-  ) => Either.Either<A, E>;
+  ) => Effect.Effect<Either.Either<A, E>>;
 }
 
-const fixture = (): Fixture => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
-  const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'codex-test.json');
-  Effect.runSync(
-    scratch.files.writeJson(sessionPath, sessionFile({ control_protocol: FULL_CONTROL_V2 }))
-  );
-  const loaded = Effect.runSync(store.resolveV2(sessionPath));
-  const layer = Layer.merge(
-    Layer.succeed(SessionStore, store),
-    Layer.succeed(PrivateFs, scratch.files)
-  );
-  return {
-    store,
-    sessionPath,
-    session: loaded.session,
-    run: (effect) => Effect.runSync(Effect.either(Effect.provide(effect, layer))),
-  };
-};
+const fixture = (): Effect.Effect<Fixture> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
+    const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'codex-test.json');
+    yield* scratch.files.writeJson(
+      sessionPath,
+      sessionFile({ control_protocol: FULL_CONTROL_V2 })
+    );
+    const loaded = yield* store.resolveV2(sessionPath);
+    const layer = Layer.merge(
+      Layer.succeed(SessionStore, store),
+      Layer.succeed(PrivateFs, scratch.files)
+    );
+    const run = <A, E>(
+      effect: Effect.Effect<A, E, SessionStore | PrivateFs>
+    ): Effect.Effect<Either.Either<A, E>> =>
+      Effect.either(provideTestLayer(effect, layer));
+    return { store, sessionPath, session: loaded.session, run };
+  }).pipe(Effect.orDie);
 
 const ok = <A, E>(either: Either.Either<A, E>): A => {
   if (Either.isLeft(either)) {
@@ -182,49 +187,52 @@ const sectionPage = (
   page: { section, items, total_items: items.length, next_cursor: null },
 });
 
-const ingestLegal = (fx: Fixture, page: JsonObject): V2ClientState =>
-  ok(
+const ingestLegal = (fx: Fixture, page: JsonObject): Effect.Effect<V2ClientState> =>
+  Effect.map(
     fx.run(
       Effect.flatMap(
         Effect.mapError(decodeLegalPage(page, fx.session), (error) => ({ message: error.message })),
         (decoded) => rememberPage(fx.sessionPath, fx.session, { legal: true, page: decoded })
       )
-    )
-  ).state;
+    ),
+    (result) => ok(result).state
+  );
 
-const ingestState = (fx: Fixture, page: JsonObject): V2ClientState =>
-  ok(
+const ingestState = (fx: Fixture, page: JsonObject): Effect.Effect<V2ClientState> =>
+  Effect.map(
     fx.run(
       Effect.flatMap(
         Effect.mapError(decodePage(page, fx.session), (error) => ({ message: error.message })),
         (decoded) => rememberPage(fx.sessionPath, fx.session, { legal: false, page: decoded })
       )
-    )
-  ).state;
+    ),
+    (result) => ok(result).state
+  );
 
 /**
  * `stage_stale_aliases`: cache one actor's catalog at rev7 (a1 = found city,
  * a2 = move), then bump the revision so both aliases go stale.
  */
-const stageStaleAliases = (fx: Fixture): V2ClientState => {
-  const old = revision(7);
-  ingestLegal(
-    fx,
-    scopedLegalPage(
-      old,
-      [foundCity(old, `action_found${'7'.repeat(20)}`), moveAction(old, `action_move${'7'.repeat(21)}`)],
-      UNIT_ONE,
-      `catalog_${'a'.repeat(32)}`
-    )
-  );
-  return ingestState(fx, sectionPage('overview', revision(9), []));
-};
+const stageStaleAliases = (fx: Fixture): Effect.Effect<V2ClientState> =>
+  Effect.gen(function* () {
+    const old = revision(7);
+    yield* ingestLegal(
+      fx,
+      scopedLegalPage(
+        old,
+        [
+          foundCity(old, `action_found${'7'.repeat(20)}`),
+          moveAction(old, `action_move${'7'.repeat(21)}`),
+        ],
+        UNIT_ONE,
+        `catalog_${'a'.repeat(32)}`
+      )
+    );
+    return yield* ingestState(fx, sectionPage('overview', revision(9), []));
+  });
 
 /** A `LegalPageFetcher` that ingests one page and counts its own calls. */
-const fetcherFor = (
-  fx: Fixture,
-  page: JsonObject
-): { readonly fetch: LegalPageFetcher; readonly calls: string[] } => {
+const fetcherFor = (_fixture: Fixture, page: JsonObject) => {
   const calls: string[] = [];
   const fetch: LegalPageFetcher = (sessionPath, session, actorId) =>
     Effect.gen(function* () {
@@ -237,14 +245,14 @@ const fetcherFor = (
   return { fetch, calls };
 };
 
-const aliasEntries = (state: V2ClientState): Record<string, string> => {
+const aliasEntries = (state: V2ClientState) => {
   const table = state.action_aliases['by_alias'];
   const mapped: Record<string, string> = {};
   if (!isJsonObject(table)) return mapped;
   for (const [alias, entry] of Object.entries(table)) {
-    if (isJsonObject(entry) && typeof entry['action_id'] === 'string') {
-      mapped[alias] = entry['action_id'];
-    }
+    if (!isJsonObject(entry)) continue;
+    const actionId = Schema.decodeUnknownOption(Schema.String)(entry['action_id']);
+    if (Option.isSome(actionId)) mapped[alias] = actionId.value;
   }
   return mapped;
 };
@@ -252,9 +260,9 @@ const aliasEntries = (state: V2ClientState): Record<string, string> => {
 // ---------------------------------------------------------------------------
 
 describe('a stale alias is rebound by meaning and keeps its number', () => {
-  test('fresh numbering would swap a1 and a2; rebinding puts them back', () => {
-    const fx = fixture();
-    const stale = stageStaleAliases(fx);
+  effectTest('fresh numbering would swap a1 and a2; rebinding puts them back', () => Effect.gen(function* () {
+    const fx = yield* fixture();
+    const stale = yield* stageStaleAliases(fx);
     const at = revision(9);
     // The same two actions at the new revision, in the opposite order and with
     // new handles.
@@ -266,7 +274,7 @@ describe('a stale alias is rebound by meaning and keeps its number', () => {
     );
 
     const outcome = ok(
-      fx.run(
+      yield* fx.run(
         expandActionAliasRefreshing(fx.sessionPath, fx.session, stale, 'a1', {
           locked: false,
           fetch,
@@ -274,42 +282,42 @@ describe('a stale alias is rebound by meaning and keeps its number', () => {
       )
     );
     expect(outcome.note).toBe('a1 rebound at rev9');
-    expect(outcome.identifier).toBe(freshFound['action_id'] as string);
+    expect(outcome.identifier).toBe(fixtureString(freshFound['action_id']));
     expect(calls).toEqual([UNIT_ONE]);
 
     // a1 still means "found this city"; a2 still means that move.
-    const reloaded = ok(fx.run(fx.store.readState(fx.sessionPath, fx.session)));
+    const reloaded = ok(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session)));
     expect(aliasEntries(reloaded)).toEqual({
-      a1: freshFound['action_id'] as string,
-      a2: freshMove['action_id'] as string,
+      a1: fixtureString(freshFound['action_id']),
+      a2: fixtureString(freshMove['action_id']),
     });
     // The expired handle never survives the rebind.
     expect(Object.values(aliasEntries(reloaded))).not.toContain(`action_found${'7'.repeat(20)}`);
-  });
+  }));
 
-  test('an alias that was already fresh costs nothing and notes nothing', () => {
-    const fx = fixture();
+  effectTest('an alias that was already fresh costs nothing and notes nothing', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const old = revision(7);
-    const state = ingestLegal(
+    const state = yield* ingestLegal(
       fx,
       scopedLegalPage(old, [foundCity(old, 'action_found_one')], UNIT_ONE, `catalog_${'a'.repeat(32)}`)
     );
     const { fetch, calls } = fetcherFor(fx, scopedLegalPage(old, [], UNIT_ONE, `catalog_${'b'.repeat(32)}`));
     const outcome = ok(
-      fx.run(
+      yield* fx.run(
         expandActionAliasRefreshing(fx.sessionPath, fx.session, state, 'a1', { locked: false, fetch })
       )
     );
     expect(outcome.note).toBe('');
     expect(outcome.identifier).toBe('action_found_one');
     expect(calls).toEqual([]);
-  });
+  }));
 });
 
 describe('a vanished or ambiguous alias still fails closed', () => {
-  test('a meaning that no longer exists keeps the plain refusal', () => {
-    const fx = fixture();
-    const stale = stageStaleAliases(fx);
+  effectTest('a meaning that no longer exists keeps the plain refusal', () => Effect.gen(function* () {
+    const fx = yield* fixture();
+    const stale = yield* stageStaleAliases(fx);
     const at = revision(9);
     const gone = actorAction(at, `action_other${'9'.repeat(20)}`, UNIT_ONE, {
       kind: 'unit.sentry',
@@ -322,7 +330,7 @@ describe('a vanished or ambiguous alias still fails closed', () => {
     );
     expect(
       failure(
-        fx.run(
+        yield* fx.run(
           expandActionAliasRefreshing(fx.sessionPath, fx.session, stale, 'a1', {
             locked: false,
             fetch,
@@ -330,11 +338,11 @@ describe('a vanished or ambiguous alias still fails closed', () => {
         )
       )
     ).toContain('die with their revision');
-  });
+  }));
 
-  test('two actions with one meaning refuse to be rebound and name both', () => {
-    const fx = fixture();
-    const stale = stageStaleAliases(fx);
+  effectTest('two actions with one meaning refuse to be rebound and name both', () => Effect.gen(function* () {
+    const fx = yield* fixture();
+    const stale = yield* stageStaleAliases(fx);
     const at = revision(9);
     const twins = [0, 1].map((index) => foundCity(at, `action_twin${index}${'9'.repeat(20)}`));
     const { fetch } = fetcherFor(
@@ -342,7 +350,7 @@ describe('a vanished or ambiguous alias still fails closed', () => {
       scopedLegalPage(at, twins, UNIT_ONE, `catalog_${'b'.repeat(32)}`)
     );
     const message = failure(
-      fx.run(
+      yield* fx.run(
         expandActionAliasRefreshing(fx.sessionPath, fx.session, stale, 'a1', {
           locked: false,
           fetch,
@@ -353,11 +361,11 @@ describe('a vanished or ambiguous alias still fails closed', () => {
     // Both candidates are named so the agent can pick one.
     expect(message).toMatch(/\(a\d+ a\d+\)/);
     expect(message).toContain('name exactly one of them');
-  });
+  }));
 
-  test('an alias with no semantics is never re-resolved', () => {
-    const fx = fixture();
-    const stale = stageStaleAliases(fx);
+  effectTest('an alias with no semantics is never re-resolved', () => Effect.gen(function* () {
+    const fx = yield* fixture();
+    const stale = yield* stageStaleAliases(fx);
     const empty = v2StateSchema.empty(fx.session);
     const stripped: V2ClientState = {
       ...stale,
@@ -372,40 +380,40 @@ describe('a vanished or ambiguous alias still fails closed', () => {
       scopedLegalPage(revision(9), [], UNIT_ONE, `catalog_${'b'.repeat(32)}`)
     );
     const outcome = ok(
-      fx.run(
+      yield* fx.run(
         refreshStaleAlias(fx.sessionPath, fx.session, stripped, 'a1', { locked: false, fetch })
       )
     );
     expect(Option.isNone(outcome)).toBe(true);
     expect(calls).toEqual([]);
-  });
+  }));
 
-  test('an alias that was never numbered is never re-resolved', () => {
-    const fx = fixture();
-    const stale = stageStaleAliases(fx);
+  effectTest('an alias that was never numbered is never re-resolved', () => Effect.gen(function* () {
+    const fx = yield* fixture();
+    const stale = yield* stageStaleAliases(fx);
     const { fetch, calls } = fetcherFor(
       fx,
       scopedLegalPage(revision(9), [], UNIT_ONE, `catalog_${'b'.repeat(32)}`)
     );
     const outcome = ok(
-      fx.run(refreshStaleAlias(fx.sessionPath, fx.session, stale, 'a9', { locked: false, fetch }))
+      yield* fx.run(refreshStaleAlias(fx.sessionPath, fx.session, stale, 'a9', { locked: false, fetch }))
     );
     expect(Option.isNone(outcome)).toBe(true);
     expect(calls).toEqual([]);
-  });
+  }));
 });
 
 describe('resolveAliasArguments', () => {
-  test('--no-refresh keeps the plain refusal and sends nothing', () => {
-    const fx = fixture();
-    stageStaleAliases(fx);
+  effectTest('--no-refresh keeps the plain refusal and sends nothing', () => Effect.gen(function* () {
+    const fx = yield* fixture();
+    yield* stageStaleAliases(fx);
     const { fetch, calls } = fetcherFor(
       fx,
       scopedLegalPage(revision(9), [], UNIT_ONE, `catalog_${'b'.repeat(32)}`)
     );
     expect(
       failure(
-        fx.run(
+        yield* fx.run(
           resolveAliasArguments(
             fx.sessionPath,
             fx.session,
@@ -416,19 +424,19 @@ describe('resolveAliasArguments', () => {
       )
     ).toContain('die with their revision');
     expect(calls).toEqual([]);
-  });
+  }));
 
-  test('with no fetcher at all the refusal is identical', () => {
-    const fx = fixture();
-    stageStaleAliases(fx);
+  effectTest('with no fetcher at all the refusal is identical', () => Effect.gen(function* () {
+    const fx = yield* fixture();
+    yield* stageStaleAliases(fx);
     expect(
-      failure(fx.run(resolveAliasArguments(fx.sessionPath, fx.session, { action_id: 'a1' }, {})))
+      failure(yield* fx.run(resolveAliasArguments(fx.sessionPath, fx.session, { action_id: 'a1' }, {})))
     ).toContain('die with their revision');
-  });
+  }));
 
-  test('a stale action alias is rebound and its note is collected', () => {
-    const fx = fixture();
-    stageStaleAliases(fx);
+  effectTest('a stale action alias is rebound and its note is collected', () => Effect.gen(function* () {
+    const fx = yield* fixture();
+    yield* stageStaleAliases(fx);
     const at = revision(9);
     const freshFound = foundCity(at, `action_found${'9'.repeat(20)}`);
     const { fetch, calls } = fetcherFor(
@@ -436,19 +444,19 @@ describe('resolveAliasArguments', () => {
       scopedLegalPage(at, [freshFound], UNIT_ONE, `catalog_${'b'.repeat(32)}`)
     );
     const resolved = ok(
-      fx.run(
+      yield* fx.run(
         resolveAliasArguments(fx.sessionPath, fx.session, { action_id: ' a1 ' }, { fetch })
       )
     );
     expect(resolved.notes).toEqual(['a1 rebound at rev9']);
-    expect(resolved.values['action_id']).toBe(freshFound['action_id'] as string);
+    expect(resolved.values['action_id']).toBe(fixtureString(freshFound['action_id']));
     expect(calls).toEqual([UNIT_ONE]);
-  });
+  }));
 
-  test('a field that names no alias is left exactly as it was typed', () => {
-    const fx = fixture();
+  effectTest('a field that names no alias is left exactly as it was typed', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const untouched = ok(
-      fx.run(
+      yield* fx.run(
         resolveAliasArguments(fx.sessionPath, fx.session, {
           actor_id: UNIT_ONE,
           target_id: '',
@@ -457,12 +465,12 @@ describe('resolveAliasArguments', () => {
     );
     expect(untouched.values).toEqual({ actor_id: UNIT_ONE, target_id: '' });
     expect(untouched.notes).toEqual([]);
-  });
+  }));
 
-  test('entity and tile aliases expand without any refresh', () => {
-    const fx = fixture();
+  effectTest('entity and tile aliases expand without any refresh', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const at = revision(7);
-    ingestState(
+    yield* ingestState(
       fx,
       sectionPage('units', at, [
         {
@@ -482,7 +490,7 @@ describe('resolveAliasArguments', () => {
       ])
     );
     const resolved = ok(
-      fx.run(
+      yield* fx.run(
         resolveAliasArguments(fx.sessionPath, fx.session, {
           actor_id: 'u1',
           center_id: 'T(31,72)',
@@ -496,14 +504,14 @@ describe('resolveAliasArguments', () => {
       section: 'units',
     });
     expect(resolved.notes).toEqual([]);
-  });
+  }));
 
-  test('an unknown alias is a refusal, never a pass-through', () => {
-    const fx = fixture();
+  effectTest('an unknown alias is a refusal, never a pass-through', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     expect(
-      failure(fx.run(resolveAliasArguments(fx.sessionPath, fx.session, { actor_id: 'u1' })))
+      failure(yield* fx.run(resolveAliasArguments(fx.sessionPath, fx.session, { actor_id: 'u1' })))
     ).toBe('unknown unit alias u1; known unit aliases: none are known yet');
-  });
+  }));
 
   test('the alias shapes are exactly the three the dialect defines', () => {
     for (const good of ['a1', 'a9999', 'u1', 'c12', 'p3', 'r7', 'T(1,2)', 'T(-1, -2)', 't(0,0)']) {

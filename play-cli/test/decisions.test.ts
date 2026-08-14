@@ -15,7 +15,6 @@
  * contract of the projection — the Python's own test asserts the request list
  * is empty.
  */
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect } from 'effect';
 import { batchFocusCommand, decisionLine, type DecisionRow } from 'src/render/decisions';
@@ -30,15 +29,17 @@ import {
   decisionVerb,
   liveDecisionDeps,
   nextFocusLine,
-  type DecisionOptions,
 } from 'src/services/decisions';
-import { compactLegalAction } from 'src/services/legal-compact';
+import { compactLegalAction, type CompactAction } from 'src/services/legal-compact';
 import { meetingGroups, meetingRemedy, openMeetings } from 'src/services/meetings';
 import type { PrivateFs } from 'src/services/private-fs';
 import type { V2ClientState } from 'src/services/session-store';
 import { mirrorDir, writeMirror } from 'src/services/mirror';
 import { mirrorNumber } from 'src/services/turn-pages';
 import { scratchWorkspace, type Scratch } from 'test/_fixtures';
+import { awaitTest, provideTestLayer } from 'test/_effect-test';
+import { observedAt } from 'test/_expect';
+import { path } from 'test/_test-platform';
 
 const GAME_ID = 'game_12345678901234567890';
 const UNIT_ONE = `unit_${'a'.repeat(32)}`;
@@ -223,36 +224,71 @@ const DIPLOMACY_TSV = [
 
 interface Seat {
   readonly sessionPath: string;
-  readonly run: <A, E>(effect: Effect.Effect<A, E, PrivateFs>) => A;
+  readonly run: <A, E>(effect: Effect.Effect<A, E, PrivateFs>) => Effect.Effect<A>;
 }
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() =>
+  Effect.runPromise(
+    Effect.forEach(scratches.splice(0), (scratch) => scratch.cleanup, { discard: true })
+  )
+);
 
-const stageSeat = (files: ReadonlyArray<readonly [ReadonlyArray<string>, string]>): Seat => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const sessionPath = path.join(scratch.workspace.stateRoot, GAME_ID, 'codex-test.json');
-  const dir = Effect.runSync(mirrorDir(sessionPath));
-  const run = <A, E>(effect: Effect.Effect<A, E, PrivateFs>): A =>
-    Effect.runSync(Effect.provide(effect, scratch.layer) as Effect.Effect<A>);
-  for (const [parts, text] of files) run(writeMirror(dir, parts, text));
-  return { sessionPath, run };
-};
+const stageSeat = (
+  files: ReadonlyArray<readonly [ReadonlyArray<string>, string]>
+): Effect.Effect<Seat> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const sessionPath = path.join(scratch.workspace.stateRoot, GAME_ID, 'codex-test.json');
+    const dir = yield* Effect.orDie(mirrorDir(sessionPath));
+    const run = <A, E>(effect: Effect.Effect<A, E, PrivateFs>): Effect.Effect<A> =>
+      Effect.orDie(provideTestLayer(effect, scratch.layer));
+    yield* Effect.forEach(files, ([parts, text]) => run(writeMirror(dir, parts, text)), {
+      discard: true,
+    });
+    return { sessionPath, run };
+  });
 
-const focusSeat = (): Seat =>
+const focusSeat = (): Effect.Effect<Seat> =>
   stageSeat([
     [['state', 'units.tsv'], UNITS_TSV],
     [['state', 'cities.tsv'], CITIES_TSV],
   ]);
 
-const compact = (actionId: string): JsonObject => {
+const compact = (actionId: string): CompactAction => {
   const found = ACTIONS.find(([id]) => id === actionId);
   if (found === undefined) throw new Error(`no fixture action ${actionId}`);
-  return Effect.runSync(compactLegalAction(found[1]) as Effect.Effect<JsonObject>);
+  return Effect.runSync(Effect.orDie(compactLegalAction(found[1])));
 };
+
+const runDecisionOrder = (pool: ReadonlyArray<CompactAction>, alias: string): string =>
+  Effect.runSync(Effect.orDie(decisionOrder(pool, alias, liveDecisionDeps)));
+
+const decisionRow = (overrides: Partial<DecisionRow>): DecisionRow => ({
+  alias: 'u1',
+  actor_id: 'unit_1',
+  state: 'idle',
+  options: [],
+  option_count: 1,
+  order: '',
+  remedy: 'just legal --actor_id u1 --all',
+  ...overrides,
+});
+
+const protoAction = (
+  operation: string,
+  actionId = `action_p${'0'.repeat(23)}`
+): CompactAction =>
+  Effect.runSync(
+    Effect.orDie(compactLegalAction(actorAction({ actionId, actorId: UNIT_ONE, operation })))
+  );
+
+const decisionOptionTexts = (
+  pool: ReadonlyArray<CompactAction>,
+  aliases: Record<string, string>
+): ReadonlyArray<string> =>
+  Effect.runSync(Effect.orDie(decisionOptions(pool, aliases, liveDecisionDeps))).options;
 
 // ---------------------------------------------------------------------------
 
@@ -274,9 +310,9 @@ describe('_decision_verb / _decision_option_rank', () => {
 });
 
 describe('_decision_rows', () => {
-  test('walks units then cities, skips the unit with a standing route', () => {
-    const seat = focusSeat();
-    const rows = seat.run(decisionRows(seat.sessionPath, focusState(), liveDecisionDeps));
+  awaitTest('walks units then cities, skips the unit with a standing route', function* () {
+    const seat = yield* focusSeat();
+    const rows = yield* seat.run(decisionRows(seat.sessionPath, focusState(), liveDecisionDeps));
 
     expect(rows.map((row) => row.alias)).toEqual(['u1', 'u2', 'c1']);
     expect(rows[0]?.state).toBe('Settlers @31,72 idle');
@@ -286,9 +322,9 @@ describe('_decision_rows', () => {
     expect(rows.some((row) => row.state.includes('Explorer'))).toBe(false);
   });
 
-  test('each row carries the option aliases `do` accepts, best verb first', () => {
-    const seat = focusSeat();
-    const rows = seat.run(decisionRows(seat.sessionPath, focusState(), liveDecisionDeps));
+  awaitTest('each row carries the option aliases `do` accepts, best verb first', function* () {
+    const seat = yield* focusSeat();
+    const rows = yield* seat.run(decisionRows(seat.sessionPath, focusState(), liveDecisionDeps));
 
     expect(rows[0]?.options).toEqual(['a1 found_city T(31,72)', 'a2 move T(31,72)']);
     expect(rows[1]?.options).toEqual(['a4 road T(31,72)', 'a3 sentry T(31,72)']);
@@ -298,29 +334,29 @@ describe('_decision_rows', () => {
     expect(rows[0]?.remedy).toBe('just legal --actor_id u1 --all');
   });
 
-  test('every printed line stays inside the 120-column budget', () => {
-    const seat = focusSeat();
-    const rows = seat.run(decisionRows(seat.sessionPath, focusState(), liveDecisionDeps));
+  awaitTest('every printed line stays inside the 120-column budget', function* () {
+    const seat = yield* focusSeat();
+    const rows = yield* seat.run(decisionRows(seat.sessionPath, focusState(), liveDecisionDeps));
     for (const row of rows) expect(decisionLine(row).length).toBeLessThanOrEqual(120);
-    expect(decisionLine(rows[0] as DecisionRow)).toContain('a1 found_city');
+    expect(decisionLine(observedAt(rows, 0))).toContain('a1 found_city');
   });
 
-  test('a catalog that died with its revision degrades to the enumeration command', () => {
-    const seat = focusSeat();
+  awaitTest('a catalog that died with its revision degrades to the enumeration command', function* () {
+    const seat = yield* focusSeat();
     // The receipt bumped the revision; every cached descriptor is now stale.
     const bumped: Revision = { turn: 3, revision: 9, state_token: 'token_3_9' };
-    const rows = seat.run(
+    const rows = yield* seat.run(
       decisionRows(seat.sessionPath, focusState(bumped), liveDecisionDeps)
     );
     expect(rows[1]?.options).toEqual([]);
-    expect(decisionLine(rows[1] as DecisionRow)).toBe(
+    expect(decisionLine(observedAt(rows, 1))).toBe(
       'u2 Workers @31,72 idle — just legal --actor_id u2 --all'
     );
   });
 
-  test('an actor already ordered is never offered back', () => {
-    const seat = focusSeat();
-    const rows = seat.run(
+  awaitTest('an actor already ordered is never offered back', function* () {
+    const seat = yield* focusSeat();
+    const rows = yield* seat.run(
       decisionRows(seat.sessionPath, focusState(), liveDecisionDeps, {
         done: new Set([UNIT_ONE]),
       })
@@ -332,7 +368,7 @@ describe('_decision_rows', () => {
 describe('_decision_order', () => {
   test('only an order that resolves and binds its whole schema is offered', () => {
     const founding = Effect.runSync(
-      compactLegalAction({
+      Effect.orDie(compactLegalAction({
         ...actorAction({
           actionId: FOUND,
           actorId: UNIT_ONE,
@@ -345,81 +381,66 @@ describe('_decision_order', () => {
           properties: { city_name: { type: 'string' } },
           required: ['city_name'],
         },
-      }) as Effect.Effect<JsonObject>
+      }))
     );
     const pool = [founding, compact(MOVE)];
     // `found_city` outranks `move`, but its city name is the player's to
     // choose, so the tail yields rather than printing a line that would refuse.
-    expect(Effect.runSync(decisionOrder(pool, 'u1', liveDecisionDeps) as Effect.Effect<string>)).toBe(
-      'u1 move T(31,72)'
-    );
+    expect(runDecisionOrder(pool, 'u1')).toBe('u1 move T(31,72)');
   });
 
   test('with no schema to fill, the top-ranked verb is offered first', () => {
-    expect(
-      Effect.runSync(
-        decisionOrder([compact(FOUND), compact(MOVE)], 'u1', liveDecisionDeps) as Effect.Effect<string>
-      )
-    ).toBe('u1 found_city T(31,72)');
+    expect(runDecisionOrder([compact(FOUND), compact(MOVE)], 'u1')).toBe(
+      'u1 found_city T(31,72)'
+    );
   });
 
   test('two actions sharing one verb and one target key are both withheld', () => {
     const twins = [
       Effect.runSync(
-        compactLegalAction(
-          actorAction({
-            actionId: `action_twin1${'0'.repeat(20)}`,
-            actorId: UNIT_ONE,
-            kind: 'unit.start_activity',
-            operation: 'road',
-            label: 'Road',
-          })
-        ) as Effect.Effect<JsonObject>
+        Effect.orDie(
+          compactLegalAction(
+            actorAction({
+              actionId: `action_twin1${'0'.repeat(20)}`,
+              actorId: UNIT_ONE,
+              kind: 'unit.start_activity',
+              operation: 'road',
+              label: 'Road',
+            })
+          )
+        )
       ),
       Effect.runSync(
-        compactLegalAction(
-          actorAction({
-            actionId: `action_twin2${'0'.repeat(20)}`,
-            actorId: UNIT_ONE,
-            kind: 'unit.start_activity',
-            operation: 'road',
-            label: 'Road',
-          })
-        ) as Effect.Effect<JsonObject>
+        Effect.orDie(
+          compactLegalAction(
+            actorAction({
+              actionId: `action_twin2${'0'.repeat(20)}`,
+              actorId: UNIT_ONE,
+              kind: 'unit.start_activity',
+              operation: 'road',
+              label: 'Road',
+            })
+          )
+        )
       ),
     ];
-    const run = (pool: ReadonlyArray<JsonObject>, alias: string): string =>
-      Effect.runSync(decisionOrder(pool, alias, liveDecisionDeps) as Effect.Effect<string>);
-    expect(run(twins, 'u1')).toBe('');
-    expect(run([compact(FOUND), compact(MOVE)], '')).toBe('');
-    expect(run([], 'u1')).toBe('');
+    expect(runDecisionOrder(twins, 'u1')).toBe('');
+    expect(runDecisionOrder([compact(FOUND), compact(MOVE)], '')).toBe('');
+    expect(runDecisionOrder([], 'u1')).toBe('');
   });
 
   test('a tier-1 word that fixes no arguments replaces the wire operation', () => {
     // `build` is `city.set_production/set_production` with no fixed arguments.
-    expect(
-      Effect.runSync(
-        decisionOrder([compact(PROD_A), compact(PROD_B)], 'c1', liveDecisionDeps) as Effect.Effect<string>
-      )
-    ).toBe('c1 build Warriors');
+    expect(runDecisionOrder([compact(PROD_A), compact(PROD_B)], 'c1')).toBe(
+      'c1 build Warriors'
+    );
   });
 });
 
 describe('_batch_focus_command', () => {
-  const row = (overrides: Partial<DecisionRow>): DecisionRow => ({
-    alias: 'u1',
-    actor_id: 'unit_1',
-    state: 'idle',
-    options: [],
-    option_count: 1,
-    order: '',
-    remedy: 'just legal --actor_id u1 --all',
-    ...overrides,
-  });
-
-  test('every actor with a composable order becomes one `just do` line', () => {
-    const seat = focusSeat();
-    const rows = seat.run(decisionRows(seat.sessionPath, focusState(), liveDecisionDeps));
+  awaitTest('every actor with a composable order becomes one `just do` line', function* () {
+    const seat = yield* focusSeat();
+    const rows = yield* seat.run(decisionRows(seat.sessionPath, focusState(), liveDecisionDeps));
     expect(batchFocusCommand(rows)).toBe(
       'next 3 actors: just do "u1 found_city T(31,72); u2 road T(31,72); c1 build Warriors"'
     );
@@ -428,7 +449,7 @@ describe('_batch_focus_command', () => {
 
   test('an overflowing line trims the actors it names while the count stays honest', () => {
     const wide = Array.from({ length: 8 }, (_value, index) =>
-      row({
+      decisionRow({
         alias: `u${index + 1}`,
         actor_id: `unit_${index + 1}`,
         order: `u${index + 1} connect_route T(100,${String(index + 1).padStart(3, '0')})`,
@@ -439,7 +460,9 @@ describe('_batch_focus_command', () => {
     expect(trimmed.startsWith('next 8 actors, top ')).toBe(true);
     expect(trimmed.length).toBeLessThanOrEqual(200);
 
-    const wider = wide.map((entry) => row({ ...entry, order: `${entry.order} ${'x'.repeat(90)}` }));
+    const wider = wide.map((entry) =>
+      decisionRow({ ...entry, order: `${entry.order} ${'x'.repeat(90)}` })
+    );
     expect(batchFocusCommand(wider)).toBe(
       'next 8 actors need orders — just turn --decisions'
     );
@@ -448,7 +471,7 @@ describe('_batch_focus_command', () => {
   test('one actor is not a batch', () => {
     expect(
       batchFocusCommand([
-        row({
+        decisionRow({
           alias: 'u2',
           actor_id: 'unit_2',
           state: 'Workers idle',
@@ -493,16 +516,16 @@ describe('_decision_line', () => {
 });
 
 describe('_next_focus_line / _briefing_decision_lines', () => {
-  test('an empty seat teaches the one-call ending', () => {
-    const seat = stageSeat([]);
+  awaitTest('an empty seat teaches the one-call ending', function* () {
+    const seat = yield* stageSeat([]);
     expect(
-      seat.run(nextFocusLine(seat.sessionPath, focusState(), new Set(), liveDecisionDeps))
+      yield* seat.run(nextFocusLine(seat.sessionPath, focusState(), new Set(), liveDecisionDeps))
     ).toBe('next: no actors need orders — just turn --end --await --brief');
   });
 
-  test('one remaining actor degrades to the single-actor row', () => {
-    const seat = focusSeat();
-    const line = seat.run(
+  awaitTest('one remaining actor degrades to the single-actor row', function* () {
+    const seat = yield* focusSeat();
+    const line = yield* seat.run(
       nextFocusLine(
         seat.sessionPath,
         focusState({ turn: 3, revision: 9, state_token: 'token_3_9' }),
@@ -513,9 +536,9 @@ describe('_next_focus_line / _briefing_decision_lines', () => {
     expect(line).toBe('next: u2 Workers @31,72 idle — just legal --actor_id u2 --all');
   });
 
-  test('the briefing block closes with the composed batch', () => {
-    const seat = focusSeat();
-    const lines = seat.run(
+  awaitTest('the briefing block closes with the composed batch', function* () {
+    const seat = yield* focusSeat();
+    const lines = yield* seat.run(
       briefingDecisionLines(seat.sessionPath, focusState(), liveDecisionDeps)
     );
     expect(lines).toHaveLength(4);
@@ -525,9 +548,9 @@ describe('_next_focus_line / _briefing_decision_lines', () => {
 });
 
 describe('open meetings', () => {
-  test('only relations still waiting on this seat are returned', () => {
-    const seat = stageSeat([[['state', 'diplomacy.tsv'], DIPLOMACY_TSV]]);
-    expect(seat.run(openMeetings(seat.sessionPath))).toEqual({
+  awaitTest('only relations still waiting on this seat are returned', function* () {
+    const seat = yield* stageSeat([[['state', 'diplomacy.tsv'], DIPLOMACY_TSV]]);
+    expect(yield* seat.run(openMeetings(seat.sessionPath))).toEqual({
       r1: 'meeting pending: Spain, cease-fire, 2 clauses',
     });
   });
@@ -541,13 +564,13 @@ describe('open meetings', () => {
     );
   });
 
-  test('a relation with an open meeting is a row of its own', () => {
-    const seat = stageSeat([
+  awaitTest('a relation with an open meeting is a row of its own', function* () {
+    const seat = yield* stageSeat([
       [['state', 'units.tsv'], UNITS_TSV],
       [['state', 'cities.tsv'], CITIES_TSV],
       [['state', 'diplomacy.tsv'], DIPLOMACY_TSV],
     ]);
-    const rows = seat.run(decisionRows(seat.sessionPath, focusState(), liveDecisionDeps));
+    const rows = yield* seat.run(decisionRows(seat.sessionPath, focusState(), liveDecisionDeps));
     const meeting = rows.find((entry) => entry.alias === 'r1');
     expect(meeting?.state).toBe('meeting pending: Spain, cease-fire, 2 clauses');
     // A meeting's actor is this seat's own player, so no order can compose.
@@ -569,34 +592,19 @@ describe('open meetings', () => {
  * keep a briefing from turning a successful receipt into a failure.
  */
 describe('an inherited member name is a miss, not a hit', () => {
-  const protoAction = (operation: string, actionId = `action_p${'0'.repeat(23)}`): JsonObject =>
-    Effect.runSync(
-      compactLegalAction(
-        actorAction({ actionId, actorId: UNIT_ONE, operation })
-      ) as Effect.Effect<JsonObject>
-    );
-
-  const order = (pool: ReadonlyArray<JsonObject>, alias: string): string =>
-    Effect.runSync(decisionOrder(pool, alias, liveDecisionDeps) as Effect.Effect<string>);
-
-  const options = (
-    pool: ReadonlyArray<JsonObject>,
-    aliases: Record<string, string>
-  ): ReadonlyArray<string> =>
-    Effect.runSync(decisionOptions(pool, aliases, liveDecisionDeps) as Effect.Effect<DecisionOptions>)
-      .options;
-
   test('an operation naming a built-in composes its order instead of throwing', () => {
     // `V2_TIER1_VERBS.get("toString")` misses, `defaults` stays `{}`, and the
     // order composes exactly as `move` does.
     for (const operation of ['toString', 'constructor', 'valueOf', 'hasOwnProperty']) {
-      expect(order([protoAction(operation)], 'u1')).toBe(`u1 ${operation} T(31,72)`);
+      expect(runDecisionOrder([protoAction(operation)], 'u1')).toBe(
+        `u1 ${operation} T(31,72)`
+      );
     }
-    expect(order([protoAction('move')], 'u1')).toBe('u1 move T(31,72)');
+    expect(runDecisionOrder([protoAction('move')], 'u1')).toBe('u1 move T(31,72)');
   });
 
-  test('the same operation still reaches the briefing and the focus line', () => {
-    const seat = focusSeat();
+  awaitTest('the same operation still reaches the briefing and the focus line', function* () {
+    const seat = yield* focusSeat();
     // `_next_focus_line` and `_briefing_decision_lines` promise never to turn a
     // successful receipt into an error; a thrown `TypeError` is not something
     // their `orElseSucceed` can absorb, so this asserts they still print.
@@ -608,25 +616,27 @@ describe('an inherited member name is a miss, not a hit', () => {
         },
       },
     };
-    expect(seat.run(briefingDecisionLines(seat.sessionPath, state, liveDecisionDeps))[0]).toBe(
+    expect((yield* seat.run(briefingDecisionLines(seat.sessionPath, state, liveDecisionDeps)))[0]).toBe(
       'u1 Settlers @31,72 idle — a2 toString T(31,72)'
     );
     expect(
-      seat.run(nextFocusLine(seat.sessionPath, state, new Set([UNIT_TWO, CITY_ONE]), liveDecisionDeps))
+      yield* seat.run(nextFocusLine(seat.sessionPath, state, new Set([UNIT_TWO, CITY_ONE]), liveDecisionDeps))
     ).toBe('next: u1 Settlers @31,72 idle — a2 toString T(31,72)');
   });
 
   test('an action_id naming a built-in has no alias, not a function body', () => {
     const pool = [protoAction('move', 'toString')];
-    expect(options(pool, {})).toEqual(['move T(31,72)']);
+    expect(decisionOptionTexts(pool, {})).toEqual(['move T(31,72)']);
     // …and a table that really carries the key still names it, so the guard
     // did not simply drop the lookup.
-    expect(options(pool, Object.fromEntries([['toString', 'a1']]))).toEqual(['a1 move T(31,72)']);
+    expect(decisionOptionTexts(pool, Object.fromEntries([['toString', 'a1']]))).toEqual([
+      'a1 move T(31,72)',
+    ]);
   });
 
   test('a meeting actor or relation naming a built-in stays itself in the remedy', () => {
     const meeting = Effect.runSync(
-      compactLegalAction({
+      Effect.orDie(compactLegalAction({
         action_id: `action_m${'0'.repeat(23)}`,
         kind: 'diplomacy.meeting',
         label: 'Meet',
@@ -638,7 +648,7 @@ describe('an inherited member name is a miss, not a hit', () => {
         },
         arguments_schema: { type: 'object' },
         state_revision: { ...REVISION },
-      }) as Effect.Effect<JsonObject>
+      }))
     );
     // The remedy line's whole job is to be copy-pasteable; `just legal
     // --actor_id function Object() { [native code] } --all` is not a command.

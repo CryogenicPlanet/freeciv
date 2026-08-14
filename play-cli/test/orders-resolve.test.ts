@@ -15,11 +15,10 @@
  * line-for-line port of client.py:7899-7947 so this unit is tested against the
  * projection it will actually receive.  See NOTES.md §15.1.
  */
-import * as path from 'node:path';
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect } from 'bun:test';
 import { Effect, Either, Layer } from 'effect';
 import { FULL_CONTROL_V2, V2_WITHHELD } from 'src/constants';
-import { playerError, type PlayerError } from 'src/errors';
+import { playerError, type PlayerError, type PlayError } from 'src/errors';
 import { decodeLegalPage, decodePage } from 'src/schema/page';
 import { isJsonObject, type JsonObject, type JsonValue } from 'src/schema/primitives';
 import { rememberPage, v2StateSchema } from 'src/services/aliases';
@@ -47,7 +46,9 @@ import {
   type OrdersFetchDeps,
   type ResolvedOrder,
 } from 'src/services/orders';
+import { awaitTest, provideTestLayer } from 'test/_effect-test';
 import { FIXTURE_GAME_ID, scratchWorkspace, sessionFile, type Scratch } from 'test/_fixtures';
+import { path } from 'test/_test-platform';
 
 // ---------------------------------------------------------------------------
 // `_compact_legal_action` (client.py:7899-7947) — U11's, ported for the seam
@@ -65,6 +66,10 @@ const CERTAIN: JsonObject = { kind: 'exact', minimum_percent: 100, maximum_perce
 
 const sameJson = (left: JsonValue, right: JsonValue): boolean =>
   JSON.stringify(left) === JSON.stringify(right);
+
+interface CompactLegalResult {
+  [key: string]: JsonValue;
+}
 
 const compactLegalAction = (descriptor: JsonObject): Effect.Effect<JsonObject, PlayerError> =>
   Effect.sync(() => {
@@ -84,7 +89,7 @@ const compactLegalAction = (descriptor: JsonObject): Effect.Effect<JsonObject, P
     }
     const schema = (descriptor['arguments_schema'] ?? null);
     const target = (subject['target'] ?? null);
-    const result: Record<string, JsonValue> = {
+    const result: CompactLegalResult = {
       action_id: (descriptor['action_id'] ?? null),
       kind: (descriptor['kind'] ?? null),
       label: (descriptor['label'] ?? null),
@@ -104,7 +109,8 @@ const compactLegalAction = (descriptor: JsonObject): Effect.Effect<JsonObject, P
     if (isJsonObject(gold)) {
       const range: Record<string, JsonValue> = {};
       for (const key of ['minimum', 'maximum'] as const) {
-        if (Object.hasOwn(gold, key)) range[key] = gold[key] as JsonValue;
+        const bound = gold[key];
+        if (bound !== undefined) range[key] = bound;
       }
       result['gold_range'] = range;
     }
@@ -118,9 +124,11 @@ const deps: OrdersDeps = { compactLegalAction };
 // ---------------------------------------------------------------------------
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() =>
+  Effect.runPromise(
+    Effect.forEach(scratches.splice(0), (scratch) => scratch.cleanup, { discard: true })
+  )
+);
 
 interface TestRevision {
   readonly turn: number;
@@ -135,29 +143,31 @@ interface Fixture {
   readonly session: Session;
   readonly run: <A, E>(
     effect: Effect.Effect<A, E, SessionStore | PrivateFs>
-  ) => Either.Either<A, E>;
+  ) => Effect.Effect<Either.Either<A, E>>;
 }
 
-const fixture = (): Fixture => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
-  const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'codex-test.json');
-  Effect.runSync(
-    scratch.files.writeJson(sessionPath, sessionFile({ control_protocol: FULL_CONTROL_V2 }))
-  );
-  const loaded = Effect.runSync(store.resolveV2(sessionPath));
-  const layer = Layer.merge(
-    Layer.succeed(SessionStore, store),
-    Layer.succeed(PrivateFs, scratch.files)
-  );
-  return {
-    store,
-    sessionPath,
-    session: loaded.session,
-    run: (effect) => Effect.runSync(Effect.either(Effect.provide(effect, layer))),
-  };
-};
+const fixture = (): Effect.Effect<Fixture, PlayError> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
+    const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'codex-test.json');
+    yield* scratch.files.writeJson(
+      sessionPath,
+      sessionFile({ control_protocol: FULL_CONTROL_V2 })
+    );
+    const loaded = yield* store.resolveV2(sessionPath);
+    const layer = Layer.merge(
+      Layer.succeed(SessionStore, store),
+      Layer.succeed(PrivateFs, scratch.files)
+    );
+    return {
+      store,
+      sessionPath,
+      session: loaded.session,
+      run: (effect) => Effect.either(provideTestLayer(effect, layer)),
+    };
+  });
 
 const ok = <A, E>(either: Either.Either<A, E>): A => {
   if (Either.isLeft(either)) {
@@ -301,41 +311,44 @@ const sectionPage = (
   page: { section, items, total_items: items.length, next_cursor: null },
 });
 
-const ingestLegal = (fx: Fixture, page: JsonObject): V2ClientState =>
-  ok(
+const ingestLegal = (fx: Fixture, page: JsonObject): Effect.Effect<V2ClientState> =>
+  Effect.map(
     fx.run(
       Effect.flatMap(
         Effect.mapError(decodeLegalPage(page, fx.session), (error) => playerError(error.message)),
         (decoded) => rememberPage(fx.sessionPath, fx.session, { legal: true, page: decoded })
       )
-    )
-  ).state;
+    ),
+    (result) => ok(result).state
+  );
 
-const ingestState = (fx: Fixture, page: JsonObject): V2ClientState =>
-  ok(
+const ingestState = (fx: Fixture, page: JsonObject): Effect.Effect<V2ClientState> =>
+  Effect.map(
     fx.run(
       Effect.flatMap(
         Effect.mapError(decodePage(page, fx.session), (error) => playerError(error.message)),
         (decoded) => rememberPage(fx.sessionPath, fx.session, { legal: false, page: decoded })
       )
-    )
-  ).state;
+    ),
+    (result) => ok(result).state
+  );
 
 /** A `LegalPageFetcher` that ingests one page per actor and counts its calls. */
 const fetcherFor = (
-  fx: Fixture,
+  _fixture: Fixture,
   pages: Readonly<Record<string, JsonObject>>
-): { readonly fetch: LegalPageFetcher; readonly calls: string[] } => {
+) => {
   const calls: string[] = [];
   const fetch: LegalPageFetcher = (sessionPath, session, actorId) =>
     Effect.gen(function* () {
       calls.push(actorId);
       const page = pages[actorId];
-      if (page === undefined) return yield* Effect.fail(playerError(`no catalog for ${actorId}`));
+      if (page === undefined) return yield* playerError(`no catalog for ${actorId}`);
       const decoded = yield* Effect.mapError(decodeLegalPage(page, session), (error) =>
         playerError(error.message)
       );
       yield* rememberPage(sessionPath, session, { legal: true, page: decoded });
+      return undefined;
     });
   return { fetch, calls };
 };
@@ -346,8 +359,9 @@ const resolve = (
   fx: Fixture,
   state: V2ClientState,
   text: string
-): Either.Either<ResolvedOrder, { readonly message?: string; readonly reason?: string }> =>
-  fx.run(resolveOrder(deps, state, fx.sessionPath, text));
+): Effect.Effect<
+  Either.Either<ResolvedOrder, { readonly message?: string; readonly reason?: string }>
+> => fx.run(resolveOrder(deps, state, fx.sessionPath, text));
 
 // ---------------------------------------------------------------------------
 // test_v2_order_grammar_uses_only_what_the_catalog_advertised
@@ -355,8 +369,8 @@ const resolve = (
 
 const GOAL_ID = `action_${'g'.repeat(26)}`;
 
-const withGoal = (): { readonly fx: Fixture; readonly state: V2ClientState } => {
-  const fx = fixture();
+const withGoal = () => Effect.gen(function* () {
+  const fx = yield* fixture();
   const at = revision(7);
   const goal = pregameAction(
     at,
@@ -371,12 +385,12 @@ const withGoal = (): { readonly fx: Fixture; readonly state: V2ClientState } => 
     },
     null
   );
-  return { fx, state: ingestLegal(fx, legalPage(at, [goal])) };
-};
+  return { fx, state: yield* ingestLegal(fx, legalPage(at, [goal])) };
+});
 
 describe('the order grammar uses only what the catalog advertised', () => {
-  test('family form, full kind, bare verb, bare alias and the Tier-1 word all name it', () => {
-    const { fx, state } = withGoal();
+  awaitTest('family form, full kind, bare verb, bare alias and the Tier-1 word all name it', function* () {
+    const { fx, state } = yield* withGoal();
     for (const [text, tech] of [
       ['research set_goal currency', 'Currency'],
       ['research.set_goal Currency', 'Currency'],
@@ -385,7 +399,7 @@ describe('the order grammar uses only what the catalog advertised', () => {
       // The one documented Tier-1 word for this capability.
       ['research goal Currency', 'Currency'],
     ] as const) {
-      const resolved = ok(resolve(fx, state, text));
+      const resolved = ok(yield* resolve(fx, state, text));
       expect(resolved.action_id).toBe(GOAL_ID);
       expect(resolved.arguments).toEqual({ tech });
       expect(resolved.order).toBe(text);
@@ -395,42 +409,42 @@ describe('the order grammar uses only what the catalog advertised', () => {
     }
   });
 
-  test('a verb the catalog never advertised is never guessed at', () => {
-    const { fx, state } = withGoal();
-    expect(failure(resolve(fx, state, 'research target Currency'))).toBe(
+  awaitTest('a verb the catalog never advertised is never guessed at', function* () {
+    const { fx, state } = yield* withGoal();
+    expect(failure(yield* resolve(fx, state, 'research target Currency'))).toBe(
       'no cached action advertises the verb `target`'
     );
   });
 
-  test('a verb spelling an inherited property name is not a Tier-1 word', () => {
-    const { fx, state } = withGoal();
+  awaitTest('a verb spelling an inherited property name is not a Tier-1 word', function* () {
+    const { fx, state } = yield* withGoal();
     // CPython's `V2_TIER1_VERBS.get("constructor")` is a miss, so the word falls
     // through to the catalog's own verbs and gets the ordinary refusal.  A
     // prototype walk would instead report a capability named `undefined`.
     for (const word of ['constructor', 'toString', 'valueOf', 'hasOwnProperty']) {
-      expect(failure(resolve(fx, state, `research ${word} Currency`))).toBe(
+      expect(failure(yield* resolve(fx, state, `research ${word} Currency`))).toBe(
         `no cached action advertises the verb \`${word}\``
       );
     }
   });
 
-  test('a Tier-1 word still needs its capability in scope', () => {
-    const { fx, state } = withGoal();
+  awaitTest('a Tier-1 word still needs its capability in scope', function* () {
+    const { fx, state } = yield* withGoal();
     // `u1` is not an entity this seat learned, so it never reaches the verb.
-    expect(failure(resolve(fx, state, 'u1 set_goal Currency'))).toContain('unknown unit alias u1');
+    expect(failure(yield* resolve(fx, state, 'u1 set_goal Currency'))).toContain('unknown unit alias u1');
   });
 
-  test('a value outside the advertised enum is refused, not coerced', () => {
-    const { fx, state } = withGoal();
-    expect(failure(resolve(fx, state, 'research set_goal Pottery'))).toBe(
+  awaitTest('a value outside the advertised enum is refused, not coerced', function* () {
+    const { fx, state } = yield* withGoal();
+    expect(failure(yield* resolve(fx, state, 'research set_goal Pottery'))).toBe(
       'no cached action takes those arguments; 1 candidate(s) matched the verb'
     );
   });
 
-  test('two cached actions that answer the same words are ambiguous, and name their aliases', () => {
-    const { fx } = withGoal();
+  awaitTest('two cached actions that answer the same words are ambiguous, and name their aliases', function* () {
+    const { fx } = yield* withGoal();
     const at = revision(7);
-    const state = ingestLegal(
+    const state = yield* ingestLegal(
       fx,
       scopedLegalPage(
         at,
@@ -442,14 +456,14 @@ describe('the order grammar uses only what the catalog advertised', () => {
         `catalog_${'a'.repeat(32)}`
       )
     );
-    const message = failure(resolve(fx, state, 'u1 move'));
+    const message = failure(yield* resolve(fx, state, 'u1 move'));
     expect(message).toContain('2 cached actions match');
     expect(message).toContain('name exactly one by its alias');
     expect(message).toMatch(/a\d+ a\d+/);
 
     // Naming the target disambiguates without a request.
-    expect(ok(resolve(fx, state, 'u1 move 31,71')).action_id).toBe(`action_${'2'.repeat(26)}`);
-    expect(ok(resolve(fx, state, 'u1 move T(32,72)')).action_id).toBe(`action_${'1'.repeat(26)}`);
+    expect(ok(yield* resolve(fx, state, 'u1 move 31,71')).action_id).toBe(`action_${'2'.repeat(26)}`);
+    expect(ok(yield* resolve(fx, state, 'u1 move T(32,72)')).action_id).toBe(`action_${'1'.repeat(26)}`);
   });
 });
 
@@ -458,16 +472,16 @@ describe('the order grammar uses only what the catalog advertised', () => {
 // ---------------------------------------------------------------------------
 
 describe('the pool is narrowed only by what the order named', () => {
-  test('a bare action alias names one exact capability and takes no verb', () => {
-    const { fx, state } = withGoal();
-    const resolved = ok(resolve(fx, state, 'a1 Currency'));
+  awaitTest('a bare action alias names one exact capability and takes no verb', function* () {
+    const { fx, state } = yield* withGoal();
+    const resolved = ok(yield* resolve(fx, state, 'a1 Currency'));
     expect(resolved.action_id).toBe(GOAL_ID);
   });
 
-  test('an actor with no verb says what to write instead', () => {
-    const fx = fixture();
+  awaitTest('an actor with no verb says what to write instead', function* () {
+    const fx = yield* fixture();
     const at = revision(7);
-    const state = ingestLegal(
+    const state = yield* ingestLegal(
       fx,
       scopedLegalPage(
         at,
@@ -476,30 +490,30 @@ describe('the pool is narrowed only by what the order named', () => {
         `catalog_${'a'.repeat(32)}`
       )
     );
-    expect(failure(resolve(fx, state, 'u1'))).toBe(
+    expect(failure(yield* resolve(fx, state, 'u1'))).toBe(
       'u1 names an actor but no verb; write `u1 <verb> [arguments]`'
     );
   });
 
-  test('an entity that is not an actor cannot be acted as', () => {
-    const fx = fixture();
+  awaitTest('an entity that is not an actor cannot be acted as', function* () {
+    const fx = yield* fixture();
     const at = revision(7);
     // A tiles page teaches `T(x,y)`; a units page teaches `u1`.  Neither makes
     // a relation alias an actor.
-    ingestState(fx, sectionPage('units', at, [{ id: UNIT_ONE, tile_id: tileId(31, 72), x: 31, y: 72 }]));
-    const state = ingestState(
+    yield* ingestState(fx, sectionPage('units', at, [{ id: UNIT_ONE, tile_id: tileId(31, 72), x: 31, y: 72 }]));
+    const state = yield* ingestState(
       fx,
       sectionPage('diplomacy', revision(7), [{ relation_id: `relation_${'e'.repeat(32)}` }])
     );
-    expect(failure(resolve(fx, state, 'r1 move'))).toBe(
+    expect(failure(yield* resolve(fx, state, 'r1 move'))).toBe(
       'r1 is not a unit, city, or player this seat can act as'
     );
   });
 
-  test('an actor with no cached action says so by the name the agent typed', () => {
-    const fx = fixture();
+  awaitTest('an actor with no cached action says so by the name the agent typed', function* () {
+    const fx = yield* fixture();
     const at = revision(7);
-    ingestLegal(
+    yield* ingestLegal(
       fx,
       scopedLegalPage(
         at,
@@ -508,27 +522,27 @@ describe('the pool is narrowed only by what the order named', () => {
         `catalog_${'a'.repeat(32)}`
       )
     );
-    const state = ingestState(fx, sectionPage('units', at, [{ id: UNIT_TWO, x: 4, y: 4 }]));
-    expect(failure(resolve(fx, state, 'u2 move'))).toBe('no cached action belongs to u2');
+    const state = yield* ingestState(fx, sectionPage('units', at, [{ id: UNIT_TWO, x: 4, y: 4 }]));
+    expect(failure(yield* resolve(fx, state, 'u2 move'))).toBe('no cached action belongs to u2');
   });
 
-  test('a family word with nothing cached names the family', () => {
-    const { fx, state } = withGoal();
-    expect(failure(resolve(fx, state, 'spaceship launch'))).toBe('no cached spaceship action');
+  awaitTest('a family word with nothing cached names the family', function* () {
+    const { fx, state } = yield* withGoal();
+    expect(failure(yield* resolve(fx, state, 'spaceship launch'))).toBe('no cached spaceship action');
   });
 
-  test('a Tier-1 word names the capability it routes to when the catalog lacks it', () => {
-    const { fx, state } = withGoal();
-    expect(failure(resolve(fx, state, 'build Warriors'))).toBe(
+  awaitTest('a Tier-1 word names the capability it routes to when the catalog lacks it', function* () {
+    const { fx, state } = yield* withGoal();
+    expect(failure(yield* resolve(fx, state, 'build Warriors'))).toBe(
       '`build` names city.set_production/set_production, ' +
         "which this seat's cached catalog does not advertise here"
     );
   });
 
-  test('the same Tier-1 refusal names the actor when one was given', () => {
-    const fx = fixture();
+  awaitTest('the same Tier-1 refusal names the actor when one was given', function* () {
+    const fx = yield* fixture();
     const at = revision(7);
-    const state = ingestLegal(
+    const state = yield* ingestLegal(
       fx,
       scopedLegalPage(
         at,
@@ -537,16 +551,16 @@ describe('the pool is narrowed only by what the order named', () => {
         `catalog_${'a'.repeat(32)}`
       )
     );
-    expect(failure(resolve(fx, state, 'u1 build Warriors'))).toBe(
+    expect(failure(yield* resolve(fx, state, 'u1 build Warriors'))).toBe(
       '`build` names city.set_production/set_production, ' +
         "which this seat's cached catalog does not advertise for u1"
     );
   });
 
-  test('a coordinate that no cached action targets is refused by that coordinate', () => {
-    const fx = fixture();
+  awaitTest('a coordinate that no cached action targets is refused by that coordinate', function* () {
+    const fx = yield* fixture();
     const at = revision(7);
-    const state = ingestLegal(
+    const state = yield* ingestLegal(
       fx,
       scopedLegalPage(
         at,
@@ -555,15 +569,15 @@ describe('the pool is narrowed only by what the order named', () => {
         `catalog_${'a'.repeat(32)}`
       )
     );
-    expect(failure(resolve(fx, state, 'u1 move 99,99'))).toBe(
+    expect(failure(yield* resolve(fx, state, 'u1 move 99,99'))).toBe(
       'no cached `move` action targets 99,99'
     );
   });
 
-  test('a listed action reads its coordinates as elements, not as a target key', () => {
-    const fx = fixture();
+  awaitTest('a listed action reads its coordinates as elements, not as a target key', function* () {
+    const fx = yield* fixture();
     const at = revision(7);
-    const state = ingestLegal(
+    const state = yield* ingestLegal(
       fx,
       scopedLegalPage(
         at,
@@ -587,20 +601,20 @@ describe('the pool is narrowed only by what the order named', () => {
         `catalog_${'a'.repeat(32)}`
       )
     );
-    const resolved = ok(resolve(fx, state, 'u1 route T(31,72)'));
+    const resolved = ok(yield* resolve(fx, state, 'u1 route T(31,72)'));
     // `mode` is the Tier-1 word's own fixed value; the coordinate became the
     // one list element, resolved through the tile alias cache.
     expect(resolved.arguments).toEqual({ mode: 'goto', tiles: [tileId(31, 72)] });
-    expect(ok(resolve(fx, state, 'u1 patrol 31,72')).arguments).toEqual({
+    expect(ok(yield* resolve(fx, state, 'u1 patrol 31,72')).arguments).toEqual({
       mode: 'patrol',
       tiles: [tileId(31, 72)],
     });
   });
 
-  test('one capability in play names the element that failed', () => {
-    const fx = fixture();
+  awaitTest('one capability in play names the element that failed', function* () {
+    const fx = yield* fixture();
     const at = revision(7);
-    const state = ingestLegal(
+    const state = yield* ingestLegal(
       fx,
       scopedLegalPage(
         at,
@@ -622,12 +636,12 @@ describe('the pool is narrowed only by what the order named', () => {
         'city'
       )
     );
-    expect(failure(resolve(fx, state, 'c1 queue Colossus'))).toBe(
+    expect(failure(yield* resolve(fx, state, 'c1 queue Colossus'))).toBe(
       '`queue` takes items this seat has been offered by name; ' +
         'no cached target is named Colossus'
     );
     // An uncached coordinate names the tile refusal verbatim.
-    expect(failure(resolve(fx, state, 'c1 queue 88,88'))).toContain('unknown tile T(88,88)');
+    expect(failure(yield* resolve(fx, state, 'c1 queue 88,88'))).toContain('unknown tile T(88,88)');
   });
 });
 
@@ -636,12 +650,11 @@ describe('the pool is narrowed only by what the order named', () => {
 // ---------------------------------------------------------------------------
 
 describe('the batch resolves whole or refuses whole', () => {
-  const withMove = (): { readonly fx: Fixture; readonly state: V2ClientState } => {
-    const fx = fixture();
-    const at = revision(7);
-    return {
-      fx,
-      state: ingestLegal(
+  const withMove = () =>
+    Effect.gen(function* () {
+      const fx = yield* fixture();
+      const at = revision(7);
+      const state = yield* ingestLegal(
         fx,
         scopedLegalPage(
           at,
@@ -649,14 +662,14 @@ describe('the batch resolves whole or refuses whole', () => {
           UNIT_ONE,
           `catalog_${'a'.repeat(32)}`
         )
-      ),
-    };
-  };
+      );
+      return { fx, state };
+    });
 
-  test('one unresolvable order refuses the whole line and names every verdict', () => {
-    const { fx, state } = withMove();
+  awaitTest('one unresolvable order refuses the whole line and names every verdict', function* () {
+    const { fx, state } = yield* withMove();
     const message = failure(
-      fx.run(
+      yield* fx.run(
         resolveOrders(deps, state, fx.sessionPath, [
           'u1 move 32,72',
           'u1 teleport 99,99',
@@ -676,10 +689,10 @@ describe('the batch resolves whole or refuses whole', () => {
     expect(message).toContain('enumerate with: just legal --actor_id u1 --all');
   });
 
-  test('a batch that resolves whole hands back one resolution per order', () => {
-    const { fx, state } = withMove();
+  awaitTest('a batch that resolves whole hands back one resolution per order', function* () {
+    const { fx, state } = yield* withMove();
     const resolved = ok(
-      fx.run(resolveOrders(deps, state, fx.sessionPath, ['u1 move 32,72', 'u1 move T(32,72)']))
+      yield* fx.run(resolveOrders(deps, state, fx.sessionPath, ['u1 move 32,72', 'u1 move T(32,72)']))
     );
     expect(resolved).toHaveLength(2);
     expect(resolved.map((item) => item.action_id)).toEqual([
@@ -689,20 +702,20 @@ describe('the batch resolves whole or refuses whole', () => {
     expect(resolved[0]?.target_key).toBe('T(32,72)');
   });
 
-  test('_order_outcomes keeps the actor an unresolved order asked for', () => {
-    const { fx, state } = withMove();
+  awaitTest('_order_outcomes keeps the actor an unresolved order asked for', function* () {
+    const { fx, state } = yield* withMove();
     const outcomes = ok(
-      fx.run(orderOutcomes(deps, state, fx.sessionPath, ['u1 teleport 9,9', 'set_goal X']))
+      yield* fx.run(orderOutcomes(deps, state, fx.sessionPath, ['u1 teleport 9,9', 'set_goal X']))
     );
     expect(outcomes[0]?.resolved).toBeNull();
     expect(outcomes[0]?.actor).toBe(UNIT_ONE);
     expect(outcomes[1]?.actor).toBe('');
   });
 
-  test('_order_fetch_targets names only actors this seat never drained', () => {
-    const { fx, state } = withMove();
+  awaitTest('_order_fetch_targets names only actors this seat never drained', function* () {
+    const { fx, state } = yield* withMove();
     const outcomes = ok(
-      fx.run(orderOutcomes(deps, state, fx.sessionPath, ['u1 teleport 9,9']))
+      yield* fx.run(orderOutcomes(deps, state, fx.sessionPath, ['u1 teleport 9,9']))
     );
     // u1's whole catalog is cached, so a bad verb is a real refusal.
     expect(orderFetchTargets(state, outcomes)).toEqual([]);
@@ -720,18 +733,22 @@ describe('the batch resolves whole or refuses whole', () => {
 // ---------------------------------------------------------------------------
 
 describe('every unread actor is fetched before anything is sent', () => {
-  const withUnitAliases = (): { readonly fx: Fixture; readonly state: V2ClientState } => {
-    const fx = fixture();
-    const at = revision(7);
-    // Learn the entity aliases without learning any capability.
-    const state = ingestState(fx, sectionPage('units', at, [
-      { id: UNIT_ONE, tile_id: tileId(31, 72), x: 31, y: 72 },
-      { id: UNIT_TWO, tile_id: tileId(30, 72), x: 30, y: 72 },
-    ]));
-    return { fx, state };
-  };
+  const withUnitAliases = () =>
+    Effect.gen(function* () {
+      const fx = yield* fixture();
+      const at = revision(7);
+      // Learn the entity aliases without learning any capability.
+      const state = yield* ingestState(
+        fx,
+        sectionPage('units', at, [
+          { id: UNIT_ONE, tile_id: tileId(31, 72), x: 31, y: 72 },
+          { id: UNIT_TWO, tile_id: tileId(30, 72), x: 30, y: 72 },
+        ])
+      );
+      return { fx, state };
+    });
 
-  const catalogs = (at: TestRevision): Readonly<Record<string, JsonObject>> => ({
+  const catalogs = (at: TestRevision) => ({
     [UNIT_ONE]: scopedLegalPage(
       at,
       [
@@ -758,12 +775,12 @@ describe('every unread actor is fetched before anything is sent', () => {
     ),
   });
 
-  test('both actors are fetched first, then the batch refuses whole', () => {
-    const { fx, state } = withUnitAliases();
+  awaitTest('both actors are fetched first, then the batch refuses whole', function* () {
+    const { fx, state } = yield* withUnitAliases();
     const { fetch, calls } = fetcherFor(fx, catalogs(revision(7)));
     const fetching: OrdersFetchDeps = { compactLegalAction, drainLegal: fetch };
     const message = failure(
-      fx.run(
+      yield* fx.run(
         resolveOrdersFetching(fetching, fx.sessionPath, fx.session, state, [
           'u1 teleport 9,9',
           'u2 sentry',
@@ -778,12 +795,12 @@ describe('every unread actor is fetched before anything is sent', () => {
     expect(message).toContain('enumerate with: just legal --actor_id u1 --all');
   });
 
-  test('the pre-fetch is what makes the printed turn → do loop run as printed', () => {
-    const { fx, state } = withUnitAliases();
+  awaitTest('the pre-fetch is what makes the printed turn → do loop run as printed', function* () {
+    const { fx, state } = yield* withUnitAliases();
     const { fetch, calls } = fetcherFor(fx, catalogs(revision(7)));
     const fetching: OrdersFetchDeps = { compactLegalAction, drainLegal: fetch };
     const outcome = ok(
-      fx.run(
+      yield* fx.run(
         resolveOrdersFetching(fetching, fx.sessionPath, fx.session, state, ['u1 sentry', 'u2 sentry'])
       )
     );
@@ -795,31 +812,33 @@ describe('every unread actor is fetched before anything is sent', () => {
     ]);
   });
 
-  test('an actor already read is never re-fetched for a bad verb', () => {
-    const { fx } = withUnitAliases();
+  awaitTest('an actor already read is never re-fetched for a bad verb', function* () {
+    const { fx } = yield* withUnitAliases();
     const at = revision(7);
-    const state = ingestLegal(fx, catalogs(at)[UNIT_ONE] as JsonObject);
+    const unitOneCatalog = catalogs(at)[UNIT_ONE];
+    if (unitOneCatalog === undefined) throw new Error('expected the unit-one catalog');
+    const state = yield* ingestLegal(fx, unitOneCatalog);
     const fetching: OrdersFetchDeps = { compactLegalAction, drainLegal: never };
     const message = failure(
-      fx.run(resolveOrdersFetching(fetching, fx.sessionPath, fx.session, state, ['u1 teleport 9,9']))
+      yield* fx.run(resolveOrdersFetching(fetching, fx.sessionPath, fx.session, state, ['u1 teleport 9,9']))
     );
     expect(message).toContain('did not resolve');
     // The plain report, with no fetch note in front of it.
     expect(message.startsWith('1 of 1 orders did not resolve')).toBe(true);
   });
 
-  test('--no-refresh keeps the plain refusal and fetches nothing', () => {
-    const { fx, state } = withUnitAliases();
-    const message = failure(fx.run(resolveOrders(deps, state, fx.sessionPath, ['u1 sentry'])));
+  awaitTest('--no-refresh keeps the plain refusal and fetches nothing', function* () {
+    const { fx, state } = yield* withUnitAliases();
+    const message = failure(yield* fx.run(resolveOrders(deps, state, fx.sessionPath, ['u1 sentry'])));
     expect(message).toContain('did not resolve');
   });
 
-  test('the caller\'s earlier notes survive in front of the refusal', () => {
-    const { fx, state } = withUnitAliases();
+  awaitTest('the caller\'s earlier notes survive in front of the refusal', function* () {
+    const { fx, state } = yield* withUnitAliases();
     const { fetch } = fetcherFor(fx, catalogs(revision(7)));
     const fetching: OrdersFetchDeps = { compactLegalAction, drainLegal: fetch };
     const message = failure(
-      fx.run(
+      yield* fx.run(
         resolveOrdersFetching(
           fetching,
           fx.sessionPath,
@@ -840,29 +859,31 @@ describe('every unread actor is fetched before anything is sent', () => {
 // ---------------------------------------------------------------------------
 
 describe('a stale alias is re-bound before the order resolves', () => {
-  const stage = (): { readonly fx: Fixture; readonly state: V2ClientState } => {
-    const fx = fixture();
-    const old = revision(7);
-    ingestLegal(
-      fx,
-      scopedLegalPage(
-        old,
-        [
-          actorAction(old, `action_found${'7'.repeat(20)}`, UNIT_ONE, {
-            kind: 'unit.found_city',
-            operation: 'found_city',
-            label: 'Found city',
-          }),
-        ],
-        UNIT_ONE,
-        `catalog_${'a'.repeat(32)}`
-      )
-    );
-    return { fx, state: ingestState(fx, sectionPage('overview', revision(9), [])) };
-  };
+  const stage = () =>
+    Effect.gen(function* () {
+      const fx = yield* fixture();
+      const old = revision(7);
+      yield* ingestLegal(
+        fx,
+        scopedLegalPage(
+          old,
+          [
+            actorAction(old, `action_found${'7'.repeat(20)}`, UNIT_ONE, {
+              kind: 'unit.found_city',
+              operation: 'found_city',
+              label: 'Found city',
+            }),
+          ],
+          UNIT_ONE,
+          `catalog_${'a'.repeat(32)}`
+        )
+      );
+      const state = yield* ingestState(fx, sectionPage('overview', revision(9), []));
+      return { fx, state };
+    });
 
-  test('a1 keeps its number and the order resolves at the new revision', () => {
-    const { fx, state } = stage();
+  awaitTest('a1 keeps its number and the order resolves at the new revision', function* () {
+    const { fx, state } = yield* stage();
     const at = revision(9);
     const fresh = actorAction(at, `action_found${'9'.repeat(20)}`, UNIT_ONE, {
       kind: 'unit.found_city',
@@ -874,25 +895,25 @@ describe('a stale alias is re-bound before the order resolves', () => {
     });
     const fetching: OrdersFetchDeps = { compactLegalAction, drainLegal: fetch };
     const refreshed = ok(
-      fx.run(refreshStaleOrderAliases(fetching, fx.sessionPath, fx.session, state, ['a1']))
+      yield* fx.run(refreshStaleOrderAliases(fetching, fx.sessionPath, fx.session, state, ['a1']))
     );
     expect(calls).toEqual([UNIT_ONE]);
     expect(refreshed.notes).toEqual(['a1 rebound at rev9']);
-    expect(ok(resolve(fx, refreshed.state, 'a1')).action_id).toBe(`action_found${'9'.repeat(20)}`);
+    expect(ok(yield* resolve(fx, refreshed.state, 'a1')).action_id).toBe(`action_found${'9'.repeat(20)}`);
   });
 
-  test('an order that names no alias is left entirely alone', () => {
-    const { fx, state } = stage();
+  awaitTest('an order that names no alias is left entirely alone', function* () {
+    const { fx, state } = yield* stage();
     const fetching: OrdersFetchDeps = { compactLegalAction, drainLegal: never };
     const refreshed = ok(
-      fx.run(refreshStaleOrderAliases(fetching, fx.sessionPath, fx.session, state, ['u1 found_city X']))
+      yield* fx.run(refreshStaleOrderAliases(fetching, fx.sessionPath, fx.session, state, ['u1 found_city X']))
     );
     expect(refreshed.notes).toEqual([]);
     expect(refreshed.state).toEqual(state);
   });
 
-  test('two actions with one meaning refuse to be re-bound', () => {
-    const { fx, state } = stage();
+  awaitTest('two actions with one meaning refuse to be re-bound', function* () {
+    const { fx, state } = yield* stage();
     const at = revision(9);
     const twins = [0, 1].map((index) =>
       actorAction(at, `action_twin${index}${'9'.repeat(20)}`, UNIT_ONE, {
@@ -906,15 +927,15 @@ describe('a stale alias is re-bound before the order resolves', () => {
     });
     const fetching: OrdersFetchDeps = { compactLegalAction, drainLegal: fetch };
     const message = failure(
-      fx.run(refreshStaleOrderAliases(fetching, fx.sessionPath, fx.session, state, ['a1']))
+      yield* fx.run(refreshStaleOrderAliases(fetching, fx.sessionPath, fx.session, state, ['a1']))
     );
     expect(message).toContain('a1 names 2 actions at rev9/t3');
     expect(message).toMatch(/\(a\d+ a\d+\)/);
   });
 
-  test('a stale alias with no refresh keeps the plain refusal', () => {
-    const { fx, state } = stage();
-    expect(failure(resolve(fx, state, 'a1'))).toContain('die with their revision');
+  awaitTest('a stale alias with no refresh keeps the plain refusal', function* () {
+    const { fx, state } = yield* stage();
+    expect(failure(yield* resolve(fx, state, 'a1'))).toContain('die with their revision');
   });
 });
 
@@ -935,49 +956,49 @@ describe('_rebind_order re-points a resolved order at the newest handle', () => 
       },
     });
 
-  test('the same action at a new revision keeps the order and its arguments', () => {
-    const fx = fixture();
+  awaitTest('the same action at a new revision keeps the order and its arguments', function* () {
+    const fx = yield* fixture();
     const old = revision(7);
-    const before = ingestLegal(
+    const before = yield* ingestLegal(
       fx,
       scopedLegalPage(old, [found(old, `action_${'7'.repeat(26)}`)], UNIT_ONE, `catalog_${'a'.repeat(32)}`)
     );
-    const resolved = ok(resolve(fx, before, 'u1 found_city London'));
+    const resolved = ok(yield* resolve(fx, before, 'u1 found_city London'));
     expect(resolved.action_id).toBe(`action_${'7'.repeat(26)}`);
 
     const at = revision(9);
-    const after = ingestLegal(
+    const after = yield* ingestLegal(
       fx,
       scopedLegalPage(at, [found(at, `action_${'9'.repeat(26)}`)], UNIT_ONE, `catalog_${'b'.repeat(32)}`)
     );
-    const rebound = ok(fx.run(rebindOrder(deps, after, resolved)));
+    const rebound = ok(yield* fx.run(rebindOrder(deps, after, resolved)));
     expect(rebound?.action_id).toBe(`action_${'9'.repeat(26)}`);
     expect(rebound?.order).toBe('u1 found_city London');
     expect(rebound?.arguments).toEqual({ city_name: 'London' });
   });
 
-  test('an action the new revision no longer offers rebinds to nothing', () => {
-    const fx = fixture();
+  awaitTest('an action the new revision no longer offers rebinds to nothing', function* () {
+    const fx = yield* fixture();
     const old = revision(7);
-    const before = ingestLegal(
+    const before = yield* ingestLegal(
       fx,
       scopedLegalPage(old, [found(old, `action_${'7'.repeat(26)}`)], UNIT_ONE, `catalog_${'a'.repeat(32)}`)
     );
-    const resolved = ok(resolve(fx, before, 'u1 found_city London'));
-    const after = ingestState(fx, sectionPage('overview', revision(9), []));
-    expect(ok(fx.run(rebindOrder(deps, after, resolved)))).toBeNull();
+    const resolved = ok(yield* resolve(fx, before, 'u1 found_city London'));
+    const after = yield* ingestState(fx, sectionPage('overview', revision(9), []));
+    expect(ok(yield* fx.run(rebindOrder(deps, after, resolved)))).toBeNull();
   });
 
-  test('two candidates with one identity rebind to nothing rather than guess', () => {
-    const fx = fixture();
+  awaitTest('two candidates with one identity rebind to nothing rather than guess', function* () {
+    const fx = yield* fixture();
     const old = revision(7);
-    const before = ingestLegal(
+    const before = yield* ingestLegal(
       fx,
       scopedLegalPage(old, [found(old, `action_${'7'.repeat(26)}`)], UNIT_ONE, `catalog_${'a'.repeat(32)}`)
     );
-    const resolved = ok(resolve(fx, before, 'u1 found_city London'));
+    const resolved = ok(yield* resolve(fx, before, 'u1 found_city London'));
     const at = revision(9);
-    const after = ingestLegal(
+    const after = yield* ingestLegal(
       fx,
       scopedLegalPage(
         at,
@@ -986,7 +1007,7 @@ describe('_rebind_order re-points a resolved order at the newest handle', () => 
         `catalog_${'b'.repeat(32)}`
       )
     );
-    expect(ok(fx.run(rebindOrder(deps, after, resolved)))).toBeNull();
+    expect(ok(yield* fx.run(rebindOrder(deps, after, resolved)))).toBeNull();
   });
 });
 
@@ -994,79 +1015,77 @@ describe('_rebind_order re-points a resolved order at the newest handle', () => 
 // _drain_legal_unlocked / _refresh_orders
 // ---------------------------------------------------------------------------
 
+/** A `LegalPageReader` over a scripted cursor chain, recording every query. */
+const readerFor = (pages: ReadonlyArray<JsonObject>) => {
+  const queries: string[] = [];
+  let index = 0;
+  const read: LegalPageReader = (_sessionPath, session, query) =>
+    Effect.gen(function* () {
+      queries.push(query);
+      const page = pages[Math.min(index, pages.length - 1)];
+      index += 1;
+      if (page === undefined) return yield* playerError('no page');
+      return yield* Effect.mapError(decodeLegalPage(page, session), (error) =>
+        playerError(error.message)
+      );
+    });
+  return { read, queries };
+};
+
+const paged = (
+  stateRevision: TestRevision,
+  items: ReadonlyArray<JsonValue>,
+  cursor: string | null
+): JsonObject => ({
+  schema_version: 2,
+  control_protocol: FULL_CONTROL_V2,
+  game_id: FIXTURE_GAME_ID,
+  agent_id: 'agent_0123456789abcdef',
+  state_revision: stateRevision,
+  page: {
+    section: 'legal_actions',
+    items,
+    total_items: items.length + (cursor === null ? 0 : 1),
+    next_cursor: cursor,
+    cursor_expires_at: cursor === null ? null : '2030-01-01T00:00:00Z',
+  },
+});
+
 describe('_drain_legal_unlocked walks the cursor chain and nothing else', () => {
-  /** A `LegalPageReader` over a scripted cursor chain, recording every query. */
-  const readerFor = (
-    fx: Fixture,
-    pages: ReadonlyArray<JsonObject>
-  ): { readonly read: LegalPageReader; readonly queries: string[] } => {
-    const queries: string[] = [];
-    let index = 0;
-    const read: LegalPageReader = (_sessionPath, session, query) =>
-      Effect.gen(function* () {
-        queries.push(query);
-        const page = pages[Math.min(index, pages.length - 1)];
-        index += 1;
-        if (page === undefined) return yield* Effect.fail(playerError('no page'));
-        return yield* Effect.mapError(decodeLegalPage(page, session), (error) =>
-          playerError(error.message)
-        );
-      });
-    return { read, queries };
-  };
 
-  const paged = (
-    stateRevision: TestRevision,
-    items: ReadonlyArray<JsonValue>,
-    cursor: string | null
-  ): JsonObject => ({
-    schema_version: 2,
-    control_protocol: FULL_CONTROL_V2,
-    game_id: FIXTURE_GAME_ID,
-    agent_id: 'agent_0123456789abcdef',
-    state_revision: stateRevision,
-    page: {
-      section: 'legal_actions',
-      items,
-      total_items: items.length + (cursor === null ? 0 : 1),
-      next_cursor: cursor,
-      cursor_expires_at: cursor === null ? null : '2030-01-01T00:00:00Z',
-    },
-  });
-
-  test('a scoped drain asks by actor, then by cursor, and stops at the last page', () => {
-    const fx = fixture();
+  awaitTest('a scoped drain asks by actor, then by cursor, and stops at the last page', function* () {
+    const fx = yield* fixture();
     const at = revision(7);
     const first = `cursor_${'1'.repeat(32)}`;
-    const { read, queries } = readerFor(fx, [
+    const { read, queries } = readerFor([
       paged(at, [actorAction(at, `action_${'1'.repeat(26)}`, UNIT_ONE)], first),
       paged(at, [actorAction(at, `action_${'2'.repeat(26)}`, UNIT_ONE, { x: 30, y: 70 })], null),
     ]);
-    const revisionRead = ok(fx.run(drainLegalUnlocked(read, fx.sessionPath, fx.session, UNIT_ONE)));
+    const revisionRead = ok(yield* fx.run(drainLegalUnlocked(read, fx.sessionPath, fx.session, UNIT_ONE)));
     expect(revisionRead?.revision).toBe(7);
     expect(queries).toEqual([`actor_id=${UNIT_ONE}`, `cursor=${first}`]);
   });
 
-  test('a global drain sends no query at all', () => {
-    const fx = fixture();
+  awaitTest('a global drain sends no query at all', function* () {
+    const fx = yield* fixture();
     const at = revision(7);
-    const { read, queries } = readerFor(fx, [paged(at, [], null)]);
-    ok(fx.run(drainLegalUnlocked(read, fx.sessionPath, fx.session)));
+    const { read, queries } = readerFor([paged(at, [], null)]);
+    ok(yield* fx.run(drainLegalUnlocked(read, fx.sessionPath, fx.session)));
     expect(queries).toEqual(['']);
   });
 
-  test('a repeated cursor is refused rather than looped on', () => {
-    const fx = fixture();
+  awaitTest('a repeated cursor is refused rather than looped on', function* () {
+    const fx = yield* fixture();
     const at = revision(7);
     const stuck = `cursor_${'9'.repeat(32)}`;
-    const { read } = readerFor(fx, [paged(at, [], stuck), paged(at, [], stuck)]);
-    expect(failure(fx.run(drainLegalUnlocked(read, fx.sessionPath, fx.session)))).toBe(
+    const { read } = readerFor([paged(at, [], stuck), paged(at, [], stuck)]);
+    expect(failure(yield* fx.run(drainLegalUnlocked(read, fx.sessionPath, fx.session)))).toBe(
       'the legal catalog repeated a cursor'
     );
   });
 
-  test('a catalog that never ends stops at the safe page limit', () => {
-    const fx = fixture();
+  awaitTest('a catalog that never ends stops at the safe page limit', function* () {
+    const fx = yield* fixture();
     const at = revision(7);
     let issued = 0;
     const read: LegalPageReader = (_sessionPath, session) =>
@@ -1077,7 +1096,7 @@ describe('_drain_legal_unlocked walks the cursor chain and nothing else', () => 
           playerError(error.message)
         );
       });
-    expect(failure(fx.run(drainLegalUnlocked(read, fx.sessionPath, fx.session)))).toBe(
+    expect(failure(yield* fx.run(drainLegalUnlocked(read, fx.sessionPath, fx.session)))).toBe(
       'the legal catalog exceeded the safe 512-page drain limit'
     );
     expect(issued).toBe(512);
@@ -1085,8 +1104,8 @@ describe('_drain_legal_unlocked walks the cursor chain and nothing else', () => 
 });
 
 describe('_refresh_orders re-reads exactly the catalogs the pending orders name', () => {
-  test('one drain per distinct actor, in first-seen order', () => {
-    const fx = fixture();
+  awaitTest('one drain per distinct actor, in first-seen order', function* () {
+    const fx = yield* fixture();
     const at = revision(7);
     const { fetch, calls } = fetcherFor(fx, {
       [UNIT_ONE]: scopedLegalPage(
@@ -1135,7 +1154,7 @@ describe('_refresh_orders re-reads exactly the catalogs the pending orders name'
         arguments: {},
       },
     ];
-    ok(fx.run(refreshOrders(fetching, fx.sessionPath, fx.session, pending)));
+    ok(yield* fx.run(refreshOrders(fetching, fx.sessionPath, fx.session, pending)));
     expect(calls).toEqual([UNIT_ONE, UNIT_TWO]);
   });
 });
@@ -1201,12 +1220,11 @@ describe('a cached target name folds the way CPython folds it', () => {
 
   const withJoinCity = (
     ...cities: ReadonlyArray<readonly [string, string, string]>
-  ): { readonly fx: Fixture; readonly state: V2ClientState } => {
-    const fx = fixture();
-    const at = revision(7);
-    return {
-      fx,
-      state: ingestLegal(
+  ) =>
+    Effect.gen(function* () {
+      const fx = yield* fixture();
+      const at = revision(7);
+      const state = yield* ingestLegal(
         fx,
         scopedLegalPage(
           at,
@@ -1214,46 +1232,46 @@ describe('a cached target name folds the way CPython folds it', () => {
           UNIT_ONE,
           `catalog_${'a'.repeat(32)}`
         )
-      ),
-    };
-  };
+      );
+      return { fx, state };
+    });
 
-  test('the ASCII spelling of a ruleset city name selects the argument-free action', () => {
-    const { fx, state } = withJoinCity([
+  awaitTest('the ASCII spelling of a ruleset city name selects the argument-free action', function* () {
+    const { fx, state } = yield* withJoinCity([
       `action_${'j'.repeat(26)}`,
       CITY_STRASSBURG,
       'Straßburg',
     ]);
     for (const spelling of ['Straßburg', 'Strassburg', 'STRASSBURG', 'strassburg']) {
-      expect(ok(resolve(fx, state, `u1 join_city ${spelling}`)).action_id).toBe(
+      expect(ok(yield* resolve(fx, state, `u1 join_city ${spelling}`)).action_id).toBe(
         `action_${'j'.repeat(26)}`
       );
     }
     // A name that folds onto nothing cached is still refused, not guessed.
-    expect(failure(resolve(fx, state, 'u1 join_city Strasbourg'))).toBe(
+    expect(failure(yield* resolve(fx, state, 'u1 join_city Strasbourg'))).toBe(
       'no cached action takes those arguments; 1 candidate(s) matched the verb'
     );
   });
 
-  test('the fold disambiguates rather than collapsing two named targets', () => {
-    const { fx, state } = withJoinCity(
+  awaitTest('the fold disambiguates rather than collapsing two named targets', function* () {
+    const { fx, state } = yield* withJoinCity(
       [`action_${'j'.repeat(26)}`, CITY_STRASSBURG, 'Straßburg'],
       [`action_${'k'.repeat(26)}`, CITY_WITTENBERG, 'Wittenberg']
     );
-    expect(ok(resolve(fx, state, 'u1 join_city Strassburg')).action_id).toBe(
+    expect(ok(yield* resolve(fx, state, 'u1 join_city Strassburg')).action_id).toBe(
       `action_${'j'.repeat(26)}`
     );
-    expect(ok(resolve(fx, state, 'u1 join_city Wittenberg')).action_id).toBe(
+    expect(ok(yield* resolve(fx, state, 'u1 join_city Wittenberg')).action_id).toBe(
       `action_${'k'.repeat(26)}`
     );
     // Naming neither is still the ambiguity refusal, not a guess.
-    expect(failure(resolve(fx, state, 'u1 join_city'))).toContain('2 cached actions match');
+    expect(failure(yield* resolve(fx, state, 'u1 join_city'))).toContain('2 cached actions match');
   });
 
-  test('_named_target_id binds a worklist element through the same fold', () => {
-    const fx = fixture();
+  awaitTest('_named_target_id binds a worklist element through the same fold', function* () {
+    const fx = yield* fixture();
     const at = revision(7);
-    const state = ingestLegal(
+    const state = yield* ingestLegal(
       fx,
       scopedLegalPage(
         at,
@@ -1279,12 +1297,12 @@ describe('a cached target name folds the way CPython folds it', () => {
     );
     // `translations/core/de.po` renders Raft as `Floß`; `Floss` is the spelling
     // an agent types, and CPython folds the two together.
-    expect(ok(resolve(fx, state, 'c1 queue Floss')).arguments).toEqual({ items: [RAFT] });
-    expect(ok(resolve(fx, state, 'c1 queue Floß Trireme')).arguments).toEqual({
+    expect(ok(yield* resolve(fx, state, 'c1 queue Floss')).arguments).toEqual({ items: [RAFT] });
+    expect(ok(yield* resolve(fx, state, 'c1 queue Floß Trireme')).arguments).toEqual({
       items: [RAFT, TRIREME],
     });
     // And the refusal still fires for a word no cached target is named.
-    expect(failure(resolve(fx, state, 'c1 queue Flotte'))).toBe(
+    expect(failure(yield* resolve(fx, state, 'c1 queue Flotte'))).toBe(
       '`queue` takes items this seat has been offered by name; ' +
         'no cached target is named Flotte'
     );

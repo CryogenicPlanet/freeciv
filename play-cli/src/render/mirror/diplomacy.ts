@@ -11,7 +11,7 @@
  */
 import { Effect } from 'effect';
 import type { PlayerError } from 'src/errors';
-import { isJsonObject } from 'src/schema/primitives';
+import { isJsonObject, type JsonValue, type JsonValueInput } from 'src/schema/primitives';
 import {
   aliasMap,
   cell,
@@ -33,7 +33,7 @@ export const DIPLOMACY_COLUMNS: ReadonlyArray<string> = [
 ];
 
 /** Which sides have accepted the open meeting, in CPython's order. */
-const acceptedText = (meeting: unknown): string => {
+const acceptedText = (meeting: JsonValue): string => {
   const sides = (
     [
       ['you', 'self_accepted'],
@@ -45,7 +45,7 @@ const acceptedText = (meeting: unknown): string => {
 
 /** `_render_diplomacy` — project a diplomacy page. */
 export const renderDiplomacy = (
-  items: ReadonlyArray<unknown>,
+  items: ReadonlyArray<JsonValueInput>,
   aliases?: MirrorAliases | null
 ): Effect.Effect<RenderedSection, PlayerError> => {
   const names = aliasMap(

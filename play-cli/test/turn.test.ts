@@ -52,6 +52,19 @@ const deps: RenderTurnDeps = {
 
 const run = <A, E>(effect: Effect.Effect<A, E>): A => Effect.runSync(Effect.orDie(effect));
 
+interface FlagOptions {
+  readonly end: boolean;
+  readonly awaitPhase: boolean;
+  readonly brief: boolean;
+  readonly decisions: boolean;
+}
+
+const refusal = (options: FlagOptions): string => {
+  const outcome = Effect.runSync(Effect.either(checkTurnFlags(options)));
+  if (outcome._tag !== 'Left') throw new Error('expected a refusal');
+  return outcome.left.message;
+};
+
 const revision = (value: number, turn = 3): Revision => ({
   turn,
   revision: value,
@@ -231,7 +244,7 @@ describe('_render_turn', () => {
   });
 
   test('an overview without a turn is drift, not a blank line', () => {
-    const drifted = { ...briefing(), overview: { player: null } as JsonValue };
+    const drifted = { ...briefing(), overview: { player: null } };
     const failure = Effect.runSync(Effect.either(renderTurn(drifted, deps)));
     expect(failure._tag).toBe('Left');
   });
@@ -385,17 +398,6 @@ describe('_briefing_events_line', () => {
 });
 
 describe('the flag matrix', () => {
-  const refusal = (options: {
-    end: boolean;
-    awaitPhase: boolean;
-    brief: boolean;
-    decisions: boolean;
-  }): string => {
-    const outcome = Effect.runSync(Effect.either(checkTurnFlags(options)));
-    if (outcome._tag !== 'Left') throw new Error('expected a refusal');
-    return outcome.left.message;
-  };
-
   test('--await without --end names the form that works', () => {
     expect(
       refusal({ end: false, awaitPhase: true, brief: false, decisions: false })

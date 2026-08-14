@@ -21,7 +21,8 @@ import { meetingSummary } from 'src/render/state/diplomacy';
 import { flattenItem, renderGenericItems } from 'src/render/state/generic';
 import { governmentScopeLines } from 'src/render/state/government';
 import type { AliasMap, JsonValue } from 'src/render/primitives';
-import type { JsonObject } from 'src/schema/primitives';
+import type { JsonObject, MutableJsonObject } from 'src/schema/primitives';
+import { fixtureString, observedAt } from 'test/_expect';
 import type { Revision } from 'src/schema/revision';
 import { privateFsFor, PrivateFs } from 'src/services/private-fs';
 import type { V2ClientState } from 'src/services/session-store';
@@ -32,6 +33,36 @@ import type { V2ClientState } from 'src/services/session-store';
 
 /** `_render_state_page` never touches the mirror unless a session path is passed. */
 const NO_FILES = privateFsFor({ root: '/nonexistent', stateRoot: '/nonexistent/.sessions' });
+
+const summarizeRoute = (route: JsonValue): string => Effect.runSync(routeSummary(route));
+
+const tileWindow = (): ReadonlyArray<JsonObject> => {
+  const items: JsonObject[] = [];
+  for (const y of [71, 72]) {
+    for (const x of [30, 31]) {
+      const unknown = x === 30 && y === 71;
+      const item: MutableJsonObject = {
+        id: `tile_${x}${y}${'0'.repeat(28)}`,
+        x,
+        y,
+        visibility: unknown ? 'unknown' : 'visible',
+      };
+      if (!unknown) {
+        item['terrain'] = x === 30 ? 'Ocean' : 'Desert';
+        item['owner_player_id'] = null;
+        item['infrastructure_placement'] = null;
+      }
+      items.push(item);
+    }
+  }
+  return items;
+};
+
+const wideItem = (seed: string): JsonObject => {
+  const item: MutableJsonObject = {};
+  for (let index = 0; index < 15; index += 1) item[`f${index}`] = `${seed}${index}`;
+  return item;
+};
 
 const revision = (number = 7, turn = 3): Revision => ({
   turn,
@@ -123,8 +154,8 @@ describe('units', () => {
       `u2  Workers   @31,72 mv1/3 hp10/10 irrigate →(33,70) 4st !controller=ai  unit_${'2'.repeat(32)}`,
     ]);
     // The ID column starts at the same offset on every row.
-    expect(lines[1]?.indexOf(`unit_${'1'.repeat(32)}`)).toBe(
-      lines[2]?.indexOf(`unit_${'2'.repeat(32)}`) as number
+    expect(observedAt(lines, 1).indexOf(`unit_${'1'.repeat(32)}`)).toBe(
+      observedAt(lines, 2).indexOf(`unit_${'2'.repeat(32)}`)
     );
   });
 
@@ -151,32 +182,30 @@ describe('routeSummary', () => {
     path_step_count: 3,
     destination: { tile_id: TILE, x: 40, y: 60 },
   };
-  const summary = (route: JsonValue): string => Effect.runSync(routeSummary(route));
-
   test('the path step count leads, because that is what the wire carries', () => {
-    expect(summary(walking)).toBe('→(40,60) 3st');
+    expect(summarizeRoute(walking)).toBe('→(40,60) 3st');
   });
 
   test('an unreconstructable path falls back to the queued order count', () => {
-    expect(summary({ ...walking, mode: 'patrol', path_available: false })).toBe(
+    expect(summarizeRoute({ ...walking, mode: 'patrol', path_available: false })).toBe(
       '→(40,60) 5st patrol'
     );
   });
 
   test('neither count named prints `?st` rather than inventing one', () => {
-    expect(summary({ destination: { x: 40, y: 60 } })).toBe('→(40,60) ?st');
+    expect(summarizeRoute({ destination: { x: 40, y: 60 } })).toBe('→(40,60) ?st');
   });
 
   test('vigilant is a non-default, so it prints; `goto` is the default and does not', () => {
-    expect(summary({ ...walking, vigilant: true })).toBe('→(40,60) 3st vigilant');
+    expect(summarizeRoute({ ...walking, vigilant: true })).toBe('→(40,60) 3st vigilant');
   });
 
   test('a destination the payload does not carry is `?`, not a blank', () => {
-    expect(summary({ path_step_count: 2 })).toBe('→(?) 2st');
+    expect(summarizeRoute({ path_step_count: 2 })).toBe('→(?) 2st');
   });
 
   test('no route at all says nothing about one', () => {
-    expect(summary(null)).toBe('');
+    expect(summarizeRoute(null)).toBe('');
     expect(Effect.runSync(unitRow('u3', { ...UNITS[0], route: null })).join(' ')).not.toContain('→');
   });
 });
@@ -215,7 +244,9 @@ describe('cities', () => {
         can_buy: true,
       },
     };
-    const lines = rendered(statePage('cities', [buyable]), { [city['id'] as string]: 'c1' });
+    const lines = rendered(statePage('cities', [buyable]), {
+      [fixtureString(city['id'])]: 'c1',
+    });
     expect(lines[1]).toBe('c1  London  @31,72 sz1 Musketeers 30/30 f+2 s+1 t+0 buy=4');
   });
 });
@@ -258,31 +289,9 @@ describe('research', () => {
 // ---------------------------------------------------------------------------
 
 describe('tiles', () => {
-  const window = (): ReadonlyArray<JsonObject> => {
-    const items: JsonObject[] = [];
-    for (const y of [71, 72]) {
-      for (const x of [30, 31]) {
-        const unknown = x === 30 && y === 71;
-        items.push({
-          id: `tile_${x}${y}${'0'.repeat(28)}`,
-          x,
-          y,
-          visibility: unknown ? 'unknown' : 'visible',
-          ...(unknown
-            ? {}
-            : {
-                terrain: x === 30 ? 'Ocean' : 'Desert',
-                owner_player_id: null,
-                infrastructure_placement: null,
-              }),
-        });
-      }
-    }
-    return items;
-  };
 
   test('the grid is a coordinate table and the legend explains every glyph', () => {
-    const grid = rendered(statePage('tile_window', window()));
+    const grid = rendered(statePage('tile_window', tileWindow()));
     expect(grid[1]?.split(/\s+/)).toEqual(['y\\x', '30', '31']);
     expect(grid[2]?.split(/\s+/)).toEqual(['71', '?', 'De']);
     expect(grid[3]?.split(/\s+/)).toEqual(['72', 'Oc', 'De']);
@@ -329,7 +338,7 @@ describe('tiles', () => {
 
   test('a genuine collision is broken over the colliding names alone', () => {
     const codes = terrainCodes(new Set(['Slime', 'Sludge', 'Slag']));
-    expect([...codes.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))).toEqual([
+    expect([...codes.entries()].toSorted((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))).toEqual([
       ['Slag', 'Sl'],
       ['Slime', 'S0'],
       ['Sludge', 'S1'],
@@ -542,12 +551,7 @@ describe('generic items', () => {
   });
 
   test('past fourteen columns the rows go long-form rather than off the screen', () => {
-    const wide = (seed: string): Record<string, JsonValue> => {
-      const item: Record<string, JsonValue> = {};
-      for (let index = 0; index < 15; index += 1) item[`f${index}`] = `${seed}${index}`;
-      return item;
-    };
-    const lines = renderGenericItems([wide('a'), wide('b')]);
+    const lines = renderGenericItems([wideItem('a'), wideItem('b')]);
     expect(lines).toHaveLength(2);
     expect(lines[0]).toBe(
       '1  f0=a0 f1=a1 f2=a2 f3=a3 f4=a4 f5=a5 f6=a6 f7=a7 f8=a8 f9=a9 f10=a10 f11=a11 f12=a12 f13=a13 f14=a14'

@@ -10,8 +10,6 @@
  * 2. running the command emits those bytes and exactly those bytes, trailing
  *    newline included — `cat` adds nothing and neither may this.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { describe, expect, test } from 'bun:test';
 import { Command } from '@effect/cli';
 import { BunContext } from '@effect/platform-bun';
@@ -20,6 +18,8 @@ import { helpCommand } from 'src/commands/help.cmd';
 import { rulesCommand } from 'src/commands/rules.cmd';
 import { GAMEPLAY_RULES } from 'src/docs/gameplay-rules';
 import { PLAY_CARD } from 'src/docs/play-card';
+import { effectTest, provideTestLayer } from 'test/_effect-test';
+import { path, withTestFileSystem } from 'test/_test-platform';
 
 /** The Python tree this port is a copy of, from `play-cli/test/`. */
 const docPath = (name: string): string =>
@@ -33,10 +33,10 @@ const docPath = (name: string): string =>
  * a line comparison — the trailing newline is the part `cat` would emit and a
  * line-wise assertion would never notice missing.
  */
-const runForBytes = async <Name extends string, A>(
+const runForBytes = <Name extends string, A>(
   command: Command.Command<Name, never, never, A>,
   argv: ReadonlyArray<string>
-): Promise<string> => {
+): Effect.Effect<string> => {
   const root = Command.make('play', {}, () => Effect.void).pipe(
     Command.withSubcommands([command])
   );
@@ -45,27 +45,34 @@ const runForBytes = async <Name extends string, A>(
   console.log = (...parts: ReadonlyArray<unknown>) => {
     out += `${parts.join(' ')}\n`;
   };
-  try {
-    await Effect.runPromise(
-      Command.run(root, { name: 'play', version: '0.1.0' })(['bun', 'play', ...argv]).pipe(
-        Effect.provide(BunContext.layer),
-        Effect.orDie
-      )
-    );
-  } finally {
-    console.log = original;
-  }
-  return out;
+  return provideTestLayer(
+    Command.run(root, { name: 'play', version: '0.1.0' })(['bun', 'play', ...argv]),
+    BunContext.layer
+  ).pipe(
+    Effect.orDie,
+    Effect.ensuring(Effect.sync(() => {
+      console.log = original;
+    })),
+    Effect.map(() => out)
+  );
 };
 
 describe('the embedded documents', () => {
-  test('the play card is play/docs/play.md, byte for byte', () => {
-    expect(`${PLAY_CARD}\n`).toBe(fs.readFileSync(docPath('play.md'), 'utf8'));
-  });
+  effectTest('the play card is play/docs/play.md, byte for byte', () =>
+    withTestFileSystem((files) =>
+      Effect.gen(function* () {
+        expect(`${PLAY_CARD}\n`).toBe(yield* files.readFileString(docPath('play.md')));
+      }).pipe(Effect.orDie)
+    )
+  );
 
-  test('the rules are play/docs/gameplay.md, byte for byte', () => {
-    expect(`${GAMEPLAY_RULES}\n`).toBe(fs.readFileSync(docPath('gameplay.md'), 'utf8'));
-  });
+  effectTest('the rules are play/docs/gameplay.md, byte for byte', () =>
+    withTestFileSystem((files) =>
+      Effect.gen(function* () {
+        expect(`${GAMEPLAY_RULES}\n`).toBe(yield* files.readFileString(docPath('gameplay.md')));
+      }).pipe(Effect.orDie)
+    )
+  );
 
   test('the constants carry no trailing newline of their own', () => {
     // The printer supplies it. Carrying it in the constant *and* printing it
@@ -81,31 +88,43 @@ describe('the embedded documents', () => {
 });
 
 describe('play help', () => {
-  test('prints docs/play.md and nothing else', async () => {
-    expect(await runForBytes(helpCommand, ['help'])).toBe(
-      fs.readFileSync(docPath('play.md'), 'utf8')
-    );
-  });
+  effectTest('prints docs/play.md and nothing else', () =>
+    withTestFileSystem((files) =>
+      Effect.gen(function* () {
+        expect(yield* runForBytes(helpCommand, ['help'])).toBe(
+          yield* files.readFileString(docPath('play.md'))
+        );
+      }).pipe(Effect.orDie)
+    )
+  );
 
-  test('does not print the harness-author reference the recipe withheld', async () => {
-    // justfile:396-397 — every doc character an agent reads is part of its
-    // per-turn budget, so `commands.md` stays out of the agent-facing card.
-    const printed = await runForBytes(helpCommand, ['help']);
-    expect(printed).not.toContain('# Commands');
-    expect(printed.length).toBeLessThan(6000);
-  });
+  effectTest('does not print the harness-author reference the recipe withheld', () =>
+    Effect.gen(function* () {
+      // justfile:396-397 — every doc character an agent reads is part of its
+      // per-turn budget, so `commands.md` stays out of the agent-facing card.
+      const printed = yield* runForBytes(helpCommand, ['help']);
+      expect(printed).not.toContain('# Commands');
+      expect(printed.length).toBeLessThan(6000);
+    })
+  );
 });
 
 describe('play rules', () => {
-  test('prints docs/gameplay.md and nothing else', async () => {
-    expect(await runForBytes(rulesCommand, ['rules'])).toBe(
-      fs.readFileSync(docPath('gameplay.md'), 'utf8')
-    );
-  });
+  effectTest('prints docs/gameplay.md and nothing else', () =>
+    withTestFileSystem((files) =>
+      Effect.gen(function* () {
+        expect(yield* runForBytes(rulesCommand, ['rules'])).toBe(
+          yield* files.readFileString(docPath('gameplay.md'))
+        );
+      }).pipe(Effect.orDie)
+    )
+  );
 
-  test('the two surfaces are different documents', async () => {
-    const card = await runForBytes(helpCommand, ['help']);
-    const rules = await runForBytes(rulesCommand, ['rules']);
-    expect(card).not.toBe(rules);
-  });
+  effectTest('the two surfaces are different documents', () =>
+    Effect.gen(function* () {
+      const card = yield* runForBytes(helpCommand, ['help']);
+      const rules = yield* runForBytes(rulesCommand, ['rules']);
+      expect(card).not.toBe(rules);
+    })
+  );
 });

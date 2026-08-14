@@ -14,7 +14,7 @@
  *   66  the game is over (stop looping)
  */
 import { Command, Options } from '@effect/cli';
-import { Console, Effect, Layer, Option } from 'effect';
+import { Console, Effect, Option } from 'effect';
 import { exitWith } from 'src/exit';
 import { dualFloat, resolveDual } from 'src/options';
 import { V2_PROTOCOL_CARD } from 'src/render/join';
@@ -64,16 +64,17 @@ export const liveWaitHooks: WaitHooksFor = (sessionPath, session) =>
   Effect.gen(function* () {
     const files = yield* PrivateFs;
     const store = yield* SessionStore;
-    const provided = Layer.merge(
-      Layer.succeed(PrivateFs, files),
-      Layer.succeed(SessionStore, store)
-    );
+    const give = <A, E>(
+      body: Effect.Effect<A, E, PrivateFs | SessionStore>
+    ): Effect.Effect<A, E> =>
+      Effect.provideService(
+        Effect.provideService(body, PrivateFs, files),
+        SessionStore,
+        store
+      );
     return {
       rememberPage: (page) =>
-        Effect.provide(
-          Effect.asVoid(rememberPage(sessionPath, session, { legal: false, page })),
-          provided
-        ),
+        give(Effect.asVoid(rememberPage(sessionPath, session, { legal: false, page }))),
       /**
        * `_mirror_page` (client.py:3016-3027), reached from `_legacy_wait_value`
        * (client.py:9976-9977) as `_mirror_page(path, cached, overview, "wait")`.
@@ -107,10 +108,7 @@ export const liveWaitHooks: WaitHooksFor = (sessionPath, session) =>
       // rewrites the header on every tick, a later `play show header` would
       // diverge from the Python byte-for-byte.
       mirrorHealth: (health, command) =>
-        Effect.provide(
-          mirrorHealth(sessionPath, health, command, { commands: V2_PROTOCOL_CARD }),
-          provided
-        ),
+        give(mirrorHealth(sessionPath, health, command, { commands: V2_PROTOCOL_CARD })),
       holderSeat,
     };
   });
@@ -183,7 +181,7 @@ export const waitCommandWith = (makeHooks: WaitHooksFor) =>
             // The tick lines are prose, and `--json` is a byte-identical wire
             // payload: a JSON consumer gets the same single object it always
             // got.
-            ...(json ? {} : { echo: (health) => echo(waitingTickLine(health)) }),
+            echo: json ? undefined : (health) => echo(waitingTickLine(health)),
           }
         );
         if (json) {
@@ -200,8 +198,8 @@ export const waitCommandWith = (makeHooks: WaitHooksFor) =>
         // P1: the wake reason is now readable from the exit status, which is
         // the one channel every harness's job supervisor already watches.
         const code = waitExitCode(value);
-        if (code !== 0) return yield* Effect.fail(exitWith(code));
-        return;
+        if (code !== 0) return yield*exitWith(code);
+        return undefined;
       })
   );
 

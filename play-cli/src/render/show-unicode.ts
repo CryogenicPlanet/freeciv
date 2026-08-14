@@ -488,7 +488,7 @@ export const asciiIsCased = (code: number): boolean =>
   (code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a);
 
 /** The sorted code points that have any case relative — 2,940 of them. */
-export const CASED_CODE_POINTS: ReadonlyArray<number> = [...CASE_CLASSES.keys()].sort(
+export const CASED_CODE_POINTS: ReadonlyArray<number> = [...CASE_CLASSES.keys()].toSorted(
   (left, right) => left - right
 );
 

@@ -12,7 +12,7 @@
  * Ownership: this file is U06's (see NOTES.md §U06 and PORT_MAP §0's addendum
  * row).  Add a golden here; do not copy one into a unit's test file.
  */
-import type { JsonObject } from 'src/schema/index';
+import type { JsonObject, MutableJsonObject } from 'src/schema/index';
 import { healthPayload } from 'test/_fixtures/wire';
 
 // ---------------------------------------------------------------------------
@@ -69,7 +69,7 @@ export const phaseHealthPayload = (options: PhaseHealthOptions): JsonObject => {
   const elapsedS = options.elapsedS === undefined ? 13.0 : options.elapsedS;
   const remainingS = options.remainingS === undefined ? 587.0 : options.remainingS;
   const timeoutS = options.timeoutS === undefined ? 600.0 : options.timeoutS;
-  const phase: JsonObject = {
+  const phase: MutableJsonObject = {
     state: options.phaseState ?? 'awaiting_agent',
     turn: options.turn ?? 3,
     phase: 1,
@@ -82,20 +82,18 @@ export const phaseHealthPayload = (options: PhaseHealthOptions): JsonObject => {
       elapsed_s: elapsedS,
       remaining_s: remainingS,
     },
-    ...(options.mine
-      ? {}
-      : {
-          waiting_on: {
-            kind: 'other_seat',
-            summary:
-              'Seat 2 AgentPlace2 (pi-gpt-5.6-sol) holds turn 3 phase 1 and has not ended it.',
-            waiting_s: elapsedS,
-            seats: options.waitingSeats ?? [opponentSeat()],
-          },
-        }),
-    ...(options.priorEnd === undefined ? {} : { prior_end: options.priorEnd }),
-    ...(options.autoEnd === undefined ? {} : { auto_end: options.autoEnd }),
   };
+  if (!options.mine) {
+    phase['waiting_on'] = {
+      kind: 'other_seat',
+      summary:
+        'Seat 2 AgentPlace2 (pi-gpt-5.6-sol) holds turn 3 phase 1 and has not ended it.',
+      waiting_s: elapsedS,
+      seats: options.waitingSeats ?? [opponentSeat()],
+    };
+  }
+  if (options.priorEnd !== undefined) phase['prior_end'] = options.priorEnd;
+  if (options.autoEnd !== undefined) phase['auto_end'] = options.autoEnd;
   return { ...base, phase };
 };
 

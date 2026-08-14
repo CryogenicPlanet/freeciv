@@ -13,13 +13,13 @@
 import { Command, Options } from '@effect/cli';
 import { Console, Effect, Option } from 'effect';
 import { STRATEGIC_V1, TERMINAL_STATES } from 'src/constants';
-import { PlayerError, SessionMissingError, playerError } from 'src/errors';
+import { type PlayerError, type SessionMissingError, playerError } from 'src/errors';
 import { dualFloat, dualInteger, resolveDual, resolveDualOption } from 'src/options';
 import { compactJson } from 'src/services/json-output';
 import { printPyJson, pyField, pyToJson, v1Json } from 'src/services/v1-json';
 import type { PyObject } from 'src/services/canonical-body';
 import { SessionStore } from 'src/services/session-store';
-import { field, type JsonObject, type JsonValue } from 'src/schema/primitives';
+import { field, isJsonString, type JsonObject, type JsonValue } from 'src/schema/primitives';
 
 /**
  * `value.get(key) not in {None, session[key]}` — the identity guard both of
@@ -84,20 +84,18 @@ export const nextCommand = Command.make(
       const http = yield* v1Json;
       const loaded = yield* sessions.resolve(session);
       if (loaded.session.controlProtocol !== STRATEGIC_V1) {
-        return yield* Effect.fail(
+        return yield*
           playerError(
             'just next is strategic-v1 only; this full-control-v2 session ' +
               'uses `just health`, `just state`, and `just legal`'
-          )
-        );
+          );
       }
       const after = yield* resolveDual('after-turn', afterTurn, 0);
       const supplied = yield* resolveDualOption('wait-s', waitS);
       const wait = Option.getOrElse(supplied, () => DEFAULT_WAIT_S);
       if (after < 0 || !(wait >= 0 && wait <= 300)) {
-        return yield* Effect.fail(
-          playerError('after-turn must be >= 0 and wait-s must be in [0, 300]')
-        );
+        return yield*
+          playerError('after-turn must be >= 0 and wait-s must be in [0, 300]');
       }
       const waitText = Option.isSome(supplied)
         ? pythonFloatText(supplied.value)
@@ -114,19 +112,19 @@ export const nextCommand = Command.make(
         }
       );
       if (echoBelongsElsewhere(value, loaded.session.raw, 'game_id')) {
-        return yield* Effect.fail(playerError('the next response belongs to a different game'));
+        return yield*playerError('the next response belongs to a different game');
       }
       if (echoBelongsElsewhere(value, loaded.session.raw, 'agent_id')) {
-        return yield* Effect.fail(
-          playerError('the next response belongs to a different agent seat')
-        );
+        return yield*
+          playerError('the next response belongs to a different agent seat');
       }
       yield* printPyJson(value);
       const state = pyField(value, 'state');
-      if (typeof state === 'string' && TERMINAL_STATES.has(state)) {
+      if (isJsonString(state) && TERMINAL_STATES.has(state)) {
         // stdout stays pure JSON for the machine consumer; the human-facing
         // "stop the play loop" hint goes to stderr, leading blank line and all.
         yield* Console.error(`\nGame is ${state}; stop the play loop.`);
       }
+      return undefined;
     })
 );

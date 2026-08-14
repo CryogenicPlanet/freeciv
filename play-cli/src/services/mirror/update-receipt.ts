@@ -11,7 +11,7 @@
  */
 import { Effect } from 'effect';
 import type { PlayerError } from 'src/errors';
-import { isJsonObject } from 'src/schema/primitives';
+import { isJsonObject, type JsonValueInput } from 'src/schema/primitives';
 import type { PrivateFs } from 'src/services/private-fs';
 import {
   OVERVIEW_FILE,
@@ -27,7 +27,7 @@ import { parseTable } from 'src/services/mirror/table';
 import { updateDelta } from 'src/services/mirror/delta';
 
 /** The refusal or observation a receipt carried, appended to its digest line. */
-const detail = (receipt: unknown): string => {
+const detail = (receipt: JsonValueInput): string => {
   const error = dig(receipt, 'error');
   const inner = isJsonObject(error) ? error['error'] : undefined;
   const refusal = isJsonObject(inner)
@@ -52,7 +52,7 @@ const detail = (receipt: unknown): string => {
 export const updateFromReceipt = (
   dir: string,
   command: string,
-  receipt: unknown
+  receipt: JsonValueInput
 ): Effect.Effect<ReadonlyArray<string>, PlayerError, PrivateFs> =>
   Effect.gen(function* () {
     const revision = yield* revisionPair(dig(receipt, 'state_revision'));
@@ -80,7 +80,7 @@ export const updateFromReceipt = (
  */
 export const mirrorReceipt = (
   sessionPath: string,
-  receipt: unknown,
+  receipt: JsonValueInput,
   command = 'batch'
 ): Effect.Effect<void, never, PrivateFs> =>
   mirrorGuard(

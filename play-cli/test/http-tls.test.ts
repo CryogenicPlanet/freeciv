@@ -4,21 +4,25 @@
  * configured-but-unreadable CA refuses with the path in the message instead of
  * degrading to the untrusted default.
  */
-import { afterEach, describe, expect, test } from 'bun:test';
-import * as fs from 'node:fs';
-import * as os from 'node:os';
-import * as path from 'node:path';
+import { afterEach, describe, expect } from 'bun:test';
+import { Effect, Either, Option, Schema } from 'effect';
 import { caTrustedFetch } from 'src/services/http';
+import { scratchWorkspace, type Scratch } from 'test/_fixtures';
+import { awaitTest } from 'test/_effect-test';
+import { path, withTestFileSystem } from 'test/_test-platform';
 
 interface Captured {
-  init: RequestInit | undefined;
+  tlsCa: string | undefined;
 }
 
-const capturing = (): { fetchImpl: typeof fetch; captured: Captured } => {
-  const captured: Captured = { init: undefined };
+const tlsInitSchema = Schema.Struct({ tls: Schema.Struct({ ca: Schema.String }) });
+
+const capturing = () => {
+  const captured: Captured = { tlsCa: undefined };
   const fetchImpl = Object.assign(
     (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-      captured.init = init;
+      const decoded = Schema.decodeUnknownOption(tlsInitSchema)(init);
+      captured.tlsCa = Option.isSome(decoded) ? decoded.value.tls.ca : undefined;
       return Promise.resolve(new Response('{}'));
     },
     { preconnect: fetch.preconnect }
@@ -26,85 +30,94 @@ const capturing = (): { fetchImpl: typeof fetch; captured: Captured } => {
   return { fetchImpl, captured };
 };
 
-const tlsOf = (init: RequestInit | undefined): unknown =>
-  (init as { tls?: unknown } | undefined)?.tls;
-
-const scratches: string[] = [];
+const scratches: Scratch[] = [];
 const savedEnv = {
-  PLAY_TLS_CA: process.env['PLAY_TLS_CA'],
-  PLAY_ROOT: process.env['PLAY_ROOT'],
+  PLAY_TLS_CA: Bun.env['PLAY_TLS_CA'],
+  PLAY_ROOT: Bun.env['PLAY_ROOT'],
 };
 
 afterEach(() => {
   for (const [name, value] of Object.entries(savedEnv)) {
     if (value === undefined) {
-      delete process.env[name];
+      delete Bun.env[name];
     } else {
-      process.env[name] = value;
+      Bun.env[name] = value;
     }
   }
-  for (const scratch of scratches.splice(0)) {
-    fs.rmSync(scratch, { recursive: true, force: true });
-  }
+  return Effect.runPromise(
+    Effect.forEach(scratches.splice(0), (scratch) => scratch.cleanup, { discard: true })
+  );
 });
 
-const scratchDir = (): string => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'http-tls-'));
-  scratches.push(dir);
-  return dir;
-};
+const scratchDir = (): Effect.Effect<string> =>
+  Effect.map(scratchWorkspace(), (scratch) => {
+    scratches.push(scratch);
+    return scratch.workspace.root;
+  });
+
+const writeFile = (target: string, contents: string): Effect.Effect<void> =>
+  Effect.orDie(withTestFileSystem((files) => files.writeFileString(target, contents)));
 
 describe('caTrustedFetch', () => {
-  test('no configuration leaves the request untouched', async () => {
-    delete process.env['PLAY_TLS_CA'];
-    process.env['PLAY_ROOT'] = scratchDir(); // no .playconfig.json inside
+  awaitTest('no configuration leaves the request untouched', function* (wait) {
+    delete Bun.env['PLAY_TLS_CA'];
+    Bun.env['PLAY_ROOT'] = yield* scratchDir(); // no .playconfig.json inside
     const { fetchImpl, captured } = capturing();
-    await caTrustedFetch(fetchImpl)('https://supervisor.test/health');
-    expect(tlsOf(captured.init)).toBeUndefined();
+    yield* wait(caTrustedFetch(fetchImpl)('https://supervisor.test/health'));
+    expect(captured.tlsCa).toBeUndefined();
   });
 
-  test('PLAY_TLS_CA injects the file contents as tls.ca', async () => {
-    const dir = scratchDir();
+  awaitTest('PLAY_TLS_CA injects the file contents as tls.ca', function* (wait) {
+    const dir = yield* scratchDir();
     const caPath = path.join(dir, 'ca.pem');
-    fs.writeFileSync(caPath, 'FAKE CA PEM\n');
-    process.env['PLAY_TLS_CA'] = caPath;
+    yield* writeFile(caPath, 'FAKE CA PEM\n');
+    Bun.env['PLAY_TLS_CA'] = caPath;
     const { fetchImpl, captured } = capturing();
-    await caTrustedFetch(fetchImpl)('https://supervisor.test/health');
-    expect(tlsOf(captured.init)).toEqual({ ca: 'FAKE CA PEM\n' });
+    yield* wait(caTrustedFetch(fetchImpl)('https://supervisor.test/health'));
+    expect(captured.tlsCa).toBe('FAKE CA PEM\n');
   });
 
-  test('the workspace .playconfig.json tls_ca is the fallback, relative to the root', async () => {
-    const dir = scratchDir();
-    fs.writeFileSync(path.join(dir, 'stack-ca.pem'), 'WORKSPACE CA\n');
-    fs.writeFileSync(
+  awaitTest('the workspace .playconfig.json tls_ca is the fallback, relative to the root', function* (wait) {
+    const dir = yield* scratchDir();
+    yield* writeFile(path.join(dir, 'stack-ca.pem'), 'WORKSPACE CA\n');
+    yield* writeFile(
       path.join(dir, '.playconfig.json'),
       JSON.stringify({ schema_version: 1, game_id: 'game_x', name: 'n', tls_ca: 'stack-ca.pem' })
     );
-    delete process.env['PLAY_TLS_CA'];
-    process.env['PLAY_ROOT'] = dir;
+    delete Bun.env['PLAY_TLS_CA'];
+    Bun.env['PLAY_ROOT'] = dir;
     const { fetchImpl, captured } = capturing();
-    await caTrustedFetch(fetchImpl)('https://supervisor.test/health');
-    expect(tlsOf(captured.init)).toEqual({ ca: 'WORKSPACE CA\n' });
+    yield* wait(caTrustedFetch(fetchImpl)('https://supervisor.test/health'));
+    expect(captured.tlsCa).toBe('WORKSPACE CA\n');
   });
 
-  test('an empty PLAY_TLS_CA opts out of the workspace fallback', async () => {
-    const dir = scratchDir();
-    fs.writeFileSync(path.join(dir, 'stack-ca.pem'), 'WORKSPACE CA\n');
-    fs.writeFileSync(
+  awaitTest('an empty PLAY_TLS_CA opts out of the workspace fallback', function* (wait) {
+    const dir = yield* scratchDir();
+    yield* writeFile(path.join(dir, 'stack-ca.pem'), 'WORKSPACE CA\n');
+    yield* writeFile(
       path.join(dir, '.playconfig.json'),
       JSON.stringify({ schema_version: 1, game_id: 'game_x', name: 'n', tls_ca: 'stack-ca.pem' })
     );
-    process.env['PLAY_TLS_CA'] = '';
-    process.env['PLAY_ROOT'] = dir;
+    Bun.env['PLAY_TLS_CA'] = '';
+    Bun.env['PLAY_ROOT'] = dir;
     const { fetchImpl, captured } = capturing();
-    await caTrustedFetch(fetchImpl)('https://supervisor.test/health');
-    expect(tlsOf(captured.init)).toBeUndefined();
+    yield* wait(caTrustedFetch(fetchImpl)('https://supervisor.test/health'));
+    expect(captured.tlsCa).toBeUndefined();
   });
 
-  test('a configured but unreadable CA refuses with the path in the message', () => {
-    const missing = path.join(scratchDir(), 'gone.pem');
-    process.env['PLAY_TLS_CA'] = missing;
+  awaitTest('a configured but unreadable CA refuses with the path in the message', function* () {
+    const missing = path.join(yield* scratchDir(), 'gone.pem');
+    Bun.env['PLAY_TLS_CA'] = missing;
     const { fetchImpl } = capturing();
-    expect(() => caTrustedFetch(fetchImpl)('https://supervisor.test/health')).toThrow(missing);
+    const outcome = yield* Effect.either(
+      Effect.tryPromise({
+        try: () => caTrustedFetch(fetchImpl)('https://supervisor.test/health'),
+        catch: (cause) => cause instanceof Error ? cause.message : String(cause),
+      })
+    );
+    expect(Either.isLeft(outcome)).toBe(true);
+    if (Either.isLeft(outcome)) {
+      expect(outcome.left).toContain(missing);
+    }
   });
 });

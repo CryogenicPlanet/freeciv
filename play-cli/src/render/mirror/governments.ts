@@ -6,7 +6,7 @@
  */
 import { Effect } from 'effect';
 import type { PlayerError } from 'src/errors';
-import { isJsonObject } from 'src/schema/primitives';
+import { isJsonObject, type JsonValueInput } from 'src/schema/primitives';
 import { cell, dig, mirrorError, type MirrorAliases } from 'src/services/mirror';
 import type { RenderedSection } from 'src/render/mirror/section';
 
@@ -20,7 +20,7 @@ export const GOVERNMENT_COLUMNS: ReadonlyArray<string> = [
 
 /** `_render_governments` — project a `governments` page. */
 export const renderGovernments = (
-  items: ReadonlyArray<unknown>,
+  items: ReadonlyArray<JsonValueInput>,
   _aliases?: MirrorAliases | null
 ): Effect.Effect<RenderedSection, PlayerError> => {
   const rows: Array<ReadonlyArray<string>> = [];

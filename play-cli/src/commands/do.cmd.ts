@@ -30,12 +30,12 @@
  * to the landed unit that owns it.
  */
 import { Args, Command, Options } from '@effect/cli';
-import { Console, Effect, Either, Layer } from 'effect';
+import { Console, Effect, Either } from 'effect';
 import { playerError, type PlayError, type PlayerError } from 'src/errors';
 import { exitWith, passThroughExit, type ExitCodeSignal } from 'src/exit';
 import { dualFloat, resolveDual } from 'src/options';
 import type { BatchDisposition } from 'src/schema/batch';
-import type { JsonObject } from 'src/schema/primitives';
+import type { JsonObject, JsonValueInput } from 'src/schema/primitives';
 import { compareRevisions, revisionsEqual, type Revision } from 'src/schema/revision';
 import { render, revisionLabel } from 'src/render/primitives';
 import {
@@ -112,14 +112,12 @@ export interface PhaseEndOutcome {
 /**
  * `_await_and_brief_locked`'s 4-tuple, as U12 landed it.
  *
- * `wait` and `briefing` are `unknown` on purpose: `do` never reads inside
- * them, it only forwards them into `--json`'s composite under the part names
- * `_composite_json` fixed.  Typing them as U12's envelopes here would make
- * `do` a consumer of a shape it has no opinion about.
+ * `wait` and `briefing` are validated JSON values. `do` never reads inside
+ * them; it only forwards them into the composite JSON response.
  */
 export interface AwaitBriefOutcome {
-  readonly wait: unknown;
-  readonly briefing: unknown;
+  readonly wait: JsonValueInput;
+  readonly briefing: JsonValueInput;
   readonly briefError: string;
   readonly lines: ReadonlyArray<string>;
 }
@@ -317,7 +315,7 @@ const resolveOrders = (
     const outcomes = yield* hooks.orderOutcomes(state, orders);
     if (outcomes.some((outcome) => outcome.resolved === null)) {
       const report = yield* hooks.unresolvedReport(state, outcomes);
-      return yield* Effect.fail(playerError(report.join('\n')));
+      return yield* playerError(report.join('\n'));
     }
     return resolvedOf(outcomes);
   });
@@ -351,7 +349,7 @@ const resolveOrdersFetching = (
     if (targets.length === 0) {
       if (outcomes.some((outcome) => outcome.resolved === null)) {
         const report = yield* hooks.unresolvedReport(state, outcomes);
-        return yield* Effect.fail(playerError(report.join('\n')));
+        return yield* playerError(report.join('\n'));
       }
       return { pending: resolvedOf(outcomes), state };
     }
@@ -368,7 +366,7 @@ const resolveOrdersFetching = (
     // A drain that CPython would have raised on is raised on here too, before
     // any note is printed — the fetch notes below only describe drains that
     // actually happened.
-    if (failure !== null) return yield* Effect.fail(failure);
+    if (failure !== null) return yield* failure;
     for (const drain of drains) {
       notes.push(fetchedOptionsNote(aliases[drain.actorId] ?? drain.actorId, drain.revision));
     }
@@ -377,9 +375,7 @@ const resolveOrdersFetching = (
     if (Either.isLeft(retried)) {
       // The fetch already happened; a refusal that hid it would leave the
       // agent unable to tell a cold cache from a wrong word.
-      return yield* Effect.fail(
-        playerError([...notes, failureText(retried.left)].join('\n'))
-      );
+      return yield* playerError([...notes, failureText(retried.left)].join('\n'));
     }
     return { pending: retried.right, state: fresh };
   });
@@ -407,7 +403,8 @@ const refreshOrders = (
       stopOnFailure: true,
     });
     const failure = firstDrainFailure(drains);
-    if (failure !== null) return yield* Effect.fail(failure);
+    if (failure !== null) return yield* failure;
+    return undefined;
   });
 
 // ---------------------------------------------------------------------------
@@ -415,6 +412,20 @@ const refreshOrders = (
 // ---------------------------------------------------------------------------
 
 /** What one `do` invocation produced, before it is printed. */
+interface DoJsonPayload {
+  readonly schema_version: 1;
+  readonly command: 'do';
+  readonly orders: ReadonlyArray<DoRecord>;
+  readonly requested: number;
+  readonly applied: number;
+  readonly state_revision: Revision | null;
+  readonly stopped: string | null;
+  readonly end?: BatchDisposition | null;
+  readonly wait?: JsonValueInput;
+  readonly turn?: JsonValueInput;
+  readonly turn_error?: string | null;
+}
+
 interface DoOutcome {
   readonly lines: ReadonlyArray<string>;
   readonly options: ReadonlyArray<string>;
@@ -424,8 +435,8 @@ interface DoOutcome {
   readonly stopped: string;
   readonly ended: boolean;
   readonly ending: BatchDisposition | null;
-  readonly wait: unknown;
-  readonly briefing: unknown;
+  readonly wait: JsonValueInput;
+  readonly briefing: JsonValueInput;
   readonly briefError: string;
   readonly ordered: ReadonlySet<string>;
   readonly exitCode: number;
@@ -449,9 +460,9 @@ export const runDo = (
     const endPhase = args.endPhase;
     const awaitNext = args.awaitPhase;
     const brief = args.brief;
-    if (awaitNext && !endPhase) return yield* Effect.fail(playerError(AWAIT_WITHOUT_END));
+    if (awaitNext && !endPhase) return yield* playerError(AWAIT_WITHOUT_END);
     if (brief && !(endPhase && awaitNext)) {
-      return yield* Effect.fail(playerError(BRIEF_WITHOUT_WAKE));
+      return yield* playerError(BRIEF_WITHOUT_WAKE);
     }
     const hooks = yield* makeHooks(sessionPath, session, args.wait);
     const json = jsonRequested('do', args.json);
@@ -475,7 +486,7 @@ export const runDo = (
 
     const lines = [...outcome.lines];
     if (json) {
-      const payload: Record<string, unknown> = {
+      const base: DoJsonPayload = {
         schema_version: 1,
         command: 'do',
         orders: outcome.records,
@@ -484,15 +495,15 @@ export const runDo = (
         state_revision: outcome.bound,
         stopped: outcome.stopped === '' ? null : outcome.stopped,
       };
-      if (endPhase) {
-        // A new surface: the composite only ever appears when the new flag
-        // asked for it, so the shape `just do --json` has always returned is
-        // untouched.
-        payload['end'] = outcome.ending;
-        payload['wait'] = outcome.wait;
-        payload['turn'] = outcome.briefing;
-        payload['turn_error'] = outcome.briefError === '' ? null : outcome.briefError;
-      }
+      const payload: DoJsonPayload = endPhase
+        ? {
+            ...base,
+            end: outcome.ending,
+            wait: outcome.wait,
+            turn: outcome.briefing,
+            turn_error: outcome.briefError === '' ? null : outcome.briefError,
+          }
+        : base;
       // NOT `printV2Json`: with `--end` the payload embeds a `WaitEnvelope`
       // under `"wait"` and the next briefing under `"turn"`, so the twelve
       // supervisor floats ride along; core's encoder prints `600` where
@@ -515,9 +526,9 @@ export const runDo = (
       yield* render(lines);
     }
     if (outcome.exitCode !== 0) {
-      return yield* Effect.fail(exitWith(passThroughExit(outcome.exitCode)));
+      return yield* exitWith(passThroughExit(outcome.exitCode));
     }
-    return;
+    return undefined;
   });
 
 interface LockedInput {
@@ -544,8 +555,8 @@ const doLocked = (input: LockedInput): Effect.Effect<DoOutcome, PlayError, Priva
     let exitCode = 0;
     let applied = 0;
     let ending: BatchDisposition | null = null;
-    let wait: unknown = null;
-    let briefing: unknown = null;
+    let wait: JsonValueInput = null;
+    let briefing: JsonValueInput = null;
     let briefError = '';
     let ended = false;
     let options: ReadonlyArray<string> = [];
@@ -704,7 +715,7 @@ const doLocked = (input: LockedInput): Effect.Effect<DoOutcome, PlayError, Priva
           }
           const woken = yield* Effect.either(hooks.awaitAndBriefLocked({ brief, prelude }));
           if (Either.isLeft(woken)) {
-            if (json) return yield* Effect.fail(woken.left);
+            if (json) return yield* woken.left;
             const message = failureText(woken.left);
             tail.push(
               'phase ended: the receipts above are authoritative',
@@ -829,13 +840,14 @@ export const liveDoHooks: DoHooksFor = (sessionPath, session, wait) =>
     const files = yield* PrivateFs;
     const store = yield* SessionStore;
     const client = yield* V2Client;
-    const provided = Layer.mergeAll(
-      Layer.succeed(PrivateFs, files),
-      Layer.succeed(SessionStore, store),
-      Layer.succeed(V2Client, client)
-    );
-    const give = <A, E>(body: Effect.Effect<A, E, PrivateFs | SessionStore | V2Client>) =>
-      Effect.provide(body, provided);
+    const give = <A, E>(
+      body: Effect.Effect<A, E, PrivateFs | SessionStore | V2Client>
+    ): Effect.Effect<A, E> =>
+      body.pipe(
+        Effect.provideService(PrivateFs, files),
+        Effect.provideService(SessionStore, store),
+        Effect.provideService(V2Client, client)
+      );
 
     const orderDeps: OrdersDeps = { compactLegalAction };
     const legalCtx: LegalCtx = { sessionPath, session };
@@ -846,12 +858,11 @@ export const liveDoHooks: DoHooksFor = (sessionPath, session, wait) =>
     const fetchOnly: OrdersFetchDeps = {
       ...orderDeps,
       drainLegal: (path, current, actorId) =>
-        Effect.provide(
+        give(
           Effect.mapError(
             Effect.asVoid(drainLegal({ sessionPath: path, session: current }, actorId)),
             (error) => playerError(error.message)
-          ),
-          provided
+          )
         ),
     };
     const turn = turnCtx(sessionPath, session, yield* liveTurnSeams(sessionPath, session));

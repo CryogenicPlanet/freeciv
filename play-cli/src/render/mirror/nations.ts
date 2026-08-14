@@ -8,7 +8,7 @@
  */
 import { Effect } from 'effect';
 import type { PlayerError } from 'src/errors';
-import { isJsonObject } from 'src/schema/primitives';
+import { isJsonObject, type JsonValueInput } from 'src/schema/primitives';
 import { cell, dig, mirrorError, type MirrorAliases } from 'src/services/mirror';
 import type { RenderedSection } from 'src/render/mirror/section';
 
@@ -16,7 +16,7 @@ export const NATION_COLUMNS: ReadonlyArray<string> = ['id', 'nation', 'default_s
 
 /** `_render_nations` — project a `pregame_nations` page. */
 export const renderNations = (
-  items: ReadonlyArray<unknown>,
+  items: ReadonlyArray<JsonValueInput>,
   _aliases?: MirrorAliases | null
 ): Effect.Effect<RenderedSection, PlayerError> => {
   const rows: Array<ReadonlyArray<string>> = [];

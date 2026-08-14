@@ -19,7 +19,7 @@
  */
 import { Effect } from 'effect';
 import type { PlayerError } from 'src/errors';
-import { isJsonObject } from 'src/schema/primitives';
+import { isJsonObject, isJsonString, type JsonValueInput } from 'src/schema/primitives';
 import type { PrivateFs } from 'src/services/private-fs';
 import {
   YIELD_COLUMNS,
@@ -68,7 +68,7 @@ const aliased = (aliases: MirrorAliases | null | undefined, key: string): string
  * need a filesystem.
  */
 export const yieldRows = (
-  items: ReadonlyArray<unknown>,
+  items: ReadonlyArray<JsonValueInput>,
   aliases?: MirrorAliases | null
 ): Effect.Effect<ReadonlyArray<ReadonlyArray<string>>, PlayerError> =>
   Effect.suspend(() => {
@@ -80,7 +80,7 @@ export const yieldRows = (
       if (dig(item, 'kind') !== 'tile') continue;
       const yields = dig(item, 'yields');
       const tileId = dig(item, 'tile_id');
-      if (!isJsonObject(yields) || typeof tileId !== 'string') continue;
+      if (!isJsonObject(yields) || !isJsonString(tileId)) continue;
       const cityId = dig(item, 'city_id');
       rows.push([
         cell(aliased(aliases, tileId)),
@@ -88,7 +88,7 @@ export const yieldRows = (
         cell(dig(yields, 'shields')),
         cell(dig(yields, 'trade')),
         dig(item, 'worked') === true ? 'yes' : 'no',
-        cell(typeof cityId === 'string' ? aliased(aliases, cityId) : cityId),
+        cell(isJsonString(cityId) ? aliased(aliases, cityId) : cityId),
       ]);
     }
     return Effect.succeed(rows);
@@ -116,7 +116,7 @@ export const updateYields = (
   dir: string,
   command: string,
   revision: MirrorRevision,
-  items: ReadonlyArray<unknown>,
+  items: ReadonlyArray<JsonValueInput>,
   aliases?: MirrorAliases | null
 ): Effect.Effect<ReadonlyArray<string>, PlayerError, PrivateFs> =>
   Effect.gen(function* () {

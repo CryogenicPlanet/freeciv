@@ -14,7 +14,14 @@
  */
 import { Effect } from 'effect';
 import type { PlayerError } from 'src/errors';
-import { isJsonObject, type JsonObject } from 'src/schema/primitives';
+import {
+  isJsonObject,
+  isJsonString,
+  isWholeNumber,
+  type JsonObject,
+  type JsonValue,
+  type JsonValueInput,
+} from 'src/schema/primitives';
 import type { PrivateFs } from 'src/services/private-fs';
 import {
   MAX_ROWS,
@@ -70,31 +77,30 @@ interface PageParts {
   readonly revision: MirrorRevision;
   readonly inner: JsonObject;
   readonly section: string;
-  readonly items: ReadonlyArray<unknown>;
+  readonly items: ReadonlyArray<JsonValue>;
 }
 
 /** The shape checks CPython runs before it touches a file. */
-const pageParts = (page: unknown): Effect.Effect<PageParts, PlayerError> =>
+const pageParts = (page: JsonValueInput): Effect.Effect<PageParts, PlayerError> =>
   Effect.gen(function* () {
     const revision = yield* revisionPair(dig(page, 'state_revision'));
     const inner = dig(page, 'page');
     if (!isJsonObject(inner)) {
-      return yield* Effect.fail(mirrorError('page payload carries no page envelope'));
+      return yield*mirrorError('page payload carries no page envelope');
     }
     const section = inner['section'];
     const items = inner['items'];
-    if (typeof section !== 'string' || !Array.isArray(items)) {
-      return yield* Effect.fail(mirrorError('page envelope carries no section items'));
+    if (!isJsonString(section) || !Array.isArray(items)) {
+      return yield*mirrorError('page envelope carries no section items');
     }
     if (items.length > MAX_ROWS) {
-      return yield* Effect.fail(mirrorError('page envelope carries too many items'));
+      return yield*mirrorError('page envelope carries too many items');
     }
     return { revision, inner, section, items };
   });
 
 /** `isinstance(total_items, int)` — a JSON integer, never a bool. */
-const isCount = (value: unknown): value is number =>
-  typeof value === 'number' && Number.isInteger(value);
+const isCount = isWholeNumber;
 
 const columnsEqual = (
   left: ReadonlyArray<string>,
@@ -111,7 +117,7 @@ const columnsEqual = (
 export const updateFromPage = (
   dir: string,
   command: string,
-  page: unknown,
+  page: JsonValueInput,
   options: UpdatePageOptions = {}
 ): Effect.Effect<ReadonlyArray<string>, PlayerError, PrivateFs> =>
   Effect.gen(function* () {
@@ -202,7 +208,7 @@ const mergedRows = (input: MergeInput): ReadonlyArray<ReadonlyArray<string>> => 
  */
 export const mirrorPage = (
   sessionPath: string,
-  page: unknown,
+  page: JsonValueInput,
   command: string,
   options: UpdatePageOptions = {}
 ): Effect.Effect<void, never, PrivateFs> =>

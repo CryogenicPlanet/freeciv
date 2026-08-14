@@ -12,7 +12,12 @@
  */
 import { Effect } from 'effect';
 import type { PlayerError } from 'src/errors';
-import { isJsonObject } from 'src/schema/primitives';
+import {
+  isJsonObject,
+  isJsonString,
+  isWholeNumber,
+  type JsonValueInput,
+} from 'src/schema/primitives';
 import type { PrivateFs } from 'src/services/private-fs';
 import {
   OVERVIEW_FILE,
@@ -82,7 +87,7 @@ export const terrainChars = (
 ): ReadonlyMap<string, string> => {
   const assigned = new Map(existing ?? []);
   const used = new Set(assigned.values());
-  const unique = [...new Set(names)].sort(codePointSort);
+  const unique = [...new Set(names)].toSorted(codePointSort);
   for (const name of unique) {
     const char = TERRAIN_CHARS.get(name);
     if (char !== undefined && !used.has(char)) {
@@ -191,7 +196,7 @@ export interface TileChars {
  * `?` even if the payload volunteered a terrain for it.
  */
 export const tileChars = (
-  items: ReadonlyArray<unknown>,
+  items: ReadonlyArray<JsonValueInput>,
   legend: ReadonlyMap<string, string>
 ): Effect.Effect<TileChars, PlayerError> =>
   Effect.suspend(() => {
@@ -202,7 +207,7 @@ export const tileChars = (
       }
       if (dig(item, 'visibility') !== 'unknown') {
         const terrain = dig(item, 'terrain');
-        if (typeof terrain === 'string') names.push(terrain);
+        if (isJsonString(terrain)) names.push(terrain);
       }
     }
     const chars = terrainChars(names, legend);
@@ -210,13 +215,13 @@ export const tileChars = (
     for (const item of items) {
       const x = dig(item, 'x');
       const y = dig(item, 'y');
-      if (!Number.isInteger(x) || !Number.isInteger(y)) {
+      if (!isWholeNumber(x) || !isWholeNumber(y)) {
         return Effect.fail(mirrorError('tile item carries no coordinates'));
       }
-      const key = tileKey(x as number, y as number);
+      const key = tileKey(x, y);
       const visibility = dig(item, 'visibility');
       const terrain = dig(item, 'terrain');
-      if (visibility === 'unknown' || typeof terrain !== 'string') {
+      if (visibility === 'unknown' || !isJsonString(terrain)) {
         grid.set(key, '?');
         continue;
       }

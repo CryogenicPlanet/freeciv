@@ -37,20 +37,25 @@ import {
 // Helpers
 // ---------------------------------------------------------------------------
 
-const parsed = (text: unknown): Either.Either<ReadonlyArray<string>, { readonly message: string }> =>
+type OrderLineInput = JsonValue | undefined;
+
+const parsed = (text: OrderLineInput): Either.Either<ReadonlyArray<string>, { readonly message: string }> =>
   Effect.runSync(Effect.either(parseOrders(text)));
 
-const refusal = (text: unknown): string => {
+const refusal = (text: OrderLineInput): string => {
   const outcome = parsed(text);
   expect(Either.isLeft(outcome)).toBe(true);
   return Either.isLeft(outcome) ? outcome.left.message : '';
 };
 
-const orders = (text: unknown): ReadonlyArray<string> => {
+const orders = (text: OrderLineInput): ReadonlyArray<string> => {
   const outcome = parsed(text);
   if (Either.isLeft(outcome)) throw new Error(`expected orders, got ${outcome.left.message}`);
   return outcome.right;
 };
+
+const wire = (bound: JsonObject | null): string | null =>
+  bound === null ? null : JSON.stringify(bound);
 
 const compact = (
   kind: string,
@@ -248,7 +253,7 @@ describe('_order_value', () => {
 describe('_order_verbs', () => {
   test('a descriptor answers only to the four words it advertises', () => {
     const verbs = orderVerbs(compact('research.set_goal', { operation: 'set_goal' }));
-    expect([...verbs].sort()).toEqual([
+    expect([...verbs].toSorted()).toEqual([
       'research.set_goal',
       'research.set_goal/set_goal',
       'set_goal',
@@ -258,7 +263,7 @@ describe('_order_verbs', () => {
   });
 
   test('an operation-free descriptor answers to its kind and tail alone', () => {
-    expect([...orderVerbs(compact('unit.sentry'))].sort()).toEqual(['sentry', 'unit.sentry']);
+    expect([...orderVerbs(compact('unit.sentry'))].toSorted()).toEqual(['sentry', 'unit.sentry']);
   });
 
   test('kind splitting matches CPython split(".", 1)', () => {
@@ -438,9 +443,6 @@ describe('_order_arguments', () => {
  * drift as the cause of three incidents.
  */
 describe('an argument named for an inherited property still binds', () => {
-  const wire = (bound: JsonObject | null): string | null =>
-    bound === null ? null : JSON.stringify(bound);
-
   test('an optional property named `toString` is a name, not a method', () => {
     const action = compact('unit.order', {
       schema: {

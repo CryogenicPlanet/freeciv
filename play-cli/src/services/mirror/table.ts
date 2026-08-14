@@ -19,6 +19,7 @@ import {
   splitLines,
   strip,
   type MirrorRevision,
+  type MirrorCellValue,
 } from 'src/services/mirror/store';
 
 /** `_Table` — a parsed mirror table: its revision, column names and rows. */
@@ -114,7 +115,7 @@ export const tableText = (
 export const pageNote = (
   section: string,
   shown: number,
-  total: unknown,
+  total: MirrorCellValue,
   complete: boolean
 ): string =>
   `${section} ${shown}/${cell(total)} ${

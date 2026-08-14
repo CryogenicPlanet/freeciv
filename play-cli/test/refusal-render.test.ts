@@ -10,7 +10,7 @@
  * offered when it would add nothing.
  */
 import { describe, expect, test } from 'bun:test';
-import { Effect, Layer } from 'effect';
+import { Effect, Layer, Schema } from 'effect';
 import { FULL_CONTROL_V2 } from 'src/constants';
 import {
   ERROR_REMEDIES,
@@ -24,6 +24,7 @@ import { RefusalRender } from 'src/render/refusal-seam';
 import { decodeError } from 'src/schema/error';
 import type { JsonObject } from 'src/schema/primitives';
 import { errorPayload, identity } from 'test/_fixtures';
+import { provideTestLayer } from 'test/_effect-test';
 
 // ---------------------------------------------------------------------------
 // The `error_lines` helper, ported (test_client.py:9775-9782)
@@ -33,16 +34,19 @@ const errorLines = (
   code: string,
   details: JsonObject,
   options: { readonly retryable?: boolean; readonly revision?: JsonObject } = {}
-): ReadonlyArray<string> =>
-  renderErrorPayload({
+): ReadonlyArray<string> => {
+  const payload = {
     error: {
       code,
       message: 'the request could not be completed',
       details,
       retryable: options.retryable ?? false,
     },
-    ...(options.revision === undefined ? {} : { state_revision: options.revision }),
-  });
+  };
+  return options.revision === undefined
+    ? renderErrorPayload(payload)
+    : renderErrorPayload({ ...payload, state_revision: options.revision });
+};
 
 const JSON_OFFER = 'full payload: re-run the same command with --json';
 const RETRYABLE = 'retryable: the same request may be sent again';
@@ -226,7 +230,7 @@ describe('renderErrorPayload: remedies', () => {
   });
 
   test('every safe_next in the table gets its sentence, and none is invented', () => {
-    expect([...ERROR_REMEDIES.keys()].sort()).toEqual([
+    expect([...ERROR_REMEDIES.keys()].toSorted()).toEqual([
       'receipt_first',
       'refresh',
       'retry_exact',
@@ -347,7 +351,10 @@ describe('the RefusalRender seam', () => {
       })
     );
     // `--json` prints the validated envelope; the text path prints this.
-    expect(renderErrorPayload(JSON.parse(JSON.stringify(payload)) as unknown)).toEqual([
+    const roundTripped = Schema.decodeUnknownSync(Schema.parseJson(Schema.Unknown))(
+      JSON.stringify(payload)
+    );
+    expect(renderErrorPayload(roundTripped)).toEqual([
       'error conflict: another seat moved first  rev8/t3',
       'next (receipt_first): resolve the outcome with `just receipt --batch_id batch_9` ' +
         'before any replay',
@@ -356,7 +363,7 @@ describe('the RefusalRender seam', () => {
 
   test('RefusalRenderLive is the renderer, not the one-line default', () => {
     const lines = Effect.runSync(
-      Effect.provide(
+      provideTestLayer(
         Effect.map(RefusalRender, (renderer) =>
           renderer.renderErrorPayload({
             error: {

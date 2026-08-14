@@ -13,6 +13,7 @@
  */
 import { duration, scalar } from 'src/render/primitives';
 import type { JsonValue, PhaseBlock, PriorEnd, WaitingOnSeat } from 'src/schema/index';
+import { isJsonNumber, isJsonString } from 'src/schema/primitives';
 
 /**
  * Anything that can be named as a seat on a line.
@@ -41,14 +42,14 @@ export const holderSeat = (phase: PhaseBlock | null | undefined): WaitingOnSeat 
   // `is_self is False`, not "falsy": a row that omits the flag is not a claim
   // that the seat is somebody else.
   const others = waitingOn.seats.filter((row) => row.is_self === false);
-  return others.length === 1 ? (others[0] as WaitingOnSeat) : null;
+  return others.length === 1 ? (others.at(0) ?? null) : null;
 };
 
 export const seatLabel = (row: SeatLabelSource): string => {
   const label = row.controller_label;
   return (
     `seat ${scalar(row.place)} ${scalar(row.player_name)}` +
-    (typeof label === 'string' && label !== '' ? ` (${label})` : '')
+    (isJsonString(label) && label !== '' ? ` (${label})` : '')
   );
 };
 
@@ -123,7 +124,7 @@ const priorCause = (prior: PriorEnd): string => {
   }
   return (
     'agent' +
-    (typeof orders === 'number' ? `, ${orders} order${orders === 1 ? '' : 's'}` : '')
+    (isJsonNumber(orders) ? `, ${orders} order${orders === 1 ? '' : 's'}` : '')
   );
 };
 

@@ -13,13 +13,19 @@
  *   destroyed by the HTTP status.  `requestJson` is the v1 wrapper that does
  *   raise, with the Python's exact message shape.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import { Context, Effect, Either, Layer } from 'effect';
-import { PlayerError, playerError } from 'src/errors';
+import { fileSystem, path } from 'src/services/platform';
+import { Config, Context, Effect, Either, Layer, Option, Schema } from 'effect';
+import { type PlayerError, playerError } from 'src/errors';
 import { DEFAULT_SERVICE_URL } from 'src/constants';
 import { compactJson, pyJsonDumps } from 'src/services/json-output';
-import { isJsonObject, type JsonObject } from 'src/schema/primitives';
+import {
+  JsonObjectSchema,
+  field,
+  isJsonObject,
+  isJsonString,
+  type JsonObject,
+  type JsonValueInput,
+} from 'src/schema/primitives';
 
 // ---------------------------------------------------------------------------
 // service_url
@@ -84,7 +90,7 @@ export interface JsonResponse {
 
 export interface RequestOptions {
   readonly token?: string | undefined;
-  readonly body?: unknown;
+  readonly body?: JsonValueInput;
   /** Pre-serialized bytes, for the retry path that must resend exact bytes. */
   readonly encodedBody?: string | undefined;
   /** Seconds. CPython's default is 60. */
@@ -125,20 +131,20 @@ const unreachable = (url: string, reason: string): PlayerError =>
 
 /** The message `request_json` raises for a non-2xx v1 response. */
 export const v1ErrorMessage = (status: number, value: JsonObject): string => {
-  const error = value['error'];
+  const error = field(value, 'error');
   if (isJsonObject(error)) {
-    const message = error['message'] ?? error['code'];
-    if (message === null || message === undefined) return `HTTP ${status}: None`;
-    return `HTTP ${status}: ${typeof message === 'string' ? message : compactJson(message)}`;
+    const message = field(error, 'message') ?? field(error, 'code');
+    if (message === null) return `HTTP ${status}: None`;
+    return `HTTP ${status}: ${isJsonString(message) ? message : compactJson(message)}`;
   }
-  if (error === undefined || error === null) {
+  if (error === null) {
     return `HTTP ${status}: HTTP ${status}`;
   }
-  return `HTTP ${status}: ${typeof error === 'string' ? error : compactJson(error)}`;
+  return `HTTP ${status}: ${isJsonString(error) ? error : compactJson(error)}`;
 };
 
 /** The bytes a request body serializes to. CPython: sorted keys, no spaces. */
-export const encodeRequestBody = (body: unknown): string =>
+export const encodeRequestBody = (body: JsonValueInput): string =>
   pyJsonDumps(body, { sortKeys: true, separators: [',', ':'] });
 
 const makeApi = (fetchImpl: typeof fetch): HttpApi => {
@@ -149,7 +155,7 @@ const makeApi = (fetchImpl: typeof fetch): HttpApi => {
   ): Effect.Effect<JsonResponse, PlayerError> =>
     Effect.gen(function* () {
       if (options.body !== undefined && options.encodedBody !== undefined) {
-        return yield* Effect.fail(playerError('a request cannot contain two JSON bodies'));
+        return yield*playerError('a request cannot contain two JSON bodies');
       }
       const data =
         options.encodedBody !== undefined
@@ -157,24 +163,26 @@ const makeApi = (fetchImpl: typeof fetch): HttpApi => {
           : options.body !== undefined
             ? encodeRequestBody(options.body)
             : null;
-      const headers: Record<string, string> = { Accept: 'application/json' };
-      if (data !== null) headers['Content-Type'] = 'application/json';
+      const headers = new Headers({ Accept: 'application/json' });
+      if (data !== null) headers.set('Content-Type', 'application/json');
       if (options.token !== undefined && options.token !== '') {
-        headers['Authorization'] = `Bearer ${options.token}`;
+        headers.set('Authorization', `Bearer ${options.token}`);
       }
       const timeoutMillis = (options.timeout ?? DEFAULT_TIMEOUT_S) * 1000;
 
       const response = yield* Effect.tryPromise({
-        try: (signal) =>
-          fetchImpl(url, {
+        try: (signal) => {
+          const base: RequestInit = {
             method,
             headers,
-            ...(data === null ? {} : { body: data }),
             // Keep bearer credentials on the exact configured supervisor
             // origin: a redirect is a refusal, not a hop.
             redirect: 'error',
             signal,
-          }),
+          };
+          const request: RequestInit = data === null ? base : { ...base, body: data };
+          return fetchImpl(url, request);
+        },
         catch: (cause) => unreachable(url, cause instanceof Error ? cause.message : String(cause)),
       }).pipe(
         Effect.timeoutFail({
@@ -190,18 +198,14 @@ const makeApi = (fetchImpl: typeof fetch): HttpApi => {
             `invalid supervisor response: ${cause instanceof Error ? cause.message : String(cause)}`
           ),
       });
-      const parsed = yield* Effect.try({
-        try: () => JSON.parse(text) as unknown,
-        catch: (cause) =>
-          playerError(
-            `invalid supervisor response: ${cause instanceof Error ? cause.message : String(cause)}`
-          ),
-      });
-      if (!isJsonObject(parsed)) {
-        return yield* Effect.fail(
-          playerError('the supervisor returned a non-object JSON response')
-        );
+      const decoded = yield* Effect.mapError(
+        Schema.decodeUnknown(Schema.parseJson(Schema.Unknown))(text),
+        (cause) => playerError(`invalid supervisor response: ${String(cause)}`)
+      );
+      if (!isJsonObject(decoded)) {
+        return yield* playerError('the supervisor returned a non-object JSON response');
       }
+      const parsed = decoded;
       const headerRecord: Record<string, string> = {};
       response.headers.forEach((headerValue, name) => {
         headerRecord[name.toLowerCase()] = headerValue;
@@ -239,29 +243,32 @@ const makeApi = (fetchImpl: typeof fetch): HttpApi => {
 // message rather than silently degrading to the untrusted default — the
 // resulting certificate error would point everywhere but the actual cause.
 
+const configValue = (name: string): string | undefined =>
+  Option.getOrUndefined(Effect.runSync(Config.option(Config.string(name))));
+
 const workspaceRoot = (): string => {
-  const configured = process.env['PLAY_ROOT']?.trim();
+  const configured = configValue('PLAY_ROOT')?.trim();
   return configured !== undefined && configured !== '' ? configured : process.cwd();
 };
 
-const configuredCaPath = (): string | undefined => {
-  const explicit = process.env['PLAY_TLS_CA'];
-  if (explicit !== undefined) {
-    const trimmed = explicit.trim();
-    return trimmed === '' ? undefined : trimmed;
-  }
-  const root = workspaceRoot();
-  const parsed: unknown = Either.getOrElse(
-    Either.try(
-      (): unknown => JSON.parse(fs.readFileSync(path.join(root, '.playconfig.json'), 'utf8'))
-    ),
-    () => undefined
-  );
-  if (!isJsonObject(parsed)) return undefined;
-  const configured = parsed['tls_ca'];
-  if (typeof configured !== 'string' || configured === '') return undefined;
-  return path.isAbsolute(configured) ? configured : path.join(root, configured);
-};
+const configuredCaPath = (): Effect.Effect<string | undefined> =>
+  Effect.gen(function* () {
+    const explicit = configValue('PLAY_TLS_CA');
+    if (explicit !== undefined) {
+      const trimmed = explicit.trim();
+      return trimmed === '' ? undefined : trimmed;
+    }
+    const root = workspaceRoot();
+    const text = yield* Effect.orElseSucceed(
+      fileSystem.readFileString(path.join(root, '.playconfig.json')),
+      () => ''
+    );
+    const parsed = Schema.decodeUnknownEither(Schema.parseJson(JsonObjectSchema))(text);
+    if (Either.isLeft(parsed)) return undefined;
+    const configured = field(parsed.right, 'tls_ca');
+    if (!isJsonString(configured) || configured === '') return undefined;
+    return path.isAbsolute(configured) ? configured : path.join(root, configured);
+  });
 
 /**
  * Wrap a fetch so every request trusts the configured private CA.  The CA is
@@ -270,20 +277,19 @@ const configuredCaPath = (): string | undefined => {
  */
 export const caTrustedFetch = (fetchImpl: typeof fetch): typeof fetch =>
   Object.assign(
-    (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-      const caPath = configuredCaPath();
-      if (caPath === undefined) return fetchImpl(input, init);
-      const ca = Either.getOrThrowWith(
-        Either.try(() => fs.readFileSync(caPath, 'utf8')),
-        (cause: unknown) =>
-          new Error(
-            `the configured TLS CA ${caPath} is unreadable ` +
-              `(${cause instanceof Error ? cause.message : String(cause)}); ` +
-              'fix PLAY_TLS_CA or the workspace .playconfig.json tls_ca entry'
-          )
-      );
-      return fetchImpl(input, { ...init, tls: { ca } });
-    },
+    (input: string | URL | Request, init?: RequestInit): Promise<Response> =>
+      Effect.runPromise(configuredCaPath()).then((caPath) => {
+        if (caPath === undefined) return fetchImpl(input, init);
+        return Effect.runPromise(Effect.either(fileSystem.readFileString(caPath))).then((read) => {
+          if (Either.isLeft(read)) {
+            throw new Error(
+              `the configured TLS CA ${caPath} is unreadable (${String(read.left)}); ` +
+                'fix PLAY_TLS_CA or the workspace .playconfig.json tls_ca entry'
+            );
+          }
+          return fetchImpl(input, { ...init, tls: { ca: read.right } });
+        });
+      }),
     { preconnect: fetch.preconnect }
   );
 

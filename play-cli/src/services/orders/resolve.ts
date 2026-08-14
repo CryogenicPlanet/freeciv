@@ -16,16 +16,13 @@
 import { Effect } from 'effect';
 import { ACTION_ALIAS_RE, ACTOR_ID_RE, ENTITY_ALIAS_RE } from 'src/constants';
 import { playerError, type LockTimeoutError, type PlayerError } from 'src/errors';
-import { field, type JsonObject, type JsonValue } from 'src/schema/primitives';
+import { field, isJsonString, type JsonObject, type JsonValue } from 'src/schema/primitives';
 import { aliasMap } from 'src/services/aliases';
 import { expandAlias, expandActionAlias } from 'src/services/alias-expand';
 import type { LegalPageFetcher } from 'src/services/alias-refresh';
-import { PrivateFs } from 'src/services/private-fs';
-import {
-  SessionStore,
-  type Session,
-  type V2ClientState,
-} from 'src/services/session-store';
+import type { PrivateFs } from 'src/services/private-fs';
+import { SessionStore } from 'src/services/session-store';
+import type { Session, V2ClientState } from 'src/services/session-store';
 import {
   casefold,
   orderUnresolved,
@@ -95,9 +92,7 @@ export const resolveOrder = (
       const actionId = yield* expandActionAlias(state, first, sessionPath);
       pool = pool.filter((item) => compactText(item, 'action_id') === actionId);
       if (pool.length === 0) {
-        return yield* Effect.fail(
-          orderUnresolved(`${first} names an action this seat no longer holds`)
-        );
+        return yield* orderUnresolved(`${first} names an action this seat no longer holds`);
       }
       values = tokens.slice(1);
     } else {
@@ -105,33 +100,29 @@ export const resolveOrder = (
       if (ENTITY_ALIAS_RE.test(first) || ACTOR_ID_RE.test(first)) {
         actorId = yield* expandAlias(state, first, sessionPath);
         if (!ACTOR_ID_RE.test(actorId)) {
-          return yield* Effect.fail(
-            orderUnresolved(`${first} is not a unit, city, or player this seat can act as`)
+          return yield* orderUnresolved(
+            `${first} is not a unit, city, or player this seat can act as`
           );
         }
         if (rest.length === 0) {
-          return yield* Effect.fail(
-            orderUnresolved(
-              `${first} names an actor but no verb; write \`${first} <verb> [arguments]\``,
-              actorId
-            )
+          return yield* orderUnresolved(
+            `${first} names an actor but no verb; write \`${first} <verb> [arguments]\``,
+            actorId
           );
         }
-        verb = rest[0] as string;
+        verb = rest[0] ?? '';
         rest = rest.slice(1);
         pool = pool.filter((item) => orderActor(item) === actorId);
         if (pool.length === 0) {
-          return yield* Effect.fail(
-            orderUnresolved(`no cached action belongs to ${first}`, actorId)
-          );
+          return yield* orderUnresolved(`no cached action belongs to ${first}`, actorId);
         }
       } else if (V2_ACTION_FAMILIES.has(casefold(first)) && rest.length > 0) {
         const family = casefold(first);
-        verb = rest[0] as string;
+        verb = rest[0] ?? '';
         rest = rest.slice(1);
         pool = pool.filter((item) => kindHead(compactText(item, 'kind')) === family);
         if (pool.length === 0) {
-          return yield* Effect.fail(orderUnresolved(`no cached ${family} action`));
+          return yield* orderUnresolved(`no cached ${family} action`);
         }
       } else {
         verb = first;
@@ -140,30 +131,27 @@ export const resolveOrder = (
       // `selector` is a word the agent typed, so the lookup must be a dict
       // lookup and not a prototype walk: CPython's `.get("toString")` is a
       // miss, and the miss is what routes the word to the catalog's own verbs.
-      const tier1 = Object.hasOwn(V2_TIER1_VERBS, selector)
-        ? V2_TIER1_VERBS[selector]
-        : undefined;
+      const tier1 = Object.entries(V2_TIER1_VERBS).find(([word]) => word === selector)?.[1];
       if (tier1 !== undefined) {
         pool = pool.filter(
           (item) =>
             compactText(item, 'kind') === tier1.kind && orderOperation(item) === tier1.operation
         );
         if (pool.length === 0) {
-          return yield* Effect.fail(
-            orderUnresolved(
-              `\`${verb}\` names ${tier1.kind}/${tier1.operation}, ` +
-                "which this seat's cached catalog does not advertise " +
-                (actorId !== '' ? `for ${first}` : 'here'),
-              actorId
-            )
+          return yield* orderUnresolved(
+            `\`${verb}\` names ${tier1.kind}/${tier1.operation}, ` +
+              "which this seat's cached catalog does not advertise " +
+              (actorId !== '' ? `for ${first}` : 'here'),
+            actorId
           );
         }
         defaults = tier1.arguments;
       } else {
         pool = pool.filter((item) => orderVerbs(item).has(selector));
         if (pool.length === 0) {
-          return yield* Effect.fail(
-            orderUnresolved(`no cached action advertises the verb \`${verb}\``, actorId)
+          return yield* orderUnresolved(
+            `no cached action advertises the verb \`${verb}\``,
+            actorId
           );
         }
       }
@@ -182,8 +170,9 @@ export const resolveOrder = (
             if (keys.includes(key)) narrowed.push(item);
           }
           if (narrowed.length === 0) {
-            return yield* Effect.fail(
-              orderUnresolved(`no cached \`${verb}\` action targets ${head}`, actorId)
+            return yield* orderUnresolved(
+              `no cached \`${verb}\` action targets ${head}`,
+              actorId
             );
           }
           pool = narrowed;
@@ -202,15 +191,13 @@ export const resolveOrder = (
     const matches: Array<readonly [JsonObject, JsonObject]> = [];
     for (const item of pool) {
       const args = yield* orderMatch(item, values, defaults, element);
-      if (args !== null) matches.push([item, args] as const);
+      if (args !== null) matches.push([item, args]);
     }
     if (matches.length === 0) {
-      return yield* Effect.fail(
-        orderUnresolved(
-          `no cached action takes those arguments; ` +
-            `${pool.length} candidate(s) matched the verb`,
-          actorId
-        )
+      return yield* orderUnresolved(
+        `no cached action takes those arguments; ` +
+          `${pool.length} candidate(s) matched the verb`,
+        actorId
       );
     }
     if (matches.length > 1) {
@@ -220,16 +207,17 @@ export const resolveOrder = (
         .map(([item]) => aliases[compactText(item, 'action_id')] ?? '')
         .filter((alias) => alias !== '')
         .join(' ');
-      return yield* Effect.fail(
-        orderUnresolved(
-          `${matches.length} cached actions match; name exactly one by its ` +
-            `alias${named !== '' ? `: ${named}` : ''}`,
-          actorId
-        )
+      return yield* orderUnresolved(
+        `${matches.length} cached actions match; name exactly one by its ` +
+          `alias${named !== '' ? `: ${named}` : ''}`,
+        actorId
       );
     }
-    const [compact, args] = matches[0] as readonly [JsonObject, JsonObject];
-    return yield* orderResolution(compact, text, args);
+    const match = matches[0];
+    if (match === undefined) {
+      return yield* orderUnresolved('no cached action takes those arguments', actorId);
+    }
+    return yield* orderResolution(match[0], text, match[1]);
   });
 
 // ---------------------------------------------------------------------------
@@ -270,7 +258,7 @@ export const orderFetchTargets = (
   outcomes: ReadonlyArray<OrderOutcome>
 ): ReadonlyArray<string> => {
   const drained = new Set(
-    state.drained_actors.filter((value): value is string => typeof value === 'string')
+    state.drained_actors.filter(isJsonString)
   );
   const wanted: string[] = [];
   for (const outcome of outcomes) {
@@ -302,9 +290,13 @@ export const resolveOrders = (
     const outcomes = yield* orderOutcomes(deps, state, sessionPath, orders);
     if (outcomes.some((outcome) => outcome.resolved === null)) {
       const report = yield* unresolvedReport(sessionPath, state, outcomes);
-      return yield* Effect.fail(playerError(report.join('\n')));
+      return yield* playerError(report.join('\n'));
     }
-    return outcomes.map((outcome) => outcome.resolved as ResolvedOrder);
+    const resolved: ResolvedOrder[] = [];
+    for (const outcome of outcomes) {
+      if (outcome.resolved !== null) resolved.push(outcome.resolved);
+    }
+    return resolved;
   });
 
 // ---------------------------------------------------------------------------
@@ -340,17 +332,17 @@ export const resolveOrdersFetching = (
     if (targets.length === 0) {
       if (outcomes.some((outcome) => outcome.resolved === null)) {
         const report = yield* unresolvedReport(sessionPath, state, outcomes);
-        return yield* Effect.fail(playerError(report.join('\n')));
+        return yield* playerError(report.join('\n'));
       }
-      return {
-        resolved: outcomes.map((outcome) => outcome.resolved as ResolvedOrder),
-        state,
-        notes,
-      };
+      const resolved: ResolvedOrder[] = [];
+      for (const outcome of outcomes) {
+        if (outcome.resolved !== null) resolved.push(outcome.resolved);
+      }
+      return { resolved, state, notes };
     }
     const aliases = new Map<string, string>();
     for (const [alias, identifier] of Object.entries(state.entity_aliases)) {
-      if (typeof identifier === 'string') aliases.set(identifier, alias);
+      if (isJsonString(identifier)) aliases.set(identifier, alias);
     }
     let current = state;
     const grown = [...notes];

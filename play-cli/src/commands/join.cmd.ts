@@ -16,11 +16,10 @@
  * binding: from here every command in this workspace resolves this seat by
  * itself, which is why the card never prints the session path.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
+import { fileSystem, path } from 'src/services/platform';
 import { Command, Options } from '@effect/cli';
-import { Console, Effect, Either } from 'effect';
-import { PlayerError, playerError } from 'src/errors';
+import { Console, Effect, Either, Schema } from 'effect';
+import { type PlayerError, playerError } from 'src/errors';
 import { FULL_CONTROL_V2, GAME_ID_RE, STRATEGIC_V1, TERMINAL_STATES } from 'src/constants';
 import { dualText, resolveDual } from 'src/options';
 import { joinGuidance, renderJoin, seatBindingLine } from 'src/render/join';
@@ -36,11 +35,23 @@ import {
   gameId as validGameId,
   sessionKey,
 } from 'src/services/session-store';
-import { isJsonObject, type JsonObject, type JsonValue } from 'src/schema/primitives';
+import {
+  field,
+  isJsonBoolean,
+  isJsonNumber,
+  isJsonObject,
+  isJsonString,
+  isWholeNumber,
+  type JsonObject,
+  type MutableJsonObject,
+  type JsonValue,
+} from 'src/schema/primitives';
 
 // ---------------------------------------------------------------------------
 // Arguments
 // ---------------------------------------------------------------------------
+
+const refuse = (error: PlayerError): Effect.Effect<void, PlayerError> => Effect.asVoid(error);
 
 export interface JoinArgs {
   readonly gameId: string;
@@ -67,8 +78,7 @@ const PLAYCONFIG_INVALID =
   'the repository root';
 
 const isPlace = (value: JsonValue | undefined): boolean =>
-  value === null ||
-  (typeof value === 'number' && Number.isInteger(value) && value >= 1);
+  value === null || (value !== undefined && isWholeNumber(value) && value >= 1);
 
 /**
  * Fill omitted join identity from `.playconfig.json` when present.
@@ -82,54 +92,60 @@ export const applyPlayDefaults = (
   workspace: WorkspacePaths,
   args: PlayIdentity
 ): Effect.Effect<PlayIdentity, PlayerError> =>
-  Effect.suspend(() => {
+  Effect.gen(function* () {
     const target = path.join(workspace.root, '.playconfig.json');
-    const present = Either.getOrElse(
-      Either.try(() => fs.statSync(target).isFile()),
-      () => false
-    );
-    if (!present) return Effect.succeed(args);
+    const present = yield* Effect.match(fileSystem.stat(target), {
+      onFailure: () => false,
+      onSuccess: (info) => info.type === 'File',
+    });
+    if (!present) return args;
     // `read_text(encoding="utf-8")` is strict, and `except ValueError` catches
     // the `UnicodeDecodeError` it raises.  Node's `'utf8'` reader would
     // substitute U+FFFD and accept a config CPython refuses, so the decode is
     // `fatal` here too (NOTES §12.8).
-    const raw = Either.mapLeft(
-      Either.try(
-        (): unknown =>
-          JSON.parse(
-            new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(
-              fs.readFileSync(target)
-            )
-          )
-      ),
-      (cause) => (cause instanceof Error ? cause.message : String(cause))
+    const bytes = yield* Effect.either(fileSystem.readFile(target));
+    const decoded = Either.flatMap(
+      Either.mapLeft(bytes, String),
+      (content) =>
+        Either.mapLeft(
+          Either.try(() =>
+            new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(content)
+          ),
+          String
+        )
+    );
+    const raw = Either.flatMap(decoded, (text) =>
+      Either.mapLeft(
+        Schema.decodeUnknownEither(Schema.parseJson(Schema.Unknown))(text),
+        String
+      )
     );
     if (Either.isLeft(raw)) {
-      return Effect.fail(playerError(`invalid .playconfig.json: ${raw.left}`));
+      return yield* playerError(`invalid .playconfig.json: ${raw.left}`);
     }
+    if (!isJsonObject(raw.right)) return yield* playerError(PLAYCONFIG_INVALID);
     const value = raw.right;
-    if (!isJsonObject(value)) return Effect.fail(playerError(PLAYCONFIG_INVALID));
-    const configuredGame = value['game_id'];
-    const configuredName = value['name'];
-    const configuredPlace = value['place'];
+    const configuredGame = field(value, 'game_id');
+    const configuredName = field(value, 'name');
+    const configuredPlace = field(value, 'place');
     if (
       value['schema_version'] !== 1 ||
-      typeof configuredGame !== 'string' ||
+      !isJsonString(configuredGame) ||
       !GAME_ID_RE.test(configuredGame) ||
-      typeof configuredName !== 'string' ||
+      !isJsonString(configuredName) ||
       pyStrip(configuredName) === '' ||
       !isPlace(configuredPlace === undefined ? null : configuredPlace)
     ) {
-      return Effect.fail(playerError(PLAYCONFIG_INVALID));
+      return yield* playerError(PLAYCONFIG_INVALID);
     }
-    return Effect.succeed({
+    return {
       gameId: pyStrip(args.gameId) === '' ? configuredGame : args.gameId,
       name: pyStrip(args.name) === '' ? configuredName : args.name,
       place:
-        pyStrip(args.place) === '' && typeof configuredPlace === 'number'
+        pyStrip(args.place) === '' && isJsonNumber(configuredPlace)
           ? String(configuredPlace)
           : args.place,
-    });
+    };
   });
 
 // ---------------------------------------------------------------------------
@@ -147,14 +163,14 @@ const pyRepr = (value: JsonValue): string => {
   if (value === null) return 'None';
   if (value === true) return 'True';
   if (value === false) return 'False';
-  if (typeof value !== 'string') return compactJson(value);
+  if (!isJsonString(value)) return compactJson(value);
   const escaped = value.replace(/\\/g, '\\\\');
   return escaped.includes("'") && !escaped.includes('"')
     ? `"${escaped}"`
     : `'${escaped.replace(/'/g, "\\'")}'`;
 };
 
-const isFilledString = (value: JsonValue): boolean => typeof value === 'string' && value !== '';
+const isFilledString = (value: JsonValue): boolean => isJsonString(value) && value !== '';
 
 const staleInvite = (gameId: string): string =>
   '\nThe game invitation may be stale. Ask the game ' +
@@ -222,14 +238,12 @@ export const commandJoin = (
     );
     const base = invitation.base;
 
-    yield* Effect.catchAll(
+    yield* Effect.mapError(
       http.requestJson('GET', `${base}/health`, { timeout: 3 }),
       (error) =>
-        Effect.fail(
           playerError(
             `${error.message}\nThe assigned game cannot be joined. Stop and tell the user.`
           )
-        )
     );
 
     const status = yield* http.requestJson('GET', `${base}/v1/games/${game}/status`, {
@@ -238,37 +252,32 @@ export const commandJoin = (
     const declared = pick(status, 'control_protocol');
     const controlProtocol = declared === null ? STRATEGIC_V1 : declared;
     if (controlProtocol !== STRATEGIC_V1 && controlProtocol !== FULL_CONTROL_V2) {
-      return yield* Effect.fail(
+      yield* refuse(
         playerError(`game requires unsupported control protocol ${pyRepr(controlProtocol)}`)
       );
+      return;
     }
 
-    const body: JsonObject = {
-      controller_label: controller,
-      ...(controlProtocol === FULL_CONTROL_V2
-        ? { supported_control_protocols: [FULL_CONTROL_V2] }
-        : {}),
-      ...(identity.place === ''
-        ? {}
-        : {
-            place: /^[0-9]+$/.test(identity.place)
-              ? Number.parseInt(identity.place, 10)
-              : identity.place,
-          }),
-    };
+    const body: MutableJsonObject = { controller_label: controller };
+    if (controlProtocol === FULL_CONTROL_V2) {
+      body['supported_control_protocols'] = [FULL_CONTROL_V2];
+    }
+    if (identity.place !== '') {
+      body['place'] = /^[0-9]+$/.test(identity.place)
+        ? Number.parseInt(identity.place, 10)
+        : identity.place;
+    }
 
-    const result = yield* Effect.catchAll(
+    const result = yield* Effect.mapError(
       http.requestJson('POST', `${base}/v1/games/${game}/join`, {
         token: invitation.token,
         body,
         timeout: 30,
       }),
       (error) =>
-        Effect.fail(
           error.message.startsWith('HTTP 401:') || error.message.startsWith('HTTP 403:')
             ? playerError(`${error.message}${staleInvite(game)}`)
             : error
-        )
     );
 
     const core: JsonObject = {
@@ -290,23 +299,26 @@ export const commandJoin = (
     };
 
     if (!(['game_id', 'agent_id', 'agent_token'] as const).every((key) => isFilledString(pick(core, key)))) {
-      return yield* Effect.fail(playerError('the supervisor returned an incomplete join response'));
+      yield* refuse(playerError('the supervisor returned an incomplete join response'));
+      return;
     }
     if (core['game_id'] !== game) {
-      return yield* Effect.fail(playerError('the join response belongs to a different game'));
+      yield* refuse(playerError('the join response belongs to a different game'));
+      return;
     }
     if (core['controller_label'] !== controller) {
-      return yield* Effect.fail(
-        playerError(
-          'the join response controller label does not match the requested ' +
-            'harness-model identity'
-        )
-      );
+      yield*
+        refuse(
+          playerError(
+            'the join response controller label does not match the requested ' +
+              'harness-model identity'
+          )
+        );
+      return;
     }
     if (core['control_protocol'] !== controlProtocol) {
-      return yield* Effect.fail(
-        playerError('the join result changed the preflight control protocol')
-      );
+      yield* refuse(playerError('the join result changed the preflight control protocol'));
+      return;
     }
 
     const evaluation =
@@ -330,29 +342,29 @@ export const commandJoin = (
         !supported.includes(FULL_CONTROL_V2) ||
         supported.some((item) => !isFilledString(item))
       ) {
-        return yield* Effect.fail(
-          playerError('the v2 join result omitted the negotiated protocol')
-        );
+        yield* refuse(playerError('the v2 join result omitted the negotiated protocol'));
+        return;
       }
-      const available = result['v2_transport_available'];
-      if (typeof available !== 'boolean') {
-        return yield* Effect.fail(
-          playerError('the v2 join result omitted transport availability')
-        );
+      const available = field(result, 'v2_transport_available');
+      if (!isJsonBoolean(available)) {
+        yield* refuse(playerError('the v2 join result omitted transport availability'));
+        return;
       }
       const state = pick(result, 'state');
       if (
         !
         available ||
-        (typeof state === 'string' && TERMINAL_STATES.has(state)) ||
+        (isJsonString(state) && TERMINAL_STATES.has(state)) ||
         pick(result, 'error') !== null
       ) {
-        return yield* Effect.fail(
-          playerError(
-            'the full-control-v2 transport did not become playable; ' +
-              'stop and tell the game owner'
-          )
-        );
+        yield*
+          refuse(
+            playerError(
+              'the full-control-v2 transport did not become playable; ' +
+                'stop and tell the game owner'
+            )
+          );
+        return;
       }
       const prefix = `${base}/v2/games/${game}/me`;
       const endpoints: ReadonlyArray<readonly [string, string]> = [
@@ -366,9 +378,9 @@ export const commandJoin = (
       ];
       for (const [name, expected] of endpoints) {
         if (result[name] !== expected) {
-          return yield* Effect.fail(
-            playerError(`the v2 join result has an invalid same-origin ${name}`)
-          );
+          yield*
+            refuse(playerError(`the v2 join result has an invalid same-origin ${name}`));
+          return;
         }
       }
     }

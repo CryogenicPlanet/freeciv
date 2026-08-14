@@ -19,7 +19,7 @@
 import { Effect } from 'effect';
 import type { PlayerError } from 'src/errors';
 import type { PageScope } from 'src/schema/page';
-import { field, isJsonObject, type JsonObject, type JsonValue } from 'src/schema/primitives';
+import { field, isJsonObject, isJsonString, type JsonObject, type JsonValue } from 'src/schema/primitives';
 import type { Revision } from 'src/schema/revision';
 import type { LegalActionDescriptor } from 'src/schema/descriptor';
 import type { LegalActionPageEnvelope } from 'src/schema/page';
@@ -115,7 +115,7 @@ const descriptorActorId = (descriptor: JsonObject): string | null => {
   const subject = field(descriptor, 'subject');
   const actor = isJsonObject(subject) ? field(subject, 'actor') : null;
   const actorId = isJsonObject(actor) ? field(actor, 'id') : null;
-  return typeof actorId === 'string' ? actorId : null;
+  return isJsonString(actorId) ? actorId : null;
 };
 
 /** Every cached descriptor whose subject names this actor. */
@@ -248,7 +248,7 @@ export const catalogEquivalence = (
     }
     const signature = yield* catalogSignature(result.actions, scope, aliases, deps);
     for (const otherValue of drained) {
-      if (typeof otherValue !== 'string' || otherValue === actorId) continue;
+      if (!isJsonString(otherValue) || otherValue === actorId) continue;
       const descriptors = cachedActorCatalog(state, otherValue);
       if (descriptors.length !== signature.choices.length) continue;
       const otherType = idPrefix(otherValue);

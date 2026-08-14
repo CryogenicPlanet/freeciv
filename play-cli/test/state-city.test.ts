@@ -12,8 +12,6 @@
  * the whole point of the section is that the surviving columns explain where
  * the shields went.  So the tables are asserted as whole lines.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect } from 'effect';
 import { renderStatePage, type StatePageValue } from 'src/render/state/page';
@@ -25,13 +23,17 @@ import type { JsonObject } from 'src/schema/primitives';
 import type { Revision } from 'src/schema/revision';
 import { PrivateFs, privateFsFor } from 'src/services/private-fs';
 import { scratchWorkspace, type Scratch } from 'test/_fixtures';
+import { effectTest } from 'test/_effect-test';
+import { path } from 'test/_test-platform';
 
 const NO_FILES = privateFsFor({ root: '/nonexistent', stateRoot: '/nonexistent/.sessions' });
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() =>
+  Effect.runPromise(
+    Effect.asVoid(Effect.all(scratches.splice(0).map((scratch) => scratch.cleanup)))
+  )
+);
 
 const revision = (number: number, turn: number): Revision => ({
   turn,
@@ -53,6 +55,12 @@ const statePage = (
     cursor_expires_at: null,
   },
 });
+
+const granaryText = (storage: JsonValue, food: number): string =>
+  Effect.runSync(cityGranaryText({ food_storage: storage }, { food }));
+
+const outputRows = (outputs: JsonValue): ReadonlyArray<string> =>
+  table(Effect.runSync(cityOutputRows(outputs)));
 
 const rendered = (
   value: StatePageValue,
@@ -255,12 +263,10 @@ describe('city_detail', () => {
   });
 
   test('a granary with no growth at all says so, and a full one says why', () => {
-    const text = (storage: JsonValue, food: number): string =>
-      Effect.runSync(cityGranaryText({ food_storage: storage }, { food }));
-    expect(text({ stock: 5, granary_size: 20, growth_turns: null }, 0)).toBe(
+    expect(granaryText({ stock: 5, granary_size: 20, growth_turns: null }, 0)).toBe(
       'granary 5/20 food +0/turn no growth'
     );
-    expect(text({ stock: 20, granary_size: 20, growth_turns: 0 }, 3)).toBe(
+    expect(granaryText({ stock: 20, granary_size: 20, growth_turns: 0 }, 3)).toBe(
       'granary 20/20 food +3/turn !full, growth blocked'
     );
   });
@@ -280,11 +286,8 @@ describe('city_detail', () => {
 // ---------------------------------------------------------------------------
 
 describe('cityOutputRows', () => {
-  const rows = (outputs: JsonValue): ReadonlyArray<string> =>
-    table(Effect.runSync(cityOutputRows(outputs)));
-
   test('a chain step that merely repeats the step before it is dropped', () => {
-    expect(rows(cityOutputs({ food: [3, 3, 2, 1, 0, 0] }))).toEqual([
+    expect(outputRows(cityOutputs({ food: [3, 3, 2, 1, 0, 0] }))).toEqual([
       'output  base  used  surplus',
       'food    3     1     +2',
     ]);
@@ -297,7 +300,7 @@ describe('cityOutputRows', () => {
   });
 
   test('an output the chain does not name sorts after the ones it does', () => {
-    const lines = rows(
+    const lines = outputRows(
       cityOutputs({ pollution: [1, 1, 1, 0, 0, 0], food: [2, 2, 2, 0, 0, 0] })
     );
     expect(lines[1]).toContain('food');
@@ -428,59 +431,70 @@ const CHOICES: ReadonlyArray<JsonObject> = [
 ];
 
 /** Write the `cities` mirror table this seat would have written at `at`. */
-const stageCitiesMirror = (scratch: Scratch, sessionPath: string, at: Revision | null): void => {
+const stageCitiesMirror = (
+  scratch: Scratch,
+  sessionPath: string,
+  at: Revision | null
+): Effect.Effect<void> => {
   const directory = path.join(path.dirname(sessionPath), path.basename(sessionPath, '.json'));
-  fs.mkdirSync(path.join(directory, 'state'), { recursive: true, mode: 0o700 });
   const stamp = at === null ? '# rev - turn -' : `# rev ${at.revision} turn ${at.turn}`;
-  fs.writeFileSync(
-    path.join(directory, ...CITIES_MIRROR_FILE),
-    `${stamp}\n# cities 1/1 complete\n` +
-      'alias\tcity\tpos\tsize\tbuilding\tshields\tsurplus\tbuy\n' +
-      'c1   \tLondon\t31,72\t3\tMusketeers\t25/30\tf1 s2 t3\t12\n',
-    { mode: 0o600 }
-  );
-  void scratch;
+  return Effect.asVoid(
+    scratch.files.writeText(
+      path.join(directory, ...CITIES_MIRROR_FILE),
+      `${stamp}\n# cities 1/1 complete\n` +
+        'alias\tcity\tpos\tsize\tbuilding\tshields\tsurplus\tbuy\n' +
+        'c1   \tLondon\t31,72\t3\tMusketeers\t25/30\tf1 s2 t3\t12\n'
+    )
+  ).pipe(Effect.orDie);
 };
 
 describe('city_build_choices', () => {
-  test('the forfeit is stated only when the mirror stands at this page revision', () => {
-    const scratch = scratchWorkspace();
-    scratches.push(scratch);
-    const sessionPath = path.join(scratch.workspace.stateRoot, 'session.json');
-    const at = revision(19, 4);
-    stageCitiesMirror(scratch, sessionPath, at);
-    const lines = rendered(
-      statePage('city_build_choices', CHOICES, at),
-      { [CITY_ONE]: 'c1' },
-      sessionPath,
-      scratch.files
-    );
-    expect(lines).toEqual([
-      'rev19/t4 city_build_choices 2/2 complete',
-      'stock 25 shields; a switch to another production class forfeits half of it',
-      '#  name        kind         shields  turns  note',
-      '1  City Walls  improvement  60       12     !forfeits 13 of 25 shields !upkeep gold 1',
-      '2  Musketeers  unit         30       1      !worklist only !upkeep shields 1 !unhappy 1',
-    ]);
-    for (const line of lines) expect(line.length).toBeLessThanOrEqual(120);
-  });
+  effectTest('the forfeit is stated only when the mirror stands at this page revision', () =>
+    Effect.gen(function* () {
+      const scratch = yield* scratchWorkspace();
+      scratches.push(scratch);
+      const sessionPath = path.join(scratch.workspace.stateRoot, 'session.json');
+      const at = revision(19, 4);
+      yield* stageCitiesMirror(scratch, sessionPath, at);
+      const lines = yield* Effect.provideService(
+        renderStatePage(statePage('city_build_choices', CHOICES, at), {
+          aliases: { [CITY_ONE]: 'c1' },
+          sessionPath,
+        }),
+        PrivateFs,
+        scratch.files
+      );
+      expect(lines).toEqual([
+        'rev19/t4 city_build_choices 2/2 complete',
+        'stock 25 shields; a switch to another production class forfeits half of it',
+        '#  name        kind         shields  turns  note',
+        '1  City Walls  improvement  60       12     !forfeits 13 of 25 shields !upkeep gold 1',
+        '2  Musketeers  unit         30       1      !worklist only !upkeep shields 1 !unhappy 1',
+      ]);
+      for (const line of lines) expect(line.length).toBeLessThanOrEqual(120);
+    })
+  );
 
-  test('one revision on, the mirror stock is a memory and no forfeit is claimed', () => {
-    const scratch = scratchWorkspace();
-    scratches.push(scratch);
-    const sessionPath = path.join(scratch.workspace.stateRoot, 'session.json');
-    stageCitiesMirror(scratch, sessionPath, revision(19, 4));
-    const lines = rendered(
-      statePage('city_build_choices', CHOICES, revision(21, 4)),
-      { [CITY_ONE]: 'c1' },
-      sessionPath,
-      scratch.files
-    );
-    const body = lines.join('\n');
-    expect(body).not.toContain('forfeits');
-    expect(body).not.toContain('stock 25 shields');
-    expect(body).toContain('keep 12');
-  });
+  effectTest('one revision on, the mirror stock is a memory and no forfeit is claimed', () =>
+    Effect.gen(function* () {
+      const scratch = yield* scratchWorkspace();
+      scratches.push(scratch);
+      const sessionPath = path.join(scratch.workspace.stateRoot, 'session.json');
+      yield* stageCitiesMirror(scratch, sessionPath, revision(19, 4));
+      const lines = yield* Effect.provideService(
+        renderStatePage(statePage('city_build_choices', CHOICES, revision(21, 4)), {
+          aliases: { [CITY_ONE]: 'c1' },
+          sessionPath,
+        }),
+        PrivateFs,
+        scratch.files
+      );
+      const body = lines.join('\n');
+      expect(body).not.toContain('forfeits');
+      expect(body).not.toContain('stock 25 shields');
+      expect(body).toContain('keep 12');
+    })
+  );
 
   test('no mirror at all is the same answer as a stale one: keep, never forfeit', () => {
     const lines = rendered(statePage('city_build_choices', CHOICES, revision(19, 4)), {

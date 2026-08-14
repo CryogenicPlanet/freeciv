@@ -26,13 +26,17 @@
  * {game_id}` — because the agent reading the refusal cannot run it and has to
  * quote it to the game owner verbatim.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import { Effect } from 'effect';
-import { PlayerError, playerError, attemptOr } from 'src/errors';
+import type { FileSystem } from '@effect/platform';
+import { fileSystem, path } from 'src/services/platform';
+import { Effect, Either, Schema } from 'effect';
+import { type PlayerError, playerError } from 'src/errors';
 import { serviceUrl } from 'src/services/http';
 import { expandUser, type WorkspacePaths } from 'src/services/private-fs';
-import { isJsonObject, type JsonObject } from 'src/schema/primitives';
+import {
+  isJsonString,
+  JsonObjectSchema,
+  type JsonObject,
+} from 'src/schema/primitives';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -141,27 +145,20 @@ export const pyStrip = (text: string): string =>
 const isInside = (parent: string, child: string): boolean =>
   child === parent || child.startsWith(parent + path.sep);
 
-const lstatOrNull = (target: string): fs.Stats | null => {
-  return attemptOr(
-      () => fs.lstatSync(target),
-      () => null
-  );
-};
+interface InvitePathInfo {
+  readonly link: string | null;
+  readonly info: FileSystem.File.Info | null;
+}
 
-/** `Path.is_file()` / `Path.stat()` — follows symlinks, on an already-resolved path. */
-const statOrNull = (target: string): fs.Stats | null => {
-  return attemptOr(
-      () => fs.statSync(target),
-      () => null
-  );
-};
-
-const readlinkOrNull = (target: string): string | null => {
-  return attemptOr(
-      () => fs.readlinkSync(target),
-      () => null
-  );
-};
+const inspectPath = (target: string): Effect.Effect<InvitePathInfo> =>
+  Effect.gen(function* () {
+    const link = yield* Effect.either(fileSystem.readLink(target));
+    if (Either.isRight(link)) return { link: link.right, info: null };
+    const info = yield* Effect.either(fileSystem.stat(target));
+    return Either.isRight(info)
+      ? { link: null, info: info.right }
+      : { link: null, info: null };
+  });
 
 // ---------------------------------------------------------------------------
 // `Path.resolve()` — symlinks first, `..` afterwards
@@ -212,57 +209,50 @@ const joinRealpath = (
   start: string,
   rest: string,
   seen: Map<string, string | null>
-): Resolution => {
-  let resolved = start;
-  let remaining = rest;
-  if (remaining.startsWith(SEP)) {
-    remaining = remaining.slice(1);
-    resolved = SEP;
-  }
-  while (remaining !== '') {
-    const cut = remaining.indexOf(SEP);
-    const name = cut === -1 ? remaining : remaining.slice(0, cut);
-    remaining = cut === -1 ? '' : remaining.slice(cut + 1);
-    if (name === '' || name === '.') continue;
-    if (name === '..') {
-      // The parent of what has been resolved SO FAR, which is the whole point.
-      if (resolved === '') {
-        resolved = '..';
-      } else {
-        const [head, tail] = splitPath(resolved);
-        resolved = tail === '..' ? joinPath(joinPath(head, '..'), '..') : head;
-      }
-      continue;
+): Effect.Effect<Resolution> =>
+  Effect.gen(function* () {
+    let resolved = start;
+    let remaining = rest;
+    if (remaining.startsWith(SEP)) {
+      remaining = remaining.slice(1);
+      resolved = SEP;
     }
-    const candidate = joinPath(resolved, name);
-    const metadata = lstatOrNull(candidate);
-    if (metadata === null || !metadata.isSymbolicLink()) {
-      resolved = candidate;
-      continue;
-    }
-    const cached = seen.get(candidate);
-    if (cached !== undefined) {
-      if (cached !== null) {
-        resolved = cached;
+    while (remaining !== '') {
+      const cut = remaining.indexOf(SEP);
+      const name = cut === -1 ? remaining : remaining.slice(0, cut);
+      remaining = cut === -1 ? '' : remaining.slice(cut + 1);
+      if (name === '' || name === '.') continue;
+      if (name === '..') {
+        if (resolved === '') {
+          resolved = '..';
+        } else {
+          const [head, tail] = splitPath(resolved);
+          resolved = tail === '..' ? joinPath(joinPath(head, '..'), '..') : head;
+        }
         continue;
       }
-      // Seen but unresolved: a symlink loop.  Non-strict resolution keeps the
-      // rest of the path as written rather than raising ELOOP.
-      return { path: joinPath(candidate, remaining), ok: false };
+      const candidate = joinPath(resolved, name);
+      const target = yield* Effect.either(fileSystem.readLink(candidate));
+      if (Either.isLeft(target)) {
+        resolved = candidate;
+        continue;
+      }
+      const cached = seen.get(candidate);
+      if (cached !== undefined) {
+        if (cached !== null) {
+          resolved = cached;
+          continue;
+        }
+        return { path: joinPath(candidate, remaining), ok: false };
+      }
+      seen.set(candidate, null);
+      const inner = yield* joinRealpath(resolved, target.right, seen);
+      resolved = inner.path;
+      if (!inner.ok) return { path: joinPath(resolved, remaining), ok: false };
+      seen.set(candidate, resolved);
     }
-    seen.set(candidate, null);
-    const target = readlinkOrNull(candidate);
-    if (target === null) {
-      resolved = candidate;
-      continue;
-    }
-    const inner = joinRealpath(resolved, target, seen);
-    resolved = inner.path;
-    if (!inner.ok) return { path: joinPath(resolved, remaining), ok: false };
-    seen.set(candidate, resolved);
-  }
-  return { path: resolved, ok: true };
-};
+    return { path: resolved, ok: true };
+  });
 
 /**
  * `Path(target).expanduser().resolve()` — `realpath` then `abspath`, exactly as
@@ -270,8 +260,11 @@ const joinRealpath = (
  * directory link, a relative link, a link to `..`, a dangling link, a two-hop
  * loop, `.`/`//`/trailing-slash noise): 25 of 25 paths agree.
  */
-const pathResolve = (target: string): string =>
-  path.resolve(joinRealpath('', expandUser(target), new Map()).path);
+const pathResolve = (target: string): Effect.Effect<string> =>
+  Effect.map(
+    joinRealpath('', expandUser(target), new Map()),
+    (resolution) => path.resolve(resolution.path)
+  );
 
 /** `pathlib`'s `/` — joining, *without* `path.join`'s lexical normalization. */
 const rawJoin = (base: string, name: string): string =>
@@ -287,40 +280,41 @@ const readInviteFile = (
   configured: string,
   explicitToken: string
 ): Effect.Effect<LoadedInvite, PlayerError> =>
-  Effect.suspend(() => {
-    const root = pathResolve(workspace.root);
+  Effect.gen(function* () {
+    const root = yield* pathResolve(workspace.root);
     const inviteRoot = rawJoin(workspace.root, '.invites');
-    const rootMetadata = lstatOrNull(inviteRoot);
-    if (rootMetadata === null) {
-      return Effect.fail(playerError(directoryUnavailable(gameId)));
+    const rootMetadata = yield* inspectPath(inviteRoot);
+    if (rootMetadata.link === null && rootMetadata.info === null) {
+      return yield* playerError(directoryUnavailable(gameId));
     }
-    const resolvedRoot = pathResolve(inviteRoot);
+    const resolvedRoot = yield* pathResolve(inviteRoot);
     if (
-      rootMetadata.isSymbolicLink() ||
-      !rootMetadata.isDirectory() ||
+      rootMetadata.link !== null ||
+      rootMetadata.info?.type !== 'Directory' ||
       !isInside(root, resolvedRoot)
     ) {
-      return Effect.fail(playerError(INVITE_ROOT_NOT_REAL));
+      return yield* playerError(INVITE_ROOT_NOT_REAL);
     }
 
     const named =
       configured === '' ? rawJoin(inviteRoot, `${gameId}.json`) : expandUser(configured);
     const absolute = path.isAbsolute(named) ? named : rawJoin(workspace.root, named);
-    const resolved = pathResolve(absolute);
+    const resolved = yield* pathResolve(absolute);
     if (!isInside(resolvedRoot, resolved)) {
-      return Effect.fail(playerError(INVITE_ESCAPES));
+      return yield* playerError(INVITE_ESCAPES);
     }
 
-    const metadata = statOrNull(resolved);
-    if (metadata === null || !metadata.isFile()) {
+    const inspected = yield* inspectPath(resolved);
+    const metadata = inspected.info;
+    if (inspected.link !== null || metadata?.type !== 'File') {
       // An absent *default* invitation is not yet a failure: an explicit token
       // may still be a complete credential.  An absent *configured* one is.
       return configured === ''
-        ? Effect.succeed<LoadedInvite>({ invite: {}, token: '' })
-        : Effect.fail(playerError(configuredMissing(gameId)));
+        ? { invite: {}, token: '' }
+        : yield* playerError(configuredMissing(gameId));
     }
     if ((metadata.mode & 0o777) !== 0o600) {
-      return Effect.fail(playerError(notPrivate(gameId)));
+      return yield* playerError(notPrivate(gameId));
     }
 
     // `Path.read_text(encoding="utf-8")`, and it is STRICT: Node's `'utf8'`
@@ -332,40 +326,40 @@ const readInviteFile = (
     // credential file.  `ignoreBOM: true` means "do not strip a leading
     // U+FEFF": the utf-8 codec keeps it, and `json.loads` then rejects it,
     // exactly as `JSON.parse` does here.
-    const parsed = attemptOr(
-      (): unknown =>
-        JSON.parse(
-          new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(
-            fs.readFileSync(resolved)
-          )
-        ),
-      () => undefined
-    );
-    if (!isJsonObject(parsed)) {
-      return Effect.fail(playerError(unreadable(gameId)));
-    }
+    const content = yield* Effect.either(fileSystem.readFile(resolved));
+    const decoded = Either.isRight(content)
+      ? Either.getOrElse(
+          Either.try(() =>
+            new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(content.right)
+          ),
+          () => ''
+        )
+      : '';
+    const parsedResult = Schema.decodeUnknownEither(Schema.parseJson(JsonObjectSchema))(decoded);
+    if (Either.isLeft(parsedResult)) return yield* playerError(unreadable(gameId));
+    const parsed = parsedResult.right;
     if (parsed['schema_version'] !== 1) {
-      return Effect.fail(playerError(unsupportedSchema(gameId)));
+      return yield* playerError(unsupportedSchema(gameId));
     }
     if (parsed['game_id'] !== gameId) {
-      return Effect.fail(playerError(differentGame(gameId)));
+      return yield* playerError(differentGame(gameId));
     }
     const stored = parsed['join_token'];
     // With a CLI/environment token in hand the stored one is never used, so a
     // rotted token in an explicitly configured file is not a reason to refuse.
     if (
       explicitToken === '' &&
-      (typeof stored !== 'string' || pyStrip(stored) === '' || stored !== pyStrip(stored))
+      (!isJsonString(stored) || pyStrip(stored) === '' || stored !== pyStrip(stored))
     ) {
-      return Effect.fail(playerError(invalidToken(gameId)));
+      return yield* playerError(invalidToken(gameId));
     }
-    if (typeof parsed['service_url'] !== 'string') {
-      return Effect.fail(playerError(invalidServiceUrl(gameId)));
+    if (!isJsonString(parsed['service_url'])) {
+      return yield* playerError(invalidServiceUrl(gameId));
     }
-    return Effect.succeed<LoadedInvite>({
+    return {
       invite: parsed,
-      token: typeof stored === 'string' ? stored : '',
-    });
+      token: isJsonString(stored) ? stored : '',
+    };
   });
 
 // ---------------------------------------------------------------------------
@@ -392,14 +386,13 @@ export const loadInvitation = (
 
     const token = explicitToken !== '' ? explicitToken : loaded.token;
     if (token === '') {
-      return yield* Effect.fail(playerError(noInvitation(gameId)));
+      return yield*playerError(noInvitation(gameId));
     }
 
     const declared = loaded.invite['service_url'];
     const configuredUrl =
-      loadInvite && typeof declared === 'string' && declared !== '' ? declared : undefined;
-    const base = yield* Effect.catchAll(serviceUrl(configuredUrl, environment), () =>
-      Effect.fail(playerError(invalidServiceUrl(gameId)))
+      loadInvite && isJsonString(declared) && declared !== '' ? declared : undefined;
+    const base = yield* Effect.mapError(serviceUrl(configuredUrl, environment), () =>playerError(invalidServiceUrl(gameId))
     );
     return { token, base };
   });

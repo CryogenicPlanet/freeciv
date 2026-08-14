@@ -8,21 +8,23 @@
  * (762-800).
  *
  * DIVERGENCE (NOTES.md §3): CPython walks the workspace with `openat` +
- * `O_NOFOLLOW` through directory file descriptors; neither Node nor Bun exposes
- * the `*at` family.  The port keeps every property the Python was buying —
- * refuse any symlinked component, refuse a non-directory component, create with
- * mode 0700, write through a temp file and `rename`, enforce mode 0600 on read
- * — by `lstat`-walking each component from the workspace root and opening the
- * final component with `O_NOFOLLOW`.  The difference is TOCTOU width, not
- * reachability: nothing outside `PLAY_STATE_DIR` becomes writable.
+ * `O_NOFOLLOW` through directory file descriptors; Effect Platform does not
+ * expose the `*at` family. The port refuses symlinks before every directory and
+ * final-file access, creates directories with mode 0700, writes through an
+ * exclusive temp file and atomic rename, and enforces mode 0600 on reads. The
+ * difference is TOCTOU width, not intended reachability.
  */
-import * as fs from 'node:fs';
 import * as os from 'node:os';
-import * as path from 'node:path';
-import { Context, Effect, Layer } from 'effect';
-import { PlayerError, playerError, attemptOr } from 'src/errors';
-import { isJsonObject, type JsonObject } from 'src/schema/primitives';
+import type { FileSystem } from '@effect/platform';
+import { Context, Effect, Either, Layer, Schema } from 'effect';
+import { type PlayerError, playerError } from 'src/errors';
+import {
+  JsonObjectSchema,
+  type JsonObject,
+  type JsonValueInput,
+} from 'src/schema/primitives';
 import { indentedJson } from 'src/services/json-output';
+import { fileSystem, path } from 'src/services/platform';
 
 // ---------------------------------------------------------------------------
 // Workspace
@@ -44,14 +46,18 @@ export const expandUser = (value: string): string =>
  * `Path.resolve()` — resolve symlinks without requiring the path to exist, by
  * realpath-ing the longest existing prefix and re-appending the rest.
  */
-export const resolveExisting = (target: string): string => {
+export const resolveExisting = (target: string): Effect.Effect<string> => {
   const absolute = path.resolve(expandUser(target));
-  const walk = (head: string, tail: ReadonlyArray<string>): string =>
-    attemptOr(
-      () => path.join(fs.realpathSync.native(head), ...[...tail].reverse()),
+  const walk = (head: string, tail: ReadonlyArray<string>): Effect.Effect<string> =>
+    Effect.orElse(
+      Effect.map(fileSystem.realPath(head), (resolved) =>
+        path.join(resolved, ...[...tail].toReversed())
+      ),
       () => {
         const parent = path.dirname(head);
-        return parent === head ? absolute : walk(parent, [...tail, path.basename(head)]);
+        return parent === head
+          ? Effect.succeed(absolute)
+          : walk(parent, [...tail, path.basename(head)]);
       }
     );
   return walk(absolute, []);
@@ -60,25 +66,21 @@ export const resolveExisting = (target: string): string => {
 const isInside = (parent: string, child: string): boolean =>
   child === parent || child.startsWith(parent + path.sep);
 
-/**
- * Build the workspace paths.  `root` defaults to the current directory, which
- * is where `just` always invoked `client.py` from; `PLAY_ROOT` overrides it so
- * the CLI can live outside the workspace it plays (NOTES.md §3).
- */
+/** Build the workspace paths from `PLAY_ROOT` and `PLAY_STATE_DIR`. */
 export const workspacePaths = (
   environment: Readonly<Record<string, string | undefined>> = process.env,
   cwd: string = process.cwd()
 ): Effect.Effect<WorkspacePaths, PlayerError> =>
-  Effect.suspend(() => {
+  Effect.gen(function* () {
     const root = path.resolve(expandUser(environment['PLAY_ROOT'] ?? cwd));
     const configured = environment['PLAY_STATE_DIR'] ?? '.sessions';
     const expanded = expandUser(configured);
     const candidate = path.isAbsolute(expanded) ? expanded : path.join(root, expanded);
-    const resolvedRoot = resolveExisting(root);
-    const stateRoot = resolveExisting(candidate);
+    const resolvedRoot = yield* resolveExisting(root);
+    const stateRoot = yield* resolveExisting(candidate);
     return isInside(resolvedRoot, stateRoot)
-      ? Effect.succeed({ root: resolvedRoot, stateRoot })
-      : Effect.fail(playerError('PLAY_STATE_DIR must stay inside the player workspace'));
+      ? { root: resolvedRoot, stateRoot }
+      : yield* playerError('PLAY_STATE_DIR must stay inside the player workspace');
   });
 
 export const WorkspaceLive = Layer.effect(Workspace, workspacePaths());
@@ -100,7 +102,7 @@ export interface StatePath {
   /** The absolute destination inside `stateRoot`. */
   readonly destination: string;
   /** Its components relative to `stateRoot`, at least one long. */
-  readonly relative: ReadonlyArray<string>;
+  readonly relative: readonly [string, ...ReadonlyArray<string>];
 }
 
 const BAD_PARTS: ReadonlySet<string> = new Set(['', '.', '..']);
@@ -111,10 +113,6 @@ export const stateRelativePath = (
 ): Effect.Effect<StatePath, PlayerError> =>
   Effect.suspend(() => {
     const lexical = path.resolve(expandUser(target));
-    // macOS presents the same temporary directory as both /var and
-    // /private/var.  Canonicalize only the already-trusted workspace prefix;
-    // resolving the complete destination would follow the very nested symlink
-    // this routine exists to reject.
     const lexicalWorkspace = path.resolve(workspace.root);
     const destination = isInside(lexicalWorkspace, lexical)
       ? path.join(workspace.root, path.relative(lexicalWorkspace, lexical))
@@ -126,82 +124,78 @@ export const stateRelativePath = (
       .relative(workspace.stateRoot, destination)
       .split(path.sep)
       .filter((part) => part !== '');
-    if (relative.length === 0 || relative.some((part) => BAD_PARTS.has(part))) {
+    const [first, ...rest] = relative;
+    if (first === undefined || relative.some((part) => BAD_PARTS.has(part))) {
       return Effect.fail(playerError('private state path is invalid'));
     }
-    return Effect.succeed({ destination, relative });
+    return Effect.succeed({ destination, relative: [first, ...rest] });
   });
 
 // ---------------------------------------------------------------------------
-// Directory walk
+// Symlink-safe directory walk
 // ---------------------------------------------------------------------------
 
 const REAL_DIR_ERROR =
   'private state directories must be real directories inside PLAY_STATE_DIR';
 
-/**
- * Walk into a state directory, refusing every symlink, and return its absolute
- * path.  The Python returned a directory file descriptor; a path is the closest
- * the JavaScript runtimes allow (see the module docstring).
- */
+interface PathInspection {
+  readonly symbolicLink: boolean;
+  readonly info: FileSystem.File.Info | null;
+}
+
+const inspectPath = (target: string): Effect.Effect<PathInspection> =>
+  Effect.gen(function* () {
+    const link = yield* Effect.either(fileSystem.readLink(target));
+    if (Either.isRight(link)) return { symbolicLink: true, info: null };
+    const info = yield* Effect.either(fileSystem.stat(target));
+    return Either.isRight(info)
+      ? { symbolicLink: false, info: info.right }
+      : { symbolicLink: false, info: null };
+  });
+
+const realDirectory = (target: string): Effect.Effect<boolean> =>
+  Effect.map(
+    inspectPath(target),
+    ({ symbolicLink, info }) => !symbolicLink && info?.type === 'Directory'
+  );
+
+/** Walk into a state directory, refusing every symlinked component. */
 export const openStateDirectory = (
   workspace: WorkspacePaths,
   parts: ReadonlyArray<string>,
   options: { readonly create: boolean }
 ): Effect.Effect<string, PlayerError> =>
-  Effect.suspend(() => {
+  Effect.gen(function* () {
     const rootParts = path
       .relative(workspace.root, workspace.stateRoot)
       .split(path.sep)
       .filter((part) => part !== '');
     if (!isInside(workspace.root, workspace.stateRoot)) {
-      return Effect.fail(playerError('PLAY_STATE_DIR must stay inside the player workspace'));
+      return yield* playerError('PLAY_STATE_DIR must stay inside the player workspace');
     }
-    const rootIsDirectory = attemptOr(
-      () => fs.lstatSync(workspace.root).isDirectory(),
-      () => false
-    );
-    if (!rootIsDirectory) {
-      return Effect.fail(playerError('the player workspace is not a safe directory'));
+    if (!(yield* realDirectory(workspace.root))) {
+      return yield* playerError('the player workspace is not a safe directory');
     }
-    // Each component is proved (no symlink, a real directory) before the walk
-    // descends into it; the fold carries the proven prefix.
-    const descend = (parent: string, part: string): Effect.Effect<string, PlayerError> => {
-      if (BAD_PARTS.has(part)) {
-        return Effect.fail(playerError('private state path is invalid'));
-      }
-      const child = path.join(parent, part);
-      const stat = attemptOr(
-        (): fs.Stats | null => fs.lstatSync(child),
-        () => null
-      );
-      if (stat !== null) {
-        return stat.isSymbolicLink() || !stat.isDirectory()
-          ? Effect.fail(playerError(REAL_DIR_ERROR))
-          : Effect.succeed(child);
-      }
-      if (!options.create) {
-        return Effect.fail(playerError('private state directory does not exist'));
-      }
-      const made = attemptOr(
-        () => {
-          fs.mkdirSync(child, { mode: 0o700 });
-          return true;
-        },
-        (cause) => (cause as NodeJS.ErrnoException).code === 'EEXIST'
-      );
-      if (!made) return Effect.fail(playerError(REAL_DIR_ERROR));
-      const created = attemptOr(
-        (): fs.Stats | null => fs.lstatSync(child),
-        () => null
-      );
-      return created === null || created.isSymbolicLink() || !created.isDirectory()
-        ? Effect.fail(playerError(REAL_DIR_ERROR))
-        : Effect.succeed(child);
-    };
-    return Effect.reduce([...rootParts, ...parts], workspace.root, (parent, part) =>
-      descend(parent, part)
-    );
+    const descend = (parent: string, part: string): Effect.Effect<string, PlayerError> =>
+      Effect.gen(function* () {
+        if (BAD_PARTS.has(part)) return yield* playerError('private state path is invalid');
+        const child = path.join(parent, part);
+        const inspected = yield* inspectPath(child);
+        if (inspected.symbolicLink) return yield* playerError(REAL_DIR_ERROR);
+        if (inspected.info !== null) {
+          return inspected.info.type === 'Directory'
+            ? child
+            : yield* playerError(REAL_DIR_ERROR);
+        }
+        if (!options.create) {
+          return yield* playerError('private state directory does not exist');
+        }
+        yield* Effect.ignore(fileSystem.makeDirectory(child, { mode: 0o700 }));
+        return (yield* realDirectory(child))
+          ? child
+          : yield* playerError(REAL_DIR_ERROR);
+      });
+    return yield* Effect.reduce([...rootParts, ...parts], workspace.root, descend);
   });
 
 // ---------------------------------------------------------------------------
@@ -212,7 +206,10 @@ export interface PrivateFsApi {
   readonly workspace: WorkspacePaths;
   readonly resolve: (target: string) => Effect.Effect<StatePath, PlayerError>;
   readonly writeText: (target: string, text: string) => Effect.Effect<string, PlayerError>;
-  readonly writeJson: (target: string, value: unknown) => Effect.Effect<string, PlayerError>;
+  readonly writeJson: (
+    target: string,
+    value: JsonValueInput
+  ) => Effect.Effect<string, PlayerError>;
   readonly readText: (target: string, label: string) => Effect.Effect<string, PlayerError>;
   readonly loadObject: (target: string, label: string) => Effect.Effect<JsonObject, PlayerError>;
   readonly appendText: (target: string, text: string) => Effect.Effect<string, PlayerError>;
@@ -227,18 +224,36 @@ export interface PrivateFsApi {
 
 export class PrivateFs extends Context.Tag('PrivateFs')<PrivateFs, PrivateFsApi>() {}
 
-const openFlag = (name: string): number => {
-  const table = fs.constants as unknown as Readonly<Record<string, number | undefined>>;
-  return table[name] ?? 0;
-};
-
-const NOFOLLOW = openFlag('O_NOFOLLOW');
-const CLOEXEC = openFlag('O_CLOEXEC');
-
 const randomSuffix = (): string =>
   [...crypto.getRandomValues(new Uint8Array(6))]
     .map((byte) => byte.toString(16).padStart(2, '0'))
     .join('');
+
+const leafOf = (relative: StatePath['relative']): string => relative.at(-1) ?? relative[0];
+const bytes = (text: string): Uint8Array => new TextEncoder().encode(text);
+
+interface ReadState {
+  readonly chunks: ReadonlyArray<Uint8Array>;
+  readonly complete: boolean;
+}
+
+const initialReadState: ReadState = { chunks: [], complete: false };
+
+const readAll = (opened: FileSystem.File) =>
+  Effect.map(
+    Effect.iterate(initialReadState, {
+      while: ({ complete }) => !complete,
+      body: (state) =>
+        Effect.map(
+          opened.readAlloc(64 * 1024),
+          (chunk): ReadState =>
+            chunk._tag === 'None'
+              ? { ...state, complete: true }
+              : { chunks: [...state.chunks, chunk.value], complete: false }
+        ),
+    }),
+    ({ chunks }) => Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)))
+  );
 
 const makeApi = (workspace: WorkspacePaths): PrivateFsApi => {
   const resolve = (target: string): Effect.Effect<StatePath, PlayerError> =>
@@ -250,46 +265,27 @@ const makeApi = (workspace: WorkspacePaths): PrivateFsApi => {
   ): Effect.Effect<string, PlayerError> =>
     openStateDirectory(workspace, relative.slice(0, -1), { create });
 
-  const leafOf = (relative: ReadonlyArray<string>): string =>
-    relative[relative.length - 1] as string;
-
   const writeText = (target: string, text: string): Effect.Effect<string, PlayerError> =>
     Effect.gen(function* () {
       const { destination, relative } = yield* resolve(target);
       const parent = yield* parentOf(relative, true);
       const name = leafOf(relative);
       const temporary = path.join(parent, `.${name}.${randomSuffix()}.tmp`);
-      const write = Effect.try({
-        try: () => {
-          const descriptor = fs.openSync(
-            temporary,
-            fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NOFOLLOW | CLOEXEC,
-            0o600
-          );
-          const written = attemptOr(
-            () => {
-              fs.fchmodSync(descriptor, 0o600);
-              fs.writeFileSync(descriptor, text, { encoding: 'utf8' });
-              fs.fsyncSync(descriptor);
-              return null;
-            },
-            (cause) => cause
-          );
-          fs.closeSync(descriptor);
-          if (written !== null) throw written;
-          fs.renameSync(temporary, path.join(parent, name));
-          return destination;
-        },
-        catch: () =>
-          playerError('cannot safely write private state inside PLAY_STATE_DIR'),
-      });
-      return yield* Effect.onError(write, () =>
-        Effect.sync(() =>
-          attemptOr(
-            () => fs.unlinkSync(temporary),
-            () => undefined /* the rename already consumed it */
-          )
+      const write = Effect.scoped(
+        Effect.gen(function* () {
+          const opened = yield* fileSystem.open(temporary, { flag: 'wx', mode: 0o600 });
+          yield* opened.writeAll(bytes(text));
+          yield* opened.sync;
+        })
+      ).pipe(
+        Effect.flatMap(() => fileSystem.rename(temporary, path.join(parent, name))),
+        Effect.as(destination),
+        Effect.mapError(() =>
+          playerError('cannot safely write private state inside PLAY_STATE_DIR')
         )
+      );
+      return yield* Effect.onError(write, () =>
+        Effect.ignore(fileSystem.remove(temporary, { force: true }))
       );
     });
 
@@ -298,26 +294,21 @@ const makeApi = (workspace: WorkspacePaths): PrivateFsApi => {
       const { relative } = yield* resolve(target);
       const parent = yield* parentOf(relative, false);
       const file = path.join(parent, leafOf(relative));
-      const opened = yield* Effect.try({
-        try: () => fs.openSync(file, fs.constants.O_RDONLY | NOFOLLOW | CLOEXEC),
-        catch: () => playerError(`cannot safely read private ${label}`),
-      });
-      return yield* Effect.try({
-        try: () => {
-          const stat = fs.fstatSync(opened);
-          if (!stat.isFile() || (stat.mode & 0o777) !== 0o600) {
-            return null;
+      const inspected = yield* inspectPath(file);
+      if (inspected.symbolicLink) {
+        return yield* playerError(`cannot safely read private ${label}`);
+      }
+      const readFailure = playerError(`cannot safely read private ${label}`);
+      return yield* Effect.scoped(
+        Effect.gen(function* () {
+          const opened = yield* Effect.mapError(fileSystem.open(file), () => readFailure);
+          const info = yield* Effect.mapError(opened.stat, () => readFailure);
+          if (info.type !== 'File' || (info.mode & 0o777) !== 0o600) {
+            return yield* playerError(`private ${label} must be a mode-0600 file`);
           }
-          return fs.readFileSync(opened, { encoding: 'utf8' });
-        },
-        catch: () => playerError(`cannot safely read private ${label}`),
-      }).pipe(
-        Effect.ensuring(Effect.sync(() => fs.closeSync(opened))),
-        Effect.flatMap((text) =>
-          text === null
-            ? Effect.fail(playerError(`private ${label} must be a mode-0600 file`))
-            : Effect.succeed(text)
-        )
+          const content = yield* Effect.mapError(readAll(opened), () => readFailure);
+          return new TextDecoder('utf-8', { fatal: false, ignoreBOM: true }).decode(content);
+        })
       );
     });
 
@@ -326,31 +317,32 @@ const makeApi = (workspace: WorkspacePaths): PrivateFsApi => {
       const { destination, relative } = yield* resolve(target);
       const parent = yield* parentOf(relative, true);
       const file = path.join(parent, leafOf(relative));
-      const opened = yield* Effect.try({
-        try: () =>
-          fs.openSync(
-            file,
-            fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | NOFOLLOW | CLOEXEC,
-            0o600
-          ),
-        catch: () => playerError('cannot safely append to private state'),
-      });
-      return yield* Effect.try({
-        try: () => {
-          const stat = fs.fstatSync(opened);
-          if (!stat.isFile()) return null;
-          fs.fchmodSync(opened, 0o600);
-          fs.writeSync(opened, Buffer.from(text, 'utf8'));
+      const inspected = yield* inspectPath(file);
+      if (inspected.symbolicLink) {
+        return yield* playerError('cannot safely append to private state');
+      }
+      if (inspected.info === null) {
+        yield* Effect.ignore(
+          fileSystem.writeFile(file, new Uint8Array(), { flag: 'wx', mode: 0o600 })
+        );
+        const created = yield* inspectPath(file);
+        if (created.symbolicLink) {
+          return yield* playerError('cannot safely append to private state');
+        }
+      }
+      const appendFailure = playerError('cannot safely append to private state');
+      return yield* Effect.scoped(
+        Effect.gen(function* () {
+          const opened = yield* Effect.mapError(
+            fileSystem.open(file, { flag: 'a', mode: 0o600 }),
+            () => appendFailure
+          );
+          const info = yield* Effect.mapError(opened.stat, () => appendFailure);
+          if (info.type !== 'File') return yield* playerError('a private log must be a regular file');
+          yield* Effect.mapError(fileSystem.chmod(file, 0o600), () => appendFailure);
+          yield* Effect.mapError(opened.writeAll(bytes(text)), () => appendFailure);
           return destination;
-        },
-        catch: () => playerError('cannot safely append to private state'),
-      }).pipe(
-        Effect.ensuring(Effect.sync(() => fs.closeSync(opened))),
-        Effect.flatMap((appended) =>
-          appended === null
-            ? Effect.fail(playerError('a private log must be a regular file'))
-            : Effect.succeed(appended)
-        )
+        })
       );
     });
 
@@ -363,13 +355,14 @@ const makeApi = (workspace: WorkspacePaths): PrivateFsApi => {
     loadObject: (target, label) =>
       Effect.gen(function* () {
         const text = yield* readText(target, label);
-        const parsed = yield* Effect.try({
-          try: () => JSON.parse(text) as unknown,
-          catch: () => playerError(`cannot read ${label}: invalid JSON`),
-        });
-        return isJsonObject(parsed)
-          ? parsed
-          : yield* Effect.fail(playerError(`${label} must contain a JSON object`));
+        const decoded = yield* Effect.mapError(
+          Schema.decodeUnknown(Schema.parseJson(Schema.Unknown))(text),
+          () => playerError(`cannot read ${label}: invalid JSON`)
+        );
+        return yield* Effect.mapError(
+          Schema.decodeUnknown(JsonObjectSchema)(decoded),
+          () => playerError(`${label} must contain a JSON object`)
+        );
       }),
     appendText,
     regularFile: (target, label) =>
@@ -377,22 +370,16 @@ const makeApi = (workspace: WorkspacePaths): PrivateFsApi => {
         const { relative } = yield* resolve(target);
         const parent = yield* parentOf(relative, false);
         const file = path.join(parent, leafOf(relative));
-        const ok = yield* Effect.sync(() =>
-          attemptOr(() => fs.lstatSync(file).isFile(), () => false)
-        );
-        return ok
+        const inspected = yield* inspectPath(file);
+        return !inspected.symbolicLink && inspected.info?.type === 'File'
           ? relative.join(path.sep)
-          : yield* Effect.fail(
-              playerError(`the ${label} must be a real file inside PLAY_STATE_DIR`)
-            );
+          : yield* playerError(`the ${label} must be a real file inside PLAY_STATE_DIR`);
       }),
     exists: (target) =>
-      Effect.sync(() => {
-        return attemptOr(
-          () => fs.lstatSync(path.resolve(expandUser(target))).isFile(),
-          () => false
-        );
-      }),
+      Effect.map(
+        inspectPath(path.resolve(expandUser(target))),
+        (inspected) => !inspected.symbolicLink && inspected.info?.type === 'File'
+      ),
     openDirectory: (parts, options) => openStateDirectory(workspace, parts, options),
   };
 };

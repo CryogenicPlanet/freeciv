@@ -30,7 +30,13 @@ import { holderSeat } from 'src/render/phase';
 import { formatG, render } from 'src/render/primitives';
 import { waitingTickLine } from 'src/render/wait';
 import type { HealthEnvelope } from 'src/schema/health';
-import { isJsonObject, type JsonObject, type JsonValue } from 'src/schema/primitives';
+import {
+  isJsonNumber,
+  isJsonObject,
+  isWholeNumber,
+  type JsonObject,
+  type JsonValue,
+} from 'src/schema/primitives';
 import type { WaitEnvelope } from 'src/schema/wait';
 import { printV2Json } from 'src/services/json-output';
 import {
@@ -41,8 +47,8 @@ import {
 } from 'src/services/mirror';
 import { runMonitorHook, shellHookRunner, type HookRunner } from 'src/services/monitor-hook';
 import { PrivateFs, type PrivateFsApi } from 'src/services/private-fs';
-import { SessionStore, type Session } from 'src/services/session-store';
-import { V2Client } from 'src/services/v2-client';
+import { type SessionStore, type Session } from 'src/services/session-store';
+import { type V2Client } from 'src/services/v2-client';
 import {
   phaseIsMine,
   seatRebound,
@@ -66,7 +72,7 @@ export const V2_MONITOR_BACKOFF_MAX_S = 30.0;
 // ---------------------------------------------------------------------------
 
 const wholeOrZero = (value: JsonValue | undefined): number =>
-  typeof value === 'number' && Number.isInteger(value) ? value : 0;
+  value !== undefined && isWholeNumber(value) ? value : 0;
 
 /** `_announced_tuple` — the `[incarnation, turn, phase]` identity now open. */
 export const announcedTuple = (health: HealthEnvelope): ReadonlyArray<number> | null => {
@@ -84,9 +90,9 @@ export const announcedTuple = (health: HealthEnvelope): ReadonlyArray<number> | 
 const notAfter = (left: ReadonlyArray<number>, right: ReadonlyArray<JsonValue>): boolean => {
   const width = Math.min(left.length, right.length);
   for (let index = 0; index < width; index += 1) {
-    const a = left[index] as number;
-    const b = right[index];
-    if (typeof b !== 'number') return false;
+    const a = left.at(index);
+    const b = right.at(index);
+    if (a === undefined || b === undefined || !isJsonNumber(b)) return false;
     if (a !== b) return a < b;
   }
   return left.length <= right.length;

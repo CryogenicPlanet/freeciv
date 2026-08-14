@@ -12,12 +12,11 @@
  * the clock rather than sleeping through it, exactly as the Python's `clocked`
  * context manager does.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect, Either, Layer } from 'effect';
 import { decodeHealth, type HealthEnvelope } from 'src/schema/health';
-import type { JsonObject } from 'src/schema/primitives';
+import type { PageEnvelope } from 'src/schema/page';
+import type { JsonObject, JsonValue } from 'src/schema/primitives';
 import { decodeWait, type WaitEnvelope } from 'src/schema/wait';
 import { renderHealth } from 'src/render/health';
 import { awaitLine, renderWait, waitingTickLine } from 'src/render/wait';
@@ -59,16 +58,31 @@ import {
   waitPayload,
   type Scratch,
 } from 'test/_fixtures';
+import { awaitTest, effectTest, provideTestLayer } from 'test/_effect-test';
+import { leftValue, rightValue } from 'test/_expect';
+import { fileSystem, path } from 'test/_test-platform';
 
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
 
+type FetchInput = Parameters<typeof fetch>[0];
+type FetchArguments = Parameters<typeof fetch>;
+
+const urlOf = (input: FetchInput): string =>
+  input instanceof Request ? input.url : new URL(input).href;
+
+const completeFetch = (
+  handler: (...args: FetchArguments) => ReturnType<typeof fetch>
+): typeof fetch => Object.assign(handler, { preconnect: fetch.preconnect });
+
 const scratches: Scratch[] = [];
 
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() =>
+  Effect.runPromise(
+    Effect.asVoid(Effect.all(scratches.splice(0).map((scratch) => scratch.cleanup)))
+  )
+);
 
 /** The core placeholder for the U03 seam; alias behaviour is U03's to prove. */
 const stateSchema = {
@@ -84,15 +98,19 @@ interface Bench {
   readonly store: SessionStoreApi;
 }
 
-const bench = (): Bench => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const sessionPath = path.join(scratch.workspace.stateRoot, 'session-codex-gpt-5.6-sol.json');
-  Effect.runSync(scratch.files.writeJson(sessionPath, sessionFile()));
-  const store = sessionStoreFor(scratch.workspace, scratch.files, stateSchema, {});
-  const loaded = Effect.runSync(store.resolveV2(sessionPath));
-  return { scratch, sessionPath, session: loaded.session, store };
-};
+const bench = (): Effect.Effect<Bench> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const sessionPath = path.join(
+      scratch.workspace.stateRoot,
+      'session-codex-gpt-5.6-sol.json'
+    );
+    yield* scratch.files.writeJson(sessionPath, sessionFile());
+    const store = sessionStoreFor(scratch.workspace, scratch.files, stateSchema, {});
+    const loaded = yield* store.resolveV2(sessionPath);
+    return { scratch, sessionPath, session: loaded.session, store };
+  }).pipe(Effect.orDie);
 
 /**
  * `_holder_seat` (client.py:5350-5367).
@@ -109,8 +127,8 @@ const holderSeat: HolderSeatFn = (phase) => {
 };
 
 interface Recorded {
-  readonly pages: unknown[];
-  readonly mirroredPages: unknown[];
+  readonly pages: PageEnvelope[];
+  readonly mirroredPages: PageEnvelope[];
   readonly mirroredHealth: HealthEnvelope[];
   readonly echoed: HealthEnvelope[];
   readonly order: string[];
@@ -171,40 +189,36 @@ const run = <A, E>(
   effect: Effect.Effect<A, E, V2Client | SessionStore>,
   fetchImpl: typeof fetch,
   store: SessionStoreApi
-): Promise<Either.Either<A, E>> =>
-  Effect.runPromise(Effect.either(Effect.provide(effect, layers(fetchImpl, store))));
+): Effect.Effect<Either.Either<A, E>> =>
+  Effect.either(provideTestLayer(effect, layers(fetchImpl, store)));
 
-const right = <A, E>(either: Either.Either<A, E>): A => {
-  expect(Either.isRight(either)).toBe(true);
-  if (Either.isLeft(either)) throw new Error(`expected success, got ${JSON.stringify(either.left)}`);
-  return either.right;
-};
+const right = <A, E>(either: Either.Either<A, E>): A => rightValue(either);
 
-const message = <A>(either: Either.Either<A, { readonly message: string }>): string => {
-  expect(Either.isLeft(either)).toBe(true);
-  return Either.isLeft(either) ? either.left.message : '';
-};
-
-const urlOf = (input: Parameters<typeof fetch>[0]): string =>
-  typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+const message = <A>(either: Either.Either<A, { readonly message: string }>): string =>
+  leftValue(either).message;
 
 interface Reply {
   readonly status?: number;
-  readonly body: unknown;
+  readonly body: JsonValue;
+}
+
+interface ScriptedServer {
+  readonly fetch: typeof fetch;
+  readonly urls: ReadonlyArray<string>;
 }
 
 /** A fetch that records every URL and answers from a per-URL script. */
-const scripted = (
-  answer: (url: string) => Reply
-): { readonly fetch: typeof fetch; readonly urls: string[] } => {
+const scripted = (answer: (url: string) => Reply): ScriptedServer => {
   const urls: string[] = [];
-  const impl = (async (input: Parameters<typeof fetch>[0]): Promise<Response> => {
-    const url = urlOf(input);
-    const reply = answer(url);
-    urls.push(url);
-    return jsonResponse(reply.body, reply.status ?? 200);
-  }) as typeof fetch;
-  return { fetch: impl, urls };
+  return {
+    fetch: completeFetch((input) => {
+      const url = urlOf(input);
+      const reply = answer(url);
+      urls.push(url);
+      return Promise.resolve(jsonResponse(reply.body, reply.status ?? 200));
+    }),
+    urls,
+  };
 };
 
 // ---------------------------------------------------------------------------
@@ -220,7 +234,7 @@ const OPPONENT: JsonObject = {
   is_self: false,
 };
 
-interface PvpShape {
+interface PvpHealthFixture {
   readonly mine: boolean;
   readonly remainingS?: number | null;
   readonly elapsedS?: number | null;
@@ -228,37 +242,41 @@ interface PvpShape {
   readonly selfHeld?: boolean;
 }
 
-const pvpHealth = (shape: PvpShape): JsonObject => {
-  const elapsedS = shape.elapsedS === undefined ? 13 : shape.elapsedS;
-  const remainingS = shape.remainingS === undefined ? 587 : shape.remainingS;
+const pvpHealth = (fixture: PvpHealthFixture): JsonObject => {
+  const elapsedS = fixture.elapsedS === undefined ? 13 : fixture.elapsedS;
+  const remainingS = fixture.remainingS === undefined ? 587 : fixture.remainingS;
   const waitingOn: JsonObject = {
     kind: 'other_seat',
     summary: 'Seat 2 AgentPlace2 (pi-gpt-5.6-sol) holds turn 3 phase 1 and has not ended it.',
     waiting_s: elapsedS,
-    seats: shape.selfHeld === true ? [{ ...OPPONENT, is_self: true }] : [OPPONENT],
+    seats: fixture.selfHeld === true ? [{ ...OPPONENT, is_self: true }] : [OPPONENT],
   };
+  const timing: JsonObject = {
+    mode: 'default',
+    timeout_s: 600,
+    deadline_started_at: 1000,
+    deadline_at: 1600,
+    elapsed_s: elapsedS,
+    remaining_s: remainingS,
+  };
+  const phase: JsonObject = fixture.mine
+    ? { state: 'awaiting_agent', turn: 3, phase: 1, active: true, timing }
+    : {
+        state: 'awaiting_agent',
+        turn: 3,
+        phase: 1,
+        active: false,
+        timing,
+        waiting_on: waitingOn,
+      };
   return healthPayload({
-    game_state: shape.gameState ?? 'running',
-    phase: {
-      state: 'awaiting_agent',
-      turn: 3,
-      phase: 1,
-      active: shape.mine,
-      timing: {
-        mode: 'default',
-        timeout_s: 600,
-        deadline_started_at: 1000,
-        deadline_at: 1600,
-        elapsed_s: elapsedS,
-        remaining_s: remainingS,
-      },
-      ...(shape.mine ? {} : { waiting_on: waitingOn }),
-    },
+    game_state: fixture.gameState ?? 'running',
+    phase,
   });
 };
 
-const pvpWake = (reason: string, shape: PvpShape): JsonObject =>
-  waitPayload({ wake_reason: reason, health: pvpHealth(shape) });
+const pvpWake = (reason: string, fixture: PvpHealthFixture): JsonObject =>
+  waitPayload({ wake_reason: reason, health: pvpHealth(fixture) });
 
 // ---------------------------------------------------------------------------
 // _wait_args
@@ -293,11 +311,11 @@ describe('waitArgs', () => {
 // ---------------------------------------------------------------------------
 
 describe('waitValue', () => {
-  test('uses the server actionable phase without ever fetching state', async () => {
-    const seat = bench();
+  awaitTest('uses the server actionable phase without ever fetching state', function* (wait) {
+    const seat = yield* bench();
     const server = scripted(() => ({ body: waitPayload() }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: recorder().hooks });
-    const wake = right(await run(waitValue(ctx, waitArgs({})), server.fetch, seat.store));
+    const wake = right(yield* wait(run(waitValue(ctx, waitArgs({})), server.fetch, seat.store)));
 
     expect(wake.wake_reason).toBe('phase_active');
     expect(server.urls).toHaveLength(1);
@@ -308,8 +326,8 @@ describe('waitValue', () => {
     expect(server.urls[0]).not.toContain('after_state_token');
   });
 
-  test('wait_s reaches the wire in CPython %g', async () => {
-    const seat = bench();
+  awaitTest('wait_s reaches the wire in CPython %g', function* (wait) {
+    const seat = yield* bench();
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: recorder().hooks });
     for (const [given, encoded] of [
       [615, 'wait_s=615'],
@@ -318,88 +336,86 @@ describe('waitValue', () => {
       [1.5, 'wait_s=1.5'],
     ] as const) {
       const server = scripted(() => ({ body: waitPayload() }));
-      right(await run(waitValue(ctx, waitArgs({ waitS: given })), server.fetch, seat.store));
+      right(yield* wait(run(waitValue(ctx, waitArgs({ waitS: given })), server.fetch, seat.store)));
       expect(server.urls[0]).toContain(encoded);
     }
   });
 
-  test('the ceiling covers a whole opponent phase and refuses one second more', async () => {
+  awaitTest('the ceiling covers a whole opponent phase and refuses one second more', function* (wait) {
     expect(V2_WAIT_S_MAX).toBe(615);
-    const seat = bench();
+    const seat = yield* bench();
     const server = scripted(() => ({ body: waitPayload() }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: recorder().hooks });
-    expect(message(await run(waitValue(ctx, waitArgs({ waitS: 616 })), server.fetch, seat.store))).toBe(
+    expect(message(yield* wait(run(waitValue(ctx, waitArgs({ waitS: 616 })), server.fetch, seat.store)))).toBe(
       'wait-s must be in [0, 615]'
     );
-    expect(message(await run(waitValue(ctx, waitArgs({ waitS: -1 })), server.fetch, seat.store))).toBe(
+    expect(message(yield* wait(run(waitValue(ctx, waitArgs({ waitS: -1 })), server.fetch, seat.store)))).toBe(
       'wait-s must be in [0, 615]'
     );
     expect(server.urls).toHaveLength(0);
   });
 
-  test('poll-s is bounded too', async () => {
-    const seat = bench();
+  awaitTest('poll-s is bounded too', function* (wait) {
+    const seat = yield* bench();
     const server = scripted(() => ({ body: waitPayload() }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: recorder().hooks });
-    expect(message(await run(waitValue(ctx, waitArgs({ pollS: 0.04 })), server.fetch, seat.store))).toBe(
+    expect(message(yield* wait(run(waitValue(ctx, waitArgs({ pollS: 0.04 })), server.fetch, seat.store)))).toBe(
       'poll-s must be in [0.05, 30]'
     );
-    expect(message(await run(waitValue(ctx, waitArgs({ pollS: 31 })), server.fetch, seat.store))).toBe(
+    expect(message(yield* wait(run(waitValue(ctx, waitArgs({ pollS: 31 })), server.fetch, seat.store)))).toBe(
       'poll-s must be in [0.05, 30]'
     );
   });
 
-  test('--until takes exactly two values', async () => {
-    const seat = bench();
+  awaitTest('--until takes exactly two values', function* (wait) {
+    const seat = yield* bench();
     const server = scripted(() => ({ body: waitPayload() }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: recorder().hooks });
     expect(
-      message(await run(waitValue(ctx, waitArgs({ until: 'forever' })), server.fetch, seat.store))
+      message(yield* wait(run(waitValue(ctx, waitArgs({ until: 'forever' })), server.fetch, seat.store)))
     ).toBe('wait --until must be phase or revision');
   });
 
-  test('--until revision without a validated state page is refused', async () => {
-    const seat = bench();
+  awaitTest('--until revision without a validated state page is refused', function* (wait) {
+    const seat = yield* bench();
     const server = scripted(() => ({ body: waitPayload() }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: recorder().hooks });
     expect(
-      message(await run(waitValue(ctx, waitArgs({ until: 'revision' })), server.fetch, seat.store))
+      message(yield* wait(run(waitValue(ctx, waitArgs({ until: 'revision' })), server.fetch, seat.store)))
     ).toBe('wait --until revision requires a previously validated state page');
   });
 
-  test('a stateless wait is refused outside phase mode', async () => {
-    const seat = bench();
+  awaitTest('a stateless wait is refused outside phase mode', function* (wait) {
+    const seat = yield* bench();
     const server = scripted(() => ({ body: waitPayload() }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: recorder().hooks });
     expect(
       message(
-        await run(
+        yield* wait(run(
           waitValue(ctx, waitArgs({ until: 'revision' }), { stateless: true }),
           server.fetch,
           seat.store
-        )
+        ))
       )
     ).toBe('a stateless wait is phase-mode only');
   });
 
-  test('a stateless wait never reads .v2-state', async () => {
-    const seat = bench();
+  awaitTest('a stateless wait never reads .v2-state', function* (wait) {
+    const seat = yield* bench();
     const server = scripted(() => ({ body: waitPayload() }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: recorder().hooks });
-    right(await run(waitValue(ctx, waitArgs({}), { stateless: true }), server.fetch, seat.store));
-    expect(fs.existsSync(seat.store.statePath(seat.sessionPath))).toBe(false);
+    right(yield* wait(run(waitValue(ctx, waitArgs({}), { stateless: true }), server.fetch, seat.store)));
+    expect(yield* wait(fileSystem.exists(seat.store.statePath(seat.sessionPath)))).toBe(false);
     expect(server.urls[0]).toContain('until=phase');
     expect(server.urls[0]).not.toContain('after_state_token');
   });
 
-  test('--until revision sends the cached baseline as after_state_token', async () => {
-    const seat = bench();
-    Effect.runSync(
-      seat.store.writeState(seat.sessionPath, {
-        ...emptyV2ClientState(seat.session),
-        last_revision: { turn: 5, revision: 12, state_token: 'token_5_12' },
-      })
-    );
+  awaitTest('--until revision sends the cached baseline as after_state_token', function* (wait) {
+    const seat = yield* bench();
+    yield* seat.store.writeState(seat.sessionPath, {
+      ...emptyV2ClientState(seat.session),
+      last_revision: { turn: 5, revision: 12, state_token: 'token_5_12' },
+    });
     const server = scripted(() => ({
       body: waitPayload({
         wake_reason: 'revision_changed',
@@ -408,15 +424,15 @@ describe('waitValue', () => {
     }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: recorder().hooks });
     const wake = right(
-      await run(waitValue(ctx, waitArgs({ until: 'revision' })), server.fetch, seat.store)
+      yield* wait(run(waitValue(ctx, waitArgs({ until: 'revision' })), server.fetch, seat.store))
     );
     expect(wake.wake_reason).toBe('revision_changed');
     expect(server.urls[0]).toContain('until=revision');
     expect(server.urls[0]).toContain('after_state_token=token_5_12');
   });
 
-  test('a structured non-2xx refusal is raised, never downgraded to polling', async () => {
-    const seat = bench();
+  awaitTest('a structured non-2xx refusal is raised, never downgraded to polling', function* (wait) {
+    const seat = yield* bench();
     const server = scripted(() => ({
       status: 404,
       body: {
@@ -427,7 +443,7 @@ describe('waitValue', () => {
       },
     }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: recorder().hooks });
-    const either = await run(waitValue(ctx, waitArgs({})), server.fetch, seat.store);
+    const either = yield* wait(run(waitValue(ctx, waitArgs({})), server.fetch, seat.store));
     expect(Either.isLeft(either)).toBe(true);
     // One request: the legacy fallback must not have started polling /health.
     expect(server.urls).toHaveLength(1);
@@ -441,33 +457,33 @@ describe('waitValue', () => {
 describe('the legacy fallback', () => {
   const missingRoute: Reply = { status: 404, body: { error: 'Not Found' } };
 
-  test('a bare-string 404 downgrades to polling /health', async () => {
-    const seat = bench();
+  awaitTest('a bare-string 404 downgrades to polling /health', function* (wait) {
+    const seat = yield* bench();
     const server = scripted((url) =>
       url.includes('/me/wait?') ? missingRoute : { body: healthPayload() }
     );
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: recorder().hooks });
-    const wake = right(await run(waitValue(ctx, waitArgs({})), server.fetch, seat.store));
+    const wake = right(yield* wait(run(waitValue(ctx, waitArgs({})), server.fetch, seat.store)));
     expect(wake.wake_reason).toBe('phase_active');
     expect(server.urls[1]).toContain('/me/health');
     expect(server.urls.filter((url) => url.includes('/state?'))).toHaveLength(0);
   });
 
-  test('a terminal game answers game_terminal without waiting out the clock', async () => {
-    const seat = bench();
+  awaitTest('a terminal game answers game_terminal without waiting out the clock', function* (wait) {
+    const seat = yield* bench();
     const server = scripted((url) =>
       url.includes('/me/wait?')
         ? missingRoute
         : { body: healthPayload({ game_state: 'completed', phase: null }) }
     );
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: recorder().hooks });
-    const wake = right(await run(waitValue(ctx, waitArgs({})), server.fetch, seat.store));
+    const wake = right(yield* wait(run(waitValue(ctx, waitArgs({})), server.fetch, seat.store)));
     expect(wake.wake_reason).toBe('game_terminal');
     expect(wake.state_revision).toBeNull();
   });
 
-  test('an inactive phase polls until the budget runs out, then times out', async () => {
-    const seat = bench();
+  awaitTest('an inactive phase polls until the budget runs out, then times out', function* (wait) {
+    const seat = yield* bench();
     const server = scripted((url) =>
       url.includes('/me/wait?') ? missingRoute : { body: pvpHealth({ mine: false }) }
     );
@@ -486,7 +502,7 @@ describe('the legacy fallback', () => {
       clock,
     });
     const wake = right(
-      await run(waitValue(ctx, waitArgs({ waitS: 3, pollS: 1 })), server.fetch, seat.store)
+      yield* wait(run(waitValue(ctx, waitArgs({ waitS: 3, pollS: 1 })), server.fetch, seat.store))
     );
     expect(wake.wake_reason).toBe('timeout');
     // One `/wait` 404, then a `/health` poll at t=0, 1, 2 and 3.
@@ -494,8 +510,8 @@ describe('the legacy fallback', () => {
     expect(now.seconds).toBe(3);
   });
 
-  test('revision mode fetches the overview page, remembers it and mirrors it', async () => {
-    const seat = bench();
+  awaitTest('revision mode fetches the overview page, remembers it and mirrors it', function* (wait) {
+    const seat = yield* bench();
     const kit = recorder();
     const bumped = pagePayload([{ id: 'unit_0', name: 'Warriors' }], {
       state_revision: { turn: 5, revision: 13, state_token: 'token_5_13' },
@@ -506,14 +522,14 @@ describe('the legacy fallback', () => {
     });
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: kit.hooks });
     const wake = right(
-      await run(
+      yield* wait(run(
         legacyWaitValue(ctx, waitArgs({ waitS: 5 }), {
           until: 'revision',
           baseline: { turn: 5, revision: 12, state_token: 'token_5_12' },
         }),
         server.fetch,
         seat.store
-      )
+      ))
     );
     expect(wake.wake_reason).toBe('revision_changed');
     expect(wake.state_revision?.state_token).toBe('token_5_13');
@@ -530,9 +546,9 @@ describe('the legacy fallback', () => {
 // ---------------------------------------------------------------------------
 
 describe('localWaitResponse', () => {
-  test('carries this seat identity and nothing the server did not say', async () => {
-    const seat = bench();
-    const health = await Effect.runPromise(decodeHealth(healthPayload(), seat.session));
+  effectTest('carries this seat identity and nothing the server did not say', () => Effect.gen(function* () {
+    const seat = yield* bench();
+    const health = yield* decodeHealth(healthPayload(), seat.session);
     expect(localWaitResponse(seat.session, 'timeout', health, null)).toEqual({
       schema_version: 2,
       control_protocol: 'full-control-v2',
@@ -542,7 +558,7 @@ describe('localWaitResponse', () => {
       health,
       state_revision: null,
     });
-  });
+  }));
 });
 
 // ---------------------------------------------------------------------------
@@ -550,31 +566,33 @@ describe('localWaitResponse', () => {
 // ---------------------------------------------------------------------------
 
 describe('holderRemainingS', () => {
-  const decodedHealth = (shape: PvpShape): Promise<HealthEnvelope> =>
-    Effect.runPromise(decodeHealth(pvpHealth(shape), bench().session));
+  const decodedHealth = (fixture: PvpHealthFixture): Effect.Effect<HealthEnvelope> =>
+    Effect.flatMap(bench(), (seat) => decodeHealth(pvpHealth(fixture), seat.session)).pipe(
+      Effect.orDie
+    );
 
-  test('names the deadline when exactly one other seat holds the phase', async () => {
-    expect(holderRemainingS(await decodedHealth({ mine: false, remainingS: 40 }), holderSeat)).toBe(40);
-  });
+  effectTest('names the deadline when exactly one other seat holds the phase', () => Effect.gen(function* () {
+    expect(holderRemainingS(yield* decodedHealth({ mine: false, remainingS: 40 }), holderSeat)).toBe(40);
+  }));
 
-  test('an active phase has no holder to name', async () => {
-    expect(holderRemainingS(await decodedHealth({ mine: true }), holderSeat)).toBeNull();
-  });
+  effectTest('an active phase has no holder to name', () => Effect.gen(function* () {
+    expect(holderRemainingS(yield* decodedHealth({ mine: true }), holderSeat)).toBeNull();
+  }));
 
-  test('a seat waiting on itself is not a holder', async () => {
+  effectTest('a seat waiting on itself is not a holder', () => Effect.gen(function* () {
     expect(
-      holderRemainingS(await decodedHealth({ mine: false, selfHeld: true }), holderSeat)
+      holderRemainingS(yield* decodedHealth({ mine: false, selfHeld: true }), holderSeat)
     ).toBeNull();
-  });
+  }));
 
-  test('a spent deadline is zero and an absent one is unknown', async () => {
+  effectTest('a spent deadline is zero and an absent one is unknown', () => Effect.gen(function* () {
     // A negative `remaining_s` never survives `_validate_health`, so the
     // `max(0, …)` floor is defensive; zero is the value a pinned holder sends.
-    expect(holderRemainingS(await decodedHealth({ mine: false, remainingS: 0 }), holderSeat)).toBe(0);
+    expect(holderRemainingS(yield* decodedHealth({ mine: false, remainingS: 0 }), holderSeat)).toBe(0);
     expect(
-      holderRemainingS(await decodedHealth({ mine: false, remainingS: null }), holderSeat)
+      holderRemainingS(yield* decodedHealth({ mine: false, remainingS: null }), holderSeat)
     ).toBeNull();
-  });
+  }));
 });
 
 // ---------------------------------------------------------------------------
@@ -595,18 +613,17 @@ interface Clocked {
  * `wait_s` out of the query, advances the clock by exactly that, and answers
  * from the caller's script at the new time.
  */
-const clocked = (script: (elapsed: number) => unknown): Clocked => {
+const clocked = (script: (elapsed: number) => JsonValue): Clocked => {
   const now = { seconds: 0 };
   const blocked: number[] = [];
-  const impl = (async (input: Parameters<typeof fetch>[0]): Promise<Response> => {
-    const url = new URL(urlOf(input));
-    const waited = Number(url.searchParams.get('wait_s') ?? '0');
-    blocked.push(waited);
-    now.seconds += waited;
-    return jsonResponse(script(now.seconds));
-  }) as typeof fetch;
   return {
-    fetch: impl,
+    fetch: completeFetch((input) => {
+      const url = new URL(urlOf(input));
+      const waited = Number(url.searchParams.get('wait_s') ?? '0');
+      blocked.push(waited);
+      now.seconds += waited;
+      return Promise.resolve(jsonResponse(script(now.seconds)));
+    }),
     blocked,
     now,
     clock: {
@@ -628,12 +645,12 @@ const clockedCtx = (kit: Kit, fake: Clocked, seat: Bench): WaitCtx =>
   });
 
 describe('waitUntilTurn', () => {
-  test('an interactive await keeps even the FIRST poll short', async () => {
+  awaitTest('an interactive await keeps even the FIRST poll short', function* (wait) {
     // The 49-second silence: with echo defined, the first poll used to run
     // for the whole waitS budget, so no tick line ever printed before the
     // wake.  Interactive composites now poll at V2_WAIT_TICK_S from the
     // first request.
-    const seat = bench();
+    const seat = yield* bench();
     const kit = recorder();
     const fake = clocked((elapsed) =>
       pvpWake(elapsed >= 45 ? 'phase_active' : 'timeout', {
@@ -643,37 +660,37 @@ describe('waitUntilTurn', () => {
       })
     );
     right(
-      await run(
+      yield* wait(run(
         waitUntilTurn(clockedCtx(kit, fake, seat), waitArgs({ waitS: 120 }), {
           forTurn: false,
           echo: kit.echo,
         }),
         fake.fetch,
         seat.store
-      )
+      ))
     );
     expect(fake.blocked[0]).toBeLessThanOrEqual(V2_WAIT_TICK_S);
     expect(kit.log.echoed.length).toBeGreaterThan(0);
   });
 
-  test('a silent await still spends its budget on one long first poll', async () => {
-    const seat = bench();
+  awaitTest('a silent await still spends its budget on one long first poll', function* (wait) {
+    const seat = yield* bench();
     const kit = recorder();
     const fake = clocked(() => pvpWake('phase_active', { mine: true }));
     right(
-      await run(
+      yield* wait(run(
         waitUntilTurn(clockedCtx(kit, fake, seat), waitArgs({ waitS: 120 }), {
           forTurn: false,
         }),
         fake.fetch,
         seat.store
-      )
+      ))
     );
     expect(fake.blocked[0]).toBe(120);
   });
 
-  test('is bounded by the holder deadline plus exactly one grace window', async () => {
-    const seat = bench();
+  awaitTest('is bounded by the holder deadline plus exactly one grace window', function* (wait) {
+    const seat = yield* bench();
     const kit = recorder();
     const fake = clocked((elapsed) =>
       pvpWake('timeout', {
@@ -683,14 +700,14 @@ describe('waitUntilTurn', () => {
       })
     );
     const wake = right(
-      await run(
+      yield* wait(run(
         waitUntilTurn(clockedCtx(kit, fake, seat), waitArgs({}), {
           forTurn: true,
           echo: kit.echo,
         }),
         fake.fetch,
         seat.store
-      )
+      ))
     );
 
     expect(wake.wake_reason).toBe('timeout');
@@ -703,8 +720,8 @@ describe('waitUntilTurn', () => {
     expect(kit.log.echoed).toHaveLength(fake.blocked.length - 1);
   });
 
-  test('the marker is refreshed on every tick, before the transcript line', async () => {
-    const seat = bench();
+  awaitTest('the marker is refreshed on every tick, before the transcript line', function* (wait) {
+    const seat = yield* bench();
     const kit = recorder();
     const fake = clocked((elapsed) =>
       pvpWake(elapsed >= 45 ? 'phase_active' : 'timeout', {
@@ -714,14 +731,14 @@ describe('waitUntilTurn', () => {
       })
     );
     right(
-      await run(
+      yield* wait(run(
         waitUntilTurn(clockedCtx(kit, fake, seat), waitArgs({}), {
           forTurn: true,
           echo: kit.echo,
         }),
         fake.fetch,
         seat.store
-      )
+      ))
     );
     // One marker write per poll; one transcript line per poll but the last.
     expect(kit.log.mirroredHealth).toHaveLength(fake.blocked.length);
@@ -740,8 +757,8 @@ describe('waitUntilTurn', () => {
     ]);
   });
 
-  test('returns the moment the phase is genuinely ours', async () => {
-    const seat = bench();
+  awaitTest('returns the moment the phase is genuinely ours', function* (wait) {
+    const seat = yield* bench();
     const kit = recorder();
     const fake = clocked((elapsed) =>
       pvpWake(elapsed >= 30 ? 'phase_active' : 'timeout', {
@@ -750,35 +767,35 @@ describe('waitUntilTurn', () => {
       })
     );
     const wake = right(
-      await run(
+      yield* wait(run(
         waitUntilTurn(clockedCtx(kit, fake, seat), waitArgs({}), { forTurn: true }),
         fake.fetch,
         seat.store
-      )
+      ))
     );
     expect(wake.wake_reason).toBe('phase_active');
     expect(fake.now.seconds).toBe(30);
   });
 
-  test('a cap is a hard ceiling over the holder deadline', async () => {
-    const seat = bench();
+  awaitTest('a cap is a hard ceiling over the holder deadline', function* (wait) {
+    const seat = yield* bench();
     const kit = recorder();
     const fake = clocked((elapsed) =>
       pvpWake('timeout', { mine: false, remainingS: Math.max(0, 600 - elapsed) })
     );
     const wake = right(
-      await run(
+      yield* wait(run(
         waitUntilTurn(clockedCtx(kit, fake, seat), waitArgs({}), { forTurn: true, capS: 45 }),
         fake.fetch,
         seat.store
-      )
+      ))
     );
     expect(wake.wake_reason).toBe('timeout');
     expect(fake.now.seconds).toBe(45);
   });
 
-  test('without --for-turn the first poll is the caller own --wait-s', async () => {
-    const seat = bench();
+  awaitTest('without --for-turn the first poll is the caller own --wait-s', function* (wait) {
+    const seat = yield* bench();
     const kit = recorder();
     // A holder whose deadline has already run out: the loop continues only
     // while the server names a seat that still has time left.
@@ -786,40 +803,40 @@ describe('waitUntilTurn', () => {
       pvpWake('timeout', { mine: false, remainingS: Math.max(0, 20 - elapsed) })
     );
     right(
-      await run(
+      yield* wait(run(
         waitUntilTurn(clockedCtx(kit, fake, seat), waitArgs({ waitS: 30 }), { forTurn: false }),
         fake.fetch,
         seat.store
-      )
+      ))
     );
     expect(fake.blocked[0]).toBe(30);
     expect(fake.blocked).toHaveLength(1);
   });
 
-  test('without --for-turn and no holder named, one poll and out', async () => {
-    const seat = bench();
+  awaitTest('without --for-turn and no holder named, one poll and out', function* (wait) {
+    const seat = yield* bench();
     const kit = recorder();
     // No `waiting_on`: the server named nobody, so a single-seat game behaves
     // exactly as it always did.
     const fake = clocked(() => waitPayload({ wake_reason: 'timeout', health: healthPayload() }));
     const wake = right(
-      await run(
+      yield* wait(run(
         waitUntilTurn(clockedCtx(kit, fake, seat), waitArgs({}), { forTurn: false }),
         fake.fetch,
         seat.store
-      )
+      ))
     );
     expect(wake.wake_reason).toBe('timeout');
     expect(fake.blocked).toHaveLength(1);
   });
 
-  test('the mirror override replaces the default marker write', async () => {
-    const seat = bench();
+  awaitTest('the mirror override replaces the default marker write', function* (wait) {
+    const seat = yield* bench();
     const kit = recorder();
     const own: HealthEnvelope[] = [];
     const fake = clocked(() => pvpWake('phase_active', { mine: true }));
     right(
-      await run(
+      yield* wait(run(
         waitUntilTurn(clockedCtx(kit, fake, seat), waitArgs({}), {
           forTurn: true,
           mirror: (health) =>
@@ -829,7 +846,7 @@ describe('waitUntilTurn', () => {
         }),
         fake.fetch,
         seat.store
-      )
+      ))
     );
     expect(own).toHaveLength(1);
     expect(kit.log.mirroredHealth).toHaveLength(0);
@@ -841,39 +858,39 @@ describe('waitUntilTurn', () => {
 // ---------------------------------------------------------------------------
 
 describe('waitCommandValue', () => {
-  test('--max without --for-turn is refused rather than ignored', async () => {
-    const seat = bench();
+  awaitTest('--max without --for-turn is refused rather than ignored', function* (wait) {
+    const seat = yield* bench();
     const kit = recorder();
     const server = scripted(() => ({ body: waitPayload() }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: kit.hooks });
     expect(
-      message(await run(waitCommandValue(ctx, waitArgs({}), { maxS: 30 }), server.fetch, seat.store))
+      message(yield* wait(run(waitCommandValue(ctx, waitArgs({}), { maxS: 30 }), server.fetch, seat.store)))
     ).toBe('wait --max bounds --for-turn; pass both or neither');
     expect(server.urls).toHaveLength(0);
   });
 
-  test('--max is bounded by the same ceiling the wait is', async () => {
-    const seat = bench();
+  awaitTest('--max is bounded by the same ceiling the wait is', function* (wait) {
+    const seat = yield* bench();
     const kit = recorder();
     const server = scripted(() => ({ body: waitPayload() }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: kit.hooks });
     expect(
       message(
-        await run(
+        yield* wait(run(
           waitCommandValue(ctx, waitArgs({}), { forTurn: true, maxS: 616 }),
           server.fetch,
           seat.store
-        )
+        ))
       )
     ).toBe('max must be in [0, 615]');
   });
 
-  test('a plain wait makes exactly one request and never loops', async () => {
-    const seat = bench();
+  awaitTest('a plain wait makes exactly one request and never loops', function* (wait) {
+    const seat = yield* bench();
     const kit = recorder();
     const server = scripted(() => ({ body: pvpWake('timeout', { mine: false }) }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: kit.hooks });
-    right(await run(waitCommandValue(ctx, waitArgs({})), server.fetch, seat.store));
+    right(yield* wait(run(waitCommandValue(ctx, waitArgs({})), server.fetch, seat.store)));
     expect(server.urls).toHaveLength(1);
     expect(server.urls[0]).toContain('wait_s=120');
     // No `--for-turn`, so nothing mirrors and nothing ticks.
@@ -886,28 +903,32 @@ describe('waitCommandValue', () => {
 // _seat_rebound
 // ---------------------------------------------------------------------------
 
-const reboundOf = (seat: Bench): Promise<boolean> =>
-  Effect.runPromise(Effect.provide(seatRebound(seat.sessionPath), Layer.succeed(SessionStore, seat.store)));
+const reboundOf = (seat: Bench): Effect.Effect<boolean> =>
+  provideTestLayer(
+    seatRebound(seat.sessionPath),
+    Layer.succeed(SessionStore, seat.store)
+  );
 
 describe('seatRebound', () => {
-  test('is false when no current session can be resolved at all', async () => {
-    expect(await reboundOf(bench())).toBe(false);
+  awaitTest('is false when no current session can be resolved at all', function* () {
+    expect(yield* reboundOf(yield* bench())).toBe(false);
   });
 
-  test('is false while the workspace still points at this seat', async () => {
-    const seat = bench();
-    Effect.runSync(seat.store.setCurrentSession(seat.sessionPath));
-    expect(await reboundOf(seat)).toBe(false);
+  awaitTest('is false while the workspace still points at this seat', function* () {
+    const seat = yield* bench();
+    yield* seat.store.setCurrentSession(seat.sessionPath);
+    expect(yield* reboundOf(seat)).toBe(false);
   });
 
-  test('is true once `use` has pointed the workspace at another seat', async () => {
-    const seat = bench();
+  awaitTest('is true once `use` has pointed the workspace at another seat', function* () {
+    const seat = yield* bench();
     const other = path.join(seat.scratch.workspace.stateRoot, 'session-other-harness.json');
-    Effect.runSync(
-      seat.scratch.files.writeJson(other, sessionFile({ controller_label: 'other-harness' }))
+    yield* seat.scratch.files.writeJson(
+      other,
+      sessionFile({ controller_label: 'other-harness' })
     );
-    Effect.runSync(seat.store.setCurrentSession(other));
-    expect(await reboundOf(seat)).toBe(true);
+    yield* seat.store.setCurrentSession(other);
+    expect(yield* reboundOf(seat)).toBe(true);
   });
 });
 
@@ -915,13 +936,13 @@ describe('seatRebound', () => {
 // The renderers
 // ---------------------------------------------------------------------------
 
-const decodedWake = (payload: JsonObject, session: Session): Promise<WaitEnvelope> =>
-  Effect.runPromise(decodeWait(payload, session, { until: 'phase', afterStateToken: null }));
+const decodedWake = (payload: JsonObject, session: Session): WaitEnvelope =>
+  Effect.runSync(decodeWait(payload, session, { until: 'phase', afterStateToken: null }));
 
 describe('the wait renderers', () => {
-  test('a timeout names the holder instead of calling itself a wake', async () => {
-    const seat = bench();
-    const wake = await decodedWake(pvpWake('timeout', { mine: false }), seat.session);
+  effectTest('a timeout names the holder instead of calling itself a wake', () => Effect.gen(function* () {
+    const seat = yield* bench();
+    const wake = decodedWake(pvpWake('timeout', { mine: false }), seat.session);
     const line = awaitLine(wake);
     expect(line).toContain('still seat 2 AgentPlace2 (pi-gpt-5.6-sol)');
     expect(line).toContain('held 13s');
@@ -930,53 +951,53 @@ describe('the wait renderers', () => {
     expect(line).not.toContain('next: just turn');
     expect(line).toContain('just wait --for-turn');
     expect(line).toContain('[exit 75]');
-  });
+  }));
 
-  test('an actionable wake keeps the plain briefing tail', async () => {
-    const seat = bench();
-    const wake = await decodedWake(pvpWake('phase_active', { mine: true }), seat.session);
+  effectTest('an actionable wake keeps the plain briefing tail', () => Effect.gen(function* () {
+    const seat = yield* bench();
+    const wake = decodedWake(pvpWake('phase_active', { mine: true }), seat.session);
     const line = awaitLine(wake);
     expect(line.startsWith('T3 | ')).toBe(true);
     expect(line).toContain('next: just turn');
     expect(line).not.toContain('woke phase_active');
-  });
+  }));
 
-  test('a non-phase_active wake on our own phase says which wake it was', async () => {
-    const seat = bench();
-    const wake = await decodedWake(pvpWake('boundary_recovered', { mine: true }), seat.session);
+  effectTest('a non-phase_active wake on our own phase says which wake it was', () => Effect.gen(function* () {
+    const seat = yield* bench();
+    const wake = decodedWake(pvpWake('boundary_recovered', { mine: true }), seat.session);
     expect(awaitLine(wake)).toContain('woke boundary_recovered');
-  });
+  }));
 
-  test('an empty follow drops the tail entirely, on both branches', async () => {
-    const seat = bench();
-    const mine = await decodedWake(pvpWake('phase_active', { mine: true }), seat.session);
-    const theirs = await decodedWake(pvpWake('timeout', { mine: false }), seat.session);
+  effectTest('an empty follow drops the tail entirely, on both branches', () => Effect.gen(function* () {
+    const seat = yield* bench();
+    const mine = decodedWake(pvpWake('phase_active', { mine: true }), seat.session);
+    const theirs = decodedWake(pvpWake('timeout', { mine: false }), seat.session);
     expect(awaitLine(mine, '')).not.toContain('next:');
     expect(awaitLine(theirs, '')).not.toContain('next:');
-  });
+  }));
 
-  test('the tick line names the seat, how long it has held and what is left', async () => {
-    const seat = bench();
-    const wake = await decodedWake(pvpWake('timeout', { mine: false }), seat.session);
+  effectTest('the tick line names the seat, how long it has held and what is left', () => Effect.gen(function* () {
+    const seat = yield* bench();
+    const wake = decodedWake(pvpWake('timeout', { mine: false }), seat.session);
     const line = waitingTickLine(wake.health);
     expect(line.startsWith('… waiting on ')).toBe(true);
     expect(line).toContain('seat 2 AgentPlace2 (pi-gpt-5.6-sol)');
     expect(line).toContain('held 13s');
     expect(line).toContain('9m47s left');
-  });
+  }));
 
-  test('with nobody named, the tick line says only that the phase is shut', async () => {
-    const seat = bench();
-    const wake = await decodedWake(pvpWake('timeout', { mine: true }), seat.session);
+  effectTest('with nobody named, the tick line says only that the phase is shut', () => Effect.gen(function* () {
+    const seat = yield* bench();
+    const wake = decodedWake(pvpWake('timeout', { mine: true }), seat.session);
     expect(waitingTickLine(wake.health)).toBe("… waiting for this seat's phase to open");
-  });
+  }));
 
-  test('renderWait is the await header over the health block', async () => {
-    const seat = bench();
-    const wake = await decodedWake(pvpWake('phase_active', { mine: true }), seat.session);
+  effectTest('renderWait is the await header over the health block', () => Effect.gen(function* () {
+    const seat = yield* bench();
+    const wake = decodedWake(pvpWake('phase_active', { mine: true }), seat.session);
     expect(renderWait(wake)).toEqual([
       awaitLine(wake),
       ...renderHealth(wake.health),
     ]);
-  });
+  }));
 });

@@ -12,7 +12,7 @@
  * accumulation is promoted in one step when the final page says the catalog is
  * complete — see `rememberPage` in `src/services/aliases.ts`.
  */
-import { Effect } from 'effect';
+import { DateTime, Effect } from 'effect';
 import {
   ACTOR_ID_RE,
   CATALOG_RE,
@@ -27,6 +27,7 @@ import { cursorExpiry, type PageScope } from 'src/schema/page';
 import {
   field,
   isJsonObject,
+  isJsonString,
   isWholeNumber,
   type JsonObject,
   type JsonValue,
@@ -78,7 +79,10 @@ const INVALID = 'private v2 pending catalogs are invalid';
  * `Z` spelling directly and `_validate_cursor_expiry` already proved the string
  * is one of those spellings.
  */
-export const cursorExpired = (expiresAt: string | null, now = Date.now()): boolean => {
+export const cursorExpired = (
+  expiresAt: string | null,
+  now = DateTime.toEpochMillis(DateTime.unsafeNow())
+): boolean => {
   if (expiresAt === null) return false;
   const parsed = Date.parse(expiresAt);
   return Number.isNaN(parsed) ? false : parsed <= now;
@@ -100,7 +104,7 @@ const scopeIsValid = (scope: JsonValue): boolean => {
   const actorType = field(scope, 'actor_type');
   if (sameKeys(scope, new Set(['actor_id', 'actor_type']))) {
     return (
-      typeof actorId === 'string' &&
+      isJsonString(actorId) &&
       ACTOR_ID_RE.test(actorId) &&
       (actorType === 'player' || actorType === 'city' || actorType === 'unit')
     );
@@ -108,9 +112,9 @@ const scopeIsValid = (scope: JsonValue): boolean => {
   if (sameKeys(scope, new Set(['actor_id', 'actor_type', 'target_id', 'target_type']))) {
     const targetId = field(scope, 'target_id');
     const targetType = field(scope, 'target_type');
-    if (typeof actorId !== 'string' || !ACTOR_ID_RE.test(actorId)) return false;
+    if (!isJsonString(actorId) || !ACTOR_ID_RE.test(actorId)) return false;
     if (actorType !== 'player' && actorType !== 'unit' && actorType !== 'city') return false;
-    if (typeof targetId !== 'string') return false;
+    if (!isJsonString(targetId)) return false;
     // CPython's `and`/`or` precedence: a relation target is player-only, and a
     // tile target is open to every actor type.
     return (
@@ -165,9 +169,9 @@ export const validatePendingCatalogs = (
         !isJsonObject(items) ||
         Object.keys(items).length === 0 ||
         Object.keys(items).length >= total ||
-        typeof cursor !== 'string' ||
+        !isJsonString(cursor) ||
         !CURSOR_RE.test(cursor) ||
-        (expiry !== null && typeof expiry !== 'string')
+        (expiry !== null && !isJsonString(expiry))
       ) {
         return yield* fail;
       }
@@ -183,6 +187,7 @@ export const validatePendingCatalogs = (
         if (decoded.action_id !== actionId) return yield* fail;
       }
     }
+    return undefined;
   });
 
 // ---------------------------------------------------------------------------

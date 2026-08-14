@@ -207,19 +207,19 @@ export const ENTITY_ALIAS_RE = /^([ucpr])([1-9][0-9]{0,3})$/;
 export const TILE_ALIAS_RE = /^[Tt]\((-?[0-9]{1,4}), ?(-?[0-9]{1,4})\)$/;
 export const TILE_KEY_RE = /^(-?[0-9]{1,4}),(-?[0-9]{1,4})$/;
 
-export const ALIAS_ENTITY_PREFIXES: Readonly<Record<string, string>> = {
-  unit: 'u',
-  city: 'c',
-  player: 'p',
-  relation: 'r',
-};
+export const ALIAS_ENTITY_PREFIXES: ReadonlyMap<string, string> = new Map([
+  ['unit', 'u'],
+  ['city', 'c'],
+  ['player', 'p'],
+  ['relation', 'r'],
+]);
 
-export const ALIAS_ENTITY_TYPES: Readonly<Record<string, string>> = {
-  u: 'unit',
-  c: 'city',
-  p: 'player',
-  r: 'relation',
-};
+export const ALIAS_ENTITY_TYPES: ReadonlyMap<string, string> = new Map([
+  ['u', 'unit'],
+  ['c', 'city'],
+  ['p', 'player'],
+  ['r', 'relation'],
+]);
 
 export const ALIAS_ENTITY_KEYS = ['id', 'relation_id', 'player_id'] as const;
 

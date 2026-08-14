@@ -23,7 +23,7 @@ import { constants as osConstants } from 'node:os';
 import { Console, Effect } from 'effect';
 import { formatG } from 'src/render/primitives';
 import { holderSeat } from 'src/render/phase';
-import { isJsonObject, type JsonValue } from 'src/schema/primitives';
+import { isJsonBoolean, isJsonNumber, isJsonObject, isJsonString, type JsonValue } from 'src/schema/primitives';
 import { compactJson } from 'src/services/json-output';
 import type { WaitEnvelope } from 'src/schema/wait';
 import { mirrorMonitorLog } from 'src/services/mirror';
@@ -51,8 +51,9 @@ const orEmpty = (value: JsonValue | undefined): string => {
   }
   if (Array.isArray(value) && value.length === 0) return '';
   if (isJsonObject(value) && Object.keys(value).length === 0) return '';
-  if (typeof value === 'string') return value;
-  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (isJsonString(value)) return value;
+  if (isJsonNumber(value)) return String(value);
+  if (isJsonBoolean(value)) return String(value);
   return compactJson(value);
 };
 
@@ -101,22 +102,22 @@ export const MONITOR_HOOK_VARIABLES: ReadonlyArray<string> = [
 export const monitorHookEnvironment = (
   wait: WaitEnvelope,
   base: Readonly<Record<string, string | undefined>> = process.env
-): Record<string, string> => {
+) => {
   const health = wait.health;
   const phase = health.phase;
   const holder = holderSeat(phase);
   const remaining = phase === null ? null : phase.timing.remaining_s;
-  const environment: Record<string, string> = {};
+  const environment = new Map<string, string>();
   for (const [name, value] of Object.entries(base)) {
-    if (value !== undefined) environment[name] = value;
+    if (value !== undefined) environment.set(name, value);
   }
-  environment['FREECIV_GAME_ID'] = String(health.game_id);
-  environment['FREECIV_TURN'] = phase === null || phase.turn === null ? '' : String(phase.turn);
-  environment['FREECIV_PHASE'] = phase === null || phase.phase === null ? '' : String(phase.phase);
-  environment['FREECIV_YOUR_TURN'] = phaseIsMine(health) ? '1' : '0';
-  environment['FREECIV_DEADLINE_S'] = remaining === null ? '' : formatG(remaining);
-  environment['FREECIV_HOLDER_LABEL'] = holder === null ? '' : orEmpty(holder.controller_label);
-  return environment;
+  environment.set('FREECIV_GAME_ID', health.game_id);
+  environment.set('FREECIV_TURN', phase === null || phase.turn === null ? '' : String(phase.turn));
+  environment.set('FREECIV_PHASE', phase === null || phase.phase === null ? '' : String(phase.phase));
+  environment.set('FREECIV_YOUR_TURN', phaseIsMine(health) ? '1' : '0');
+  environment.set('FREECIV_DEADLINE_S', remaining === null ? '' : formatG(remaining));
+  environment.set('FREECIV_HOLDER_LABEL', holder === null ? '' : orEmpty(holder.controller_label));
+  return Object.fromEntries(environment);
 };
 
 // ---------------------------------------------------------------------------

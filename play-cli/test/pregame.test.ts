@@ -10,8 +10,9 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect, Either } from 'effect';
 import { createHash } from 'node:crypto';
-import * as path from 'node:path';
-import { PlayerError, V2ResponseError, playerError } from 'src/errors';
+import type { BatchDisposition } from 'src/schema/batch';
+import type { ReceiptState } from 'src/schema/receipt';
+import { type PlayerError, V2ResponseError, playerError } from 'src/errors';
 import {
   NOT_READIED_LINE,
   PREGAME_SHOWN_MAX,
@@ -40,22 +41,30 @@ import {
   type PregameItem,
 } from 'src/services/pregame';
 import { FIXTURE_GAME_ID, scratchWorkspace, type Scratch } from 'test/_fixtures';
+import { dispositionOf, rev } from 'test/_do-harness';
+import { awaitTest, effectTest } from 'test/_effect-test';
+import { observedFirst, observedLast } from 'test/_expect';
+import { path } from 'test/_test-platform';
 
 const scratches: Scratch[] = [];
 
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() =>
+  Effect.runPromise(
+    Effect.forEach(scratches.splice(0), (scratch) => scratch.cleanup, { discard: true })
+  )
+);
 
 const NATION = `nation_${'a'.repeat(32)}`;
 const ZULU = `nation_${'c'.repeat(32)}`;
 const STYLE = `style_${'b'.repeat(32)}`;
 
-const item = (id: string, name: string, style?: string): PregameItem => ({
-  id,
-  name,
-  ...(style === undefined ? {} : { default_style_id: style }),
-});
+const item = (id: string, name: string, style?: string): PregameItem => {
+  if (style === undefined) return { id, name };
+  return { id, name, default_style_id: style };
+};
+
+const receiptDisposition = (state: ReceiptState): BatchDisposition =>
+  dispositionOf('batch_receipt_truth_table', state, rev(4));
 
 // ---------------------------------------------------------------------------
 // _sanitized_leader
@@ -113,51 +122,63 @@ describe('defaultSex', () => {
 // _pregame_choice
 // ---------------------------------------------------------------------------
 
-const refusalOf = <A>(effect: Effect.Effect<A, PlayerError>): string => {
-  const outcome = Effect.runSync(Effect.either(effect));
-  if (Either.isRight(outcome)) throw new Error('expected a refusal');
-  return outcome.left.message;
-};
+const refusalOf = <A>(effect: Effect.Effect<A, PlayerError>): Effect.Effect<string> =>
+  Effect.map(Effect.either(effect), (outcome) => {
+    if (Either.isRight(outcome)) throw new Error('expected a refusal');
+    return outcome.left.message;
+  });
 
 describe('pregameChoice', () => {
   const catalog = [item(NATION, 'English', STYLE), item(ZULU, 'Zulu', STYLE)];
 
-  test('a name matches case-insensitively and exactly', () => {
-    expect(Effect.runSync(pregameChoice(catalog, 'eNgLiSh', 'nation')).id).toBe(NATION);
-  });
+  effectTest('a name matches case-insensitively and exactly', () =>
+    Effect.gen(function* () {
+      expect((yield* pregameChoice(catalog, 'eNgLiSh', 'nation')).id).toBe(NATION);
+    })
+  );
 
-  test('an unmatched name is refused with the catalog quoted back', () => {
-    const message = refusalOf(pregameChoice(catalog, 'Atlantean', 'nation'));
-    expect(message).toBe("no nation named 'Atlantean' is offered; try one of: English Zulu");
-  });
+  effectTest('an unmatched name is refused with the catalog quoted back', () =>
+    Effect.gen(function* () {
+      const message = yield* refusalOf(pregameChoice(catalog, 'Atlantean', 'nation'));
+      expect(message).toBe("no nation named 'Atlantean' is offered; try one of: English Zulu");
+    })
+  );
 
-  test('a near miss narrows the suggestion to the near misses', () => {
-    const message = refusalOf(pregameChoice(catalog, 'lish', 'nation'));
-    expect(message).toBe("no nation named 'lish' is offered; try one of: English");
-  });
+  effectTest('a near miss narrows the suggestion to the near misses', () =>
+    Effect.gen(function* () {
+      const message = yield* refusalOf(pregameChoice(catalog, 'lish', 'nation'));
+      expect(message).toBe("no nation named 'lish' is offered; try one of: English");
+    })
+  );
 
-  test('an empty catalog says so rather than trailing off', () => {
-    expect(refusalOf(pregameChoice([], 'English', 'nation'))).toBe(
-      "no nation named 'English' is offered; try one of: none were offered"
-    );
-  });
+  effectTest('an empty catalog says so rather than trailing off', () =>
+    Effect.gen(function* () {
+      expect(yield* refusalOf(pregameChoice([], 'English', 'nation'))).toBe(
+        "no nation named 'English' is offered; try one of: none were offered"
+      );
+    })
+  );
 
-  test('a duplicated name is the lobby catalog being broken, not the input', () => {
-    const doubled = [item(NATION, 'English'), item(ZULU, 'english')];
-    expect(refusalOf(pregameChoice(doubled, 'English', 'nation'))).toBe(
-      "nation 'English' is offered more than once; this lobby catalog is ambiguous"
-    );
-  });
+  effectTest('a duplicated name is the lobby catalog being broken, not the input', () =>
+    Effect.gen(function* () {
+      const doubled = [item(NATION, 'English'), item(ZULU, 'english')];
+      expect(yield* refusalOf(pregameChoice(doubled, 'English', 'nation'))).toBe(
+        "nation 'English' is offered more than once; this lobby catalog is ambiguous"
+      );
+    })
+  );
 
-  test('the suggestion list is capped, and sorted before it is cut', () => {
-    const many = Array.from({ length: 30 }, (_index, position) =>
-      item(`nation_${'z'.repeat(30)}${position}`, `N${String(position).padStart(2, '0')}`)
-    );
-    const message = refusalOf(pregameChoice(many, 'Atlantean', 'nation'));
-    const shown = message.split('try one of: ')[1] ?? '';
-    expect(shown.split(' ')).toHaveLength(PREGAME_SHOWN_MAX);
-    expect(shown.startsWith('N00 N01')).toBe(true);
-  });
+  effectTest('the suggestion list is capped, and sorted before it is cut', () =>
+    Effect.gen(function* () {
+      const many = Array.from({ length: 30 }, (_index, position) =>
+        item(`nation_${'z'.repeat(30)}${position}`, `N${String(position).padStart(2, '0')}`)
+      );
+      const message = yield* refusalOf(pregameChoice(many, 'Atlantean', 'nation'));
+      const shown = message.split('try one of: ')[1] ?? '';
+      expect(shown.split(' ')).toHaveLength(PREGAME_SHOWN_MAX);
+      expect(shown.startsWith('N00 N01')).toBe(true);
+    })
+  );
 
   test('a repr keeps CPython’s quoting choices', () => {
     expect(pyRepr('Atlantean')).toBe("'Atlantean'");
@@ -172,67 +193,62 @@ describe('pregameChoice', () => {
 // ---------------------------------------------------------------------------
 
 describe('pregameDefaultNation', () => {
-  test('the draw is made over the sorted catalog, so a seeded RNG reproduces it', () => {
-    const offered = [item(ZULU, 'Zulu', STYLE), item(NATION, 'English', STYLE)];
-    const seen: ReadonlyArray<string>[] = [];
-    const picked = Effect.runSync(
-      pregameDefaultNation(offered, (choices) => {
+  effectTest('the draw is made over the sorted catalog, so a seeded RNG reproduces it', () =>
+    Effect.gen(function* () {
+      const offered = [item(ZULU, 'Zulu', STYLE), item(NATION, 'English', STYLE)];
+      const seen: ReadonlyArray<string>[] = [];
+      const picked = yield* pregameDefaultNation(offered, (choices) => {
         seen.push(choices.map((choice) => choice.name));
-        return choices[choices.length - 1] as PregameItem;
-      })
-    );
-    expect(seen[0]).toEqual(['English', 'Zulu']);
-    expect(picked.id).toBe(ZULU);
-  });
+        return observedLast(choices);
+      });
+      expect(seen[0]).toEqual(['English', 'Zulu']);
+      expect(picked.id).toBe(ZULU);
+    })
+  );
 
-  test('a row with no id or no name is never drawable', () => {
-    const offered = [item('', 'Nameless'), item(ZULU, ''), item(NATION, 'English', STYLE)];
-    const drawn = Effect.runSync(
-      pregameDefaultNation(offered, (choices) => {
+  effectTest('a row with no id or no name is never drawable', () =>
+    Effect.gen(function* () {
+      const offered = [item('', 'Nameless'), item(ZULU, ''), item(NATION, 'English', STYLE)];
+      const drawn = yield* pregameDefaultNation(offered, (choices) => {
         expect(choices.map((choice) => choice.name)).toEqual(['English']);
-        return choices[0] as PregameItem;
-      })
-    );
-    expect(drawn.id).toBe(NATION);
-  });
+        return observedFirst(choices);
+      });
+      expect(drawn.id).toBe(NATION);
+    })
+  );
 
-  test('an empty lobby fails closed and names the catalog to read', () => {
-    expect(
-      refusalOf(
-        pregameDefaultNation([], () => {
-          throw new Error('the draw must not happen');
-        })
-      )
-    ).toBe(
-      'this lobby offers no selectable nation; read the catalog with ' +
-        '`just state --section pregame_nations`'
-    );
-  });
+  effectTest('an empty lobby fails closed and names the catalog to read', () =>
+    Effect.gen(function* () {
+      expect(
+        yield* refusalOf(
+          pregameDefaultNation([], () => {
+            throw new Error('the draw must not happen');
+          })
+        )
+      ).toBe(
+        'this lobby offers no selectable nation; read the catalog with ' +
+          '`just state --section pregame_nations`'
+      );
+    })
+  );
 });
 
 // ---------------------------------------------------------------------------
 // _mirror_pregame_catalog
 // ---------------------------------------------------------------------------
 
-const withMirror = async <E>(
+const withMirror = <A, E>(
   write: (dir: string) => Effect.Effect<unknown, E, PrivateFs>,
-  read: (sessionPath: string) => Effect.Effect<unknown, never, PrivateFs>
-): Promise<unknown> => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'codex-test.json');
-  const dir = Effect.runSync(mirrorDir(sessionPath));
-  await Effect.runPromise(
-    Effect.provideService(
-      Effect.orDie(write(dir)),
-      PrivateFs,
-      scratch.files
-    )
-  );
-  return Effect.runPromise(
-    Effect.provideService(read(sessionPath), PrivateFs, scratch.files)
-  );
-};
+  read: (sessionPath: string) => Effect.Effect<A, never, PrivateFs>
+): Effect.Effect<A> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'codex-test.json');
+    const dir = yield* Effect.orDie(mirrorDir(sessionPath));
+    yield* Effect.provideService(Effect.orDie(write(dir)), PrivateFs, scratch.files);
+    return yield* Effect.provideService(read(sessionPath), PrivateFs, scratch.files);
+  });
 
 const nationsTable = (
   rows: ReadonlyArray<ReadonlyArray<string>>,
@@ -246,8 +262,8 @@ const nationsTable = (
   );
 
 describe('mirrorPregameCatalog', () => {
-  test('a complete projection is re-read rather than re-fetched', async () => {
-    const items = await withMirror(
+  awaitTest('a complete projection is re-read rather than re-fetched', function* () {
+    const items = yield* withMirror(
       (dir) =>
         writeMirror(
           dir,
@@ -265,8 +281,8 @@ describe('mirrorPregameCatalog', () => {
     ]);
   });
 
-  test('a partial projection is refused whole; a half catalog is not a catalog', async () => {
-    const items = await withMirror(
+  awaitTest('a partial projection is refused whole; a half catalog is not a catalog', function* () {
+    const items = yield* withMirror(
       (dir) =>
         writeMirror(dir, [CACHE_DIR, 'nations.tsv'], nationsTable([[NATION, 'English', STYLE]], false)),
       (sessionPath) => mirrorPregameCatalog(sessionPath, 'pregame_nations')
@@ -274,8 +290,8 @@ describe('mirrorPregameCatalog', () => {
     expect(items).toEqual([]);
   });
 
-  test('a truncated opaque id poisons the whole projection', async () => {
-    const items = await withMirror(
+  awaitTest('a truncated opaque id poisons the whole projection', function* () {
+    const items = yield* withMirror(
       (dir) =>
         writeMirror(
           dir,
@@ -290,8 +306,8 @@ describe('mirrorPregameCatalog', () => {
     expect(items).toEqual([]);
   });
 
-  test('a projection whose columns moved is not guessed at', async () => {
-    const items = await withMirror(
+  awaitTest('a projection whose columns moved is not guessed at', function* () {
+    const items = yield* withMirror(
       (dir) =>
         writeMirror(
           dir,
@@ -308,16 +324,16 @@ describe('mirrorPregameCatalog', () => {
     expect(items).toEqual([]);
   });
 
-  test('an absent projection is empty, not an error', async () => {
-    const items = await withMirror(
+  awaitTest('an absent projection is empty, not an error', function* () {
+    const items = yield* withMirror(
       () => Effect.void,
       (sessionPath) => mirrorPregameCatalog(sessionPath, 'pregame_nations')
     );
     expect(items).toEqual([]);
   });
 
-  test('a style is named from the mirror alone', async () => {
-    const named = await withMirror(
+  awaitTest('a style is named from the mirror alone', function* () {
+    const named = yield* withMirror(
       (dir) =>
         writeMirror(
           dir,
@@ -332,7 +348,7 @@ describe('mirrorPregameCatalog', () => {
       (sessionPath) => cachedStyleName(sessionPath, STYLE)
     );
     expect(named).toBe('European');
-    const missing = await withMirror(
+    const missing = yield* withMirror(
       () => Effect.void,
       (sessionPath) => cachedStyleName(sessionPath, STYLE)
     );
@@ -347,37 +363,34 @@ describe('mirrorPregameCatalog', () => {
 const HEADER = (state: string, active: string): string =>
   `phase ${state} · turn 3 phase 1 · active ${active}\n`;
 
-const underRefusal = async (
+const underRefusal = (
   header: string | null,
   failure: PlayerError | V2ResponseError
-): Promise<string> => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'codex-test.json');
-  if (header !== null) {
-    const dir = Effect.runSync(mirrorDir(sessionPath));
-    await Effect.runPromise(
-      Effect.provideService(
+): Effect.Effect<string> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'codex-test.json');
+    if (header !== null) {
+      const dir = yield* Effect.orDie(mirrorDir(sessionPath));
+      yield* Effect.provideService(
         Effect.orDie(writeMirror(dir, HEADER_FILE, header)),
         PrivateFs,
         scratch.files
-      )
-    );
-  }
-  const outcome = await Effect.runPromise(
-    Effect.provideService(
+      );
+    }
+    const outcome = yield* Effect.provideService(
       Effect.either(phaseAwareRefusal(sessionPath, Effect.fail(failure))),
       PrivateFs,
       scratch.files
-    )
-  );
-  if (Either.isRight(outcome)) throw new Error('expected a refusal');
-  return outcome.left.message;
-};
+    );
+    if (Either.isRight(outcome)) throw new Error('expected a refusal');
+    return outcome.left.message;
+  });
 
 describe('phaseAwareRefusal', () => {
-  test('a refusal raised after the phase ended leads with the phase fact', async () => {
-    const message = await underRefusal(
+  awaitTest('a refusal raised after the phase ended leads with the phase fact', function* () {
+    const message = yield* underRefusal(
       HEADER('inactive_done', 'no'),
       playerError('unknown or expired action ID')
     );
@@ -387,26 +400,26 @@ describe('phaseAwareRefusal', () => {
     );
   });
 
-  test('a live phase leaves the refusal exactly as it was', async () => {
-    const message = await underRefusal(
+  awaitTest('a live phase leaves the refusal exactly as it was', function* () {
+    const message = yield* underRefusal(
       HEADER('awaiting_agent', 'yes'),
       playerError('unknown or expired action ID')
     );
     expect(message).toBe('unknown or expired action ID');
   });
 
-  test('a refusal that already leads with the note is not double-prefixed', async () => {
+  awaitTest('a refusal that already leads with the note is not double-prefixed', function* () {
     const note = 'your phase is not active (state ending) — just wait';
-    const message = await underRefusal(HEADER('ending', 'no'), playerError(`${note}\nand more`));
+    const message = yield* underRefusal(HEADER('ending', 'no'), playerError(`${note}\nand more`));
     expect(message).toBe(`${note}\nand more`);
   });
 
-  test('no mirror at all means no rewrite', async () => {
-    expect(await underRefusal(null, playerError('cold cache'))).toBe('cold cache');
+  awaitTest('no mirror at all means no rewrite', function* () {
+    expect(yield* underRefusal(null, playerError('cold cache'))).toBe('cold cache');
   });
 
-  test('a validated wire refusal is rewritten too, exactly as CPython subclasses it', async () => {
-    const message = await underRefusal(
+  awaitTest('a validated wire refusal is rewritten too, exactly as CPython subclasses it', function* () {
+    const message = yield* underRefusal(
       HEADER('phase_not_ready', 'no'),
       new V2ResponseError({ message: 'HTTP 409: no (conflict)', status: 409, payload: null })
     );
@@ -439,26 +452,32 @@ describe('checkPregameArguments', () => {
   };
   const good = { nation_id: NATION, leader_name: 'Ada', is_male: false, style_id: STYLE };
 
-  test('the arguments this workspace builds are accepted', () => {
-    expect(Effect.runSync(Effect.either(checkPregameArguments(action, good)))).toEqual(
-      Either.right(undefined)
-    );
-  });
+  effectTest('the arguments this workspace builds are accepted', () =>
+    Effect.gen(function* () {
+      expect(yield* Effect.either(checkPregameArguments(action, good))).toEqual(
+        Either.right(undefined)
+      );
+    })
+  );
 
-  test('a schema that wants something else names the escape hatch', () => {
-    const { nation_id: _dropped, ...missing } = good;
-    expect(refusalOf(checkPregameArguments(action, missing))).toBe(
-      'the enumerated pregame.configure action does not take the arguments ' +
-        'this workspace builds; run `just legal --kind pregame.configure --all ' +
-        '--json` and submit it with `just batch`'
-    );
-  });
+  effectTest('a schema that wants something else names the escape hatch', () =>
+    Effect.gen(function* () {
+      const { nation_id: _dropped, ...missing } = good;
+      expect(yield* refusalOf(checkPregameArguments(action, missing))).toBe(
+        'the enumerated pregame.configure action does not take the arguments ' +
+          'this workspace builds; run `just legal --kind pregame.configure --all ' +
+          '--json` and submit it with `just batch`'
+      );
+    })
+  );
 
-  test('an argument the schema never declared is refused the same way', () => {
-    expect(refusalOf(checkPregameArguments(action, { ...good, colour: 'red' }))).toContain(
-      'does not take the arguments this workspace builds'
-    );
-  });
+  effectTest('an argument the schema never declared is refused the same way', () =>
+    Effect.gen(function* () {
+      expect(
+        yield* refusalOf(checkPregameArguments(action, { ...good, colour: 'red' }))
+      ).toContain('does not take the arguments this workspace builds');
+    })
+  );
 
   test('required names the schema does not declare as properties are ignored', () => {
     const drifted = {
@@ -498,12 +517,12 @@ describe('defaultArguments and orderReceiptOk', () => {
   });
 
   test('only accepted and applied mean the seat was configured', () => {
-    const of = (state: string): unknown => ({ receipt: { receipt_state: state } });
-    expect(orderReceiptOk(of('applied') as never)).toBe(true);
-    expect(orderReceiptOk(of('accepted') as never)).toBe(true);
-    expect(orderReceiptOk(of('rejected') as never)).toBe(false);
-    expect(orderReceiptOk(of('ambiguous') as never)).toBe(false);
-    expect(orderReceiptOk({ receipt: null } as never)).toBe(false);
+    const withoutReceipt: BatchDisposition = { ...receiptDisposition('applied'), receipt: null };
+    expect(orderReceiptOk(receiptDisposition('applied'))).toBe(true);
+    expect(orderReceiptOk(receiptDisposition('accepted'))).toBe(true);
+    expect(orderReceiptOk(receiptDisposition('rejected'))).toBe(false);
+    expect(orderReceiptOk(receiptDisposition('ambiguous'))).toBe(false);
+    expect(orderReceiptOk(withoutReceipt)).toBe(false);
   });
 });
 

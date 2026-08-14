@@ -46,6 +46,7 @@ import {
   type DecisionRow,
 } from 'src/render/decisions';
 import type { AliasMap, JsonObject, JsonValue } from 'src/render/primitives';
+import { isJsonString } from 'src/schema/primitives';
 import { V2_ONE_CALL_END } from 'src/render/turn';
 import { actionTargetKey, aliasMap } from 'src/services/aliases';
 import { compactLegalAction, type CompactAction } from 'src/services/legal-compact';
@@ -62,7 +63,7 @@ import {
   orderTargetKeys,
   type Tier1Verb,
 } from 'src/services/orders';
-import { PrivateFs } from 'src/services/private-fs';
+import type { PrivateFs } from 'src/services/private-fs';
 import type { V2ClientState } from 'src/services/session-store';
 import { mirrorCell, mirrorFile, mirrorNumber, mirrorTable } from 'src/services/turn-pages';
 
@@ -199,8 +200,8 @@ const compactField = (compact: CompactAction, key: string): JsonValue =>
 const aliasNumber = (alias: string): number => Number.parseInt(alias.slice(1), 10);
 
 const entityAliasId = (state: V2ClientState, alias: string): string => {
-  const value = state.entity_aliases[alias];
-  return typeof value === 'string' ? value : '';
+  const value = dictGet(state.entity_aliases, alias);
+  return isJsonString(value) ? value : '';
 };
 
 /**
@@ -269,8 +270,7 @@ const rankedVerbs = (
   pool: ReadonlyArray<CompactAction>,
   deps: DecisionDeps
 ): ReadonlyArray<readonly [string, ReadonlyArray<CompactAction>]> =>
-  // `Array.prototype.sort` is stable, which is what makes this `sorted()`.
-  [...groupByVerb(pool, deps)].sort((left, right) => {
+  groupByVerb(pool, deps).toSorted((left, right) => {
     const first = left[1][0];
     const second = right[1][0];
     if (first === undefined || second === undefined) return 0;
@@ -469,7 +469,7 @@ export const decisionUnitRows = (
         ),
       ]);
     }
-    return found.sort((left, right) => left[0] - right[0]).map(([, row]) => row);
+    return found.toSorted((left, right) => left[0] - right[0]).map(([, row]) => row);
   });
 
 // ---------------------------------------------------------------------------
@@ -522,7 +522,7 @@ export const decisionCityRows = (
         ),
       ]);
     }
-    return found.sort((left, right) => left[0] - right[0]).map(([, row]) => row);
+    return found.toSorted((left, right) => left[0] - right[0]).map(([, row]) => row);
   });
 
 // ---------------------------------------------------------------------------

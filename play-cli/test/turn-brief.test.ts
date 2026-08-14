@@ -14,23 +14,22 @@
  * failing, and a job supervisor that reads a non-zero status re-ends a phase
  * that is already over.
  */
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Command, ValidationError } from '@effect/cli';
 import { BunContext } from '@effect/platform-bun';
-import { Cause, Effect, Exit, Layer, Option } from 'effect';
+import { Cause, Effect, Either, Exit, Layer, Option, Runtime } from 'effect';
 import { PHASE_END_REMEDY } from 'src/constants';
-import { playerError } from 'src/errors';
+import { playerError, type PlayError } from 'src/errors';
 import type { RenderTurnDeps } from 'src/render/turn';
-import type { BatchDisposition } from 'src/schema/batch';
-import type { JsonObject, JsonValue } from 'src/schema/primitives';
+import { decodeBatchDisposition, type BatchDisposition } from 'src/schema/batch';
+import { isJsonObject, type JsonObject, type JsonValue } from 'src/schema/primitives';
 import type { Revision } from 'src/schema/revision';
 import { liveTurnSeams, turnCommandWith, turnCtx, type TurnSeamsFor } from 'src/commands/turn.cmd';
 import type { DecisionDeps } from 'src/services/decisions';
 import { httpFor } from 'src/services/http';
 import { compactLegalAction } from 'src/services/legal-compact';
 import { DEFAULT_COMMAND_CARD, HEADER_FILE, mirrorText } from 'src/services/mirror';
-import { PrivateFs, Workspace } from 'src/services/private-fs';
+import { type PrivateFs, type Workspace } from 'src/services/private-fs';
 import {
   SessionStore,
   emptyV2ClientState,
@@ -58,21 +57,38 @@ import {
   FIXTURE_GAME_ID,
   fakeFetch,
   healthPayload,
+  identity,
   jsonResponse,
   scratchWorkspace,
   sessionFile,
   waitPayload,
   type Scratch,
 } from 'test/_fixtures';
+import { captureEffect } from 'test/_capture';
+import { awaitTest, provideTestLayer } from 'test/_effect-test';
+import { parseFixtureObject } from 'test/_expect';
+import { path } from 'test/_test-platform';
 
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
 
+type FetchInput = Parameters<typeof fetch>[0];
+type FetchArguments = Parameters<typeof fetch>;
+
+const urlOf = (input: FetchInput): string =>
+  input instanceof Request ? input.url : new URL(input).href;
+
+const completeFetch = (
+  handler: (...args: FetchArguments) => ReturnType<typeof fetch>
+): typeof fetch => Object.assign(handler, { preconnect: fetch.preconnect });
+
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() =>
+  Effect.runPromise(
+    Effect.forEach(scratches.splice(0), (scratch) => scratch.cleanup, { discard: true })
+  )
+);
 
 const stateSchema = {
   empty: emptyV2ClientState,
@@ -99,34 +115,37 @@ const phaseEndDescriptor = (revision: Revision): JsonObject => ({
   state_revision: { ...revision },
 });
 
-const disposition = (state: string): BatchDisposition =>
-  ({
+const dispositionPayload = (state: string): JsonObject => ({
+  schema_version: 2,
+  control_protocol: 'full-control-v2',
+  game_id: FIXTURE_GAME_ID,
+  agent_id: FIXTURE_AGENT_ID,
+  batch_id: 'batch_end',
+  disposition: 'receipt_terminal',
+  receipt: {
     schema_version: 2,
     control_protocol: 'full-control-v2',
     game_id: FIXTURE_GAME_ID,
     agent_id: FIXTURE_AGENT_ID,
     batch_id: 'batch_end',
-    disposition: 'receipt_terminal',
-    receipt: {
-      schema_version: 2,
-      control_protocol: 'full-control-v2',
-      game_id: FIXTURE_GAME_ID,
-      agent_id: FIXTURE_AGENT_ID,
-      batch_id: 'batch_end',
-      receipt_state: state,
-      idempotent: true,
-      state_revision: ENDED,
-      error: null,
-      observation: null,
-    },
+    receipt_state: state,
+    idempotent: true,
+    state_revision: { ...ENDED },
     error: null,
-  }) as unknown as BatchDisposition;
+    observation: null,
+  },
+  error: null,
+});
+
+const disposition = (state: string): BatchDisposition =>
+  Effect.runSync(decodeBatchDisposition(dispositionPayload(state), identity()));
 
 /** The order engine, as far as `phase.end` reaches it. */
 const decisionDeps = (): DecisionDeps => ({
   orderPool: (state) =>
-    Effect.forEach(Object.values(state.actions), (descriptor) =>
-      compactLegalAction(descriptor as JsonObject)
+    Effect.forEach(
+      Object.values(state.actions).filter(isJsonObject),
+      compactLegalAction
     ),
   orderActor: () => '',
   orderOperation: () => 'end',
@@ -202,78 +221,73 @@ interface Bench {
   // command run against this bench, not just the pieces that take a context.
   readonly layer: Layer.Layer<V2Client | SessionStore | Workspace | PrivateFs>;
   readonly run: <A, E>(
-    effect: Effect.Effect<A, E, V2Client | SessionStore | import('src/services/private-fs').PrivateFs>
-  ) => Promise<import('effect/Either').Either<A, E>>;
+    effect: Effect.Effect<A, E, V2Client | SessionStore | PrivateFs>
+  ) => Promise<Either.Either<A, E>>;
 }
 
 const bench = (
   fetchImpl: typeof fetch,
   options: { readonly actions?: Readonly<Record<string, JsonValue>>; readonly overrides?: PhaseEndOverrides } = {}
-): Bench => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const sessionPath = path.join(scratch.workspace.stateRoot, 'session-codex-gpt-5.6-sol.json');
-  Effect.runSync(scratch.files.writeJson(sessionPath, sessionFile()));
-  const store = sessionStoreFor(scratch.workspace, scratch.files, stateSchema, {});
-  const loaded = Effect.runSync(store.resolveV2(sessionPath));
-  const seeded: V2ClientState = {
-    ...emptyV2ClientState(loaded.session),
-    last_revision: REVISION,
-    actions: options.actions ?? {},
-  };
-  Effect.runSync(Effect.provide(store.writeState(sessionPath, seeded), scratch.layer));
-
-  const log: Log = { order: [], drained: 0, stdout: [] };
-  const ctx: TurnCtx = {
-    sessionPath,
-    session: loaded.session,
-    hooks,
-    waitHooks,
-    decisions: decisionDeps(),
-    renderers,
-    phaseEnd: phaseEndDeps(log, options.overrides ?? {}),
-  };
-  const layer = Layer.mergeAll(
-    Layer.succeed(V2Client, v2ClientFor(httpFor(fetchImpl), () => Effect.void)),
-    Layer.succeed(SessionStore, store),
-    scratch.layer
-  );
-  return {
-    ctx,
-    log,
-    store,
-    session: loaded.session,
-    sessionPath,
-    layer,
-    run: (effect) => Effect.runPromise(Effect.either(Effect.provide(effect, layer))),
-  };
-};
-
-/** Capture stdout for one effect: the receipt lines are the contract. */
-const captured = async <A, E>(
-  body: () => Promise<import('effect/Either').Either<A, E>>
-): Promise<{ readonly result: import('effect/Either').Either<A, E>; readonly lines: string[] }> => {
-  const printed: string[] = [];
-  const log = console.log;
-  const error = console.error;
-  console.log = (...parts: ReadonlyArray<unknown>): void => {
-    printed.push(parts.map((part) => String(part)).join(' '));
-  };
-  console.error = (): void => undefined;
-  try {
-    const result = await body();
-    return {
-      result,
-      lines: printed
-        .join('\n')
-        .split('\n')
-        .filter((line) => line !== ''),
+): Effect.Effect<Bench, PlayError> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    yield* Effect.sync(() => scratches.push(scratch));
+    const sessionPath = path.join(scratch.workspace.stateRoot, 'session-codex-gpt-5.6-sol.json');
+    yield* scratch.files.writeJson(sessionPath, sessionFile());
+    const store = sessionStoreFor(scratch.workspace, scratch.files, stateSchema, {});
+    const loaded = yield* store.resolveV2(sessionPath);
+    const seeded: V2ClientState = {
+      ...emptyV2ClientState(loaded.session),
+      last_revision: REVISION,
+      actions: options.actions ?? {},
     };
-  } finally {
-    console.log = log;
-    console.error = error;
-  }
+    yield* provideTestLayer(store.writeState(sessionPath, seeded), scratch.layer);
+
+    const log: Log = { order: [], drained: 0, stdout: [] };
+    const ctx: TurnCtx = {
+      sessionPath,
+      session: loaded.session,
+      hooks,
+      waitHooks,
+      decisions: decisionDeps(),
+      renderers,
+      phaseEnd: phaseEndDeps(log, options.overrides ?? {}),
+    };
+    const layer = Layer.mergeAll(
+      Layer.succeed(V2Client, v2ClientFor(httpFor(fetchImpl), () => Effect.void)),
+      Layer.succeed(SessionStore, store),
+      scratch.layer
+    );
+    const runtime = yield* Effect.runtime();
+    return {
+      ctx,
+      log,
+      store,
+      session: loaded.session,
+      sessionPath,
+      layer,
+      run: (effect) => Runtime.runPromise(runtime)(Effect.either(provideTestLayer(effect, layer))),
+    };
+  });
+
+const refusalMessage = (either: Either.Either<unknown, { readonly message: string }>): string => {
+  expect(Either.isLeft(either)).toBe(true);
+  return Either.isLeft(either) ? either.left.message : '';
 };
+
+interface CapturedStdout<A, E> {
+  readonly result: Either.Either<A, E>;
+  readonly lines: ReadonlyArray<string>;
+}
+
+/** Capture stdout while a bench run resolves, returning the Either in an Effect. */
+const captured = <A, E>(run: Promise<Either.Either<A, E>>): Effect.Effect<CapturedStdout<A, E>> =>
+  captureEffect(Effect.promise(() => run)).pipe(
+    Effect.map(({ value: result, captured: output }) => ({
+      result,
+      lines: output.out.join('\n').split('\n').filter((line) => line !== ''),
+    }))
+  );
 
 const wakeFetch = (payload: JsonObject): typeof fetch =>
   fakeFetch(new Map([['/wait', { body: payload }]]));
@@ -324,12 +338,90 @@ const timedOutWake = (): JsonObject =>
     state_revision: null,
   });
 
+const ACTIVE_HEALTH = (): JsonObject =>
+  healthPayload({
+    phase: {
+      state: 'awaiting_agent',
+      turn: 3,
+      phase: 0,
+      active: true,
+      timing: {
+        mode: 'default',
+        timeout_s: 180,
+        deadline_started_at: 1000,
+        deadline_at: 1180,
+        elapsed_s: 1,
+        remaining_s: 179,
+      },
+    },
+  });
+
+const statePage = (
+  section: string,
+  revision: Revision,
+  items: ReadonlyArray<JsonValue>,
+  cursor: string | null = null
+): JsonObject => ({
+  schema_version: 2,
+  control_protocol: 'full-control-v2',
+  game_id: FIXTURE_GAME_ID,
+  agent_id: FIXTURE_AGENT_ID,
+  state_revision: { ...revision },
+  page: {
+    section,
+    items,
+    total_items: cursor === null ? items.length : items.length + 1,
+    next_cursor: cursor,
+    cursor_expires_at: cursor === null ? null : '2099-01-01T00:00:00Z',
+  },
+});
+
+const briefingRevision = (revision: number): Revision => ({
+  turn: 3,
+  revision,
+  state_token: `token_3_${revision}`,
+});
+
+/** The bench's seams, handed to the real command. */
+const seamsOf = (kit: Bench): TurnSeamsFor => () =>
+  Effect.succeed({
+    hooks: kit.ctx.hooks,
+    waitHooks: kit.ctx.waitHooks,
+    decisions: kit.ctx.decisions,
+    renderers: kit.ctx.renderers,
+    phaseEnd: kit.ctx.phaseEnd,
+  });
+
+/** Did the *parser* refuse this argv, as argparse's `choices` did? */
+const parse = (kit: Bench, argv: ReadonlyArray<string>): Effect.Effect<boolean> =>
+  captureEffect(
+    Effect.exit(
+      provideTestLayer(
+        Command.run(turnCommandWith(seamsOf(kit)), { name: 'play', version: '0.1.0' })([
+          'bun',
+          'play',
+          '--session',
+          kit.sessionPath,
+          ...argv,
+        ]),
+        Layer.mergeAll(kit.layer, BunContext.layer)
+      )
+    )
+  ).pipe(
+    Effect.map(({ value: exit }) => {
+      if (Exit.isSuccess(exit)) return false;
+      const failure = Option.getOrNull(Cause.failureOption(exit.cause));
+      return failure !== null && ValidationError.isValidationError(failure);
+    })
+  );
+
 // ---------------------------------------------------------------------------
 
 describe('_cached_kind_action / _resolve_kind_action', () => {
-  test('exactly one cached action of the kind resolves; two are ambiguous', async () => {
+  awaitTest('exactly one cached action of the kind resolves; two are ambiguous', function* () {
+    const fixture = yield* bench(fakeFetch([]));
     const state = (actions: Readonly<Record<string, JsonValue>>): V2ClientState => ({
-      ...emptyV2ClientState({ gameId: FIXTURE_GAME_ID, agentId: FIXTURE_AGENT_ID } as Session),
+      ...emptyV2ClientState(fixture.session),
       last_revision: REVISION,
       actions,
     });
@@ -351,12 +443,12 @@ describe('_cached_kind_action / _resolve_kind_action', () => {
     expect(two).toBeNull();
   });
 
-  test('a cold cache drains once, then refuses naming the remedy', async () => {
-    const kit = bench(wakeFetch(activeWake()));
-    const outcome = await kit.run(resolveKindAction(kit.ctx, 'phase.end', PHASE_END_REMEDY));
+  awaitTest('a cold cache drains once, then refuses naming the remedy', function* (wait) {
+    const kit = yield* bench(wakeFetch(activeWake()));
+    const outcome = yield* wait(kit.run(resolveKindAction(kit.ctx, 'phase.end', PHASE_END_REMEDY)));
     expect(outcome._tag).toBe('Left');
     if (outcome._tag === 'Left') {
-      expect((outcome.left as { message: string }).message).toBe(
+      expect(refusalMessage(outcome)).toBe(
         `no phase.end action is enumerable for this seat right now; ${PHASE_END_REMEDY}`
       );
     }
@@ -365,11 +457,11 @@ describe('_cached_kind_action / _resolve_kind_action', () => {
 });
 
 describe('_phase_end_locked', () => {
-  test('resolves the capability, submits it and renders the receipt', async () => {
-    const kit = bench(wakeFetch(activeWake()), {
+  awaitTest('resolves the capability, submits it and renders the receipt', function* (wait) {
+    const kit = yield* bench(wakeFetch(activeWake()), {
       actions: { [PHASE_END_ID]: phaseEndDescriptor(REVISION) },
     });
-    const outcome = await kit.run(phaseEnd(kit.ctx));
+    const outcome = yield* wait(kit.run(phaseEnd(kit.ctx)));
     expect(outcome._tag).toBe('Right');
     if (outcome._tag !== 'Right') return;
     expect(outcome.right.exitCode).toBe(0);
@@ -378,30 +470,28 @@ describe('_phase_end_locked', () => {
     expect(kit.log.order).toEqual([`persist:${PHASE_END_ID}`, 'batch']);
   });
 
-  test('a phase.end that takes arguments refuses and names `just batch`', async () => {
-    const kit = bench(wakeFetch(activeWake()), {
+  awaitTest('a phase.end that takes arguments refuses and names `just batch`', function* (wait) {
+    const kit = yield* bench(wakeFetch(activeWake()), {
       actions: { [PHASE_END_ID]: phaseEndDescriptor(REVISION) },
       overrides: { defaultArguments: null },
     });
-    const outcome = await kit.run(phaseEnd(kit.ctx));
+    const outcome = yield* wait(kit.run(phaseEnd(kit.ctx)));
     expect(outcome._tag).toBe('Left');
     if (outcome._tag === 'Left') {
-      expect((outcome.left as { message: string }).message).toContain(
+      expect(refusalMessage(outcome)).toContain(
         'just legal --kind phase.end --all'
       );
-      expect((outcome.left as { message: string }).message).toContain('just batch');
+      expect(refusalMessage(outcome)).toContain('just batch');
     }
   });
 });
 
 describe('turn --end --await', () => {
-  test('ends the phase, blocks, then heads the next one', async () => {
-    const kit = bench(wakeFetch(activeWake()), {
+  awaitTest('ends the phase, blocks, then heads the next one', function* (wait) {
+    const kit = yield* bench(wakeFetch(activeWake()), {
       actions: { [PHASE_END_ID]: phaseEndDescriptor(REVISION) },
     });
-    const { result, lines } = await captured(() =>
-      kit.run(commandTurnEnd(kit.ctx, { awaitNext: true, json: false, wait: { waitS: 0 } }))
-    );
+    const { result, lines } = yield* wait(captured(kit.run(commandTurnEnd(kit.ctx, { awaitNext: true, json: false, wait: { waitS: 0 } }))));
     expect(result._tag).toBe('Right');
     if (result._tag === 'Right') expect(result.right.exitCode).toBe(0);
     expect(kit.log.order).toEqual([`persist:${PHASE_END_ID}`, 'batch']);
@@ -416,13 +506,11 @@ describe('turn --end --await', () => {
    * The invariant, stated as a test: the end applied, the wait timed out, and
    * the status is still the end's.
    */
-  test('an applied phase end exits 0 even when the wait times out', async () => {
-    const kit = bench(wakeFetch(timedOutWake()), {
+  awaitTest('an applied phase end exits 0 even when the wait times out', function* (wait) {
+    const kit = yield* bench(wakeFetch(timedOutWake()), {
       actions: { [PHASE_END_ID]: phaseEndDescriptor(REVISION) },
     });
-    const { result, lines } = await captured(() =>
-      kit.run(commandTurnEnd(kit.ctx, { awaitNext: true, json: false, wait: { waitS: 0 } }))
-    );
+    const { result, lines } = yield* wait(captured(kit.run(commandTurnEnd(kit.ctx, { awaitNext: true, json: false, wait: { waitS: 0 } }))));
     expect(result._tag).toBe('Right');
     if (result._tag === 'Right') expect(result.right.exitCode).toBe(0);
     expect(lines[0]?.startsWith('phase end → applied')).toBe(true);
@@ -430,15 +518,15 @@ describe('turn --end --await', () => {
     expect(lines[1]).toContain('woke timeout');
   });
 
-  test('a wake into somebody else\'s phase is reported, not briefed, and still exits 0', async () => {
-    const kit = bench(wakeFetch(timedOutWake()), {
+  awaitTest('a wake into somebody else\'s phase is reported, not briefed, and still exits 0', function* (wait) {
+    const kit = yield* bench(wakeFetch(timedOutWake()), {
       actions: { [PHASE_END_ID]: phaseEndDescriptor(REVISION) },
     });
-    const { result, lines } = await captured(() =>
-      kit.run(
-        commandTurnEnd(kit.ctx, { awaitNext: true, brief: true, json: false, wait: { waitS: 0 } })
-      )
-    );
+    const { result, lines } = yield* wait(captured(
+        kit.run(
+          commandTurnEnd(kit.ctx, { awaitNext: true, brief: true, json: false, wait: { waitS: 0 } })
+        )
+      ));
     expect(result._tag).toBe('Right');
     if (result._tag === 'Right') expect(result.right.exitCode).toBe(0);
     expect(lines).toContain(
@@ -447,28 +535,26 @@ describe('turn --end --await', () => {
     expect(lines).toContain('next: just wait --for-turn');
   });
 
-  test('a receipt that did not apply is never awaited', async () => {
-    const kit = bench(wakeFetch(activeWake()), {
+  awaitTest('a receipt that did not apply is never awaited', function* (wait) {
+    const kit = yield* bench(wakeFetch(activeWake()), {
       actions: { [PHASE_END_ID]: phaseEndDescriptor(REVISION) },
       overrides: { receiptOk: false },
     });
-    const { result, lines } = await captured(() =>
-      kit.run(commandTurnEnd(kit.ctx, { awaitNext: true, json: false, wait: { waitS: 0 } }))
-    );
+    const { result, lines } = yield* wait(captured(kit.run(commandTurnEnd(kit.ctx, { awaitNext: true, json: false, wait: { waitS: 0 } }))));
     expect(result._tag).toBe('Right');
     expect(lines).toContain('not awaited: the phase end was not accepted');
   });
 
-  test('a wait that fails outright never hides the applied receipt', async () => {
-    const kit = bench(
+  awaitTest('a wait that fails outright never hides the applied receipt', function* (wait) {
+    const kit = yield* bench(
       fakeFetch(new Map([['/wait', { status: 500, body: { error: 'boom' } }]])),
       { actions: { [PHASE_END_ID]: phaseEndDescriptor(REVISION) } }
     );
-    const { result, lines } = await captured(() =>
-      kit.run(
-        commandTurnEnd(kit.ctx, { awaitNext: true, brief: true, json: false, wait: { waitS: 0 } })
-      )
-    );
+    const { result, lines } = yield* wait(captured(
+        kit.run(
+          commandTurnEnd(kit.ctx, { awaitNext: true, brief: true, json: false, wait: { waitS: 0 } })
+        )
+      ));
     expect(result._tag).toBe('Right');
     if (result._tag === 'Right') expect(result.right.exitCode).toBe(2);
     expect(lines.join('\n')).toContain('phase end');
@@ -478,48 +564,7 @@ describe('turn --end --await', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// The argparse surface (client.py:11650-11672)
-// ---------------------------------------------------------------------------
-
 describe('turn --until is a choice', () => {
-  /** The bench's seams, handed to the real command. */
-  const seamsOf = (kit: Bench): TurnSeamsFor => () =>
-    Effect.succeed({
-      hooks: kit.ctx.hooks,
-      waitHooks: kit.ctx.waitHooks,
-      decisions: kit.ctx.decisions,
-      renderers: kit.ctx.renderers,
-      phaseEnd: kit.ctx.phaseEnd,
-    });
-
-  /** Did the *parser* refuse this argv, as argparse's `choices` did? */
-  const parse = async (kit: Bench, argv: ReadonlyArray<string>): Promise<boolean> => {
-    const log = console.log;
-    const error = console.error;
-    console.log = (): void => undefined;
-    console.error = (): void => undefined;
-    try {
-      const exit = await Effect.runPromiseExit(
-        Effect.provide(
-          Command.run(turnCommandWith(seamsOf(kit)), { name: 'play', version: '0.1.0' })([
-            'bun',
-            'play',
-            '--session',
-            kit.sessionPath,
-            ...argv,
-          ]),
-          Layer.mergeAll(kit.layer, BunContext.layer)
-        )
-      );
-      if (Exit.isSuccess(exit)) return false;
-      const failure = Option.getOrNull(Cause.failureOption(exit.cause));
-      return failure !== null && ValidationError.isValidationError(failure);
-    } finally {
-      console.log = log;
-      console.error = error;
-    }
-  };
 
   /**
    * `turn.add_argument("--until", choices=("phase", "revision"))` refuses a bad
@@ -535,57 +580,54 @@ describe('turn --until is a choice', () => {
    * exiting 2 on a run CPython never lets start.  The phase-end log is the
    * assertion that matters: a rejected flag must not end a phase.
    */
-  test('a bad value is refused by the parser, so no phase is ended', async () => {
-    const kit = bench(wakeFetch(activeWake()), {
+  awaitTest('a bad value is refused by the parser, so no phase is ended', function* (wait) {
+    const kit = yield* bench(wakeFetch(activeWake()), {
       actions: { [PHASE_END_ID]: phaseEndDescriptor(REVISION) },
     });
-    expect(await parse(kit, ['--end', '--await', '--until', 'phse'])).toBe(true);
+    expect(yield* wait(parse(kit, ['--end', '--await', '--until', 'phse']))).toBe(true);
     expect(kit.log.order).toEqual([]);
   });
 
-  test('both declared values reach the handler and end the phase', async () => {
+  awaitTest('both declared values reach the handler and end the phase', function* (wait) {
     for (const value of ['phase', 'revision']) {
-      const kit = bench(wakeFetch(activeWake()), {
+      const kit = yield* bench(wakeFetch(activeWake()), {
         actions: { [PHASE_END_ID]: phaseEndDescriptor(REVISION) },
       });
-      expect(await parse(kit, ['--end', '--await', '--until', value, '--wait-s', '0'])).toBe(false);
+      expect(yield* wait(parse(kit, ['--end', '--await', '--until', value, '--wait-s', '0']))).toBe(false);
       expect(kit.log.order).toContain('batch');
     }
     // …and the default, which argparse also spells `phase`.
-    const kit = bench(wakeFetch(activeWake()), {
+    const kit = yield* bench(wakeFetch(activeWake()), {
       actions: { [PHASE_END_ID]: phaseEndDescriptor(REVISION) },
     });
-    expect(await parse(kit, ['--end', '--await', '--wait-s', '0'])).toBe(false);
+    expect(yield* wait(parse(kit, ['--end', '--await', '--wait-s', '0']))).toBe(false);
     expect(kit.log.order).toContain('batch');
   });
 });
 
 describe('_await_and_brief_locked', () => {
-  test('the prelude flushes before the wait begins, even on an instant wake', async () => {
+  awaitTest('the prelude flushes before the wait begins, even on an instant wake', function* (wait) {
     // "Execution is done" prints while the opponent is still thinking: the
     // receipts flush ahead of the first poll, not on the first unwoken tick
     // -- a wait that wakes immediately used to keep them buffered to the end.
-    const kit = bench(wakeFetch(activeWake()));
-    const captured: string[] = [];
-    const original = console.log;
-    console.log = (...parts: ReadonlyArray<unknown>) => captured.push(parts.join(' '));
-    try {
-      const prelude = ['u1 found_city London → applied rev7/t3'];
-      const outcome = await kit.run(
-        awaitAndBrief(kit.ctx, { brief: false, wait: { waitS: 0 }, prelude })
-      );
-      expect(outcome._tag).toBe('Right');
-      expect(prelude).toHaveLength(0);
-      expect(captured).toContain('u1 found_city London → applied rev7/t3');
-    } finally {
-      console.log = original;
-    }
+    const kit = yield* bench(wakeFetch(activeWake()));
+    const prelude = ['u1 found_city London → applied rev7/t3'];
+    const { value: outcome, captured: output } = yield* wait(
+      captureEffect(
+        Effect.promise(() =>
+          kit.run(awaitAndBrief(kit.ctx, { brief: false, wait: { waitS: 0 }, prelude }))
+        )
+      )
+    );
+    expect(outcome._tag).toBe('Right');
+    expect(prelude).toHaveLength(0);
+    expect(output.out).toContain('u1 found_city London → applied rev7/t3');
   });
 
-  test('without --brief the header carries the follow-up command', async () => {
-    const kit = bench(wakeFetch(activeWake()));
-    const outcome = await kit.run(
-      awaitAndBrief(kit.ctx, { brief: false, wait: { waitS: 0 } })
+  awaitTest('without --brief the header carries the follow-up command', function* (wait) {
+    const kit = yield* bench(wakeFetch(activeWake()));
+    const outcome = yield* wait(
+      kit.run(awaitAndBrief(kit.ctx, { brief: false, wait: { waitS: 0 } }))
     );
     expect(outcome._tag).toBe('Right');
     if (outcome._tag !== 'Right') return;
@@ -594,8 +636,8 @@ describe('_await_and_brief_locked', () => {
     expect(outcome.right.briefing).toBeNull();
   });
 
-  test('a briefing that cannot be built is one more line, not a swallowed wake', async () => {
-    const kit = bench(
+  awaitTest('a briefing that cannot be built is one more line, not a swallowed wake', function* (wait) {
+    const kit = yield* bench(
       fakeFetch(
         new Map([
           ['/wait', { body: activeWake() }],
@@ -603,7 +645,7 @@ describe('_await_and_brief_locked', () => {
         ])
       )
     );
-    const outcome = await kit.run(awaitAndBrief(kit.ctx, { brief: true, wait: { waitS: 0 } }));
+    const outcome = yield* wait(kit.run(awaitAndBrief(kit.ctx, { brief: true, wait: { waitS: 0 } })));
     expect(outcome._tag).toBe('Right');
     if (outcome._tag !== 'Right') return;
     expect(outcome.right.briefError).not.toBe('');
@@ -644,60 +686,20 @@ describe('_composite_json', () => {
     expect(payload['status']).toBe('ended');
   });
 
-  test('--json prints one object and nothing else', async () => {
-    const kit = bench(wakeFetch(activeWake()), {
+  awaitTest('--json prints one object and nothing else', function* (wait) {
+    const kit = yield* bench(wakeFetch(activeWake()), {
       actions: { [PHASE_END_ID]: phaseEndDescriptor(REVISION) },
     });
-    const { result, lines } = await captured(() =>
-      kit.run(commandTurnEnd(kit.ctx, { awaitNext: true, json: true, wait: { waitS: 0 } }))
-    );
+    const { result, lines } = yield* wait(captured(kit.run(commandTurnEnd(kit.ctx, { awaitNext: true, json: true, wait: { waitS: 0 } }))));
     expect(result._tag).toBe('Right');
-    const payload: unknown = JSON.parse(lines.join('\n'));
-    expect((payload as JsonObject)['command']).toBe('turn');
-    expect((payload as JsonObject)['status']).toBe('ended');
+    const payload = parseFixtureObject(lines.join('\n'));
+    expect(payload['command']).toBe('turn');
+    expect(payload['status']).toBe('ended');
   });
 });
 
 describe('_turn_briefing_locked', () => {
-  const ACTIVE_HEALTH = (): JsonObject =>
-    healthPayload({
-      phase: {
-        state: 'awaiting_agent',
-        turn: 3,
-        phase: 0,
-        active: true,
-        timing: {
-          mode: 'default',
-          timeout_s: 180,
-          deadline_started_at: 1000,
-          deadline_at: 1180,
-          elapsed_s: 1,
-          remaining_s: 179,
-        },
-      },
-    });
-
-  const statePage = (
-    section: string,
-    revision: Revision,
-    items: ReadonlyArray<JsonValue>,
-    cursor: string | null = null
-  ): JsonObject => ({
-    schema_version: 2,
-    control_protocol: 'full-control-v2',
-    game_id: FIXTURE_GAME_ID,
-    agent_id: FIXTURE_AGENT_ID,
-    state_revision: { ...revision },
-    page: {
-      section,
-      items,
-      total_items: cursor === null ? items.length : items.length + 1,
-      next_cursor: cursor,
-      cursor_expires_at: cursor === null ? null : '2099-01-01T00:00:00Z',
-    },
-  });
-
-  test('a revision that drifts mid-fetch restarts once, then returns one revision', async () => {
+  awaitTest('a revision that drifts mid-fetch restarts once, then returns one revision', function* (wait) {
     const first: Revision = { turn: 3, revision: 7, state_token: 'token_3_7' };
     const drifted: Revision = { turn: 3, revision: 8, state_token: 'token_3_8' };
     const stable: Revision = { turn: 3, revision: 9, state_token: 'token_3_9' };
@@ -706,7 +708,7 @@ describe('_turn_briefing_locked', () => {
       turn: 3,
       player: { government: 'Despotism', economy: { gold: 25 } },
     };
-    const kit = bench(
+    const kit = yield* bench(
       fakeFetch([
         { body: ACTIVE_HEALTH() },
         { body: statePage('overview', first, [overviewItem]) },
@@ -722,7 +724,7 @@ describe('_turn_briefing_locked', () => {
         { body: ACTIVE_HEALTH() },
       ])
     );
-    const outcome = await kit.run(turnBriefingLocked(kit.ctx));
+    const outcome = yield* wait(kit.run(turnBriefingLocked(kit.ctx)));
     expect(outcome._tag).toBe('Right');
     if (outcome._tag !== 'Right') return;
     const result = outcome.right.result;
@@ -737,7 +739,7 @@ describe('_turn_briefing_locked', () => {
     expect(result.next_commands).toContain(`just state --cursor ${cursor}`);
   });
 
-  test('a second disagreement refuses, naming the command that retries it', async () => {
+  awaitTest('a second disagreement refuses, naming the command that retries it', function* (wait) {
     const a: Revision = { turn: 3, revision: 7, state_token: 'token_3_7' };
     const b: Revision = { turn: 3, revision: 8, state_token: 'token_3_8' };
     const item: JsonValue = { turn: 3, player: null };
@@ -749,21 +751,21 @@ describe('_turn_briefing_locked', () => {
       { body: statePage('research', b, []) },
       { body: ACTIVE_HEALTH() },
     ];
-    const kit = bench(fakeFetch([...drifting, ...drifting]));
-    const outcome = await kit.run(turnBriefingLocked(kit.ctx));
+    const kit = yield* bench(fakeFetch([...drifting, ...drifting]));
+    const outcome = yield* wait(kit.run(turnBriefingLocked(kit.ctx)));
     expect(outcome._tag).toBe('Left');
     if (outcome._tag === 'Left') {
-      expect((outcome.left as { message: string }).message).toBe(
+      expect(refusalMessage(outcome)).toBe(
         'the game changed twice while building the turn briefing; run `just turn` again'
       );
     }
   });
 
-  test('a terminal game names `just result`, and never fetches a page', async () => {
-    const kit = bench(
+  awaitTest('a terminal game names `just result`, and never fetches a page', function* (wait) {
+    const kit = yield* bench(
       fakeFetch([{ body: healthPayload({ game_state: 'completed', phase: null }) }])
     );
-    const outcome = await kit.run(turnBriefingLocked(kit.ctx));
+    const outcome = yield* wait(kit.run(turnBriefingLocked(kit.ctx)));
     expect(outcome._tag).toBe('Right');
     if (outcome._tag !== 'Right') return;
     expect(outcome.right.result.status).toBe('terminal');
@@ -771,20 +773,20 @@ describe('_turn_briefing_locked', () => {
     expect(outcome.right.decisions).toEqual([]);
   });
 
-  test('the lobby names the pregame reads; anything else names `just wait`', async () => {
-    const lobby = bench(
+  awaitTest('the lobby names the pregame reads; anything else names `just wait`', function* (wait) {
+    const lobby = yield* bench(
       fakeFetch([{ body: healthPayload({ game_state: 'lobby', phase: null }) }])
     );
-    const first = await lobby.run(turnBriefingLocked(lobby.ctx));
+    const first = yield* wait(lobby.run(turnBriefingLocked(lobby.ctx)));
     expect(first._tag).toBe('Right');
     if (first._tag !== 'Right') return;
     expect(first.right.result.status).toBe('lobby');
     expect(first.right.result.next_commands[1]).toBe('just state --section pregame_nations');
 
-    const notReady = bench(
+    const notReady = yield* bench(
       fakeFetch([{ body: healthPayload({ observation_available: false }) }])
     );
-    const second = await notReady.run(turnBriefingLocked(notReady.ctx));
+    const second = yield* wait(notReady.run(turnBriefingLocked(notReady.ctx)));
     expect(second._tag).toBe('Right');
     if (second._tag !== 'Right') return;
     expect(second.right.result.status).toBe('not_ready');
@@ -931,8 +933,25 @@ const sectionPayload = (
   },
 });
 
-const urlOf = (input: Parameters<typeof fetch>[0]): string =>
-  typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+type BriefingSection = 'overview' | 'units' | 'cities' | 'research';
+
+const briefingPage = (section: BriefingSection, plan: BriefingPlan): ReadonlyArray<JsonValue> => {
+  switch (section) {
+    case 'overview':
+      return [briefingOverview(plan.chat)];
+    case 'units':
+      return briefingUnits();
+    case 'cities':
+      return briefingCities();
+    case 'research':
+      return [];
+    default:
+      return [];
+  }
+};
+
+const isBriefingSection = (section: string): section is BriefingSection =>
+  section === 'overview' || section === 'units' || section === 'cities' || section === 'research';
 
 /**
  * `briefing_responder` (test_client.py:8938-8966).
@@ -943,23 +962,18 @@ const urlOf = (input: Parameters<typeof fetch>[0]): string =>
  */
 const briefingFetch = (plans: ReadonlyArray<BriefingPlan>): typeof fetch => {
   const cursor = { index: -1 };
-  return (async (input: Parameters<typeof fetch>[0]): Promise<Response> => {
+  return completeFetch((input) => {
     const url = urlOf(input);
-    if (url.includes('/health')) return jsonResponse(BRIEFING_HEALTH());
+    if (url.includes('/health')) return Promise.resolve(jsonResponse(BRIEFING_HEALTH()));
     const section = /section=(\w+)/.exec(url)?.[1] ?? '';
     if (section === 'overview') cursor.index += 1;
     const plan = plans[Math.max(0, Math.min(cursor.index, plans.length - 1))];
-    if (plan === undefined) return jsonResponse({ error: 'no plan' }, 500);
-    const items: Readonly<Record<string, ReadonlyArray<JsonValue>>> = {
-      overview: [briefingOverview(plan.chat)],
-      units: briefingUnits(),
-      cities: briefingCities(),
-      research: [],
-    };
-    const page = items[section];
-    if (page === undefined) return jsonResponse({ error: `no section ${section}` }, 500);
-    return jsonResponse(sectionPayload(section, plan.revision, page));
-  }) as typeof fetch;
+    if (plan === undefined) return Promise.resolve(jsonResponse({ error: 'no plan' }, 500));
+    if (!isBriefingSection(section)) {
+      return Promise.resolve(jsonResponse({ error: `no section ${section}` }, 500));
+    }
+    return Promise.resolve(jsonResponse(sectionPayload(section, plan.revision, briefingPage(section, plan))));
+  });
 };
 
 interface LiveBench {
@@ -968,48 +982,41 @@ interface LiveBench {
   readonly scratch: Scratch;
   readonly run: <A, E>(
     effect: Effect.Effect<A, E, V2Client | SessionStore | PrivateFs>
-  ) => Promise<import('effect/Either').Either<A, E>>;
-  readonly read: (parts: ReadonlyArray<string>) => string | null;
+  ) => Promise<Either.Either<A, E>>;
+  readonly read: (parts: ReadonlyArray<string>) => Effect.Effect<string | null>;
 }
 
-const liveBench = (fetchImpl: typeof fetch): LiveBench => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const sessionPath = path.join(scratch.workspace.stateRoot, 'session-live.json');
-  Effect.runSync(scratch.files.writeJson(sessionPath, sessionFile()));
-  const store = sessionStoreFor(scratch.workspace, scratch.files, stateSchema, {});
-  const loaded = Effect.runSync(store.resolveV2(sessionPath));
-  const layer = Layer.mergeAll(
-    Layer.succeed(V2Client, v2ClientFor(httpFor(fetchImpl), () => Effect.void)),
-    Layer.succeed(SessionStore, store),
-    scratch.layer
-  );
-  const seams = Effect.runSync(
-    Effect.provide(liveTurnSeams(sessionPath, loaded.session), layer)
-  );
-  return {
-    ctx: turnCtx(sessionPath, loaded.session, seams),
-    sessionPath,
-    scratch,
-    run: (effect) => Effect.runPromise(Effect.either(Effect.provide(effect, layer))),
-    read: (parts) =>
-      Effect.runSync(Effect.provide(mirrorText(sessionPath, parts), scratch.layer)),
-  };
-};
-
-describe('the live seams a bare `turn` is built from', () => {
-  const REV = (revision: number): Revision => ({
-    turn: 3,
-    revision,
-    state_token: `token_3_${revision}`,
+const liveBench = (fetchImpl: typeof fetch): Effect.Effect<LiveBench, PlayError> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    yield* Effect.sync(() => scratches.push(scratch));
+    const sessionPath = path.join(scratch.workspace.stateRoot, 'session-live.json');
+    yield* scratch.files.writeJson(sessionPath, sessionFile());
+    const store = sessionStoreFor(scratch.workspace, scratch.files, stateSchema, {});
+    const loaded = yield* store.resolveV2(sessionPath);
+    const layer = Layer.mergeAll(
+      Layer.succeed(V2Client, v2ClientFor(httpFor(fetchImpl), () => Effect.void)),
+      Layer.succeed(SessionStore, store),
+      scratch.layer
+    );
+    const seams = yield* provideTestLayer(liveTurnSeams(sessionPath, loaded.session), layer);
+    const runtime = yield* Effect.runtime();
+    return {
+      ctx: turnCtx(sessionPath, loaded.session, seams),
+      sessionPath,
+      scratch,
+      run: (effect) => Runtime.runPromise(runtime)(Effect.either(provideTestLayer(effect, layer))),
+      read: (parts) => provideTestLayer(mirrorText(sessionPath, parts), scratch.layer),
+    };
   });
 
-  test('the four pages reach the mirror, so the units and cities tables exist', async () => {
-    const kit = liveBench(briefingFetch([{ revision: REV(7), chat: 5 }]));
-    const outcome = await kit.run(turnBriefingLocked(kit.ctx));
+describe('the live seams a bare `turn` is built from', () => {
+  awaitTest('the four pages reach the mirror, so the units and cities tables exist', function* (wait) {
+    const kit = yield* liveBench(briefingFetch([{ revision: briefingRevision(7), chat: 5 }]));
+    const outcome = yield* wait(kit.run(turnBriefingLocked(kit.ctx)));
     expect(outcome._tag).toBe('Right');
-    const units = kit.read(['state', 'units.tsv']);
-    const cities = kit.read(['state', 'cities.tsv']);
+    const units = yield* kit.read(['state', 'units.tsv']);
+    const cities = yield* kit.read(['state', 'cities.tsv']);
     expect(units).not.toBeNull();
     expect(cities).not.toBeNull();
     // The alias column is the one `just legal --actor_id u1` accepts, which is
@@ -1019,49 +1026,47 @@ describe('the live seams a bare `turn` is built from', () => {
     expect(units ?? '').toContain('Settlers');
     expect(cities ?? '').toContain('London');
     // …and `--decisions` now finds them fresh, so it re-fetches nothing.
-    const fresh = Effect.runSync(
-      Effect.provide(
-        Effect.all([
-          mirrorIsFresh(kit.sessionPath, mirrorFile('units'), REV(7)),
-          mirrorIsFresh(kit.sessionPath, mirrorFile('cities'), REV(7)),
-        ]),
-        kit.scratch.layer
-      )
+    const fresh = yield* provideTestLayer(
+      Effect.all([
+        mirrorIsFresh(kit.sessionPath, mirrorFile('units'), briefingRevision(7)),
+        mirrorIsFresh(kit.sessionPath, mirrorFile('cities'), briefingRevision(7)),
+      ]),
+      kit.scratch.layer
     );
     expect(fresh).toEqual([true, true]);
   });
 
   /** `test_v2_briefing_counts_new_events_and_names_the_feed`. */
-  test('the events line counts the delta, because `count_chat` was written', async () => {
-    const kit = liveBench(
+  awaitTest('the events line counts the delta, because `count_chat` was written', function* (wait) {
+    const kit = yield* liveBench(
       briefingFetch([
-        { revision: REV(7), chat: 5 },
-        { revision: REV(9), chat: 7 },
-        { revision: REV(11), chat: 7 },
+        { revision: briefingRevision(7), chat: 5 },
+        { revision: briefingRevision(9), chat: 7 },
+        { revision: briefingRevision(11), chat: 7 },
       ])
     );
-    const first = await kit.run(turnBriefingLocked(kit.ctx));
+    const first = yield* wait(kit.run(turnBriefingLocked(kit.ctx)));
     expect(first._tag).toBe('Right');
     if (first._tag !== 'Right') return;
     expect(first.right.events).toBe('events: 5 new — just state --section chat');
-    expect(kit.read(['state', 'overview.tsv']) ?? '').toContain('count_chat');
+    expect((yield* kit.read(['state', 'overview.tsv'])) ?? '').toContain('count_chat');
 
     // The next briefing counts only what arrived since this one.
-    const second = await kit.run(turnBriefingLocked(kit.ctx));
+    const second = yield* wait(kit.run(turnBriefingLocked(kit.ctx)));
     expect(second._tag).toBe('Right');
     if (second._tag !== 'Right') return;
     expect(second.right.events).toBe('events: 2 new — just state --section chat');
 
     // An unchanged feed is not news and costs no line.
-    const third = await kit.run(turnBriefingLocked(kit.ctx));
+    const third = yield* wait(kit.run(turnBriefingLocked(kit.ctx)));
     expect(third._tag).toBe('Right');
     if (third._tag !== 'Right') return;
     expect(third.right.events).toBe('');
   });
 
-  test('the decision block reads the tables the same briefing just wrote', async () => {
-    const kit = liveBench(briefingFetch([{ revision: REV(7), chat: null }]));
-    const outcome = await kit.run(turnBriefingLocked(kit.ctx));
+  awaitTest('the decision block reads the tables the same briefing just wrote', function* (wait) {
+    const kit = yield* liveBench(briefingFetch([{ revision: briefingRevision(7), chat: null }]));
+    const outcome = yield* wait(kit.run(turnBriefingLocked(kit.ctx)));
     expect(outcome._tag).toBe('Right');
     if (outcome._tag !== 'Right') return;
     const decisions = outcome.right.decisions;
@@ -1074,13 +1079,13 @@ describe('the live seams a bare `turn` is built from', () => {
     expect(decisions.some((line) => line.includes('u3'))).toBe(false);
   });
 
-  test('every wait tick writes the protocol card, not the five-line default', async () => {
-    const kit = liveBench(
+  awaitTest('every wait tick writes the protocol card, not the five-line default', function* (wait) {
+    const kit = yield* liveBench(
       fakeFetch(new Map([['/wait', { body: activeWake() }]]))
     );
-    const outcome = await kit.run(awaitAndBrief(kit.ctx, { brief: false, wait: { waitS: 0 } }));
+    const outcome = yield* wait(kit.run(awaitAndBrief(kit.ctx, { brief: false, wait: { waitS: 0 } })));
     expect(outcome._tag).toBe('Right');
-    const header = kit.read(HEADER_FILE) ?? '';
+    const header = (yield* kit.read(HEADER_FILE)) ?? '';
     // `_mirror_health` always passes `commands=V2_PROTOCOL_CARD`; the default
     // card `update_from_health` falls back to has none of this.
     expect(header).toContain('ONE CALL PER TURN');
@@ -1090,13 +1095,13 @@ describe('the live seams a bare `turn` is built from', () => {
 });
 
 describe('the refusal that must never be swallowed', () => {
-  test('--json re-raises the wait failure rather than printing half a payload', async () => {
-    const kit = bench(
+  awaitTest('--json re-raises the wait failure rather than printing half a payload', function* (wait) {
+    const kit = yield* bench(
       fakeFetch(new Map([['/wait', { status: 500, body: { error: 'boom' } }]])),
       { actions: { [PHASE_END_ID]: phaseEndDescriptor(REVISION) } }
     );
-    const outcome = await kit.run(
-      commandTurnEnd(kit.ctx, { awaitNext: true, json: true, wait: { waitS: 0 } })
+    const outcome = yield* wait(
+      kit.run(commandTurnEnd(kit.ctx, { awaitNext: true, json: true, wait: { waitS: 0 } }))
     );
     expect(outcome._tag).toBe('Left');
     expect(playerError('x')._tag).toBe('PlayerError');

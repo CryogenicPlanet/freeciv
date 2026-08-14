@@ -19,7 +19,7 @@
  */
 import { Options } from '@effect/cli';
 import { Effect, Option } from 'effect';
-import { PlayerError, playerError } from 'src/errors';
+import { type PlayerError, playerError } from 'src/errors';
 
 /** One flag, two spellings, at most one of them supplied. */
 export interface DualSpelling<A> {

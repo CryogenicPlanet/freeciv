@@ -21,15 +21,15 @@ import {
 import { ACTOR_ID_RE, CURSOR_RE, RELATION_ID_RE, TILE_ID_RE } from 'src/constants';
 import type { AliasMap } from 'src/render/primitives';
 import { decodeLegalPage, type LegalActionPageEnvelope } from 'src/schema/page';
-import { field, isJsonObject } from 'src/schema/primitives';
+import { field, isJsonObject, type JsonValueInput } from 'src/schema/primitives';
 import { aliasMap, rememberPage } from 'src/services/aliases';
 import { promotedCatalogPage } from 'src/services/catalog-cache';
 // U04's barrel does not re-export the page bridge (NOTES §U12.3); the module
 // that owns `update_from_page` does.
 import { mirrorPage } from 'src/services/mirror/update-page';
 import { dropPendingForCursor, dropPendingForScope } from 'src/services/pending-catalogs';
-import { PrivateFs } from 'src/services/private-fs';
-import { SessionStore, credentialsOf, type Session } from 'src/services/session-store';
+import { type PrivateFs } from 'src/services/private-fs';
+import { type SessionStore, credentialsOf, type Session } from 'src/services/session-store';
 import { V2Client } from 'src/services/v2-client';
 
 /** Ten seconds, as CPython passed to `_v2_response`. */
@@ -203,7 +203,7 @@ export const legalQuery = (
 // _read_legal_page
 // ---------------------------------------------------------------------------
 
-const isCursorExpired = (payload: unknown): boolean => {
+const isCursorExpired = (payload: JsonValueInput): boolean => {
   if (!isJsonObject(payload)) return false;
   const error = field(payload, 'error');
   return isJsonObject(error) && field(error, 'code') === 'cursor_expired';

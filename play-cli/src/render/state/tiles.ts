@@ -24,6 +24,7 @@ import {
   type AliasMap,
   type JsonValue,
 } from 'src/render/primitives';
+import { field, isJsonString } from 'src/schema/primitives';
 
 /** CPython `str.isalnum()` over one character. */
 const ALPHANUMERIC = /[\p{L}\p{N}]/u;
@@ -33,8 +34,8 @@ export const terrainCode = (name: string): string => {
   const known = TERRAIN_CODES.get(name);
   if (known !== undefined) return known;
   const letters = [...name].filter((character) => ALPHANUMERIC.test(character));
-  const head = letters.length > 0 ? (letters[0] as string).toUpperCase() : 'X';
-  const tail = letters.length > 1 ? (letters[1] as string).toLowerCase() : '0';
+  const head = (letters.at(0) ?? 'X').toUpperCase();
+  const tail = (letters.at(1) ?? '0').toLowerCase();
   return head + tail;
 };
 
@@ -49,7 +50,7 @@ const DIGITS = '0123456789';
  */
 export const terrainCodes = (names: ReadonlySet<string>): ReadonlyMap<string, string> => {
   const collisions = new Map<string, string[]>();
-  for (const name of [...names].sort()) {
+  for (const name of [...names].toSorted()) {
     const code = terrainCode(name);
     const bucket = collisions.get(code);
     if (bucket === undefined) collisions.set(code, [name]);
@@ -57,16 +58,17 @@ export const terrainCodes = (names: ReadonlySet<string>): ReadonlyMap<string, st
   }
   const codes = new Map<string, string>();
   for (const [code, colliding] of collisions) {
-    if (colliding.length === 1) {
-      codes.set(colliding[0] as string, code);
+    const only = colliding.length === 1 ? colliding.at(0) : undefined;
+    if (only !== undefined) {
+      codes.set(only, code);
       continue;
     }
-    [...colliding].sort().forEach((name, index) => {
+    [...colliding].toSorted().forEach((name, index) => {
       codes.set(
         name,
         index === 0
           ? code
-          : (code[0] as string) + (DIGITS[Math.min(index - 1, 9)] as string)
+          : (code.at(0) ?? 'X') + (DIGITS.at(Math.min(index - 1, 9)) ?? '9')
       );
     });
   }
@@ -97,23 +99,23 @@ export const tileCells = (
       const x = yield* needInt(item, 'x', 'tile');
       const y = yield* needInt(item, 'y', 'tile');
       const visibility = yield* needText(item, 'visibility', 'tile');
-      const terrain = (isJsonObject(item) ? (item['terrain'] ?? null) : null);
+      const terrain = isJsonObject(item) ? field(item, 'terrain') : null;
       xs.push(x);
       ys.push(y);
       if (terrain === null) {
         cells.set(cellKey(x, y), [null, visibility]);
         continue;
       }
-      if (typeof terrain !== 'string' || terrain === '') {
-        return yield* Effect.fail(drift('tile terrain'));
+      if (!isJsonString(terrain) || terrain === '') {
+        return yield*drift('tile terrain');
       }
       terrains.add(terrain);
       cells.set(cellKey(x, y), [terrain, visibility]);
     }
     return {
       cells,
-      xs: [...new Set(xs)].sort((left, right) => left - right),
-      ys: [...new Set(ys)].sort((left, right) => left - right),
+      xs: [...new Set(xs)].toSorted((left, right) => left - right),
+      ys: [...new Set(ys)].toSorted((left, right) => left - right),
       terrains,
     };
   });
@@ -126,25 +128,29 @@ export const renderTiles = (
   Effect.gen(function* () {
     void aliases;
     const { cells, xs, ys, terrains } = yield* tileCells(items);
-    const firstX = xs[0] as number;
-    const lastX = xs[xs.length - 1] as number;
-    const firstY = ys[0] as number;
-    const lastY = ys[ys.length - 1] as number;
+    const firstX = xs.at(0) ?? 0;
+    const lastX = xs.at(-1) ?? firstX;
+    const firstY = ys.at(0) ?? 0;
+    const lastY = ys.at(-1) ?? firstY;
     const width = lastX - firstX + 1;
     const height = lastY - firstY + 1;
     const codes = terrainCodes(terrains);
     const lines: string[] = [];
     if (width > 40 || width * height > 1024) {
-      const sorted = [...cells.entries()].sort((left, right) => {
-        const [leftX, leftY] = left[0].split(',').map(Number) as [number, number];
-        const [rightX, rightY] = right[0].split(',').map(Number) as [number, number];
+      const sorted = [...cells.entries()].toSorted((left, right) => {
+        const [leftXText = '0', leftYText = '0'] = left[0].split(',');
+        const [rightXText = '0', rightYText = '0'] = right[0].split(',');
+        const leftX = Number(leftXText);
+        const leftY = Number(leftYText);
+        const rightX = Number(rightXText);
+        const rightY = Number(rightYText);
         return leftX === rightX ? leftY - rightY : leftX - rightX;
       });
       lines.push(
         ...table(
           sorted.map(([key, [terrain, visibility]]) => [
             key,
-            terrain === null ? '?' : (codes.get(terrain) as string),
+            terrain === null ? '?' : (codes.get(terrain) ?? terrainCode(terrain)),
             visibility,
           ])
         )
@@ -159,15 +165,15 @@ export const renderTiles = (
           const cell = cells.get(cellKey(x, y));
           if (cell === undefined) row.push('.');
           else if (cell[0] === null) row.push('?');
-          else if (cell[1] === 'visible') row.push(codes.get(cell[0]) as string);
-          else row.push((codes.get(cell[0]) as string).toLowerCase());
+          else if (cell[1] === 'visible') row.push(codes.get(cell[0]) ?? terrainCode(cell[0]));
+          else row.push((codes.get(cell[0]) ?? terrainCode(cell[0])).toLowerCase());
         }
         grid.push(row);
       }
       lines.push(...table(grid));
     }
     const legend = [...codes.entries()]
-      .sort((left, right) => (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0))
+      .toSorted((left, right) => (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0))
       .map(([name, code]) => `${code}=${name}`);
     legend.push('?=unknown/fogged', '.=not on this page', 'lowercase=remembered');
     lines.push(`legend ${legend.join(' ')}`);

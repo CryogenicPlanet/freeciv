@@ -11,16 +11,18 @@
  * --yields` run against the byte-identical mirror below.  Two local files in,
  * zero sockets: `runShow` requires `SessionStore | PrivateFs` and no more.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect, Either, Layer } from 'effect';
 import { runShow, type ShowOptions } from 'src/commands/show.cmd';
 import { renderMapYields, YIELD_TILE_RE, YIELD_WINDOW_MAX } from 'src/render/mirror/yields-overlay';
 import { v2StateSchema } from 'src/services/aliases';
-import { PrivateFs } from 'src/services/private-fs';
-import { SessionStore, sessionStoreFor } from 'src/services/session-store';
+import { type PrivateFs } from 'src/services/private-fs';
+import { SessionStore, sessionStoreFor, type V2ClientState } from 'src/services/session-store';
 import { FIXTURE_AGENT_ID, FIXTURE_GAME_ID, scratchWorkspace, sessionFile, type Scratch } from 'test/_fixtures';
+import { captureEffect } from 'test/_capture';
+import { effectTest, provideTestLayer } from 'test/_effect-test';
+import { observedAt } from 'test/_expect';
+import { path, withTestFileSystem } from 'test/_test-platform';
 
 const YIELD_MIRROR: ReadonlyArray<readonly [string, string]> = [
   ["state/map.txt", "# rev 7 turn 3\n# map 64x64 · 12 of 12 tiles known\n# window x 30..33 y 71..73\n# legend '?'=never seen · UPPERCASE=visible now · lowercase=remembered\n# terrain F=Forest · G=Grassland · H=Hills · O=Ocean\n   71 |GGFH\n   72 |GGgh\n   73 |OOOO\n"],
@@ -53,11 +55,13 @@ const GOLDEN = {
 // ---------------------------------------------------------------------------
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() =>
+  Effect.runPromise(
+    Effect.asVoid(Effect.all(scratches.splice(0).map((scratch) => scratch.cleanup)))
+  )
+);
 
-const clientState = (revision: number): unknown => ({
+const clientState = (revision: number): V2ClientState => ({
   schema_version: 5,
   game_id: FIXTURE_GAME_ID,
   agent_id: FIXTURE_AGENT_ID,
@@ -81,43 +85,37 @@ interface Seat {
 const seat = (
   files: ReadonlyArray<readonly [string, string]> = YIELD_MIRROR,
   revision = 7
-): Seat => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const home = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID);
-  fs.mkdirSync(home, { mode: 0o700, recursive: true });
-  const sessionPath = path.join(home, 'codex-test.json');
-  fs.writeFileSync(sessionPath, `${JSON.stringify(sessionFile(), null, 2)}\n`, { mode: 0o600 });
-  fs.writeFileSync(
-    path.join(home, 'codex-test.v2-state'),
-    `${JSON.stringify(clientState(revision), null, 2)}\n`,
-    { mode: 0o600 }
-  );
-  const mirror = path.join(home, 'codex-test');
-  for (const [relative, text] of files) {
-    const target = path.join(mirror, relative);
-    fs.mkdirSync(path.dirname(target), { mode: 0o700, recursive: true });
-    fs.writeFileSync(target, text, { mode: 0o600 });
-  }
-  const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
-  return {
-    sessionPath,
-    mirror,
-    layer: Layer.merge(scratch.layer, Layer.succeed(SessionStore, store)),
-  };
-};
+): Effect.Effect<Seat> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const home = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID);
+    const sessionPath = path.join(home, 'codex-test.json');
+    const mirror = path.join(home, 'codex-test');
+    yield* scratch.files.writeJson(sessionPath, sessionFile());
+    yield* scratch.files.writeJson(
+      path.join(home, 'codex-test.v2-state'),
+      clientState(revision)
+    );
+    for (const [relative, text] of files) {
+      yield* scratch.files.writeText(path.join(mirror, relative), text);
+    }
+    const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
+    return {
+      sessionPath,
+      mirror,
+      layer: Layer.merge(scratch.layer, Layer.succeed(SessionStore, store)),
+    };
+  }).pipe(Effect.orDie);
 
-const show = async (
+const show = (
   fixture: Seat,
   overrides: Partial<ShowOptions> = {}
-): Promise<{ readonly stdout: string; readonly stderr: string }> => {
-  const out: string[] = [];
-  const originalLog = console.log;
-  console.log = (...parts: ReadonlyArray<unknown>) => out.push(parts.map(String).join(' '));
-  try {
-    const result = await Effect.runPromise(
+): Effect.Effect<{ readonly stdout: string; readonly stderr: string }> =>
+  Effect.map(
+    captureEffect(
       Effect.either(
-        Effect.provide(
+        provideTestLayer(
           runShow({
             session: fixture.sessionPath,
             name: 'map',
@@ -130,121 +128,135 @@ const show = async (
           fixture.layer
         )
       )
-    );
-    return {
-      stdout: out.length === 0 ? '' : `${out.join('\n')}\n`,
+    ),
+    ({ value: result, captured }) => ({
+      stdout: captured.out.length === 0 ? '' : `${captured.out.join('\n')}\n`,
       stderr: Either.isLeft(result) ? `error: ${result.left.message}\n` : '',
-    };
-  } finally {
-    console.log = originalLog;
-  }
-};
+    })
+  );
 
-const golden = async (
+const golden = (
   key: keyof typeof GOLDEN,
-  fixture: Seat,
+  fixture: Effect.Effect<Seat>,
   overrides: Partial<ShowOptions> = {}
-): Promise<void> => {
-  const expected = GOLDEN[key];
-  const actual = await show(fixture, overrides);
-  expect(actual.stdout).toBe(expected.stdout);
-  expect(actual.stderr).toBe(expected.stderr);
-};
+): Effect.Effect<void> =>
+  Effect.flatMap(fixture, (ready) =>
+    Effect.map(show(ready, overrides), (actual) => {
+      const expected = GOLDEN[key];
+      expect(actual.stdout).toBe(expected.stdout);
+      expect(actual.stderr).toBe(expected.stderr);
+    })
+  );
 
-const overlay = (fixture: Seat): Promise<ReadonlyArray<string>> =>
-  Effect.runPromise(Effect.provide(renderMapYields(fixture.mirror), fixture.layer));
+const overlay = (fixture: Effect.Effect<Seat>): Effect.Effect<ReadonlyArray<string>> =>
+  Effect.flatMap(fixture, (ready) =>
+    provideTestLayer(renderMapYields(ready.mirror), ready.layer)
+  );
+
+const mirrorWithSpan = (span: number): ReadonlyArray<readonly [string, string]> => {
+  const row = 'G'.repeat(span);
+  const last = 30 + span - 1;
+  return [
+    ['state/map.txt', `# rev 7 turn 3\n# window x 30..${last} y 71..71\n   71 |${row}\n`],
+    [
+      'state/yields.tsv',
+      '# rev 7 turn 3\ntile\tfood\tshields\ttrade\tworked\tcity\n' +
+        `T(30,71)\t3\t0\t1\tno\t-\nT(${last},71)\t1\t2\t1\tno\t-\n`,
+    ],
+  ];
+};
 
 // ---------------------------------------------------------------------------
 
 describe('the grid overlay', () => {
-  test('two local files become one priced grid', async () => {
-    await golden('current/yields_map', seat());
-  });
+  effectTest('two local files become one priced grid', () => golden('current/yields_map', seat()));
 
-  test('the same lines come back under --json with `map --yields` as the selection', async () => {
-    await golden('current/yields_map_json', seat(), { json: true });
-  });
+  effectTest('the same lines come back under --json with `map --yields` as the selection', () =>
+    golden('current/yields_map_json', seat(), { json: true })
+  );
 
-  test('a tile inside the window that was never priced renders `?`, not a zero', async () => {
-    const lines = await overlay(seat());
-    // (31,71) is inside the priced bounding box but carries no yields row.
-    expect(lines[4]).toBe('   71 |G3/0/1 G?     F?');
-    expect(lines.join('\n')).not.toContain('G0/0/0');
-  });
+  effectTest('a tile inside the window that was never priced renders `?`, not a zero', () =>
+    Effect.map(overlay(seat()), (lines) => {
+      // (31,71) is inside the priced bounding box but carries no yields row.
+      expect(lines[4]).toBe('   71 |G3/0/1 G?     F?');
+      expect(lines.join('\n')).not.toContain('G0/0/0');
+    })
+  );
 
-  test('a remembered tile keeps its lowercase terrain character', async () => {
-    const lines = await overlay(seat());
-    expect(lines[5]).toBe('   72 |G?     G2/1/0 g1/2/1');
-  });
+  effectTest('a remembered tile keeps its lowercase terrain character', () =>
+    Effect.map(overlay(seat()), (lines) => {
+      expect(lines[5]).toBe('   72 |G?     G2/1/0 g1/2/1');
+    })
+  );
 
-  test('the overlay never rewrites either file it read', async () => {
-    const fixture = seat();
-    const before = fs.readFileSync(path.join(fixture.mirror, 'state', 'map.txt'), 'utf8');
-    await golden('current/yields_map', fixture);
-    expect(fs.readFileSync(path.join(fixture.mirror, 'state', 'map.txt'), 'utf8')).toBe(before);
-  });
+  effectTest('the overlay never rewrites either file it read', () =>
+    withTestFileSystem((platformFiles) =>
+      Effect.gen(function* () {
+        const fixture = yield* seat();
+        const fixtureMapPath = path.join(fixture.mirror, 'state', 'map.txt');
+        const before = yield* platformFiles.readFileString(fixtureMapPath);
+        yield* golden('current/yields_map', Effect.succeed(fixture));
+        expect(yield* platformFiles.readFileString(fixtureMapPath)).toBe(before);
+      })
+    ).pipe(Effect.orDie)
+  );
 
-  test('the overlay is never prefixed with the staleness banner', async () => {
+  effectTest('the overlay is never prefixed with the staleness banner', () =>
     // `show map` at the same revision *is* banner-eligible; `--yields` returns
     // before the banner is ever computed, exactly like CPython.
-    await golden('stale/yields_map', seat(YIELD_MIRROR, 12));
-  });
+    golden('stale/yields_map', seat(YIELD_MIRROR, 12))
+  );
 });
 
 describe('the degraded shapes', () => {
-  test('a window wider than 24 columns prints one line per priced tile', async () => {
-    await golden('wide/yields', seat(WIDE_MIRROR));
-  });
+  effectTest('a window wider than 24 columns prints one line per priced tile', () =>
+    golden('wide/yields', seat(WIDE_MIRROR))
+  );
 
-  test('the threshold is inclusive: exactly 24 columns still prints a grid', async () => {
-    const wide = (span: number): ReadonlyArray<readonly [string, string]> => {
-      const row = 'G'.repeat(span);
-      const last = 30 + span - 1;
-      return [
-        [
-          'state/map.txt',
-          `# rev 7 turn 3\n# window x 30..${last} y 71..71\n   71 |${row}\n`,
-        ],
-        [
-          'state/yields.tsv',
-          '# rev 7 turn 3\ntile\tfood\tshields\ttrade\tworked\tcity\n' +
-            `T(30,71)\t3\t0\t1\tno\t-\nT(${last},71)\t1\t2\t1\tno\t-\n`,
-        ],
-      ];
-    };
-    expect((await overlay(seat(wide(YIELD_WINDOW_MAX))))[3]).toContain('  30 ');
-    expect((await overlay(seat(wide(YIELD_WINDOW_MAX + 1))))[3]).toBe('30,71 G 3/0/1');
-  });
+  effectTest('the threshold is inclusive: exactly 24 columns still prints a grid', () =>
+    Effect.gen(function* () {
+      const inclusive = yield* overlay(seat(mirrorWithSpan(YIELD_WINDOW_MAX)));
+      const degraded = yield* overlay(seat(mirrorWithSpan(YIELD_WINDOW_MAX + 1)));
+      expect(inclusive[3]).toContain('  30 ');
+      expect(degraded[3]).toBe('30,71 G 3/0/1');
+    })
+  );
 
-  test('a mirror with no yields file names the command that prices tiles', async () => {
-    await golden('nopriced/yields', seat([YIELD_MIRROR[0] as readonly [string, string]]));
-  });
+  effectTest('a mirror with no yields file names the command that prices tiles', () =>
+    golden('nopriced/yields', seat([observedAt(YIELD_MIRROR, 0)]))
+  );
 
-  test('a yields table whose header drifted is ignored rather than misread', async () => {
-    await golden('othercolumns/yields', seat(OTHER_COLUMNS_MIRROR));
-  });
+  effectTest('a yields table whose header drifted is ignored rather than misread', () =>
+    golden('othercolumns/yields', seat(OTHER_COLUMNS_MIRROR))
+  );
 
-  test('no map projection at all is a refusal that names both writers', async () => {
-    await golden('nomap/yields', seat([YIELD_MIRROR[1] as readonly [string, string]]));
-    await golden('empty/yields', seat([]));
-  });
+  effectTest('no map projection at all is a refusal that names both writers', () =>
+    Effect.gen(function* () {
+      yield* golden('nomap/yields', seat([observedAt(YIELD_MIRROR, 1)]));
+      yield* golden('empty/yields', seat([]));
+    })
+  );
 
-  test('an empty overlay is an empty list, which is not an empty grid', async () => {
-    expect(await overlay(seat([]))).toEqual([]);
-    expect(await overlay(seat([YIELD_MIRROR[0] as readonly [string, string]]))).toHaveLength(2);
-  });
+  effectTest('an empty overlay is an empty list, which is not an empty grid', () =>
+    Effect.gen(function* () {
+      expect(yield* overlay(seat([]))).toEqual([]);
+      expect(yield* overlay(seat([observedAt(YIELD_MIRROR, 0)]))).toHaveLength(2);
+    })
+  );
 });
 
 describe('--yields anywhere else', () => {
-  test('it refuses on another section and on --grep', async () => {
-    await golden('current/yields_units', seat(), { name: 'units' });
-    await golden('current/yields_grep', seat(), { name: '', grep: 'Settlers' });
-    await golden('current/yields_units', seat(), { name: '' });
-  });
+  effectTest('it refuses on another section and on --grep', () =>
+    Effect.gen(function* () {
+      yield* golden('current/yields_units', seat(), { name: 'units' });
+      yield* golden('current/yields_grep', seat(), { name: '', grep: 'Settlers' });
+      yield* golden('current/yields_units', seat(), { name: '' });
+    })
+  );
 
-  test('`map` plus --grep is the --yields refusal, not the "not both" one', async () => {
-    await golden('current/yields_grep', seat(), { name: '', grep: 'G' });
-  });
+  effectTest('`map` plus --grep is the --yields refusal, not the "not both" one', () =>
+    golden('current/yields_grep', seat(), { name: '', grep: 'G' })
+  );
 });
 
 describe('the tile handle', () => {

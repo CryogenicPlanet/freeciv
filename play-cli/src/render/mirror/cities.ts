@@ -9,7 +9,7 @@
  */
 import { Effect } from 'effect';
 import type { PlayerError } from 'src/errors';
-import { isJsonObject } from 'src/schema/primitives';
+import { isJsonObject, type JsonValueInput } from 'src/schema/primitives';
 import {
   aliasMap,
   cell,
@@ -32,7 +32,7 @@ export const CITY_COLUMNS: ReadonlyArray<string> = [
   'buy',
 ];
 
-const surplusText = (surplus: unknown): string =>
+const surplusText = (surplus: JsonValueInput): string =>
   isJsonObject(surplus)
     ? `f${cell(dig(surplus, 'food'))} s${cell(dig(surplus, 'shields'))} t${cell(
         dig(surplus, 'trade')
@@ -41,7 +41,7 @@ const surplusText = (surplus: unknown): string =>
 
 /** `_render_cities` — project a cities page. */
 export const renderCities = (
-  items: ReadonlyArray<unknown>,
+  items: ReadonlyArray<JsonValueInput>,
   aliases?: MirrorAliases | null
 ): Effect.Effect<RenderedSection, PlayerError> => {
   const names = aliasMap(

@@ -10,6 +10,7 @@ import { Effect, Either } from 'effect';
 import { httpFor } from 'src/services/http';
 import { isBusyRefusal, v2ClientFor, v2Url, type V2Credentials } from 'src/services/v2-client';
 import { FIXTURE_GAME_ID, errorPayload, healthPayload, recordingFetch } from 'test/_fixtures';
+import { awaitTest } from 'test/_effect-test';
 
 const credentials: V2Credentials = {
   gameId: FIXTURE_GAME_ID,
@@ -44,25 +45,25 @@ describe('v2Url', () => {
 });
 
 describe('busy retry', () => {
-  test('a busy 429 on a GET is retried up to V2_BUSY_RETRIES', async () => {
+  awaitTest('a busy 429 on a GET is retried up to V2_BUSY_RETRIES', function* (wait) {
     const recorder = recordingFetch([
       { status: 429, body: busyBody },
       { status: 429, body: busyBody },
       { body: healthPayload() },
     ]);
     const client = v2ClientFor(httpFor(recorder.fetch), () => Effect.void);
-    const either = await runPromise(client.get(credentials, '/health'));
+    const either = yield* wait(runPromise(client.get(credentials, '/health')));
     expect(Either.isRight(either)).toBe(true);
     expect(recorder.requests).toHaveLength(3);
   });
 
-  test('a mutation is never retried — its contract is receipt-first', async () => {
+  awaitTest('a mutation is never retried — its contract is receipt-first', function* (wait) {
     const recorder = recordingFetch([
       { status: 429, body: busyBody },
       { body: healthPayload() },
     ]);
     const client = v2ClientFor(httpFor(recorder.fetch), () => Effect.void);
-    const either = await runPromise(client.post(credentials, '/batches', {}));
+    const either = yield* wait(runPromise(client.post(credentials, '/batches', {})));
     expect(Either.isLeft(either)).toBe(true);
     expect(recorder.requests).toHaveLength(1);
   });
@@ -85,10 +86,10 @@ describe('busy retry', () => {
 });
 
 describe('refusals', () => {
-  test('a non-2xx becomes a V2ResponseError with a validated payload', async () => {
+  awaitTest('a non-2xx becomes a V2ResponseError with a validated payload', function* (wait) {
     const recorder = recordingFetch([{ status: 409, body: errorPayload() }]);
     const client = v2ClientFor(httpFor(recorder.fetch), () => Effect.void);
-    const either = await runPromise(client.get(credentials, '/state'));
+    const either = yield* wait(runPromise(client.get(credentials, '/state')));
     expect(Either.isLeft(either)).toBe(true);
     if (Either.isLeft(either)) {
       const failure = either.left;
@@ -102,18 +103,18 @@ describe('refusals', () => {
     }
   });
 
-  test('a refusal body that is not a v2 error is drift, not a refusal', async () => {
+  awaitTest('a refusal body that is not a v2 error is drift, not a refusal', function* (wait) {
     const recorder = recordingFetch([{ status: 500, body: { oops: true } }]);
     const client = v2ClientFor(httpFor(recorder.fetch), () => Effect.void);
-    const either = await runPromise(client.get(credentials, '/state'));
+    const either = yield* wait(runPromise(client.get(credentials, '/state')));
     expect(Either.isLeft(either)).toBe(true);
     if (Either.isLeft(either)) expect(either.left._tag).toBe('DriftError');
   });
 
-  test('query parameters are appended after the route is validated', async () => {
+  awaitTest('query parameters are appended after the route is validated', function* (wait) {
     const recorder = recordingFetch([{ body: healthPayload() }]);
     const client = v2ClientFor(httpFor(recorder.fetch), () => Effect.void);
-    await runPromise(client.get(credentials, '/state', { section: 'units', limit: '16' }));
+    yield* wait(runPromise(client.get(credentials, '/state', { section: 'units', limit: '16' })));
     expect(recorder.requests[0]?.url).toBe(
       `http://127.0.0.1:8765/v2/games/${FIXTURE_GAME_ID}/me/state?section=units&limit=16`
     );

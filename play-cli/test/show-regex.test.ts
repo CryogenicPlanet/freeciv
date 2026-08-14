@@ -22,17 +22,18 @@
  * final sigma folds onto a medial one) and `Eﬀort` (whose ligature folds onto
  * `ff`) are the four folds a `toLowerCase` port gets wrong.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect, Either, Layer } from 'effect';
-import { runShow } from 'src/commands/show.cmd';
+import { runShow, type ShowOptions } from 'src/commands/show.cmd';
 import { PY_IGNORECASE, compilePythonRegex } from 'src/render/show-regex';
 import { casefold } from 'src/render/show-unicode';
 import { v2StateSchema } from 'src/services/aliases';
-import { PrivateFs } from 'src/services/private-fs';
+import { type PrivateFs } from 'src/services/private-fs';
 import { SessionStore, sessionStoreFor } from 'src/services/session-store';
 import { FIXTURE_AGENT_ID, FIXTURE_GAME_ID, scratchWorkspace, sessionFile, type Scratch } from 'test/_fixtures';
+import { captureEffect } from 'test/_capture';
+import { awaitTest, provideTestLayer } from 'test/_effect-test';
+import { path } from 'test/_test-platform';
 
 interface Golden {
   readonly args: ReadonlyArray<string>;
@@ -48,7 +49,7 @@ const MIRROR: ReadonlyArray<readonly [string, string]> = [
   ["state/delta.md", "# rev 7 turn 3\nsince rev 6 turn 3 · last update: state\n\n## units\n- u1 moved to 31,72\n"],
 ];
 
-const GOLDEN: Readonly<Record<string, Golden>> = {
+const GOLDEN = {
   "grep_GROSSE": {
     args: ["--grep", "GROSSE"],
     code: 0,
@@ -355,16 +356,18 @@ const GOLDEN: Readonly<Record<string, Golden>> = {
     stdout: "units:2: # units 4/4 complete\ncities:2: # cities 3/3 complete\n",
     stderr: "",
   },
-};
+} satisfies Readonly<Record<string, Golden>>;
 
 // ---------------------------------------------------------------------------
 // The fixture seat — the same bytes CPython was run against
 // ---------------------------------------------------------------------------
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() =>
+  Effect.runPromise(
+    Effect.asVoid(Effect.all(scratches.splice(0).map((scratch) => scratch.cleanup)))
+  )
+);
 
 const clientState = {
   schema_version: 5,
@@ -386,61 +389,60 @@ interface Seat {
   readonly layer: Layer.Layer<SessionStore | PrivateFs>;
 }
 
-const seat = (): Seat => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const home = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID);
-  fs.mkdirSync(home, { mode: 0o700, recursive: true });
-  const sessionPath = path.join(home, 'codex-test.json');
-  fs.writeFileSync(sessionPath, `${JSON.stringify(sessionFile(), null, 2)}\n`, { mode: 0o600 });
-  fs.writeFileSync(path.join(home, 'codex-test.v2-state'), `${JSON.stringify(clientState, null, 2)}\n`, {
-    mode: 0o600,
-  });
-  const mirror = path.join(home, 'codex-test');
-  for (const [relative, text] of MIRROR) {
-    const target = path.join(mirror, relative);
-    fs.mkdirSync(path.dirname(target), { mode: 0o700, recursive: true });
-    fs.writeFileSync(target, text, { mode: 0o600 });
-  }
-  const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
-  return {
-    sessionPath,
-    layer: Layer.merge(scratch.layer, Layer.succeed(SessionStore, store)),
-  };
-};
+const seat = (): Effect.Effect<Seat> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const home = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID);
+    const sessionPath = path.join(home, 'codex-test.json');
+    yield* scratch.files.writeJson(sessionPath, sessionFile());
+    yield* scratch.files.writeJson(path.join(home, 'codex-test.v2-state'), clientState);
+    const mirror = path.join(home, 'codex-test');
+    for (const [relative, text] of MIRROR) {
+      yield* scratch.files.writeText(path.join(mirror, relative), text);
+    }
+    const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
+    return {
+      sessionPath,
+      layer: Layer.merge(scratch.layer, Layer.succeed(SessionStore, store)),
+    };
+  }).pipe(Effect.orDie);
 
 /** `show` with the argv CPython was given, back as the three streams it wrote. */
-const show = async (args: ReadonlyArray<string>): Promise<Omit<Golden, 'args'>> => {
-  const fixture = seat();
-  const options = { session: fixture.sessionPath, name: '', grep: '', regex: false, yields: false, json: false };
-  for (let index = 0; index < args.length; index += 1) {
-    const argument = args[index];
-    if (argument === '--grep') options.grep = args[index + 1] ?? '';
-    else if (argument === '--regex') options.regex = true;
-    else if (argument === '--json') options.json = true;
-    else if (argument !== options.grep) options.name = argument ?? '';
-  }
-  const written: string[] = [];
-  const original = console.log;
-  console.log = (...parts: ReadonlyArray<unknown>) => written.push(parts.map(String).join(' '));
-  try {
-    const result = await Effect.runPromise(
-      Effect.either(Effect.provide(runShow(options), fixture.layer))
+const show = (args: ReadonlyArray<string>): Effect.Effect<Omit<Golden, 'args'>> =>
+  Effect.gen(function* () {
+    const fixture = yield* seat();
+    const options = args.reduce<ShowOptions>(
+      (parsed, argument, index) => {
+        if (argument === '--grep') return { ...parsed, grep: args[index + 1] ?? '' };
+        if (argument === '--regex') return { ...parsed, regex: true };
+        if (argument === '--json') return { ...parsed, json: true };
+        if (argument !== parsed.grep) return { ...parsed, name: argument };
+        return parsed;
+      },
+      {
+        session: fixture.sessionPath,
+        name: '',
+        grep: '',
+        regex: false,
+        yields: false,
+        json: false,
+      }
+    );
+    const { value: result, captured } = yield* captureEffect(
+      Effect.either(provideTestLayer(runShow(options), fixture.layer))
     );
     return {
       code: Either.isLeft(result) ? 2 : 0,
-      stdout: written.length > 0 ? `${written.join('\n')}\n` : '',
+      stdout: captured.out.length > 0 ? `${captured.out.join('\n')}\n` : '',
       stderr: Either.isLeft(result) ? `error: ${result.left.message}\n` : '',
     };
-  } finally {
-    console.log = original;
-  }
-};
+  });
 
 describe('show --grep against CPython', () => {
   for (const [name, golden] of Object.entries(GOLDEN)) {
-    test(`${name}: ${golden.args.join(' ')}`, async () => {
-      expect(await show(golden.args)).toEqual({
+    awaitTest(`${name}: ${golden.args.join(' ')}`, function* (wait) {
+      expect(yield* wait(show(golden.args))).toEqual({
         code: golden.code,
         stdout: golden.stdout,
         stderr: golden.stderr,
@@ -619,15 +621,15 @@ describe('astral text answers the same as CPython', () => {
  * The guard must not change a single answer, which is what these assert; the
  * end-to-end timing is `test/diff-offline.sh`'s four `\b` cases.
  */
-describe('a leading word boundary answers exactly what CPython answers', () => {
-  const search = (pattern: string, subject: string): readonly [number, string] | null => {
-    const compiled = compilePythonRegex(pattern, PY_IGNORECASE);
-    expect(Either.isRight(compiled)).toBe(true);
-    if (Either.isLeft(compiled)) throw new Error(compiled.left.message);
-    const match = compiled.right.exec(subject);
-    return match === null ? null : [Array.from(subject.slice(0, match.index)).length, match[0]];
-  };
+const search = (pattern: string, subject: string): readonly [number, string] | null => {
+  const compiled = compilePythonRegex(pattern, PY_IGNORECASE);
+  expect(Either.isRight(compiled)).toBe(true);
+  if (Either.isLeft(compiled)) throw new Error(compiled.left.message);
+  const match = compiled.right.exec(subject);
+  return match === null ? null : [Array.from(subject.slice(0, match.index)).length, match[0]];
+};
 
+describe('a leading word boundary answers exactly what CPython answers', () => {
   test('`\\bu1\\b` is the whole-word search it looks like', () => {
     expect(search('\\bu1\\b', 'u1 Settlers')).toEqual([0, 'u1']);
     expect(search('\\bu1\\b', ' u1 ')).toEqual([1, 'u1']);

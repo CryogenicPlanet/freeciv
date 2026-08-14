@@ -23,7 +23,7 @@
  *    it wait on a terminal write.
  */
 import { Command, Options } from '@effect/cli';
-import { Console, Effect, Layer } from 'effect';
+import { Console, Effect } from 'effect';
 import { exitWith, type ExitCodeSignal } from 'src/exit';
 import {
   type DriftError,
@@ -149,22 +149,28 @@ export const liveBatchHooks: BatchHooks = {
       const files = yield* PrivateFs;
       const store = yield* SessionStore;
       const client = yield* V2Client;
-      const provided = Layer.mergeAll(
-        Layer.succeed(PrivateFs, files),
-        Layer.succeed(SessionStore, store),
-        Layer.succeed(V2Client, client)
-      );
+      const give = <A, E>(
+        body: Effect.Effect<A, E, PrivateFs | SessionStore | V2Client>
+      ): Effect.Effect<A, E> =>
+        Effect.provideService(
+          Effect.provideService(
+            Effect.provideService(body, PrivateFs, files),
+            SessionStore,
+            store
+          ),
+          V2Client,
+          client
+        );
       const io: RefusedActorOptionsIo = {
-        readState: Effect.provide(store.readState(sessionPath, session), provided),
+        readState: give(store.readState(sessionPath, session)),
         // The caller holds this seat's request lock, so the drain must take no
         // new one — `drainLegal` is exactly `_drain_legal_unlocked`.
         drainActor: (actorId, gate) =>
-          Effect.provide(
+          give(
             Effect.map(
               drainLegal({ sessionPath, session, gate }, actorId),
               (drained) => drained.revision
-            ),
-            provided
+            )
           ),
         compactLegalAction,
         legalRows,
@@ -325,8 +331,8 @@ export const runBatch = (
         return issued.exitCode;
       })
     );
-    if (exitCode !== 0) return yield* Effect.fail(exitWith(exitCode));
-    return;
+    if (exitCode !== 0) return yield*exitWith(exitCode);
+    return undefined;
   });
 
 // ---------------------------------------------------------------------------

@@ -11,19 +11,21 @@
  * kernel, so that idempotency and crash recovery both come free and there is no
  * PID file to reap.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect } from 'effect';
 import { hasNativeFlock, monitorLockPath } from 'src/services/locks';
 import { monitorHolder, withMonitorLock } from 'src/services/monitor-lock';
 import { scratchWorkspace, type Scratch } from 'test/_fixtures';
+import { awaitTest, provideTestLayer } from 'test/_effect-test';
+import { fileSystem, path } from 'test/_test-platform';
 
 const scratches: Scratch[] = [];
 
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() =>
+  Effect.runPromise(
+    Effect.forEach(scratches.splice(0), (scratch) => scratch.cleanup, { discard: true })
+  )
+);
 
 interface Bench {
   readonly scratch: Scratch;
@@ -31,12 +33,15 @@ interface Bench {
   readonly lockPath: string;
 }
 
-const bench = (): Bench => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const sessionPath = path.join(scratch.workspace.stateRoot, 'session-codex-gpt-5.6-sol.json');
-  return { scratch, sessionPath, lockPath: monitorLockPath(sessionPath) };
-};
+const bench = (): Effect.Effect<Bench> =>
+  Effect.map(scratchWorkspace(), (scratch) => {
+    scratches.push(scratch);
+    const sessionPath = path.join(
+      scratch.workspace.stateRoot,
+      'session-codex-gpt-5.6-sol.json'
+    );
+    return { scratch, sessionPath, lockPath: monitorLockPath(sessionPath) };
+  });
 
 describe('the monitor lock', () => {
   test('is a real flock, not a bookkeeping approximation', () => {
@@ -46,94 +51,86 @@ describe('the monitor lock', () => {
     expect(hasNativeFlock()).toBe(true);
   });
 
-  test('the first acquires, and says so by yielding no holder', async () => {
-    const seat = bench();
-    const seen = await Effect.runPromise(
-      Effect.provide(
-        withMonitorLock(seat.sessionPath, { pid: 41207, since: '16:21:04', game_id: 'g' }, (running) =>
-          Effect.gen(function* () {
-            // From this process, a second probe sees the lock held: `flock` is
-            // per open file description, so opening it again really does
-            // contend.
-            const holder = yield* monitorHolder(seat.sessionPath);
-            return { running, holder };
-          })
-        ),
-        seat.scratch.layer
-      )
-    );
+  awaitTest('the first acquires, and says so by yielding no holder', function* () {
+    const seat = yield* bench();
+    const seen = yield* Effect.orDie(provideTestLayer(
+      withMonitorLock(seat.sessionPath, { pid: 41207, since: '16:21:04', game_id: 'g' }, (running) =>
+        Effect.gen(function* () {
+          // From this process, a second probe sees the lock held: `flock` is
+          // per open file description, so opening it again really does
+          // contend.
+          const holder = yield* monitorHolder(seat.sessionPath);
+          return { running, holder };
+        })
+      ),
+      seat.scratch.layer
+    ));
     expect(seen.running).toBeNull();
     expect(seen.holder?.['pid']).toBe(41207);
     expect(seen.holder?.['since']).toBe('16:21:04');
   });
 
-  test('a second persistent monitor is refused and told who holds it', async () => {
-    const seat = bench();
-    const running = await Effect.runPromise(
-      Effect.provide(
-        withMonitorLock(seat.sessionPath, { pid: 41207, since: '16:21:04' }, () =>
-          withMonitorLock(seat.sessionPath, { pid: 999, since: '16:22:00' }, (second) =>
-            Effect.succeed(second)
-          )
-        ),
-        seat.scratch.layer
-      )
-    );
+  awaitTest('a second persistent monitor is refused and told who holds it', function* () {
+    const seat = yield* bench();
+    const running = yield* Effect.orDie(provideTestLayer(
+      withMonitorLock(seat.sessionPath, { pid: 41207, since: '16:21:04' }, () =>
+        withMonitorLock(seat.sessionPath, { pid: 999, since: '16:22:00' }, (second) =>
+          Effect.succeed(second)
+        )
+      ),
+      seat.scratch.layer
+    ));
     expect(running).not.toBeNull();
     expect(running?.['pid']).toBe(41207);
     // The second one recorded nothing: the file still names the first.
-    const after = await Effect.runPromise(
-      Effect.provide(monitorHolder(seat.sessionPath), seat.scratch.layer)
+    const after = yield* Effect.orDie(
+      provideTestLayer(monitorHolder(seat.sessionPath), seat.scratch.layer)
     );
     expect(after).toBeNull();
   });
 
-  test('a released lock leaves nothing for the next monitor to reap', async () => {
-    const seat = bench();
-    const held = await Effect.runPromise(
-      Effect.provide(
-        withMonitorLock(seat.sessionPath, { pid: 1234 }, () => monitorHolder(seat.sessionPath)),
-        seat.scratch.layer
-      )
-    );
+  awaitTest('a released lock leaves nothing for the next monitor to reap', function* () {
+    const seat = yield* bench();
+    const held = yield* Effect.orDie(provideTestLayer(
+      withMonitorLock(seat.sessionPath, { pid: 1234 }, () => monitorHolder(seat.sessionPath)),
+      seat.scratch.layer
+    ));
     expect(held).not.toBeNull();
     // Crash recovery is the kernel's job, so there is no stale state.
-    expect(
-      await Effect.runPromise(Effect.provide(monitorHolder(seat.sessionPath), seat.scratch.layer))
-    ).toBeNull();
-    expect(fs.statSync(seat.lockPath).mode & 0o777).toBe(0o600);
+    expect(yield* Effect.orDie(
+      provideTestLayer(monitorHolder(seat.sessionPath), seat.scratch.layer)
+    )).toBeNull();
+    const info = yield* Effect.orDie(fileSystem.stat(seat.lockPath));
+    expect(info.mode & 0o777).toBe(0o600);
   });
 
-  test('the lock file is the holder record, and is emptied on release', async () => {
-    const seat = bench();
-    await Effect.runPromise(
-      Effect.provide(
-        withMonitorLock(seat.sessionPath, { pid: 4242, since: '09:00:00' }, () =>
-          Effect.sync(() => {
-            const raw = fs.readFileSync(seat.lockPath, 'utf8');
-            expect(JSON.parse(raw)).toEqual({ pid: 4242, since: '09:00:00' });
-            // `json.dumps(holder, sort_keys=True)`: keys sorted, CPython's
-            // default separators.
-            expect(raw).toBe('{"pid": 4242, "since": "09:00:00"}');
-          })
-        ),
+  awaitTest('the lock file is the holder record, and is emptied on release', function* () {
+    const seat = yield* bench();
+    yield* Effect.orDie(provideTestLayer(
+      withMonitorLock(seat.sessionPath, { pid: 4242, since: '09:00:00' }, () =>
+        Effect.map(seat.scratch.files.readText(seat.lockPath, 'monitor lock'), (raw) => {
+          expect(raw).toBe('{"pid": 4242, "since": "09:00:00"}');
+        })
+      ),
+      seat.scratch.layer
+    ));
+    expect(yield* Effect.orDie(
+      seat.scratch.files.readText(seat.lockPath, 'monitor lock')
+    )).toBe('');
+  });
+
+  awaitTest('a monitor lock that is not mode 0600 is refused', function* () {
+    const seat = yield* bench();
+    yield* Effect.orDie(fileSystem.makeDirectory(path.dirname(seat.lockPath), {
+      recursive: true,
+      mode: 0o700,
+    }));
+    yield* Effect.orDie(fileSystem.writeFileString(seat.lockPath, '', { mode: 0o644 }));
+    yield* Effect.orDie(fileSystem.chmod(seat.lockPath, 0o644));
+    const either = yield* Effect.either(
+      provideTestLayer(
+        withMonitorLock(seat.sessionPath, { pid: 1 }, () => Effect.void),
         seat.scratch.layer
-      )
-    );
-    expect(fs.readFileSync(seat.lockPath, 'utf8')).toBe('');
-  });
-
-  test('a monitor lock that is not mode 0600 is refused', async () => {
-    const seat = bench();
-    fs.mkdirSync(path.dirname(seat.lockPath), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(seat.lockPath, '', { mode: 0o644 });
-    fs.chmodSync(seat.lockPath, 0o644);
-    const either = await Effect.runPromise(
-      Effect.either(
-        Effect.provide(
-          withMonitorLock(seat.sessionPath, { pid: 1 }, () => Effect.void),
-          seat.scratch.layer
-        )
       )
     );
     expect(either._tag).toBe('Left');
@@ -142,11 +139,11 @@ describe('the monitor lock', () => {
     }
   });
 
-  test('no lock file at all means no monitor', async () => {
-    const seat = bench();
-    expect(
-      await Effect.runPromise(Effect.provide(monitorHolder(seat.sessionPath), seat.scratch.layer))
-    ).toBeNull();
+  awaitTest('no lock file at all means no monitor', function* () {
+    const seat = yield* bench();
+    expect(yield* Effect.orDie(
+      provideTestLayer(monitorHolder(seat.sessionPath), seat.scratch.layer)
+    )).toBeNull();
   });
 });
 
@@ -171,55 +168,50 @@ const holderScript = (seat: Bench, seconds: number): string => {
   ].join('\n');
 };
 
-const firstLine = async (stream: ReadableStream<Uint8Array>): Promise<string> => {
-  const reader = stream.getReader();
-  let buffer = '';
-  for (;;) {
-    const chunk = await reader.read();
-    if (chunk.done) break;
-    buffer += new TextDecoder().decode(chunk.value);
-    const newline = buffer.indexOf('\n');
-    if (newline >= 0) {
-      reader.releaseLock();
-      return buffer.slice(0, newline).trim();
-    }
-  }
-  reader.releaseLock();
-  return buffer.trim();
-};
-
 describe('the singleton', () => {
-  test('holds against a second process, not just a second closure', async () => {
+  awaitTest('holds against a second process, not just a second closure', function* (wait) {
     // `flock` is per-open-file-description, so in-process agreement proves
     // nothing about the case that matters: two `play monitor` invocations from
     // a shell.
-    const seat = bench();
+    const seat = yield* bench();
     const cwd = path.resolve(import.meta.dir, '..');
-    const first = Bun.spawn(['bun', '-e', holderScript(seat, 5)], {
+    const first = Bun.spawn(['bun', '-e', holderScript(seat, 30)], {
       cwd,
       stdout: 'pipe',
       stderr: 'pipe',
     });
+    const reader = first.stdout.getReader();
+    const readLine = (buffer: string): Effect.Effect<string> =>
+      Effect.flatMap(Effect.promise(() => reader.read()), (chunk) => {
+        if (chunk.done) return Effect.succeed(buffer.trim());
+        const next = buffer + new TextDecoder().decode(chunk.value);
+        const newline = next.indexOf('\n');
+        return newline >= 0
+          ? Effect.succeed(next.slice(0, newline).trim())
+          : readLine(next);
+      });
     try {
-      expect(await firstLine(first.stdout)).toBe('acquired');
+      expect(yield* readLine('')).toBe('acquired');
       const second = Bun.spawnSync(['bun', '-e', holderScript(seat, 0)], {
         cwd,
         stdout: 'pipe',
         stderr: 'pipe',
       });
       expect(second.stdout.toString().trim()).toBe('blocked');
-      const holder = await Effect.runPromise(
-        Effect.provide(monitorHolder(seat.sessionPath), seat.scratch.layer)
-      );
+      const holder = yield* Effect.orDie(provideTestLayer(
+        monitorHolder(seat.sessionPath),
+        seat.scratch.layer
+      ));
       expect(holder?.['pid']).toBe(first.pid);
     } finally {
+      reader.releaseLock();
       first.kill('SIGTERM');
-      await first.exited;
+      yield* wait(first.exited);
     }
     // The kernel released it when the holder died: nothing to reap.
-    expect(
-      await Effect.runPromise(Effect.provide(monitorHolder(seat.sessionPath), seat.scratch.layer))
-    ).toBeNull();
+    expect(yield* Effect.orDie(
+      provideTestLayer(monitorHolder(seat.sessionPath), seat.scratch.layer)
+    )).toBeNull();
     const third = Bun.spawnSync(['bun', '-e', holderScript(seat, 0)], {
       cwd: path.resolve(import.meta.dir, '..'),
       stdout: 'pipe',

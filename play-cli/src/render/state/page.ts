@@ -31,7 +31,7 @@ import { renderTiles } from 'src/render/state/tiles';
 import { renderUnits } from 'src/render/state/units';
 import type { PageBody } from 'src/schema/page';
 import type { Revision } from 'src/schema/revision';
-import { PrivateFs } from 'src/services/private-fs';
+import { type PrivateFs } from 'src/services/private-fs';
 import type { V2ClientState } from 'src/services/session-store';
 
 export type SectionRenderer = (

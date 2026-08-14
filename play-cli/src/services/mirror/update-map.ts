@@ -12,6 +12,7 @@
  */
 import { Effect } from 'effect';
 import type { PlayerError } from 'src/errors';
+import type { JsonValueInput } from 'src/schema/primitives';
 import { renderMap } from 'src/render/mirror/map';
 import type { PrivateFs } from 'src/services/private-fs';
 import {
@@ -37,7 +38,7 @@ export const updateMap = (
   dir: string,
   command: string,
   revision: MirrorRevision,
-  items: ReadonlyArray<unknown>
+  items: ReadonlyArray<JsonValueInput>
 ): Effect.Effect<ReadonlyArray<string>, PlayerError, PrivateFs> =>
   Effect.gen(function* () {
     const prior = parseMap(yield* readMirror(dir, MAP_FILE));

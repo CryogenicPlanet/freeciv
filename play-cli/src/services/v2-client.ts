@@ -9,11 +9,16 @@
  * what `cli-main` renders on stdout before exiting 2.
  */
 import { Context, Effect, Layer } from 'effect';
-import { DriftError, PlayerError, V2ResponseError, playerError } from 'src/errors';
+import { type DriftError, type PlayerError, V2ResponseError, playerError } from 'src/errors';
 import { V2_BUSY_BACKOFF_S, V2_BUSY_RETRIES } from 'src/constants';
 import { Http, type JsonResponse, type RequestOptions } from 'src/services/http';
 import { decodeError, v2ErrorMessage } from 'src/schema/error';
-import { isJsonObject, type JsonObject } from 'src/schema/primitives';
+import {
+  isJsonObject,
+  isJsonString,
+  type JsonObject,
+  type JsonValueInput,
+} from 'src/schema/primitives';
 
 /** The identity and credential a v2 request is made with. */
 export interface V2Credentials {
@@ -43,14 +48,14 @@ export const isBusyRefusal = (response: JsonResponse): boolean => {
   const hasRetryAfter = isJsonObject(details) && 'retry_after_seconds' in details;
   return (
     error['code'] === 'rate_limited' &&
-    typeof error['message'] === 'string' &&
+    isJsonString(error['message']) &&
     error['message'].includes('busy') &&
     !hasRetryAfter
   );
 };
 
 export interface V2RequestOptions {
-  readonly body?: unknown;
+  readonly body?: JsonValueInput;
   readonly encodedBody?: string | undefined;
   readonly timeout?: number;
 }
@@ -76,7 +81,7 @@ export interface V2ClientApi {
   readonly post: (
     credentials: V2Credentials,
     suffix: string,
-    body: unknown
+    body: JsonValueInput
   ) => Effect.Effect<JsonObject, V2ResponseError | DriftError | PlayerError>;
 }
 
@@ -88,6 +93,19 @@ const queryString = (query: Readonly<Record<string, string>>): string => {
   const encoded = parameters.toString();
   return encoded === '' ? '' : `?${encoded}`;
 };
+
+const raiseValidated = (
+  raw: JsonResponse
+): Effect.Effect<never, V2ResponseError | DriftError> =>
+  Effect.flatMap(decodeError(raw.value), (payload) =>
+    Effect.fail(
+      new V2ResponseError({
+        message: v2ErrorMessage(raw.status, payload),
+        status: raw.status,
+        payload,
+      })
+    )
+  );
 
 const makeApi = (
   http: Context.Tag.Service<Http>,
@@ -103,12 +121,16 @@ const makeApi = (
       // Reads are retried; mutations never are — their contract is
       // receipt-first, and a resend could apply an order twice.
       const attempts = method === 'GET' ? V2_BUSY_RETRIES : 1;
-      const request: RequestOptions = {
-        token: credentials.agentToken,
-        ...(options.body === undefined ? {} : { body: options.body }),
-        ...(options.encodedBody === undefined ? {} : { encodedBody: options.encodedBody }),
-        ...(options.timeout === undefined ? {} : { timeout: options.timeout }),
-      };
+      const identified: RequestOptions = { token: credentials.agentToken };
+      const withBody: RequestOptions = options.body === undefined
+        ? identified
+        : { ...identified, body: options.body };
+      const withEncoding: RequestOptions = options.encodedBody === undefined
+        ? withBody
+        : { ...withBody, encodedBody: options.encodedBody };
+      const request: RequestOptions = options.timeout === undefined
+        ? withEncoding
+        : { ...withEncoding, timeout: options.timeout };
       let last = yield* http.requestJsonResponse(method, url, request);
       for (let attempt = 1; attempt < attempts; attempt += 1) {
         if (!isBusyRefusal(last)) return last;
@@ -117,19 +139,6 @@ const makeApi = (
       }
       return last;
     });
-
-  const raiseValidated = (
-    raw: JsonResponse
-  ): Effect.Effect<never, V2ResponseError | DriftError> =>
-    Effect.flatMap(decodeError(raw.value), (payload) =>
-      Effect.fail(
-        new V2ResponseError({
-          message: v2ErrorMessage(raw.status, payload),
-          status: raw.status,
-          payload,
-        })
-      )
-    );
 
   const send = (
     method: string,

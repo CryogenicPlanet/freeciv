@@ -18,7 +18,7 @@
 import { Command, Options } from '@effect/cli';
 import { Effect } from 'effect';
 import { STRATEGIC_V1 } from 'src/constants';
-import { PlayerError, SessionMissingError, playerError } from 'src/errors';
+import { type PlayerError, type SessionMissingError, playerError } from 'src/errors';
 import { dualText, resolveDualRequired } from 'src/options';
 import { compactJson } from 'src/services/json-output';
 import { parsePyArgument, printPyJson, pyField, pyToJson, v1Json } from 'src/services/v1-json';
@@ -96,28 +96,26 @@ export const actCommand = Command.make(
       const http = yield* v1Json;
       const loaded = yield* sessions.resolve(session);
       if (loaded.session.controlProtocol !== STRATEGIC_V1) {
-        return yield* Effect.fail(
+        return yield*
           playerError(
             'just act is strategic-v1 only; this full-control-v2 session ' +
               'uses `just batch` and durable receipts'
-          )
-        );
+          );
       }
       if (turn <= 0 || observation === '') {
-        return yield* Effect.fail(
-          playerError('a positive turn and nonempty observation ID are required')
-        );
+        return yield*
+          playerError('a positive turn and nonempty observation ID are required');
       }
       // `parsePyArgument` keeps a `1.0` in the action a float all the way to
       // the request body, and answers a typo with CPython's own
       // `JSONDecodeError` sentence.
       const decoded = parsePyArgument(action);
       if (!decoded.ok) {
-        return yield* Effect.fail(playerError(`--action must be valid JSON: ${decoded.message}`));
+        return yield*playerError(`--action must be valid JSON: ${decoded.message}`);
       }
       const parsed = decoded.value;
       if (!isPyMapping(parsed)) {
-        return yield* Effect.fail(playerError('--action must be a JSON object'));
+        return yield*playerError('--action must be a JSON object');
       }
       const value = yield* http.requestPyJson(
         'POST',
@@ -129,26 +127,25 @@ export const actCommand = Command.make(
         }
       );
       if (pyField(value, 'accepted') !== true) {
-        return yield* Effect.fail(
+        return yield*
           playerError(
             'the supervisor did not acknowledge the action as accepted; ' +
               'do not advance LAST_TURN'
-          )
-        );
+          );
       }
       for (const [key, expected] of echoedFields(loaded.session.raw, turn)) {
         // `expected_value is not None and key in value and value[key] != …`
         if (expected === null) continue;
         if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
         if (!sameJson(pyToJson(pyField(value, key)), expected)) {
-          return yield* Effect.fail(
+          return yield*
             playerError(
               `the accepted action acknowledgement has the wrong ${key}; ` +
                 'do not advance LAST_TURN'
-            )
-          );
+            );
         }
       }
       yield* printPyJson(value);
+      return undefined;
     })
 );

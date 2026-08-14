@@ -34,6 +34,7 @@ import {
   receiptPayload,
   waitPayload,
 } from 'test/_fixtures';
+import { fixtureObject } from 'test/_expect';
 
 const run = <A, E>(effect: Effect.Effect<A, E>): Either.Either<A, E> =>
   Effect.runSync(Effect.either(effect));
@@ -280,7 +281,7 @@ describe('health', () => {
 
   test('an unknown waiting_on kind quotes itself Python-style', () => {
     const health = healthPayload();
-    const phase = { ...(health['phase'] as Record<string, unknown>) };
+    const phase = { ...fixtureObject(health['phase']) };
     phase['waiting_on'] = { kind: 'brand_new', summary: 's', seats: [], waiting_s: 1 };
     const message = failureMessage(
       run(decodeHealth({ ...health, phase }, identity()))
@@ -299,7 +300,7 @@ describe('wait', () => {
 
   test('phase_active over an inactive phase breaks the wake contract', () => {
     const health = healthPayload();
-    const phase = { ...(health['phase'] as Record<string, unknown>), active: false };
+    const phase = { ...fixtureObject(health['phase']), active: false };
     const payload = waitPayload({ health: { ...health, phase } });
     expect(
       failureMessage(

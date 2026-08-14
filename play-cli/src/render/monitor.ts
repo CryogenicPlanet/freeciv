@@ -13,7 +13,12 @@
  */
 import { phaseText } from 'src/render/phase';
 import { revisionLabel, scalar } from 'src/render/primitives';
-import { isJsonObject, type JsonObject, type JsonValue } from 'src/schema/primitives';
+import {
+  isJsonObject,
+  isWholeNumber,
+  type JsonObject,
+  type JsonValue,
+} from 'src/schema/primitives';
 import type { WaitEnvelope } from 'src/schema/wait';
 
 /** CPython truthiness over a JSON value — `{}` and `null` are both false. */
@@ -80,7 +85,7 @@ export const missedLine = (
     if (orders === 0) {
       return `was ended by timeout after ${elapsed}s — you issued no orders`;
     }
-    if (typeof orders === 'number' && Number.isInteger(orders)) {
+    if (isWholeNumber(orders)) {
       return (
         `was ended by timeout after ${elapsed}s — you issued ${orders} ` +
         `order${orders === 1 ? '' : 's'} but never ended the phase`
@@ -94,7 +99,7 @@ export const missedLine = (
     `${head} | your phase t${cell(event['turn'])}/p${cell(event['phase'])} opened and ${cause}`;
   if (consecutive <= 1) return line;
   const played =
-    typeof since === 'number' && Number.isInteger(since)
+    since !== undefined && isWholeNumber(since)
       ? `you have not issued an order since t${scalar(since)}. `
       : '';
   return (

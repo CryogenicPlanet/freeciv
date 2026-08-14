@@ -11,9 +11,9 @@
  * has to read back cell-for-cell, because the merge contract is exactly that
  * round trip.
  */
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect, Either } from 'effect';
+import type { PlayError } from 'src/errors';
 import type { JsonObject, JsonValue } from 'src/schema/primitives';
 import type { PrivateFs } from 'src/services/private-fs';
 import { mirrorDir, parseTable, readMirror } from 'src/services/mirror';
@@ -25,6 +25,8 @@ import { renderNations } from 'src/render/mirror/nations';
 import { renderStyles } from 'src/render/mirror/styles';
 import { renderUnits } from 'src/render/mirror/units';
 import { scratchWorkspace, type Scratch } from 'test/_fixtures';
+import { awaitTest, provideTestLayer } from 'test/_effect-test';
+import { path } from 'test/_test-platform';
 
 const GAME_ID = 'game_12345678901234567890';
 const AGENT_ID = 'agent_test-controller';
@@ -59,14 +61,23 @@ const page = (
   game_id: GAME_ID,
   agent_id: AGENT_ID,
   state_revision: rev,
-  page: {
-    section,
-    items,
-    total_items: options.total ?? items.length,
-    next_cursor: options.cursor ?? null,
-    cursor_expires_at: null,
-    ...(options.scope === undefined ? {} : { scope: options.scope }),
-  },
+  page:
+    options.scope === undefined
+      ? {
+          section,
+          items,
+          total_items: options.total ?? items.length,
+          next_cursor: options.cursor ?? null,
+          cursor_expires_at: null,
+        }
+      : {
+          section,
+          items,
+          total_items: options.total ?? items.length,
+          next_cursor: options.cursor ?? null,
+          cursor_expires_at: null,
+          scope: options.scope,
+        },
 });
 
 interface UnitOptions {
@@ -143,65 +154,60 @@ const receipt = (state = 'applied', rev: JsonObject = revision(8)): JsonObject =
 // ---------------------------------------------------------------------------
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() =>
+  Effect.runPromise(
+    Effect.forEach(scratches.splice(0), (scratch) => scratch.cleanup, { discard: true })
+  )
+);
 
 interface Mirror {
   readonly dir: string;
-  readonly run: <A, E>(effect: Effect.Effect<A, E, PrivateFs>) => Either.Either<A, E>;
+  readonly run: <A, E>(
+    effect: Effect.Effect<A, E, PrivateFs>
+  ) => Effect.Effect<Either.Either<A, E>>;
   readonly write: (
     command: string,
     payload: JsonObject,
     aliases?: Readonly<Record<string, string>>
-  ) => ReadonlyArray<string>;
-  readonly read: (...relative: ReadonlyArray<string>) => string;
+  ) => Effect.Effect<ReadonlyArray<string>>;
+  readonly read: (...relative: ReadonlyArray<string>) => Effect.Effect<string>;
 }
 
-const freshMirror = (): Mirror => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const dir = Effect.runSync(
-    mirrorDir(path.join(scratch.workspace.stateRoot, GAME_ID, 'codex-test.json'))
-  );
-  const run = <A, E>(effect: Effect.Effect<A, E, PrivateFs>): Either.Either<A, E> =>
-    Effect.runSync(Effect.either(Effect.provide(effect, scratch.layer)));
-  return {
-    dir,
-    run,
-    write: (command, payload, aliases) =>
-      right(
-        run(
-          updateFromPage(dir, command, payload, aliases === undefined ? {} : { aliases })
-        )
-      ),
-    read: (...relative) => {
-      const text = right(run(readMirror(dir, relative)));
-      expect(typeof text).toBe('string');
-      return text ?? '';
-    },
-  };
-};
+const freshMirror = (): Effect.Effect<Mirror, PlayError> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    yield* Effect.sync(() => scratches.push(scratch));
+    const dir = yield* mirrorDir(
+      path.join(scratch.workspace.stateRoot, GAME_ID, 'codex-test.json')
+    );
+    const run = <A, E>(
+      effect: Effect.Effect<A, E, PrivateFs>
+    ): Effect.Effect<Either.Either<A, E>> =>
+      Effect.either(provideTestLayer(effect, scratch.layer));
+    return {
+      dir,
+      run,
+      write: (command, payload, aliases) =>
+        Effect.map(
+          run(
+            updateFromPage(dir, command, payload, aliases === undefined ? {} : { aliases })
+          ),
+          right
+        ),
+      read: (...relative) => Effect.map(run(readMirror(dir, relative)), (result) => right(result) ?? ''),
+    };
+  });
 
-const right = <A, E>(either: Either.Either<A, E>): A => {
+const right = <A, E extends { readonly message?: string }>(either: Either.Either<A, E>): A => {
   if (Either.isLeft(either)) {
-    const failure: unknown = either.left;
-    const message =
-      typeof failure === 'object' && failure !== null && 'message' in failure
-        ? String((failure).message)
-        : String(failure);
-    throw new Error(`expected success, got: ${message}`);
+    throw new Error(`expected success, got: ${either.left.message ?? 'unknown failure'}`);
   }
   return either.right;
 };
 
-const leftMessage = <A, E>(either: Either.Either<A, E>): string => {
+const leftMessage = <A, E extends { readonly message?: string }>(either: Either.Either<A, E>): string => {
   expect(Either.isLeft(either)).toBe(true);
-  if (!Either.isLeft(either)) return '';
-  const failure: unknown = either.left;
-  return typeof failure === 'object' && failure !== null && 'message' in failure
-    ? String((failure).message)
-    : String(failure);
+  return Either.isLeft(either) ? (either.left.message ?? '') : '';
 };
 
 const bodyLines = (text: string): ReadonlyArray<string> =>
@@ -214,9 +220,9 @@ const pure = <A, E>(effect: Effect.Effect<A, E>): A => Effect.runSync(effect);
 // ---------------------------------------------------------------------------
 
 describe('the units table', () => {
-  test('is tab delimited and column aligned', () => {
-    const mirror = freshMirror();
-    mirror.write(
+  awaitTest('is tab delimited and column aligned', function* () {
+    const mirror = yield* freshMirror();
+    yield* mirror.write(
       'state',
       page('units', revision(9), [
         unit(UNIT_A),
@@ -235,7 +241,7 @@ describe('the units table', () => {
         }),
       ])
     );
-    const body = bodyLines(mirror.read('state', 'units.tsv'));
+    const body = bodyLines(yield* mirror.read('state', 'units.tsv'));
     expect((body[0] ?? '').split('\t').map((name) => name.trim())).toEqual([
       'alias',
       'unit',
@@ -256,24 +262,21 @@ describe('the units table', () => {
     expect(second[7]?.trim()).toBe('→(27,65) 4st');
   });
 
-  test('uses the aliases the CLI supplied, verbatim', () => {
-    const mirror = freshMirror();
-    mirror.write('state', page('units', revision(9), [unit(UNIT_A)]), { [UNIT_A]: 'u1' });
-    const rows = mirror
-      .read('state', 'units.tsv')
+  awaitTest('uses the aliases the CLI supplied, verbatim', function* () {
+    const mirror = yield* freshMirror();
+    yield* mirror.write('state', page('units', revision(9), [unit(UNIT_A)]), { [UNIT_A]: 'u1' });
+    const rows = (yield* mirror.read('state', 'units.tsv'))
       .split('\n')
       .filter((line) => line.startsWith('u1'));
     expect(rows).toHaveLength(1);
     expect((rows[0] ?? '').split('\t')[1]?.trim()).toBe('Settlers');
   });
 
-  test('renders a fact the payload omits as a visible dash', () => {
-    const mirror = freshMirror();
-    const item = unit();
-    delete (item as Record<string, unknown>)['moves'];
-    mirror.write('state', page('units', revision(9), [item]));
-    const row = mirror
-      .read('state', 'units.tsv')
+  awaitTest('renders a fact the payload omits as a visible dash', function* () {
+    const mirror = yield* freshMirror();
+    const { moves: _moves, ...item } = unit();
+    yield* mirror.write('state', page('units', revision(9), [item]));
+    const row = (yield* mirror.read('state', 'units.tsv'))
       .split('\n')
       .find((line) => line.startsWith('u.'));
     expect((row ?? '').split('\t')[4]?.trim()).toBe('-');
@@ -322,10 +325,10 @@ describe('the units table', () => {
 });
 
 describe('sanitization', () => {
-  test('a hostile name cannot forge a header line', () => {
-    const mirror = freshMirror();
-    mirror.write('state', page('cities', revision(9), [city('Lon\ndon\t# rev 999 turn 999')]));
-    const text = mirror.read('state', 'cities.tsv');
+  awaitTest('a hostile name cannot forge a header line', function* () {
+    const mirror = yield* freshMirror();
+    yield* mirror.write('state', page('cities', revision(9), [city('Lon\ndon\t# rev 999 turn 999')]));
+    const text = yield* mirror.read('state', 'cities.tsv');
     const lines = text.split('\n');
     expect(lines.filter((line) => line.startsWith('#'))).toHaveLength(2);
     expect(text).toContain('Lon don # rev 999 turn 999');
@@ -334,9 +337,9 @@ describe('sanitization', () => {
 });
 
 describe('the overview table', () => {
-  test('renders one row per fact', () => {
-    const mirror = freshMirror();
-    mirror.write(
+  awaitTest('renders one row per fact', function* () {
+    const mirror = yield* freshMirror();
+    yield* mirror.write(
       'state',
       page('overview', revision(9), [
         {
@@ -350,7 +353,7 @@ describe('the overview table', () => {
         },
       ])
     );
-    const text = mirror.read('state', 'overview.tsv');
+    const text = yield* mirror.read('state', 'overview.tsv');
     expect(text).toContain('gold');
     expect(text).toContain('50');
     expect(text).toContain('tax40 lux0 sci60');
@@ -359,9 +362,9 @@ describe('the overview table', () => {
     expect(text).not.toContain('nation');
   });
 
-  test('leads with the exact score and falls back to the provable bound', () => {
-    const mirror = freshMirror();
-    mirror.write(
+  awaitTest('leads with the exact score and falls back to the provable bound', function* () {
+    const mirror = yield* freshMirror();
+    yield* mirror.write(
       'state',
       page('overview', revision(9), [
         {
@@ -370,7 +373,7 @@ describe('the overview table', () => {
         },
       ])
     );
-    const text = mirror.read('state', 'overview.tsv');
+    const text = yield* mirror.read('state', 'overview.tsv');
     expect(text).toContain('>=17');
     // `cities 0` is falsy, so it is not one of the components named.
     expect(text).toContain('units 3');
@@ -455,8 +458,8 @@ describe('the catalog tables', () => {
 // ---------------------------------------------------------------------------
 
 describe('the render/parse round trip', () => {
-  test('every cell survives the file it was written to', () => {
-    const mirror = freshMirror();
+  awaitTest('every cell survives the file it was written to', function* () {
+    const mirror = yield* freshMirror();
     const rendered = pure(
       renderUnits(
         [
@@ -474,7 +477,7 @@ describe('the render/parse round trip', () => {
         { [UNIT_A]: 'u1', [UNIT_B]: 'u2' }
       )
     );
-    mirror.write(
+    yield* mirror.write(
       'state',
       page('units', revision(9), [
         unit(UNIT_A),
@@ -490,7 +493,7 @@ describe('the render/parse round trip', () => {
       ]),
       { [UNIT_A]: 'u1', [UNIT_B]: 'u2' }
     );
-    const parsed = parseTable(mirror.read('state', 'units.tsv'));
+    const parsed = parseTable(yield* mirror.read('state', 'units.tsv'));
     expect(parsed.revision).toEqual({ turn: 3, revision: 9 });
     expect(parsed.columns).toEqual([...rendered.columns]);
     expect(parsed.rows).toEqual(rendered.rows.map((row) => [...row]));
@@ -502,114 +505,116 @@ describe('the render/parse round trip', () => {
 // ---------------------------------------------------------------------------
 
 describe('update_from_page', () => {
-  test('returns the files it wrote', () => {
-    const mirror = freshMirror();
-    const written = mirror.write('state', page('units', revision(9), [unit()]));
+  awaitTest('returns the files it wrote', function* () {
+    const mirror = yield* freshMirror();
+    const written = yield* mirror.write('state', page('units', revision(9), [unit()]));
     expect(written.map((file) => path.relative(mirror.dir, file))).toEqual([
       path.join('state', 'units.tsv'),
       path.join('state', 'delta.md'),
     ]);
   });
 
-  test('an older page never overwrites a newer mirror', () => {
-    const mirror = freshMirror();
-    mirror.write('state', page('units', revision(9), [unit(UNIT_A, { moves: 1 })]));
-    const written = mirror.write('state', page('units', revision(7), [unit(UNIT_A)]));
+  awaitTest('an older page never overwrites a newer mirror', function* () {
+    const mirror = yield* freshMirror();
+    yield* mirror.write('state', page('units', revision(9), [unit(UNIT_A, { moves: 1 })]));
+    const written = yield* mirror.write('state', page('units', revision(7), [unit(UNIT_A)]));
     expect(written).toEqual([]);
-    const text = mirror.read('state', 'units.tsv');
+    const text = yield* mirror.read('state', 'units.tsv');
     expect(text.startsWith('# rev 9 turn 3')).toBe(true);
     expect(text).toContain('1/3');
     expect(text).not.toContain('3/3');
   });
 
-  test('a partial page at the same revision merges', () => {
-    const mirror = freshMirror();
+  awaitTest('a partial page at the same revision merges', function* () {
+    const mirror = yield* freshMirror();
     const rev = revision(9);
-    mirror.write(
+    yield* mirror.write(
       'state',
       page('units', rev, [unit(UNIT_A)], { cursor: `cursor_${'1'.repeat(32)}`, total: 2 })
     );
-    mirror.write('state', page('units', rev, [unit(UNIT_B, { kind: 'Workers' })], { total: 2 }));
-    const text = mirror.read('state', 'units.tsv');
+    yield* mirror.write('state', page('units', rev, [unit(UNIT_B, { kind: 'Workers' })], { total: 2 }));
+    const text = yield* mirror.read('state', 'units.tsv');
     expect(text).toContain('Settlers');
     expect(text).toContain('Workers');
     expect(text).toContain('units 2/2 complete');
   });
 
-  test('a complete page at the same revision replaces rather than merges', () => {
-    const mirror = freshMirror();
+  awaitTest('a complete page at the same revision replaces rather than merges', function* () {
+    const mirror = yield* freshMirror();
     const rev = revision(9);
-    mirror.write('state', page('units', rev, [unit(UNIT_A), unit(UNIT_B, { kind: 'Workers' })]));
-    mirror.write('state', page('units', rev, [unit(UNIT_A)]));
-    const text = mirror.read('state', 'units.tsv');
+    yield* mirror.write('state', page('units', rev, [unit(UNIT_A), unit(UNIT_B, { kind: 'Workers' })]));
+    yield* mirror.write('state', page('units', rev, [unit(UNIT_A)]));
+    const text = yield* mirror.read('state', 'units.tsv');
     expect(text).toContain('Settlers');
     expect(text).not.toContain('Workers');
     expect(text).toContain('units 1/1 complete');
   });
 
-  test('a windowed page reports itself partial', () => {
-    const mirror = freshMirror();
-    mirror.write(
+  awaitTest('a windowed page reports itself partial', function* () {
+    const mirror = yield* freshMirror();
+    yield* mirror.write(
       'state',
       page('units', revision(9), [unit(UNIT_A)], {
         cursor: `cursor_${'1'.repeat(32)}`,
         total: 4,
       })
     );
-    expect(mirror.read('state', 'units.tsv')).toContain(
+    expect(yield* mirror.read('state', 'units.tsv')).toContain(
       'units 1/4 partial - fetch the next cursor'
     );
   });
 
-  test('the overview page note counts items, not rows', () => {
-    const mirror = freshMirror();
-    mirror.write('state', page('overview', revision(9), [{ turn: 3, phase: 0 }]));
-    expect(mirror.read('state', 'overview.tsv')).toContain('overview 1/1 complete');
+  awaitTest('the overview page note counts items, not rows', function* () {
+    const mirror = yield* freshMirror();
+    yield* mirror.write('state', page('overview', revision(9), [{ turn: 3, phase: 0 }]));
+    expect(yield* mirror.read('state', 'overview.tsv')).toContain('overview 1/1 complete');
   });
 
-  test('an unmirrored section is ignored', () => {
-    const mirror = freshMirror();
-    expect(mirror.write('state', page('tombstones', revision(9), []))).toEqual([]);
-    expect(right(mirror.run(readMirror(mirror.dir, ['state', 'delta.md'])))).toBeNull();
+  awaitTest('an unmirrored section is ignored', function* () {
+    const mirror = yield* freshMirror();
+    expect(yield* mirror.write('state', page('tombstones', revision(9), []))).toEqual([]);
+    expect(right(yield* mirror.run(readMirror(mirror.dir, ['state', 'delta.md'])))).toBeNull();
   });
 
-  test('a page without a revision is refused', () => {
-    const mirror = freshMirror();
-    const broken = page('units', revision(9), [unit()]);
-    (broken as Record<string, unknown>)['state_revision'] = { state_token: 'x' };
-    const message = leftMessage(mirror.run(updateFromPage(mirror.dir, 'state', broken)));
+  awaitTest('a page without a revision is refused', function* () {
+    const mirror = yield* freshMirror();
+    const broken = {
+      ...page('units', revision(9), [unit()]),
+      state_revision: { state_token: 'x' },
+    };
+    const message = leftMessage(yield* mirror.run(updateFromPage(mirror.dir, 'state', broken)));
     expect(message).toContain('state revision counters');
   });
 
-  test('a page without a page envelope is refused', () => {
-    const mirror = freshMirror();
+  awaitTest('a page without a page envelope is refused', function* () {
+    const mirror = yield* freshMirror();
     const message = leftMessage(
-      mirror.run(updateFromPage(mirror.dir, 'state', { state_revision: revision(9) }))
+      yield* mirror.run(updateFromPage(mirror.dir, 'state', { state_revision: revision(9) }))
     );
     expect(message).toContain('page payload carries no page envelope');
   });
 
-  test('a non-object item is refused rather than blanked', () => {
-    const mirror = freshMirror();
+  awaitTest('a non-object item is refused rather than blanked', function* () {
+    const mirror = yield* freshMirror();
     const message = leftMessage(
-      mirror.run(updateFromPage(mirror.dir, 'state', page('units', revision(9), ['oops'])))
+      yield* mirror.run(updateFromPage(mirror.dir, 'state', page('units', revision(9), ['oops'])))
     );
     expect(message).toBe('state mirror: unit item is not an object');
   });
 
-  test('a page carrying too many items is refused', () => {
-    const mirror = freshMirror();
+  awaitTest('a page carrying too many items is refused', function* () {
+    const mirror = yield* freshMirror();
     const items = Array.from({ length: 4097 }, (): JsonValue => unit());
     const message = leftMessage(
-      mirror.run(updateFromPage(mirror.dir, 'state', page('units', revision(9), items)))
+      yield* mirror.run(updateFromPage(mirror.dir, 'state', page('units', revision(9), items)))
     );
     expect(message).toContain('too many items');
   });
 
-  test('every tiles section routes to U08’s map writer', () => {
+  awaitTest('every tiles section routes to U08’s map writer', function* () {
     for (const section of ['known_tiles', 'map_tiles', 'tile_window']) {
-      const mirror = freshMirror();
-      const written = mirror.write(
+      const mirror = yield* freshMirror();
+      const written = yield* mirror.write(
         'state',
         page(section, revision(9), [
           { id: 'tile_1', x: 31, y: 72, visibility: 'visible', terrain: 'Grassland' },
@@ -621,9 +626,9 @@ describe('update_from_page', () => {
     }
   });
 
-  test('a city_citizens page routes to U08’s yields writer', () => {
-    const mirror = freshMirror();
-    const written = mirror.write(
+  awaitTest('a city_citizens page routes to U08’s yields writer', function* () {
+    const mirror = yield* freshMirror();
+    const written = yield* mirror.write(
       'state',
       page('city_citizens', revision(9), [
         {
@@ -639,7 +644,7 @@ describe('update_from_page', () => {
     expect(written.map((file) => path.relative(mirror.dir, file))[0]).toBe(
       path.join('state', 'yields.tsv')
     );
-    expect(mirror.read('state', 'yields.tsv')).toContain('T(3,4)');
+    expect(yield* mirror.read('state', 'yields.tsv')).toContain('T(3,4)');
   });
 });
 
@@ -648,30 +653,30 @@ describe('update_from_page', () => {
 // ---------------------------------------------------------------------------
 
 describe('update_from_receipt', () => {
-  test('reports the receipt and warns when the tables lag', () => {
-    const mirror = freshMirror();
-    mirror.write('state', page('overview', revision(7), [{ turn: 3 }]));
+  awaitTest('reports the receipt and warns when the tables lag', function* () {
+    const mirror = yield* freshMirror();
+    yield* mirror.write('state', page('overview', revision(7), [{ turn: 3 }]));
     const written = right(
-      mirror.run(updateFromReceipt(mirror.dir, 'batch', receipt('applied', revision(9))))
+      yield* mirror.run(updateFromReceipt(mirror.dir, 'batch', receipt('applied', revision(9))))
     );
     expect(written).toHaveLength(1);
-    const text = mirror.read('state', 'delta.md');
+    const text = yield* mirror.read('state', 'delta.md');
     expect(text).toContain('## receipts');
     expect(text).toContain('applied batch batch_9999999999 at rev 9');
     expect(text).toContain('state files still show rev 7');
   });
 
-  test('a rejected receipt reports its error', () => {
-    const mirror = freshMirror();
-    right(mirror.run(updateFromReceipt(mirror.dir, 'batch', receipt('rejected'))));
-    const text = mirror.read('state', 'delta.md');
+  awaitTest('a rejected receipt reports its error', function* () {
+    const mirror = yield* freshMirror();
+    right(yield* mirror.run(updateFromReceipt(mirror.dir, 'batch', receipt('rejected'))));
+    const text = yield* mirror.read('state', 'delta.md');
     expect(text).toContain('rejected');
     expect(text).toContain('illegal_action');
     expect(text).toContain('that action is not legal now');
   });
 
-  test('an idempotent replay says so, and an investigation is spelled out', () => {
-    const mirror = freshMirror();
+  awaitTest('an idempotent replay says so, and an investigation is spelled out', function* () {
+    const mirror = yield* freshMirror();
     const observed: JsonObject = {
       ...receipt('applied', revision(9)),
       idempotent: true,
@@ -679,16 +684,16 @@ describe('update_from_receipt', () => {
         city: { name: 'Paris', size: 4, production: { name: 'Barracks' } },
       },
     };
-    right(mirror.run(updateFromReceipt(mirror.dir, 'batch', observed)));
-    const text = mirror.read('state', 'delta.md');
+    right(yield* mirror.run(updateFromReceipt(mirror.dir, 'batch', observed)));
+    const text = yield* mirror.read('state', 'delta.md');
     expect(text).toContain('(idempotent replay)');
     expect(text).toContain('investigated Paris sz4 building Barracks');
   });
 
-  test('a receipt without a revision is refused', () => {
-    const mirror = freshMirror();
+  awaitTest('a receipt without a revision is refused', function* () {
+    const mirror = yield* freshMirror();
     const message = leftMessage(
-      mirror.run(updateFromReceipt(mirror.dir, 'batch', { batch_id: 'batch_1' }))
+      yield* mirror.run(updateFromReceipt(mirror.dir, 'batch', { batch_id: 'batch_1' }))
     );
     expect(message).toContain('state revision counters');
   });

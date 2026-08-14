@@ -17,6 +17,7 @@ import {
   V2_CITY_OUTPUT_COLUMNS,
 } from 'src/constants';
 import { drift, isJsonObject, scalar, signed, type JsonValue } from 'src/render/primitives';
+import { isWholeNumber } from 'src/schema/primitives';
 
 type OutputRow = ReadonlyMap<string, number>;
 
@@ -29,18 +30,18 @@ export const cityOutputRows = (
     const known: ReadonlySet<string> = new Set<string>(V2_CITY_OUTPUTS);
     const names = [
       ...V2_CITY_OUTPUTS.filter((name) => present.has(name)),
-      ...[...present].filter((name) => !known.has(name)).sort(),
+      ...[...present].filter((name) => !known.has(name)).toSorted(),
     ];
     const values: Array<readonly [string, OutputRow]> = [];
     for (const name of names) {
       const metrics = outputs[name] ?? null;
-      if (!isJsonObject(metrics)) return yield* Effect.fail(drift('city output'));
+      if (!isJsonObject(metrics)) return yield*drift('city output');
       const row = new Map<string, number>();
       for (const [column, key] of V2_CITY_OUTPUT_COLUMNS) {
         const number = metrics[key] ?? null;
         if (number === null) continue;
-        if (typeof number !== 'number' || !Number.isInteger(number)) {
-          return yield* Effect.fail(drift('city output'));
+        if (!isWholeNumber(number)) {
+          return yield*drift('city output');
         }
         row.set(column, number);
       }
@@ -56,8 +57,9 @@ export const cityOutputRows = (
     );
     const chain = V2_CITY_OUTPUT_CHAIN.filter((column) => columns.includes(column));
     for (let position = chain.length - 1; position > 0; position -= 1) {
-      const column = chain[position] as string;
-      const previous = chain[position - 1] as string;
+      const column = chain.at(position);
+      const previous = chain.at(position - 1);
+      if (column === undefined || previous === undefined) continue;
       if (
         column !== 'surplus' &&
         values.every(([, row]) => row.get(column) === row.get(previous))
@@ -73,7 +75,7 @@ export const cityOutputRows = (
       ...values.map(([name, row]) => [
         name,
         ...columns.map((column) => {
-          const number = row.get(column) as number;
+          const number = row.get(column) ?? 0;
           return column === 'surplus' ? signed(number) : scalar(number);
         }),
       ]),

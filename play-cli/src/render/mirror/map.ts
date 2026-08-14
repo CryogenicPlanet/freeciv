@@ -24,6 +24,7 @@
  */
 import { Effect } from 'effect';
 import type { PlayerError } from 'src/errors';
+import type { JsonValueInput } from 'src/schema/primitives';
 import type { PrivateFs } from 'src/services/private-fs';
 import {
   LEGEND_SEPARATOR,
@@ -82,7 +83,7 @@ export const terrainLegendLine = (
 ): string => {
   const seen = new Set([...grid.values()].map((char) => char.toUpperCase()));
   return [...legend]
-    .sort(([left], [right]) => codePointSort(left, right))
+    .toSorted(([left], [right]) => codePointSort(left, right))
     .filter(([, char]) => seen.has(char))
     .map(([name, char]) => `${char}=${name}`)
     .join(LEGEND_SEPARATOR);
@@ -100,7 +101,7 @@ export const renderMap = (
   dir: string,
   revision: MirrorRevision,
   prior: MirrorMap,
-  items: ReadonlyArray<unknown>
+  items: ReadonlyArray<JsonValueInput>
 ): Effect.Effect<string, PlayerError, PrivateFs> =>
   Effect.gen(function* () {
     const fresh = yield* tileChars(items, prior.legend);

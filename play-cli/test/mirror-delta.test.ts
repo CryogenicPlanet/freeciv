@@ -7,7 +7,6 @@
  * `parseDelta`, `deltaText`, `updateDelta` and `rowChanges`.  Every golden
  * string came from running the CPython original on the same input.
  */
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect, Either } from 'effect';
 import type { PrivateFs } from 'src/services/private-fs';
@@ -23,6 +22,8 @@ import {
   type MirrorTable,
 } from 'src/services/mirror';
 import { scratchWorkspace, type Scratch } from 'test/_fixtures';
+import { effectTest, provideTestLayer } from 'test/_effect-test';
+import { path } from 'test/_test-platform';
 
 const GAME_ID = 'game_12345678901234567890';
 const REV9 = { turn: 3, revision: 9 } as const;
@@ -30,33 +31,39 @@ const REV10 = { turn: 3, revision: 10 } as const;
 const REV7 = { turn: 3, revision: 7 } as const;
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() =>
+  Effect.runPromise(
+    Effect.forEach(scratches.splice(0), (scratch) => scratch.cleanup, { discard: true })
+  )
+);
 
 interface Mirror {
   readonly dir: string;
-  readonly run: <A, E>(effect: Effect.Effect<A, E, PrivateFs>) => Either.Either<A, E>;
-  readonly delta: () => string;
+  readonly run: <A, E>(
+    effect: Effect.Effect<A, E, PrivateFs>
+  ) => Effect.Effect<Either.Either<A, E>>;
+  readonly delta: Effect.Effect<string>;
 }
 
-const freshMirror = (): Mirror => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const dir = Effect.runSync(
-    mirrorDir(path.join(scratch.workspace.stateRoot, GAME_ID, 'codex-test.json'))
-  );
-  const run = <A, E>(effect: Effect.Effect<A, E, PrivateFs>): Either.Either<A, E> =>
-    Effect.runSync(Effect.either(Effect.provide(effect, scratch.layer)));
-  return {
-    dir,
-    run,
-    delta: () => {
-      const either = run(readMirror(dir, DELTA_FILE));
-      return Either.isRight(either) ? (either.right ?? '') : '';
-    },
-  };
-};
+const freshMirror = (): Effect.Effect<Mirror> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const dir = yield* Effect.orDie(
+      mirrorDir(path.join(scratch.workspace.stateRoot, GAME_ID, 'codex-test.json'))
+    );
+    const run = <A, E>(
+      effect: Effect.Effect<A, E, PrivateFs>
+    ): Effect.Effect<Either.Either<A, E>> =>
+      Effect.either(provideTestLayer(effect, scratch.layer));
+    return {
+      dir,
+      run,
+      delta: Effect.map(run(readMirror(dir, DELTA_FILE)), (either) =>
+        Either.isRight(either) ? (either.right ?? '') : ''
+      ),
+    };
+  });
 
 const ok = <A, E>(either: Either.Either<A, E>): A => {
   expect(Either.isLeft(either) ? either.left : 'ok').toBe('ok');
@@ -147,86 +154,86 @@ describe('parseDelta', () => {
 });
 
 describe('updateDelta', () => {
-  test('sections accumulate inside one revision', () => {
-    const { dir, run, delta } = freshMirror();
-    ok(run(updateDelta(dir, REV9, 'state', 'units', ['u1 new: Settlers own'])));
-    ok(run(updateDelta(dir, REV9, 'state', 'cities', ['c1 new: London'])));
-    const text = delta();
+  effectTest('sections accumulate inside one revision', () => Effect.gen(function* () {
+    const { dir, run, delta } = yield* freshMirror();
+    ok(yield* run(updateDelta(dir, REV9, 'state', 'units', ['u1 new: Settlers own'])));
+    ok(yield* run(updateDelta(dir, REV9, 'state', 'cities', ['c1 new: London'])));
+    const text = (yield* delta);
     expect(text).toContain('## units');
     expect(text).toContain('## cities');
     expect(text.startsWith('# rev 9 turn 3')).toBe(true);
     expect(text).toContain('no earlier mirror');
-  });
+  }));
 
-  test('a duplicate entry inside one revision is not repeated', () => {
-    const { dir, run, delta } = freshMirror();
-    ok(run(updateDelta(dir, REV9, 'state', 'units', ['u1 moved'])));
-    ok(run(updateDelta(dir, REV9, 'state', 'units', ['u1 moved', 'u2 moved'])));
-    expect(delta().split('\n').filter((line) => line === '- u1 moved').length).toBe(1);
-  });
+  effectTest('a duplicate entry inside one revision is not repeated', () => Effect.gen(function* () {
+    const { dir, run, delta } = yield* freshMirror();
+    ok(yield* run(updateDelta(dir, REV9, 'state', 'units', ['u1 moved'])));
+    ok(yield* run(updateDelta(dir, REV9, 'state', 'units', ['u1 moved', 'u2 moved'])));
+    expect((yield* delta).split('\n').filter((line) => line === '- u1 moved').length).toBe(1);
+  }));
 
-  test('a newer revision resets the sections and records the prior stamp', () => {
-    const { dir, run, delta } = freshMirror();
-    ok(run(updateDelta(dir, REV7, 'state', 'units', ['first'])));
-    ok(run(updateDelta(dir, REV9, 'state', 'units', ['second'])));
-    const text = delta();
+  effectTest('a newer revision resets the sections and records the prior stamp', () => Effect.gen(function* () {
+    const { dir, run, delta } = yield* freshMirror();
+    ok(yield* run(updateDelta(dir, REV7, 'state', 'units', ['first'])));
+    ok(yield* run(updateDelta(dir, REV9, 'state', 'units', ['second'])));
+    const text = (yield* delta);
     expect(text.startsWith('# rev 9 turn 3')).toBe(true);
     expect(text).toContain('since rev 7 turn 3');
     expect(text).toContain('- second');
     expect(text).not.toContain('- first');
-  });
+  }));
 
-  test('the stamp advances even when nothing changed', () => {
-    const { dir, run, delta } = freshMirror();
-    ok(run(updateDelta(dir, REV9, 'state', 'map', ['terrain known: 0 -> 1 tiles'])));
-    expect(delta().startsWith('# rev 9 turn 3')).toBe(true);
-    const written = ok(run(updateDelta(dir, REV10, 'state', 'map', [])));
+  effectTest('the stamp advances even when nothing changed', () => Effect.gen(function* () {
+    const { dir, run, delta } = yield* freshMirror();
+    ok(yield* run(updateDelta(dir, REV9, 'state', 'map', ['terrain known: 0 -> 1 tiles'])));
+    expect((yield* delta).startsWith('# rev 9 turn 3')).toBe(true);
+    const written = ok(yield* run(updateDelta(dir, REV10, 'state', 'map', [])));
     expect(written === null ? '' : path.relative(dir, written)).toBe(
       path.join('state', 'delta.md')
     );
-    const text = delta();
+    const text = (yield* delta);
     expect(text.startsWith('# rev 10 turn 3')).toBe(true);
     expect(text).toContain('nothing changed.');
     expect(text).toContain('since rev 9 turn 3');
-  });
+  }));
 
-  test('nothing is written at an unchanged revision with no changes', () => {
-    const { dir, run, delta } = freshMirror();
-    ok(run(updateDelta(dir, REV9, 'state', 'map', ['terrain known: 0 -> 1 tiles'])));
-    const before = delta();
-    expect(ok(run(updateDelta(dir, REV9, 'state', 'map', [])))).toBe(null);
-    expect(delta()).toBe(before);
-  });
+  effectTest('nothing is written at an unchanged revision with no changes', () => Effect.gen(function* () {
+    const { dir, run, delta } = yield* freshMirror();
+    ok(yield* run(updateDelta(dir, REV9, 'state', 'map', ['terrain known: 0 -> 1 tiles'])));
+    const before = (yield* delta);
+    expect(ok(yield* run(updateDelta(dir, REV9, 'state', 'map', [])))).toBe(null);
+    expect((yield* delta)).toBe(before);
+  }));
 
-  test('an empty first digest is never written at all', () => {
-    const { dir, run, delta } = freshMirror();
-    expect(ok(run(updateDelta(dir, REV9, 'state', 'map', [])))).toBe(null);
-    expect(delta()).toBe('');
-  });
+  effectTest('an empty first digest is never written at all', () => Effect.gen(function* () {
+    const { dir, run, delta } = yield* freshMirror();
+    expect(ok(yield* run(updateDelta(dir, REV9, 'state', 'map', [])))).toBe(null);
+    expect((yield* delta)).toBe('');
+  }));
 
-  test('the digest never walks backwards', () => {
-    const { dir, run, delta } = freshMirror();
-    ok(run(updateDelta(dir, REV9, 'batch', 'receipts', ['applied batch b at rev 9'])));
-    expect(ok(run(updateDelta(dir, REV7, 'batch', 'receipts', ['applied batch b at rev 7'])))).toBe(
+  effectTest('the digest never walks backwards', () => Effect.gen(function* () {
+    const { dir, run, delta } = yield* freshMirror();
+    ok(yield* run(updateDelta(dir, REV9, 'batch', 'receipts', ['applied batch b at rev 9'])));
+    expect(ok(yield* run(updateDelta(dir, REV7, 'batch', 'receipts', ['applied batch b at rev 7'])))).toBe(
       null
     );
-    expect(delta().startsWith('# rev 9 turn 3')).toBe(true);
-  });
+    expect((yield* delta).startsWith('# rev 9 turn 3')).toBe(true);
+  }));
 
-  test('the digest caps its entry count the way CPython does', () => {
-    const { dir, run, delta } = freshMirror();
+  effectTest('the digest caps its entry count the way CPython does', () => Effect.gen(function* () {
+    const { dir, run, delta } = yield* freshMirror();
     const entries = Array.from({ length: 20 }, (_, index) => `Type${index} (first observation)`);
-    ok(run(updateDelta(dir, REV9, 'state', 'units', entries)));
-    const bullets = delta().split('\n').filter((line) => line.startsWith('- '));
+    ok(yield* run(updateDelta(dir, REV9, 'state', 'units', entries)));
+    const bullets = (yield* delta).split('\n').filter((line) => line.startsWith('- '));
     expect(bullets.length).toBe(13);
     expect(bullets[12]).toBe('- … and 8 more');
-  });
+  }));
 
-  test('the digest stamp is readable by the table parser show leads with', () => {
-    const { dir, run, delta } = freshMirror();
-    ok(run(updateDelta(dir, REV9, 'state', 'units', ['u1 new: Settlers own'])));
-    expect(parseTable(delta()).revision).toEqual(REV9);
-  });
+  effectTest('the digest stamp is readable by the table parser show leads with', () => Effect.gen(function* () {
+    const { dir, run, delta } = yield* freshMirror();
+    ok(yield* run(updateDelta(dir, REV9, 'state', 'units', ['u1 new: Settlers own'])));
+    expect(parseTable((yield* delta)).revision).toEqual(REV9);
+  }));
 });
 
 describe('rowChanges', () => {

@@ -27,6 +27,7 @@ import {
   type MirrorTable,
 } from 'src/services/mirror';
 import { scratchWorkspace } from 'test/_fixtures';
+import { effectTest, provideTestLayer } from 'test/_effect-test';
 
 const REV = { turn: 3, revision: 9 } as const;
 
@@ -336,12 +337,12 @@ describe('parseMap', () => {
   });
 });
 
-describe('tileChars', () => {
-  const run = <A, E>(effect: Effect.Effect<A, E>): Either.Either<A, E> =>
-    Effect.runSync(Effect.either(effect));
+const run = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<Either.Either<A, E>> =>
+  Effect.either(effect);
 
-  test('visibility alone decides fog, and an unknown tile hides its terrain', () => {
-    const either = run(
+describe('tileChars', () => {
+  effectTest('visibility alone decides fog, and an unknown tile hides its terrain', () => Effect.gen(function* () {
+    const either = yield* run(
       tileChars(
         [
           { id: 't1', x: 30, y: 71, visibility: 'visible', terrain: 'Grassland' },
@@ -363,73 +364,69 @@ describe('tileChars', () => {
       ['Grassland', 'G'],
       ['Ocean', 'O'],
     ]);
-  });
+  }));
 
-  test('a non-object item is refused rather than blanked', () => {
-    const either = run(tileChars(['oops'], new Map()));
+  effectTest('a non-object item is refused rather than blanked', () => Effect.gen(function* () {
+    const either = yield* run(tileChars(['oops'], new Map()));
     expect(Either.isLeft(either) ? either.left.message : '').toBe(
       'state mirror: tile item is not an object'
     );
-  });
+  }));
 
-  test('a tile without integer coordinates is refused', () => {
-    const either = run(
+  effectTest('a tile without integer coordinates is refused', () => Effect.gen(function* () {
+    const either = yield* run(
       tileChars([{ id: 't1', x: '30', y: 71, visibility: 'visible' }], new Map())
     );
     expect(Either.isLeft(either) ? either.left.message : '').toBe(
       'state mirror: tile item carries no coordinates'
     );
-  });
+  }));
 });
 
 describe('mapSize', () => {
-  test('the overview row named map supplies the size the map header prints', () => {
-    const scratch = scratchWorkspace();
-    try {
-      const dir = `${scratch.workspace.stateRoot}/game_x/codex-test`;
-      const write = (rows: ReadonlyArray<ReadonlyArray<string>>): void => {
-        Effect.runSync(
-          Effect.provide(
-            writeMirror(
-              dir,
-              ['state', 'overview.tsv'],
-              tableText(REV, ['overview 1/1 complete'], ['fact', 'value'], rows)
-            ),
-            scratch.layer
-          )
-        );
-      };
-      const read = (): string | null =>
-        Effect.runSync(Effect.provide(mapSize(dir), scratch.layer));
+  effectTest('the overview row named map supplies the size the map header prints', () =>
+    Effect.acquireUseRelease(
+      scratchWorkspace(),
+      (scratch) =>
+        Effect.gen(function* () {
+          const dir = `${scratch.workspace.stateRoot}/game_x/codex-test`;
+          const write = (rows: ReadonlyArray<ReadonlyArray<string>>) =>
+            provideTestLayer(
+              writeMirror(
+                dir,
+                ['state', 'overview.tsv'],
+                tableText(REV, ['overview 1/1 complete'], ['fact', 'value'], rows)
+              ),
+              scratch.layer
+            );
+          const read = () => provideTestLayer(mapSize(dir), scratch.layer);
 
-      write([
-        ['turn', '3'],
-        ['map', '64x48'],
-      ]);
-      expect(read()).toBe('64x48');
+          yield* write([['turn', '3'], ['map', '64x48']]);
+          expect(yield* read()).toBe('64x48');
+          yield* write([['map', '-']]);
+          expect(yield* read()).toBe(null);
+          yield* write([['turn', '3']]);
+          expect(yield* read()).toBe(null);
+        }).pipe(Effect.orDie),
+      (scratch) => scratch.cleanup
+    )
+  );
 
-      write([['map', '-']]);
-      expect(read()).toBe(null);
-
-      write([['turn', '3']]);
-      expect(read()).toBe(null);
-    } finally {
-      scratch.cleanup();
-    }
-  });
-
-  test('no overview at all is no size', () => {
-    const scratch = scratchWorkspace();
-    try {
-      expect(
-        Effect.runSync(
-          Effect.provide(mapSize(`${scratch.workspace.stateRoot}/game_x/codex-test`), scratch.layer)
-        )
-      ).toBe(null);
-    } finally {
-      scratch.cleanup();
-    }
-  });
+  effectTest('no overview at all is no size', () =>
+    Effect.acquireUseRelease(
+      scratchWorkspace(),
+      (scratch) =>
+        Effect.gen(function* () {
+          expect(
+            yield* provideTestLayer(
+              mapSize(`${scratch.workspace.stateRoot}/game_x/codex-test`),
+              scratch.layer
+            )
+          ).toBe(null);
+        }).pipe(Effect.orDie),
+      (scratch) => scratch.cleanup
+    )
+  );
 });
 
 describe('splitLines', () => {

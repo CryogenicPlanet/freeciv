@@ -28,7 +28,14 @@ import {
   table,
   type AliasMap,
 } from 'src/render/primitives';
-import { field, hasField, isJsonObject, type JsonObject, type JsonValue } from 'src/schema/primitives';
+import {
+  field,
+  hasField,
+  isJsonObject,
+  isJsonString,
+  type JsonObject,
+  type JsonValue,
+} from 'src/schema/primitives';
 import type { PageScope } from 'src/schema/page';
 import { tileReference } from 'src/services/aliases';
 import type { CompactAction } from 'src/services/legal-compact';
@@ -57,7 +64,7 @@ const isFalseLike = (value: JsonValue): boolean =>
 
 /** `kind`, suffixed with `/operation` unless the kind already ends in it. */
 const kindWithOperation = (kind: string, operation: JsonValue): string =>
-  typeof operation === 'string' && operation !== '' && !kind.endsWith(`.${operation}`)
+  isJsonString(operation) && operation !== '' && !kind.endsWith(`.${operation}`)
     ? `${kind}/${operation}`
     : kind;
 
@@ -70,9 +77,9 @@ export const legalRow = (
 ): Effect.Effect<ReadonlyArray<string>, PlayerError> =>
   Effect.gen(function* () {
     const subject = field(compact, 'subject');
-    if (!isJsonObject(subject)) return yield* Effect.fail(drift('legal action subject'));
+    if (!isJsonObject(subject)) return yield*drift('legal action subject');
     const rawKind = field(compact, 'kind');
-    if (typeof rawKind !== 'string') return yield* Effect.fail(drift('legal action kind'));
+    if (!isJsonString(rawKind)) return yield*drift('legal action kind');
     const kind = kindWithOperation(rawKind, field(subject, 'operation'));
     const lookup = aliases ?? undefined;
     const detail: string[] = [];
@@ -98,7 +105,7 @@ export const legalRow = (
     const scopeActor = scope === null ? null : scope.actor_id;
     if (isJsonObject(actor)) {
       const actorId = field(actor, 'id');
-      if (typeof actorId === 'string' && actorId !== scopeActor) {
+      if (isJsonString(actorId) && actorId !== scopeActor) {
         detail.push(`actor=${lookup?.[actorId] ?? actorId}`);
       }
     } else if (actor !== null) {
@@ -142,10 +149,10 @@ export const legalRow = (
     if (schema !== '') detail.push(schema);
 
     const label = field(compact, 'label');
-    const row = [alias, kind, typeof label === 'string' ? label : scalar(label), detail.join(' ')];
+    const row = [alias, kind, isJsonString(label) ? label : scalar(label), detail.join(' ')];
     if (aliases === null) {
       const actionId = field(compact, 'action_id');
-      row.push(typeof actionId === 'string' ? actionId : scalar(actionId));
+      row.push(isJsonString(actionId) ? actionId : scalar(actionId));
     }
     return row;
   });

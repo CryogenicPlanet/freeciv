@@ -22,18 +22,20 @@
  *
  * Owned by the integrator (PORT_MAP §0 core row).
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
-import { Effect } from 'effect';
-import type { PlayerError } from 'src/errors';
-import type { JsonValue } from 'src/schema/primitives';
+import { Effect, Schema } from 'effect';
+import { awaitTest } from 'test/_effect-test';
 import { emitTurn } from 'src/commands/turn.cmd';
+import type { PlayError } from 'src/errors';
 import { turnEndJson } from 'src/services/turn-end';
 import type { RenderTurnDeps, TurnResult } from 'src/render/turn';
 import { pyDumps } from 'src/services/canonical-body';
 import { healthFloatPathsUnder, pyValueWithFloats } from 'src/services/health-json';
+import { turnHealthContext } from 'src/services/health-context';
 import { compactJson } from 'src/services/json-output';
+import { decodeHealth, type HealthEnvelope } from 'src/schema/health';
+import { isJsonObject, type JsonObject } from 'src/schema/primitives';
+import { decodeWait, type WaitEnvelope } from 'src/schema/wait';
 import {
   bench,
   dispositionOf,
@@ -44,6 +46,15 @@ import {
   UNIT_ONE,
   type Bench,
 } from 'test/_do-harness';
+import { captureEffect } from 'test/_capture';
+import { effectTest } from 'test/_effect-test';
+import {
+  FIXTURE_CONTROLLER,
+  healthPayload,
+  identity,
+  waitPayload,
+} from 'test/_fixtures';
+import { path, withTestFileSystem } from 'test/_test-platform';
 
 // ---------------------------------------------------------------------------
 // Payload shapes carrying the supervisor's integral floats
@@ -57,26 +68,53 @@ import {
  * `V2_AUTO_END_IDLE_GRACE_S = 20.0` (supervisor.py:288); both are published
  * verbatim, so both reach the wire as integral Python floats on every call.
  */
-const phaseBlock = {
-  turn: 104,
-  phase: 0,
-  active: true,
-  timing: { mode: 'default', timeout_s: 600, deadline_started_at: 1000, deadline_at: 1600 },
-  auto_end: { grace_s: 20, remaining_s: 12 },
-};
+const floatHealthWire = (): JsonObject =>
+  healthPayload({
+    phase: {
+      state: 'awaiting_agent',
+      turn: 104,
+      phase: 0,
+      active: true,
+      timing: {
+        mode: 'default',
+        timeout_s: 600,
+        deadline_started_at: 1000,
+        deadline_at: 1600,
+        elapsed_s: 13,
+        remaining_s: 587,
+      },
+      auto_end: { armed: true, enabled: true, grace_s: 20, remaining_s: 12 },
+    },
+    last_phase_end: {
+      sequence: 1,
+      turn: 103,
+      phase: 0,
+      place: 1,
+      seat_id: 'seat_one',
+      player_name: 'Alice',
+      player_color: '#0067A5',
+      controller_label: FIXTURE_CONTROLLER,
+      controller_type: 'external',
+      source: 'timeout',
+      receipt_state: 'applied',
+      resolution: 'advanced',
+      deadline_started_at: 1000,
+      ended_at: 1600,
+      elapsed_s: 600,
+    },
+  });
 
-const healthBlock = {
-  schema_version: 2,
-  game_state: 'running',
-  phase: phaseBlock,
-  last_phase_end: { turn: 103, phase: 0, source: 'timeout', elapsed_s: 600 },
-};
+const decodedFloatHealth = (): HealthEnvelope =>
+  Effect.runSync(decodeHealth(floatHealthWire(), identity()));
 
-const contextBlock = {
-  game_state: 'running',
-  phase: phaseBlock,
-  last_phase_end: { turn: 103, phase: 0, source: 'timeout', elapsed_s: 600 },
-};
+const decodedFloatWake = (): WaitEnvelope =>
+  Effect.runSync(
+    decodeWait(
+      waitPayload({ wake_reason: 'phase_active', health: floatHealthWire() }),
+      identity(),
+      { until: 'phase', afterStateToken: null }
+    )
+  );
 
 /** Every integral float the twelve marked paths reach in these fixtures. */
 const FLOAT_TOKENS = [
@@ -97,19 +135,7 @@ const expectFloats = (text: string): void => {
   }
 };
 
-const captureLog = async (body: () => Promise<unknown>): Promise<ReadonlyArray<string>> => {
-  const lines: Array<string> = [];
-  const original = console.log;
-  console.log = (...parts: ReadonlyArray<unknown>): void => {
-    lines.push(parts.join(' '));
-  };
-  try {
-    await body();
-  } finally {
-    console.log = original;
-  }
-  return lines;
-};
+const jsonObjectSchema = Schema.parseJson(Schema.Unknown);
 
 // ---------------------------------------------------------------------------
 // turn --json
@@ -127,30 +153,27 @@ const unusedDeps: RenderTurnDeps = {
   renderTiles: () => Effect.die('renderer reached under --json'),
 };
 
-const turnResult = (): TurnResult =>
-  ({
-    schema_version: 1,
-    command: 'turn',
-    status: 'not_ready',
-    context: contextBlock as unknown as TurnResult['context'],
-    next_commands: ['just wait --for-turn'],
-  });
+const turnResult = (): TurnResult => ({
+  schema_version: 1,
+  command: 'turn',
+  status: 'not_ready',
+  context: turnHealthContext(decodedFloatHealth()),
+  next_commands: ['just wait --for-turn'],
+});
 
 describe('turn --json', () => {
-  test('the context prints the supervisor floats, not their integer spellings', async () => {
-    const lines = await captureLog(() =>
-      Effect.runPromise(
-        emitTurn(turnResult(), unusedDeps, { json: true }) as Effect.Effect<void, PlayerError>
-      ).catch((cause: unknown) => {
-        throw cause;
-      })
-    );
-    expect(lines).toHaveLength(1);
-    expectFloats(lines[0] ?? '');
-    // Still one valid JSON document, and still sorted-keys/compact-separator.
-    expect(() => JSON.parse(lines[0] ?? '') as unknown).not.toThrow();
-    expect(lines[0]).toContain('"command":"turn"');
-  });
+  effectTest('the context prints the supervisor floats, not their integer spellings', () =>
+    Effect.map(
+      captureEffect(Effect.orDie(emitTurn(turnResult(), unusedDeps, { json: true }))),
+      ({ captured }) => {
+        expect(captured.out).toHaveLength(1);
+        expectFloats(captured.out[0] ?? '');
+        const parsed = Schema.decodeUnknownSync(jsonObjectSchema)(captured.out[0] ?? '');
+        expect(isJsonObject(parsed)).toBe(true);
+        if (isJsonObject(parsed)) expect(parsed['command']).toBe('turn');
+      }
+    )
+  );
 
   test('the projection is rooted at `context`, which is where the briefing puts it', () => {
     const paths = healthFloatPathsUnder('context');
@@ -166,11 +189,11 @@ describe('turn --json', () => {
 // ---------------------------------------------------------------------------
 
 describe('turn --end --json', () => {
-  const waitEnvelope = { wake_reason: 'phase_started', health: healthBlock };
+  const waitEnvelope = decodedFloatWake();
   const disposition = dispositionOf('batch_end', 'applied', rev(9));
 
   test('the plain end embeds the wake, so `wait.health` is the prefix', () => {
-    const payload = turnEndJson(false, disposition, waitEnvelope as never, null, '');
+    const payload = turnEndJson(false, disposition, waitEnvelope, null, '');
     const text = pyDumps(
       pyValueWithFloats(payload, healthFloatPathsUnder('wait.health', 'turn.context')),
       true
@@ -179,13 +202,7 @@ describe('turn --end --json', () => {
   });
 
   test('the --brief composite embeds both the wake and the next briefing', () => {
-    const payload = turnEndJson(
-      true,
-      disposition,
-      waitEnvelope as never,
-      turnResult(),
-      ''
-    );
+    const payload = turnEndJson(true, disposition, waitEnvelope, turnResult(), '');
     const text = pyDumps(
       pyValueWithFloats(payload, healthFloatPathsUnder('wait.health', 'turn.context')),
       true
@@ -203,12 +220,7 @@ describe('turn --end --json', () => {
 
 describe('wait --json', () => {
   test('the envelope nests health under `health`, which is the prefix', () => {
-    const envelope = {
-      schema_version: 2,
-      wake_reason: 'phase_started',
-      health: healthBlock,
-      state_revision: null,
-    };
+    const envelope = waitPayload({ wake_reason: 'phase_active', health: floatHealthWire() });
     const text = pyDumps(pyValueWithFloats(envelope, healthFloatPathsUnder('health')), true);
     expectFloats(text);
   });
@@ -217,7 +229,7 @@ describe('wait --json', () => {
     // The self-proof: every token above is *absent* from `compactJson`, so a
     // call site that reverts to `printV2Json` fails the tests in this file
     // rather than passing them vacuously.
-    const text = compactJson({ health: healthBlock });
+    const text = compactJson({ health: floatHealthWire() });
     for (const token of FLOAT_TOKENS) expect(text).not.toContain(token);
     expect(text).toContain('"timeout_s":600}');
     expect(text).toContain('"grace_s":20,');
@@ -230,42 +242,45 @@ describe('wait --json', () => {
 
 describe('do --end --await --brief --json', () => {
   const benches: Bench[] = [];
-  afterEach(() => {
-    while (benches.length > 0) benches.pop()?.scratch.cleanup();
-  });
+  afterEach(() =>
+    Effect.runPromise(
+      Effect.forEach(benches.splice(0), (kit) => kit.scratch.cleanup, { discard: true })
+    )
+  );
 
   const FOUND_ONE = `action_${'2'.repeat(26)}`;
   const END_BATCH = 'batch_phase_end_1';
 
   /** One seat with a one-action catalog, staged at rev 7. */
-  const seated = (): Bench => {
-    const kit = bench();
-    benches.push(kit);
-    const revision = rev(7);
-    kit.world.revision = revision;
-    kit.seed(UNIT_ONE, [foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
-    kit.world.receipt = () => ({ state: 'applied', revision });
-    kit.world.phaseEnd = () =>
-      Effect.succeed({
-        disposition: dispositionOf(END_BATCH, 'applied', revision),
-        warning: '',
-        exitCode: 0,
-        lines: [`phase end → applied rev${revision.revision}/t${revision.turn}  ${END_BATCH}`],
-      });
-    return kit;
-  };
+  const seated = (): Effect.Effect<Bench, PlayError> =>
+    Effect.gen(function* () {
+      const kit = yield* bench();
+      yield* Effect.sync(() => benches.push(kit));
+      const revision = rev(7);
+      kit.world.revision = revision;
+      yield* kit.seed(UNIT_ONE, [foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
+      kit.world.receipt = () => ({ state: 'applied', revision });
+      kit.world.phaseEnd = () =>
+        Effect.succeed({
+          disposition: dispositionOf(END_BATCH, 'applied', revision),
+          warning: '',
+          exitCode: 0,
+          lines: [`phase end → applied rev${revision.revision}/t${revision.turn}  ${END_BATCH}`],
+        });
+      return kit;
+    });
 
-  test('the composite carries the wake and the briefing with CPython floats', async () => {
-    const kit = seated();
+  awaitTest('the composite carries the wake and the briefing with CPython floats', function* (wait) {
+    const kit = yield* seated();
     kit.world.awaitBrief = () =>
       Effect.succeed({
-        wait: { wake_reason: 'phase_started', health: healthBlock },
-        briefing: turnResult() as unknown as JsonValue,
+        wait: decodedFloatWake(),
+        briefing: turnResult(),
         briefError: '',
         lines: ['awake'],
       });
 
-    const run = await runDoCaptured(
+    const run = yield* wait(runDoCaptured(
       kit,
       doArgs('u1 found_city London', {
         endPhase: true,
@@ -273,20 +288,23 @@ describe('do --end --await --brief --json', () => {
         brief: true,
         json: true,
       })
-    );
+    ));
 
     expect(run.out).toHaveLength(1);
     expectFloats(run.out[0] ?? '');
     expect(run.out[0]).toContain('"command":"do"');
   });
 
-  test('without --end the payload carries neither key, so the projection is inert', async () => {
-    const kit = seated();
-    const run = await runDoCaptured(kit, doArgs('u1 found_city London', { json: true }));
+  awaitTest('without --end the payload carries neither key, so the projection is inert', function* (wait) {
+    const kit = yield* seated();
+    const run = yield* wait(runDoCaptured(kit, doArgs('u1 found_city London', { json: true })));
     expect(run.out).toHaveLength(1);
-    const payload: unknown = JSON.parse(run.out[0] ?? '');
-    expect(Object.keys(payload as Record<string, unknown>)).not.toContain('wait');
-    expect(Object.keys(payload as Record<string, unknown>)).not.toContain('turn');
+    const payload = Schema.decodeUnknownSync(jsonObjectSchema)(run.out[0] ?? '');
+    expect(isJsonObject(payload)).toBe(true);
+    if (isJsonObject(payload)) {
+      expect(Object.hasOwn(payload, 'wait')).toBe(false);
+      expect(Object.hasOwn(payload, 'turn')).toBe(false);
+    }
   });
 });
 
@@ -317,19 +335,29 @@ describe('no health-carrying --json surface reaches for printV2Json', () => {
   const root = path.resolve(import.meta.dir, '..');
 
   for (const relative of SOURCES) {
-    test(`${relative} serializes through pyValueWithFloats`, () => {
-      const source = fs.readFileSync(path.join(root, relative), 'utf8');
-      expect(source).toContain('pyValueWithFloats');
-      expect(source).toContain('healthFloatPathsUnder');
-    });
+    effectTest(`${relative} serializes through pyValueWithFloats`, () =>
+      withTestFileSystem((files) =>
+        Effect.gen(function* () {
+          const source = yield* files.readFileString(path.join(root, relative));
+          expect(source).toContain('pyValueWithFloats');
+          expect(source).toContain('healthFloatPathsUnder');
+        })
+      ).pipe(Effect.orDie)
+    );
   }
 
-  test('turn.cmd keeps printV2Json only for the decisions payload, which has no health', () => {
-    const source = fs.readFileSync(path.join(root, 'src/commands/turn.cmd.ts'), 'utf8');
-    // One import and exactly one remaining call: `turn --decisions --json`,
-    // whose payload is {schema_version, command, status, state_revision,
-    // decisions} — no phase, no last_phase_end, no float to lose.
-    const calls = source.split('printV2Json(').length - 1;
-    expect(calls).toBe(1);
-  });
+  effectTest(
+    'turn.cmd keeps printV2Json only for the decisions payload, which has no health',
+    () =>
+      withTestFileSystem((files) =>
+        Effect.gen(function* () {
+          const source = yield* files.readFileString(path.join(root, 'src/commands/turn.cmd.ts'));
+          // One import and exactly one remaining call: `turn --decisions --json`,
+          // whose payload is {schema_version, command, status, state_revision,
+          // decisions} — no phase, no last_phase_end, no float to lose.
+          const calls = source.split('printV2Json(').length - 1;
+          expect(calls).toBe(1);
+        })
+      ).pipe(Effect.orDie)
+  );
 });

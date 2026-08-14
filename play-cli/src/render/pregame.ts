@@ -11,6 +11,8 @@
  */
 import { playerError, type PlayerError } from 'src/errors';
 
+import type { JsonValueInput } from 'src/schema/primitives';
+
 /** How many catalog names one refusal is allowed to spend on the agent. */
 export const PREGAME_SHOWN_MAX = 12;
 
@@ -109,21 +111,26 @@ export const READY_INTENT = 'set ready';
 /** Said instead of readying when the configuration itself was not accepted. */
 export const NOT_READIED_LINE = 'not readied: the configuration was not accepted';
 
+export interface StartJsonEnvelope {
+  readonly schema_version: 1;
+  readonly command: 'start';
+  readonly nation: string;
+  readonly leader: string;
+  readonly is_male: boolean;
+  readonly style_id: string;
+  readonly dispositions: ReadonlyArray<JsonValueInput>;
+}
+
 /**
  * The composite `--json` payload, with `command_start`'s exact part names.
- *
- * `dispositions` is `unknown` for the same reason `do`'s composite payload is
- * (`src/commands/do.cmd.ts`): the records are U13's decoded
- * `BatchDisposition`s, which are the objects `printV2Json` serializes, and a
- * decoded envelope is a nominal interface rather than a `JsonObject`.
  */
 export const startJson = (parts: {
   readonly nation: string;
   readonly leader: string;
   readonly male: boolean;
   readonly styleId: string;
-  readonly dispositions: ReadonlyArray<unknown>;
-}): unknown => ({
+  readonly dispositions: ReadonlyArray<JsonValueInput>;
+}): StartJsonEnvelope => ({
   schema_version: 1,
   command: 'start',
   nation: parts.nation,

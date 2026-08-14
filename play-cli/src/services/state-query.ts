@@ -9,7 +9,7 @@
  * spell_every_flag_the_way_just_accepts` asserts exactly that.
  */
 import { Effect } from 'effect';
-import { PlayerError, playerError } from 'src/errors';
+import { type PlayerError, playerError } from 'src/errors';
 import {
   ACTOR_ID_RE,
   CITY_ID_RE,
@@ -46,7 +46,7 @@ const encode = (parameters: ReadonlyArray<readonly [string, string]>): string =>
     .join('&');
 
 const unsupported = (section: string): PlayerError => {
-  const available = [...V2_SECTIONS].sort().join(', ');
+  const available = [...V2_SECTIONS].toSorted().join(', ');
   return playerError(
     `state section '${section}' is not supported; valid sections: ` +
       `${available}. Economy and current government are in overview; ` +
@@ -73,19 +73,19 @@ export const stateQuery = (args: StateQueryArgs): Effect.Effect<string, PlayerEr
         limit !== null ||
         !CURSOR_RE.test(cursor)
       ) {
-        return yield* Effect.fail(playerError('state cursor must be the only page option'));
+        return yield*playerError('state cursor must be the only page option');
       }
       return encode([['cursor', cursor]]);
     }
     if (limit !== null && section === '') {
-      return yield* Effect.fail(playerError('state --limit requires --section'));
+      return yield*playerError('state --limit requires --section');
     }
     if (section !== '' && !V2_SECTIONS.has(section)) {
-      return yield* Effect.fail(unsupported(section));
+      return yield*unsupported(section);
     }
     if (section === '') {
       if (actorId !== '' || relationId !== '' || centerId !== '' || radius !== null) {
-        return yield* Effect.fail(playerError('state scope options require --section'));
+        return yield*playerError('state scope options require --section');
       }
       return '';
     }
@@ -100,9 +100,8 @@ export const stateQuery = (args: StateQueryArgs): Effect.Effect<string, PlayerEr
         centerId !== '' ||
         radius !== null
       ) {
-        return yield* Effect.fail(
-          playerError('city state sections require exactly one opaque --actor_id')
-        );
+        return yield*
+          playerError('city state sections require exactly one opaque --actor_id');
       }
       parameters.push(['actor_id', actorId]);
     } else if (section === 'diplomacy_clauses') {
@@ -112,12 +111,11 @@ export const stateQuery = (args: StateQueryArgs): Effect.Effect<string, PlayerEr
         centerId !== '' ||
         radius !== null
       ) {
-        return yield* Effect.fail(
+        return yield*
           playerError(
             'diplomacy_clauses requires exactly one opaque --relation_id ' +
               'from a `just state --section diplomacy` row'
-          )
-        );
+          );
       }
       parameters.push(['relation_id', relationId]);
     } else if (section === 'tile_window') {
@@ -130,9 +128,8 @@ export const stateQuery = (args: StateQueryArgs): Effect.Effect<string, PlayerEr
         radius < 0 ||
         radius > 8
       ) {
-        return yield* Effect.fail(
-          playerError('tile_window requires --center_id and --radius from 0 through 8')
-        );
+        return yield*
+          playerError('tile_window requires --center_id and --radius from 0 through 8');
       }
       parameters.push(['center_id', centerId], ['radius', String(radius)]);
     } else if (section === 'unit_route') {
@@ -143,15 +140,13 @@ export const stateQuery = (args: StateQueryArgs): Effect.Effect<string, PlayerEr
         centerId !== '' ||
         radius !== null
       ) {
-        return yield* Effect.fail(
-          playerError('unit_route requires exactly one opaque unit --actor_id')
-        );
+        return yield*
+          playerError('unit_route requires exactly one opaque unit --actor_id');
       }
       parameters.push(['actor_id', actorId]);
     } else if (actorId !== '' || relationId !== '' || centerId !== '' || radius !== null) {
-      return yield* Effect.fail(
-        playerError('state scope options are not valid for this section')
-      );
+      return yield*
+        playerError('state scope options are not valid for this section');
     }
     return encode(parameters);
   });

@@ -12,9 +12,9 @@
  * hid three consecutive applied phase-ends from a live agent, which then
  * re-ended phases it had already ended.
  */
-import { afterEach, describe, expect, test } from 'bun:test';
-import { Effect } from 'effect';
-import { playerError } from 'src/errors';
+import { afterEach, describe, expect } from 'bun:test';
+import { Console, Effect, Schema } from 'effect';
+import { playerError, type PlayError } from 'src/errors';
 import {
   bench,
   dispositionOf,
@@ -26,32 +26,53 @@ import {
   UNIT_ONE,
   type Bench,
 } from 'test/_do-harness';
+import { awaitTest } from 'test/_effect-test';
 
 const benches: Bench[] = [];
 
-const fresh = (): Bench => {
-  const made = bench();
-  benches.push(made);
-  return made;
-};
+const fresh = (): Effect.Effect<Bench, PlayError> =>
+  Effect.tap(bench(), (made) =>
+    Effect.sync(() => {
+      benches.push(made);
+    })
+  );
 
-afterEach(() => {
-  while (benches.length > 0) benches.pop()?.scratch.cleanup();
-});
+afterEach(() =>
+  Effect.runPromise(
+    Effect.forEach(benches.splice(0), (kit) => kit.scratch.cleanup, { discard: true })
+  )
+);
 
 const MOVE_ONE = `action_${'1'.repeat(26)}`;
 const FOUND_ONE = `action_${'2'.repeat(26)}`;
 const END_BATCH = 'batch_phase_end_1';
 
+const runCaptured = (kit: Bench, args: ReturnType<typeof doArgs>) =>
+  runDoCaptured(kit, args);
+
+const doCompositeSchema = Schema.parseJson(
+  Schema.Struct({
+    command: Schema.Literal('do'),
+    requested: Schema.Number,
+    applied: Schema.Number,
+    stopped: Schema.Null,
+    wait: Schema.Struct({ wake_reason: Schema.String }),
+    turn: Schema.Struct({ turn: Schema.Number }),
+    turn_error: Schema.Null,
+    end: Schema.Struct({ batch_id: Schema.String }),
+  })
+);
+
 /** One seat with a two-action catalog, staged at `revision`. */
-const seat = (kit: Bench, revision = rev(7)): void => {
-  kit.world.revision = revision;
-  kit.seed(UNIT_ONE, [
-    move(MOVE_ONE, UNIT_ONE, 32, 72),
-    foundCity(FOUND_ONE, UNIT_ONE, 31, 72),
-  ]);
-  kit.world.receipt = () => ({ state: 'applied', revision });
-};
+const seat = (kit: Bench, revision = rev(7)): Effect.Effect<void, PlayError> =>
+  Effect.gen(function* () {
+    kit.world.revision = revision;
+    yield* kit.seed(UNIT_ONE, [
+      move(MOVE_ONE, UNIT_ONE, 32, 72),
+      foundCity(FOUND_ONE, UNIT_ONE, 31, 72),
+    ]);
+    kit.world.receipt = () => ({ state: 'applied', revision });
+  });
 
 /** `_phase_end_locked` succeeding with `state`. */
 const endsWith = (kit: Bench, state: 'applied' | 'rejected', revision = rev(7)): void => {
@@ -65,23 +86,23 @@ const endsWith = (kit: Bench, state: 'applied' | 'rejected', revision = rev(7)):
 };
 
 describe('the flag matrix', () => {
-  test('--await without --end is refused, and sends nothing', async () => {
-    const kit = fresh();
-    seat(kit);
-    const run = await runDoCaptured(kit, doArgs('u1 move 32,72', { awaitPhase: true }));
+  awaitTest('--await without --end is refused, and sends nothing', function* () {
+    const kit = yield* fresh();
+    yield* seat(kit);
+    const run = yield* runCaptured(kit, doArgs('u1 move 32,72', { awaitPhase: true }));
     expect(run.code).toBe(2);
     expect(run.error).toContain('just do --await');
     expect(kit.world.trace).toEqual([]);
   });
 
-  test('--brief without a wake names the form that works', async () => {
-    const kit = fresh();
-    seat(kit);
+  awaitTest('--brief without a wake names the form that works', function* () {
+    const kit = yield* fresh();
+    yield* seat(kit);
     for (const overrides of [
       { endPhase: true, brief: true },
       { brief: true },
     ]) {
-      const run = await runDoCaptured(kit, doArgs('u1 move 32,72', overrides));
+      const run = yield* runCaptured(kit, doArgs('u1 move 32,72', overrides));
       expect(run.code).toBe(2);
       expect(run.error).toContain('--end --await');
     }
@@ -90,14 +111,14 @@ describe('the flag matrix', () => {
 });
 
 describe('--end', () => {
-  test('never ends a phase whose batch stopped', async () => {
-    const kit = fresh();
-    seat(kit);
+  awaitTest('never ends a phase whose batch stopped', function* () {
+    const kit = yield* fresh();
+    yield* seat(kit);
     kit.world.receipt = () => ({ state: 'rejected', revision: rev(7) });
     kit.world.phaseEnd = () => Effect.die(new Error('a stopped batch ended its phase'));
     kit.world.awaitBrief = () => Effect.die(new Error('a stopped batch awaited'));
 
-    const run = await runDoCaptured(
+    const run = yield* runCaptured(
       kit,
       doArgs('u1 move 32,72; u1 found_city London', {
         endPhase: true,
@@ -116,9 +137,9 @@ describe('--end', () => {
     expect(printed).toContain('just turn --end --await --brief');
   });
 
-  test('prints the receipts, then the end failure, then the tail', async () => {
-    const kit = fresh();
-    seat(kit);
+  awaitTest('prints the receipts, then the end failure, then the tail', function* () {
+    const kit = yield* fresh();
+    yield* seat(kit);
     kit.world.phaseEnd = () =>
       Effect.fail(
         playerError(
@@ -128,7 +149,7 @@ describe('--end', () => {
     kit.world.awaitBrief = () => Effect.die(new Error('awaited an unended phase'));
     kit.world.focus = () => 'next 2 actors: just do "u2 road T(31,72); c1 build Warriors"';
 
-    const run = await runDoCaptured(
+    const run = yield* runCaptured(
       kit,
       doArgs('u1 found_city London', { endPhase: true, awaitPhase: true, brief: true })
     );
@@ -143,13 +164,13 @@ describe('--end', () => {
     expect(run.out[3]).toBe('next 2 actors: just do "u2 road T(31,72); c1 build Warriors"');
   });
 
-  test('an end that was not accepted says so, and says it was not awaited', async () => {
-    const kit = fresh();
-    seat(kit);
+  awaitTest('an end that was not accepted says so, and says it was not awaited', function* () {
+    const kit = yield* fresh();
+    yield* seat(kit);
     endsWith(kit, 'rejected');
     kit.world.awaitBrief = () => Effect.die(new Error('awaited an unaccepted end'));
 
-    const run = await runDoCaptured(
+    const run = yield* runCaptured(
       kit,
       doArgs('u1 found_city London', { endPhase: true, awaitPhase: true })
     );
@@ -158,12 +179,12 @@ describe('--end', () => {
     expect(run.out).toContain('phase NOT ended: the phase end above was not accepted; not awaited');
   });
 
-  test('an applied end without --await teaches the one-call ending', async () => {
-    const kit = fresh();
-    seat(kit);
+  awaitTest('an applied end without --await teaches the one-call ending', function* () {
+    const kit = yield* fresh();
+    yield* seat(kit);
     endsWith(kit, 'applied');
 
-    const run = await runDoCaptured(kit, doArgs('u1 found_city London', { endPhase: true }));
+    const run = yield* runCaptured(kit, doArgs('u1 found_city London', { endPhase: true }));
 
     expect(run.code).toBe(0);
     expect(run.out[0]).toStartWith('u1 found_city London →');
@@ -178,9 +199,9 @@ describe('--end', () => {
 });
 
 describe('--end --await', () => {
-  test('the wake lines follow the receipts', async () => {
-    const kit = fresh();
-    seat(kit);
+  awaitTest('the wake lines follow the receipts', function* () {
+    const kit = yield* fresh();
+    yield* seat(kit);
     endsWith(kit, 'applied');
     kit.world.awaitBrief = () =>
       Effect.succeed({
@@ -190,7 +211,7 @@ describe('--end --await', () => {
         lines: ['awake after 4s — turn 4 phase 0 is yours', 'next: just turn'],
       });
 
-    const run = await runDoCaptured(
+    const run = yield* runCaptured(
       kit,
       doArgs('u1 found_city London', { endPhase: true, awaitPhase: true })
     );
@@ -205,9 +226,9 @@ describe('--end --await', () => {
     ]);
   });
 
-  test('the prelude flushes ahead of the first progress line and is not reprinted', async () => {
-    const kit = fresh();
-    seat(kit);
+  awaitTest('the prelude flushes ahead of the first progress line and is not reprinted', function* () {
+    const kit = yield* fresh();
+    yield* seat(kit);
     endsWith(kit, 'applied');
     // The real wait prints its own tick lines; flushing the prelude is what
     // keeps the phase end from appearing after ten minutes of waiting.
@@ -216,10 +237,10 @@ describe('--end --await', () => {
         const prelude = options.prelude;
         expect(prelude).not.toBeNull();
         if (prelude !== null) {
-          for (const line of prelude.slice()) yield* Effect.sync(() => console.log(line));
+          for (const line of prelude.slice()) yield* Console.log(line);
           prelude.length = 0;
         }
-        yield* Effect.sync(() => console.log('waiting… 15s'));
+        yield* Console.log('waiting… 15s');
         return {
           wait: { wake_reason: 'phase_started' },
           briefing: null,
@@ -228,7 +249,7 @@ describe('--end --await', () => {
         };
       });
 
-    const run = await runDoCaptured(
+    const run = yield* runCaptured(
       kit,
       doArgs('u1 found_city London', { endPhase: true, awaitPhase: true })
     );
@@ -243,14 +264,14 @@ describe('--end --await', () => {
     expect(run.out[4]).toBe('awake after 20s — turn 4 phase 0 is yours');
   });
 
-  test('an await failure never hides an applied phase end', async () => {
-    const kit = fresh();
-    seat(kit);
+  awaitTest('an await failure never hides an applied phase end', function* () {
+    const kit = yield* fresh();
+    yield* seat(kit);
     endsWith(kit, 'applied');
     kit.world.awaitBrief = () =>
       Effect.fail(playerError('invalid v2 health: unexpected future_field'));
 
-    const run = await runDoCaptured(
+    const run = yield* runCaptured(
       kit,
       doArgs('u1 found_city London', { endPhase: true, awaitPhase: true, brief: true })
     );
@@ -265,9 +286,9 @@ describe('--end --await', () => {
     expect(printed).toContain('do not re-run `turn --end` for this phase');
   });
 
-  test('a briefing that failed is an exit-2 note, not a lost wake', async () => {
-    const kit = fresh();
-    seat(kit);
+  awaitTest('a briefing that failed is an exit-2 note, not a lost wake', function* () {
+    const kit = yield* fresh();
+    yield* seat(kit);
     endsWith(kit, 'applied');
     kit.world.awaitBrief = () =>
       Effect.succeed({
@@ -277,7 +298,7 @@ describe('--end --await', () => {
         lines: ['awake after 4s', 'briefing failed: the state page could not be read', 'next: just turn'],
       });
 
-    const run = await runDoCaptured(
+    const run = yield* runCaptured(
       kit,
       doArgs('u1 found_city London', { endPhase: true, awaitPhase: true, brief: true })
     );
@@ -288,9 +309,9 @@ describe('--end --await', () => {
 });
 
 describe('--end --json', () => {
-  test('the composite carries end, wait, turn and turn_error', async () => {
-    const kit = fresh();
-    seat(kit);
+  awaitTest('the composite carries end, wait, turn and turn_error', function* () {
+    const kit = yield* fresh();
+    yield* seat(kit);
     endsWith(kit, 'applied');
     kit.world.awaitBrief = () =>
       Effect.succeed({
@@ -300,7 +321,7 @@ describe('--end --json', () => {
         lines: ['awake'],
       });
 
-    const run = await runDoCaptured(
+    const run = yield* runCaptured(
       kit,
       doArgs('u1 found_city London', {
         endPhase: true,
@@ -312,7 +333,7 @@ describe('--end --json', () => {
 
     expect(run.code).toBe(0);
     expect(run.out).toHaveLength(1);
-    const payload: unknown = JSON.parse(run.out[0] ?? '');
+    const payload = Schema.decodeUnknownSync(doCompositeSchema)(run.out[0] ?? '');
     expect(payload).toMatchObject({
       command: 'do',
       requested: 1,
@@ -322,13 +343,12 @@ describe('--end --json', () => {
       turn: { turn: 4 },
       turn_error: null,
     });
-    const end = (payload as { readonly end: { readonly batch_id: string } }).end;
-    expect(end.batch_id).toBe(END_BATCH);
+    expect(payload.end.batch_id).toBe(END_BATCH);
   });
 
-  test('--json keeps the whole rendering for one payload, so no prelude is passed', async () => {
-    const kit = fresh();
-    seat(kit);
+  awaitTest('--json keeps the whole rendering for one payload, so no prelude is passed', function* () {
+    const kit = yield* fresh();
+    yield* seat(kit);
     endsWith(kit, 'applied');
     kit.world.awaitBrief = (options) => {
       expect(options.prelude).toBeNull();
@@ -340,7 +360,7 @@ describe('--end --json', () => {
       });
     };
 
-    const run = await runDoCaptured(
+    const run = yield* runCaptured(
       kit,
       doArgs('u1 found_city London', { endPhase: true, awaitPhase: true, json: true })
     );
@@ -348,13 +368,13 @@ describe('--end --json', () => {
     expect(run.out).toHaveLength(1);
   });
 
-  test('--json re-raises an await failure instead of turning it into lines', async () => {
-    const kit = fresh();
-    seat(kit);
+  awaitTest('--json re-raises an await failure instead of turning it into lines', function* () {
+    const kit = yield* fresh();
+    yield* seat(kit);
     endsWith(kit, 'applied');
     kit.world.awaitBrief = () => Effect.fail(playerError('invalid v2 health'));
 
-    const run = await runDoCaptured(
+    const run = yield* runCaptured(
       kit,
       doArgs('u1 found_city London', { endPhase: true, awaitPhase: true, json: true })
     );

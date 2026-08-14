@@ -21,7 +21,7 @@ import {
   V2_CATALOG_LINE_MAX,
 } from 'src/constants';
 import type { AliasMap } from 'src/render/primitives';
-import { field, type JsonValue } from 'src/schema/primitives';
+import { field, isJsonString, type JsonValue } from 'src/schema/primitives';
 import { actionTargetKey } from 'src/services/aliases';
 import type { CompactAction } from 'src/services/legal-compact';
 import { legalRowIsDefault, legalRows } from 'src/render/legal/rows';
@@ -48,7 +48,7 @@ export const catalogChoiceLine = (
     const choices: Array<readonly [string, string]> = [];
     for (const compact of compacts) {
       const actionId = field(compact, 'action_id');
-      const alias = typeof actionId === 'string' ? (lookup[actionId] ?? '') : '';
+      const alias = isJsonString(actionId) ? (lookup[actionId] ?? '') : '';
       const key = yield* actionTargetKey(field(compact, 'target'));
       const label = field(compact, 'label');
       const name = key !== '' ? key : labelText(label);
@@ -72,7 +72,7 @@ export const catalogChoiceLine = (
     return `${head}${shown.join(SEPARATOR)} …${drill}`;
   });
 
-const labelText = (label: JsonValue): string => (typeof label === 'string' ? label : '');
+const labelText = (label: JsonValue): string => (isJsonString(label) ? label : '');
 
 /** Render a global catalog grouped by kind, housekeeping collapsed. */
 export const groupedLegalLines = (
@@ -84,7 +84,7 @@ export const groupedLegalLines = (
     const families = new Map<string, CompactAction[]>();
     for (const compact of compacts) {
       const kind = field(compact, 'kind');
-      const key = typeof kind === 'string' ? kind : '';
+      const key = isJsonString(kind) ? kind : '';
       const family = families.get(key);
       if (family === undefined) {
         order.push(key);

@@ -10,12 +10,11 @@
  * test here is the *comparison*: which catalogs are eligible, what "the same
  * options in the same order" means, and which rows are reported as differing.
  */
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect, Either, Layer } from 'effect';
 import { FULL_CONTROL_V2 } from 'src/constants';
 import { decodeLegalPage, type LegalActionPageEnvelope, type PageScope } from 'src/schema/page';
-import { field, isJsonObject, type JsonObject, type JsonValue } from 'src/schema/primitives';
+import { field, isJsonObject, isNonEmptyString, type JsonObject, type JsonValue } from 'src/schema/primitives';
 import { scalar } from 'src/render/primitives';
 import { PrivateFs } from 'src/services/private-fs';
 import {
@@ -25,7 +24,7 @@ import {
   type SessionStoreApi,
   type V2ClientState,
 } from 'src/services/session-store';
-import { aliasMap, rememberPage, v2StateSchema, type AliasMap } from 'src/services/aliases';
+import { aliasMap, rememberPage, v2StateSchema } from 'src/services/aliases';
 import {
   V2_KIND_LIST_MAX,
   cachedActorCatalog,
@@ -39,15 +38,19 @@ import {
   type CompactLegalResult,
 } from 'src/services/catalog-cache';
 import { FIXTURE_GAME_ID, scratchWorkspace, sessionFile, type Scratch } from 'test/_fixtures';
+import { effectTest, provideTestLayer } from 'test/_effect-test';
+import { path } from 'test/_test-platform';
 
 // ---------------------------------------------------------------------------
 // Fixture
 // ---------------------------------------------------------------------------
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() =>
+  Effect.runPromise(
+    Effect.forEach(scratches.splice(0), (scratch) => scratch.cleanup, { discard: true })
+  )
+);
 
 interface TestRevision {
   readonly turn: number;
@@ -62,29 +65,30 @@ interface Fixture {
   readonly session: Session;
   readonly run: <A, E>(
     effect: Effect.Effect<A, E, SessionStore | PrivateFs>
-  ) => Either.Either<A, E>;
+  ) => Effect.Effect<Either.Either<A, E>>;
 }
 
-const fixture = (): Fixture => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
-  const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'codex-test.json');
-  Effect.runSync(
-    scratch.files.writeJson(sessionPath, sessionFile({ control_protocol: FULL_CONTROL_V2 }))
-  );
-  const loaded = Effect.runSync(store.resolveV2(sessionPath));
-  const layer = Layer.merge(
-    Layer.succeed(SessionStore, store),
-    Layer.succeed(PrivateFs, scratch.files)
-  );
-  return {
-    store,
-    sessionPath,
-    session: loaded.session,
-    run: (effect) => Effect.runSync(Effect.either(Effect.provide(effect, layer))),
-  };
-};
+const fixture = (): Effect.Effect<Fixture> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
+    const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'codex-test.json');
+    yield* scratch.files.writeJson(
+      sessionPath,
+      sessionFile({ control_protocol: FULL_CONTROL_V2 })
+    );
+    const loaded = yield* store.resolveV2(sessionPath);
+    const layer = Layer.merge(
+      Layer.succeed(SessionStore, store),
+      Layer.succeed(PrivateFs, scratch.files)
+    );
+    const run = <A, E>(
+      effect: Effect.Effect<A, E, SessionStore | PrivateFs>
+    ): Effect.Effect<Either.Either<A, E>> =>
+      Effect.either(provideTestLayer(effect, layer));
+    return { store, sessionPath, session: loaded.session, run };
+  }).pipe(Effect.orDie);
 
 const ok = <A, E>(either: Either.Either<A, E>): A => {
   if (Either.isLeft(either)) {
@@ -148,8 +152,8 @@ const scopedLegalPage = (
   },
 });
 
-const ingest = (fx: Fixture, page: JsonObject): V2ClientState =>
-  ok(
+const ingest = (fx: Fixture, page: JsonObject): Effect.Effect<V2ClientState> =>
+  Effect.map(
     fx.run(
       Effect.flatMap(
         Effect.mapError(decodeLegalPage(page, fx.session), (error) => ({
@@ -157,8 +161,9 @@ const ingest = (fx: Fixture, page: JsonObject): V2ClientState =>
         })),
         (decoded) => rememberPage(fx.sessionPath, fx.session, { legal: true, page: decoded })
       )
-    )
-  ).state;
+    ),
+    (result) => ok(result).state
+  );
 
 // ---------------------------------------------------------------------------
 // The U11 stand-ins
@@ -185,8 +190,8 @@ const compactLegalAction = (descriptor: JsonObject): JsonObject => {
 };
 
 const kindKeyOf = (kind: JsonValue, operation: JsonValue): string => {
-  if (typeof kind !== 'string') return '';
-  if (typeof operation !== 'string' || operation === '' || kind.endsWith(`.${operation}`)) {
+  if (!isNonEmptyString(kind)) return '';
+  if (!isNonEmptyString(operation) || kind.endsWith(`.${operation}`)) {
     return kind;
   }
   return `${kind}/${operation}`;
@@ -211,14 +216,14 @@ const deps: CatalogRenderDeps = {
     }
     const actor = isJsonObject(subject) ? field(subject, 'actor') : null;
     const actorId = isJsonObject(actor) ? field(actor, 'id') : null;
-    if (typeof actorId === 'string' && actorId !== (scope === null ? null : scope.actor_id)) {
+    if (isNonEmptyString(actorId) && actorId !== (scope === null ? null : scope.actor_id)) {
       detail.push(`actor=${aliases?.[actorId] ?? actorId}`);
     }
     const label = field(compact, 'label');
     return Effect.succeed([
       alias,
       kindKeyOf(field(compact, 'kind'), isJsonObject(subject) ? field(subject, 'operation') : null),
-      typeof label === 'string' ? label : '',
+      isNonEmptyString(label) ? label : '',
       detail.join(' '),
     ]);
   },
@@ -255,34 +260,38 @@ const resultOf = (
 const scopeOf = (actorId: string): PageScope => ({ actor_id: actorId, actor_type: 'unit' });
 
 /** Two units offered exactly the same menu at one revision. */
-const twoIdenticalActors = (fx: Fixture): { state: V2ClientState; aliases: AliasMap } => {
-  const at = revision(7);
-  const menu = (actor: string, prefix: string): ReadonlyArray<JsonObject> => [
-    actorAction(at, `action_${prefix}1`.padEnd(24, 'z'), actor, { x: 31, y: 72 }),
-    actorAction(at, `action_${prefix}2`.padEnd(24, 'z'), actor, {
-      x: 32,
-      y: 72,
-      kind: 'unit.sentry',
-      operation: 'sentry',
-      label: 'Sentry',
-    }),
-  ];
-  ingest(fx, scopedLegalPage(at, menu(UNIT_ONE, 'a'), UNIT_ONE, `catalog_${'a'.repeat(32)}`));
-  const state = ingest(
-    fx,
-    scopedLegalPage(at, menu(UNIT_TWO, 'b'), UNIT_TWO, `catalog_${'b'.repeat(32)}`)
-  );
-  return { state, aliases: ok(fx.run(aliasMap(state))) };
-};
+const twoIdenticalActors = (fx: Fixture) =>
+  Effect.gen(function* () {
+    const at = revision(7);
+    const menu = (actor: string, prefix: string): ReadonlyArray<JsonObject> => [
+      actorAction(at, `action_${prefix}1`.padEnd(24, 'z'), actor, { x: 31, y: 72 }),
+      actorAction(at, `action_${prefix}2`.padEnd(24, 'z'), actor, {
+        x: 32,
+        y: 72,
+        kind: 'unit.sentry',
+        operation: 'sentry',
+        label: 'Sentry',
+      }),
+    ];
+    yield* ingest(
+      fx,
+      scopedLegalPage(at, menu(UNIT_ONE, 'a'), UNIT_ONE, `catalog_${'a'.repeat(32)}`)
+    );
+    const state = yield* ingest(
+      fx,
+      scopedLegalPage(at, menu(UNIT_TWO, 'b'), UNIT_TWO, `catalog_${'b'.repeat(32)}`)
+    );
+    return { state, aliases: ok(yield* fx.run(aliasMap(state))) };
+  });
 
 // ---------------------------------------------------------------------------
 
 describe('promotedCatalogPage', () => {
-  test('a still-staged page is projected exactly as it arrived', () => {
-    const fx = fixture();
+  effectTest('a still-staged page is projected exactly as it arrived', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const at = revision(7);
     const page = ok(
-      fx.run(
+      yield* fx.run(
         Effect.mapError(
           decodeLegalPage(
             scopedLegalPage(at, [actorAction(at, 'action_one', UNIT_ONE)], UNIT_ONE, `catalog_${'a'.repeat(32)}`),
@@ -293,13 +302,13 @@ describe('promotedCatalogPage', () => {
       )
     );
     expect(promotedCatalogPage(page, null)).toBe(page);
-  });
+  }));
 
-  test('a promoting page widens only the item list', () => {
-    const fx = fixture();
+  effectTest('a promoting page widens only the item list', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const at = revision(7);
     const page: LegalActionPageEnvelope = ok(
-      fx.run(
+      yield* fx.run(
         Effect.mapError(
           decodeLegalPage(
             scopedLegalPage(at, [actorAction(at, 'action_one', UNIT_ONE)], UNIT_ONE, `catalog_${'a'.repeat(32)}`),
@@ -317,30 +326,30 @@ describe('promotedCatalogPage', () => {
     expect(projected.page.catalog_id).toBe(page.page.catalog_id);
     // The original is untouched — the mirror gets a projection, not a mutation.
     expect(page.page.items).toHaveLength(1);
-  });
+  }));
 });
 
 describe('cachedDescriptors and cachedActorCatalog', () => {
-  test('only descriptors at the newest revision are still held', () => {
-    const fx = fixture();
-    const { state } = twoIdenticalActors(fx);
+  effectTest('only descriptors at the newest revision are still held', () => Effect.gen(function* () {
+    const fx = yield* fixture();
+    const { state } = yield* twoIdenticalActors(fx);
     expect(cachedDescriptors(state)).toHaveLength(4);
     expect(cachedActorCatalog(state, UNIT_ONE)).toHaveLength(2);
     expect(cachedActorCatalog(state, `unit_${'f'.repeat(32)}`)).toHaveLength(0);
-  });
+  }));
 
-  test('a revision bump empties the cache the descriptors lived in', () => {
-    const fx = fixture();
-    const { state } = twoIdenticalActors(fx);
+  effectTest('a revision bump empties the cache the descriptors lived in', () => Effect.gen(function* () {
+    const fx = yield* fixture();
+    const { state } = yield* twoIdenticalActors(fx);
     expect(cachedDescriptors(state)).toHaveLength(4);
     const at = revision(9);
-    const bumped = ingest(
+    const bumped = yield* ingest(
       fx,
       scopedLegalPage(at, [actorAction(at, 'action_new', UNIT_ONE)], UNIT_ONE, `catalog_${'c'.repeat(32)}`)
     );
     expect(cachedDescriptors(bumped)).toHaveLength(1);
     expect(bumped.drained_actors).toEqual([UNIT_ONE]);
-  });
+  }));
 });
 
 describe('kindList', () => {
@@ -355,31 +364,31 @@ describe('kindList', () => {
 });
 
 describe('cachedKindScopes', () => {
-  test('it names the other actor that already offers the kind, by alias', () => {
-    const fx = fixture();
-    const { state } = twoIdenticalActors(fx);
+  effectTest('it names the other actor that already offers the kind, by alias', () => Effect.gen(function* () {
+    const fx = yield* fixture();
+    const { state } = yield* twoIdenticalActors(fx);
     const found = ok(
-      fx.run(cachedKindScopes(state, 'unit.sentry', UNIT_ONE, deps.kindSelectorMatches))
+      yield* fx.run(cachedKindScopes(state, 'unit.sentry', UNIT_ONE, deps.kindSelectorMatches))
     );
     // The scope that was just searched is never named back.
     expect(found).toEqual(['u2']);
-  });
+  }));
 
-  test('an operation-qualified selector picks exactly the row it was copied from', () => {
-    const fx = fixture();
-    const { state } = twoIdenticalActors(fx);
+  effectTest('an operation-qualified selector picks exactly the row it was copied from', () => Effect.gen(function* () {
+    const fx = yield* fixture();
+    const { state } = yield* twoIdenticalActors(fx);
     expect(
-      ok(fx.run(cachedKindScopes(state, 'unit.order/move', '', deps.kindSelectorMatches)))
+      ok(yield* fx.run(cachedKindScopes(state, 'unit.order/move', '', deps.kindSelectorMatches)))
     ).toEqual(['u1', 'u2']);
     expect(
-      ok(fx.run(cachedKindScopes(state, 'unit.order/fortify', '', deps.kindSelectorMatches)))
+      ok(yield* fx.run(cachedKindScopes(state, 'unit.order/fortify', '', deps.kindSelectorMatches)))
     ).toEqual([]);
-  });
+  }));
 
-  test('an actor is named once however many rows it matched', () => {
-    const fx = fixture();
+  effectTest('an actor is named once however many rows it matched', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const at = revision(7);
-    const state = ingest(
+    const state = yield* ingest(
       fx,
       scopedLegalPage(
         at,
@@ -391,18 +400,18 @@ describe('cachedKindScopes', () => {
         `catalog_${'a'.repeat(32)}`
       )
     );
-    expect(ok(fx.run(cachedKindScopes(state, 'unit.order', '', deps.kindSelectorMatches)))).toEqual([
+    expect(ok(yield* fx.run(cachedKindScopes(state, 'unit.order', '', deps.kindSelectorMatches)))).toEqual([
       'u1',
     ]);
-  });
+  }));
 });
 
 describe('catalogSignature', () => {
-  test('it signs by choice offered and by rendered row', () => {
-    const fx = fixture();
-    const { state, aliases } = twoIdenticalActors(fx);
+  effectTest('it signs by choice offered and by rendered row', () => Effect.gen(function* () {
+    const fx = yield* fixture();
+    const { state, aliases } = yield* twoIdenticalActors(fx);
     const signature = ok(
-      fx.run(catalogSignature(compactsOf(state, UNIT_ONE), scopeOf(UNIT_ONE), aliases, deps))
+      yield* fx.run(catalogSignature(compactsOf(state, UNIT_ONE), scopeOf(UNIT_ONE), aliases, deps))
     );
     expect(signature.choices).toEqual([
       ['unit.order/move', 'T(31,72)'],
@@ -413,25 +422,25 @@ describe('catalogSignature', () => {
     for (const row of signature.rows) {
       for (const cell of row) expect(cell).not.toContain('action_');
     }
-  });
+  }));
 });
 
 describe('catalogEquivalence', () => {
-  test('two units offering the same menu are reported as equivalent', () => {
-    const fx = fixture();
-    const { state, aliases } = twoIdenticalActors(fx);
+  effectTest('two units offering the same menu are reported as equivalent', () => Effect.gen(function* () {
+    const fx = yield* fixture();
+    const { state, aliases } = yield* twoIdenticalActors(fx);
     const found = ok(
-      fx.run(catalogEquivalence(state, resultOf(state, UNIT_ONE), scopeOf(UNIT_ONE), aliases, deps))
+      yield* fx.run(catalogEquivalence(state, resultOf(state, UNIT_ONE), scopeOf(UNIT_ONE), aliases, deps))
     );
     expect(found?.actorId).toBe(UNIT_TWO);
     // Same options, same order, same rows: nothing differs.
     expect(found?.differing).toEqual([]);
-  });
+  }));
 
-  test('a differing row is reported even when the choices match', () => {
-    const fx = fixture();
+  effectTest('a differing row is reported even when the choices match', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const at = revision(7);
-    ingest(
+    yield* ingest(
       fx,
       scopedLegalPage(
         at,
@@ -440,7 +449,7 @@ describe('catalogEquivalence', () => {
         `catalog_${'a'.repeat(32)}`
       )
     );
-    const state = ingest(
+    const state = yield* ingest(
       fx,
       scopedLegalPage(
         at,
@@ -455,16 +464,16 @@ describe('catalogEquivalence', () => {
         `catalog_${'b'.repeat(32)}`
       )
     );
-    const aliases = ok(fx.run(aliasMap(state)));
+    const aliases = ok(yield* fx.run(aliasMap(state)));
     const found = ok(
-      fx.run(catalogEquivalence(state, resultOf(state, UNIT_ONE), scopeOf(UNIT_ONE), aliases, deps))
+      yield* fx.run(catalogEquivalence(state, resultOf(state, UNIT_ONE), scopeOf(UNIT_ONE), aliases, deps))
     );
     expect(found?.actorId).toBe(UNIT_TWO);
     expect(found?.differing).toHaveLength(1);
-  });
+  }));
 
-  test('a differently ordered menu is not the same menu', () => {
-    const fx = fixture();
+  effectTest('a differently ordered menu is not the same menu', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const at = revision(7);
     const move = (actor: string, prefix: string): JsonObject =>
       actorAction(at, `action_${prefix}move`.padEnd(24, 'z'), actor, { x: 31, y: 72 });
@@ -476,19 +485,19 @@ describe('catalogEquivalence', () => {
         operation: 'sentry',
         label: 'Sentry',
       });
-    ingest(
+    yield* ingest(
       fx,
       scopedLegalPage(at, [move(UNIT_ONE, 'a'), sentry(UNIT_ONE, 'a')], UNIT_ONE, `catalog_${'a'.repeat(32)}`)
     );
-    const state = ingest(
+    const state = yield* ingest(
       fx,
       scopedLegalPage(at, [sentry(UNIT_TWO, 'b'), move(UNIT_TWO, 'b')], UNIT_TWO, `catalog_${'b'.repeat(32)}`)
     );
-    const aliases = ok(fx.run(aliasMap(state)));
+    const aliases = ok(yield* fx.run(aliasMap(state)));
     expect(
-      ok(fx.run(catalogEquivalence(state, resultOf(state, UNIT_ONE), scopeOf(UNIT_ONE), aliases, deps)))
+      ok(yield* fx.run(catalogEquivalence(state, resultOf(state, UNIT_ONE), scopeOf(UNIT_ONE), aliases, deps)))
     ).toBeNull();
-  });
+  }));
 
   const rejected: ReadonlyArray<readonly [string, Partial<CompactLegalResult>]> = [
     ['a truncated window proves nothing', { truncated: true }],
@@ -496,12 +505,12 @@ describe('catalogEquivalence', () => {
     ['a byte-limited window is not the whole catalog', { byte_limited: true }],
   ];
   for (const [name, overrides] of rejected) {
-    test(name, () => {
-      const fx = fixture();
-      const { state, aliases } = twoIdenticalActors(fx);
+    effectTest(name, () => Effect.gen(function* () {
+      const fx = yield* fixture();
+      const { state, aliases } = yield* twoIdenticalActors(fx);
       expect(
         ok(
-          fx.run(
+          yield* fx.run(
             catalogEquivalence(
               state,
               resultOf(state, UNIT_ONE, overrides),
@@ -512,12 +521,12 @@ describe('catalogEquivalence', () => {
           )
         )
       ).toBeNull();
-    });
+    }));
   }
 
-  test('a target-scoped question is narrower and is never deduped', () => {
-    const fx = fixture();
-    const { state, aliases } = twoIdenticalActors(fx);
+  effectTest('a target-scoped question is narrower and is never deduped', () => Effect.gen(function* () {
+    const fx = yield* fixture();
+    const { state, aliases } = yield* twoIdenticalActors(fx);
     const scope: PageScope = {
       actor_id: UNIT_ONE,
       actor_type: 'unit',
@@ -525,26 +534,26 @@ describe('catalogEquivalence', () => {
       target_type: 'tile',
     };
     expect(
-      ok(fx.run(catalogEquivalence(state, resultOf(state, UNIT_ONE), scope, aliases, deps)))
+      ok(yield* fx.run(catalogEquivalence(state, resultOf(state, UNIT_ONE), scope, aliases, deps)))
     ).toBeNull();
-  });
+  }));
 
-  test('a comparison never crosses a revision', () => {
-    const fx = fixture();
-    const { state, aliases } = twoIdenticalActors(fx);
+  effectTest('a comparison never crosses a revision', () => Effect.gen(function* () {
+    const fx = yield* fixture();
+    const { state, aliases } = yield* twoIdenticalActors(fx);
     const stale = resultOf(state, UNIT_ONE, {
       state_revision: { turn: 3, revision: 5, state_token: 'state_old' },
     });
-    expect(ok(fx.run(catalogEquivalence(state, stale, scopeOf(UNIT_ONE), aliases, deps)))).toBeNull();
-  });
+    expect(ok(yield* fx.run(catalogEquivalence(state, stale, scopeOf(UNIT_ONE), aliases, deps)))).toBeNull();
+  }));
 
-  test('an actor whose catalog was never drained whole is not eligible', () => {
-    const fx = fixture();
-    const { state, aliases } = twoIdenticalActors(fx);
+  effectTest('an actor whose catalog was never drained whole is not eligible', () => Effect.gen(function* () {
+    const fx = yield* fixture();
+    const { state, aliases } = yield* twoIdenticalActors(fx);
     const notDrained: V2ClientState = { ...state, drained_actors: [UNIT_TWO] };
     expect(
       ok(
-        fx.run(
+        yield* fx.run(
           catalogEquivalence(
             notDrained,
             resultOf(state, UNIT_ONE),
@@ -555,20 +564,20 @@ describe('catalogEquivalence', () => {
         )
       )
     ).toBeNull();
-  });
+  }));
 
-  test('a scope-less result has no actor to compare', () => {
-    const fx = fixture();
-    const { state, aliases } = twoIdenticalActors(fx);
+  effectTest('a scope-less result has no actor to compare', () => Effect.gen(function* () {
+    const fx = yield* fixture();
+    const { state, aliases } = yield* twoIdenticalActors(fx);
     expect(
-      ok(fx.run(catalogEquivalence(state, resultOf(state, UNIT_ONE), null, aliases, deps)))
+      ok(yield* fx.run(catalogEquivalence(state, resultOf(state, UNIT_ONE), null, aliases, deps)))
     ).toBeNull();
-  });
+  }));
 
-  test('catalogs of different sizes are never equivalent', () => {
-    const fx = fixture();
+  effectTest('catalogs of different sizes are never equivalent', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const at = revision(7);
-    ingest(
+    yield* ingest(
       fx,
       scopedLegalPage(
         at,
@@ -580,7 +589,7 @@ describe('catalogEquivalence', () => {
         `catalog_${'a'.repeat(32)}`
       )
     );
-    const state = ingest(
+    const state = yield* ingest(
       fx,
       scopedLegalPage(
         at,
@@ -589,9 +598,9 @@ describe('catalogEquivalence', () => {
         `catalog_${'b'.repeat(32)}`
       )
     );
-    const aliases = ok(fx.run(aliasMap(state)));
+    const aliases = ok(yield* fx.run(aliasMap(state)));
     expect(
-      ok(fx.run(catalogEquivalence(state, resultOf(state, UNIT_ONE), scopeOf(UNIT_ONE), aliases, deps)))
+      ok(yield* fx.run(catalogEquivalence(state, resultOf(state, UNIT_ONE), scopeOf(UNIT_ONE), aliases, deps)))
     ).toBeNull();
-  });
+  }));
 });

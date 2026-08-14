@@ -13,10 +13,10 @@
  * number formatting could differ between two serializations of one order, a
  * `retry` would look like a second, different order and could apply twice.
  */
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect, Either, Layer } from 'effect';
 import { FULL_CONTROL_V2 } from 'src/constants';
+import type { PlayError } from 'src/errors';
 import { decodeLegalPage } from 'src/schema/page';
 import type { JsonObject, JsonValue } from 'src/schema/primitives';
 import { rememberPage, v2StateSchema } from 'src/services/aliases';
@@ -38,15 +38,20 @@ import {
   sessionFile,
   type Scratch,
 } from 'test/_fixtures';
+import { awaitTest, provideTestLayer } from 'test/_effect-test';
+import { fixtureObject, fixtureString, observedAt } from 'test/_expect';
+import { path } from 'test/_test-platform';
 
 // ---------------------------------------------------------------------------
 // Fixture
 // ---------------------------------------------------------------------------
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() =>
+  Effect.runPromise(
+    Effect.forEach(scratches.splice(0), (scratch) => scratch.cleanup, { discard: true })
+  )
+);
 
 interface TestRevision {
   readonly turn: number;
@@ -109,27 +114,28 @@ interface Fixture {
   readonly session: Session;
   readonly run: <A, E>(
     effect: Effect.Effect<A, E, SessionStore | PrivateFs>
-  ) => Either.Either<A, E>;
+  ) => Effect.Effect<Either.Either<A, E>>;
 }
 
-const fixture = (): Fixture => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
-  const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'seat.json');
-  Effect.runSync(scratch.files.writeJson(sessionPath, sessionFile()));
-  const loaded = Effect.runSync(store.resolveV2(sessionPath));
-  const layer = Layer.merge(
-    Layer.succeed(SessionStore, store),
-    Layer.succeed(PrivateFs, scratch.files)
-  );
-  return {
-    store,
-    sessionPath,
-    session: loaded.session,
-    run: (effect) => Effect.runSync(Effect.either(Effect.provide(effect, layer))),
-  };
-};
+const fixture = (): Effect.Effect<Fixture, PlayError> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
+    const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'seat.json');
+    yield* scratch.files.writeJson(sessionPath, sessionFile());
+    const loaded = yield* store.resolveV2(sessionPath);
+    const layer = Layer.merge(
+      Layer.succeed(SessionStore, store),
+      Layer.succeed(PrivateFs, scratch.files)
+    );
+    return {
+      store,
+      sessionPath,
+      session: loaded.session,
+      run: (effect) => Effect.either(provideTestLayer(effect, layer)),
+    };
+  });
 
 const ok = <A, E>(either: Either.Either<A, E>): A => {
   if (Either.isLeft(either)) {
@@ -143,8 +149,8 @@ const failure = <A>(either: Either.Either<A, { readonly message: string }>): str
   return Either.isLeft(either) ? either.left.message : '';
 };
 
-const ingest = (fx: Fixture, page: JsonObject): void => {
-  ok(
+const ingest = (fx: Fixture, page: JsonObject): Effect.Effect<void> =>
+  Effect.map(
     fx.run(
       Effect.flatMap(
         Effect.mapError(decodeLegalPage(page, fx.session), (error) => ({
@@ -152,9 +158,11 @@ const ingest = (fx: Fixture, page: JsonObject): void => {
         })),
         (decoded) => rememberPage(fx.sessionPath, fx.session, { legal: true, page: decoded })
       )
-    )
+    ),
+    (result) => {
+      ok(result);
+    }
   );
-};
 
 /** `_canonical_body(json.loads(text))` — the round trip the Python asserts. */
 const reCanonical = (text: string): string => {
@@ -163,11 +171,18 @@ const reCanonical = (text: string): string => {
   return Effect.runSync(canonicalText(parsed.value));
 };
 
-const persistedBody = (fx: Fixture, batchId: string): string => {
-  const state = ok(fx.run(fx.store.readState(fx.sessionPath, fx.session)));
-  const stored = state.batches[batchId];
-  expect(typeof stored).toBe('string');
-  return stored as string;
+const persistedBody = (fx: Fixture, batchId: string): Effect.Effect<string> =>
+  Effect.map(fx.run(fx.store.readState(fx.sessionPath, fx.session)), (result) => {
+    const state = ok(result);
+    return fixtureString(state.batches[batchId]);
+  });
+
+const canonicalBytes = (value: JsonValue): Uint8Array => Effect.runSync(canonicalBody(value));
+
+const canonicalOf = (text: string): string => {
+  const parsed = parsePython(text);
+  expect(parsed.failure).toBe(null);
+  return Effect.runSync(canonicalText(parsed.value));
 };
 
 // ---------------------------------------------------------------------------
@@ -175,7 +190,6 @@ const persistedBody = (fx: Fixture, batchId: string): string => {
 // ---------------------------------------------------------------------------
 
 describe('the canonical body', () => {
-  const bytes = (value: JsonValue): Uint8Array => Effect.runSync(canonicalBody(value));
 
   test('the same order built from two differently-ordered objects is the same bytes', () => {
     const first: JsonValue = {
@@ -196,7 +210,7 @@ describe('the canonical body', () => {
       control_protocol: FULL_CONTROL_V2,
       schema_version: 2,
     };
-    expect(bytes(first)).toEqual(bytes(second));
+    expect(canonicalBytes(first)).toEqual(canonicalBytes(second));
     // Not merely equal — canonical: sorted keys, no spaces, at every depth.
     expect(Effect.runSync(canonicalText(first))).toBe(
       `{"agent_id":"${FIXTURE_AGENT_ID}","batch_id":"batch_one",` +
@@ -311,12 +325,6 @@ describe('the canonical body', () => {
  * the >2**53 case, a *different order* than the agent typed.
  */
 describe('the canonical body carries CPython numbers', () => {
-  const canonicalOf = (text: string): string => {
-    const parsed = parsePython(text);
-    expect(parsed.failure).toBe(null);
-    return Effect.runSync(canonicalText(parsed.value));
-  };
-
   test('an integral float keeps its float spelling, and an int keeps its own', () => {
     expect(canonicalOf('{"tax":40.0}')).toBe('{"tax":40.0}');
     expect(canonicalOf('{"tax":40}')).toBe('{"tax":40}');
@@ -368,24 +376,24 @@ describe('the canonical body carries CPython numbers', () => {
 // ---------------------------------------------------------------------------
 
 describe('persistBatchForAction', () => {
-  test('the persisted bytes re-canonicalize to themselves and carry no credential', () => {
-    const fx = fixture();
+  awaitTest('the persisted bytes re-canonicalize to themselves and carry no credential', function* () {
+    const fx = yield* fixture();
     const rev = revision(7);
-    ingest(fx, legalPage(rev, [descriptor(rev, ACTION_ONE)]));
+    yield* ingest(fx, legalPage(rev, [descriptor(rev, ACTION_ONE)]));
     const batchId = ok(
-      fx.run(
+      yield* fx.run(
         persistBatchForAction(fx.sessionPath, fx.session, ACTION_ONE, { city: 'München' }, {
           token: () => 'A'.repeat(24),
         })
       )
     );
     expect(batchId).toBe(`batch_${'A'.repeat(24)}`);
-    const stored = persistedBody(fx, batchId);
+    const stored = (yield* persistedBody(fx, batchId));
     // The Python's own assertion: parsing and re-serializing the persisted
     // string must reproduce it byte for byte.
     expect(reCanonical(stored)).toBe(stored);
     expect(stored).not.toContain('secret-token');
-    expect(JSON.parse(stored) as JsonObject).toEqual({
+    expect(fixtureObject(JSON.parse(stored))).toEqual({
       schema_version: 2,
       control_protocol: FULL_CONTROL_V2,
       game_id: FIXTURE_GAME_ID,
@@ -396,21 +404,21 @@ describe('persistBatchForAction', () => {
     });
   });
 
-  test('an --arguments float reaches .v2-state as the float CPython wrote', () => {
-    const fx = fixture();
+  awaitTest('an --arguments float reaches .v2-state as the float CPython wrote', function* () {
+    const fx = yield* fixture();
     const rev = revision(7);
-    ingest(fx, legalPage(rev, [descriptor(rev, ACTION_ONE)]));
+    yield* ingest(fx, legalPage(rev, [descriptor(rev, ACTION_ONE)]));
     const parsed = Effect.runSync(
       parseJsonObject('{"tax":40.0,"ratio":1e-7,"seed":10000000000000000001}', '--arguments')
     );
     const batchId = ok(
-      fx.run(
+      yield* fx.run(
         persistBatchForAction(fx.sessionPath, fx.session, ACTION_ONE, parsed, {
           token: () => 'A'.repeat(24),
         })
       )
     );
-    const stored = persistedBody(fx, batchId);
+    const stored = (yield* persistedBody(fx, batchId));
     expect(stored).toContain(
       `"commands":[{"action_id":"${ACTION_ONE}",` +
         '"arguments":{"ratio":1e-07,"seed":10000000000000000001,"tax":40.0}}]'
@@ -425,13 +433,13 @@ describe('persistBatchForAction', () => {
    * untouched: there is no batch record, and therefore nothing for `retry` or
    * `receipt` to resolve — because nothing was ever sent.
    */
-  test('an --arguments surrogate refuses before anything is written', () => {
-    const fx = fixture();
+  awaitTest('an --arguments surrogate refuses before anything is written', function* () {
+    const fx = yield* fixture();
     const rev = revision(7);
-    ingest(fx, legalPage(rev, [descriptor(rev, ACTION_ONE)]));
-    const before = ok(fx.run(fx.store.readState(fx.sessionPath, fx.session)));
+    yield* ingest(fx, legalPage(rev, [descriptor(rev, ACTION_ONE)]));
+    const before = ok(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session)));
     const parsed = Effect.runSync(parseJsonObject('{"name":"\\ud800"}', '--arguments'));
-    const outcome = fx.run(
+    const outcome = yield* fx.run(
       persistBatchForAction(fx.sessionPath, fx.session, ACTION_ONE, parsed, {
         token: () => 'A'.repeat(24),
       })
@@ -440,25 +448,25 @@ describe('persistBatchForAction', () => {
       "command batch is not canonical JSON: 'utf-8' codec can't encode character " +
         "'\\ud800' in position 163: surrogates not allowed"
     );
-    const after = ok(fx.run(fx.store.readState(fx.sessionPath, fx.session)));
+    const after = ok(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session)));
     expect(after.batches).toEqual(before.batches);
     expect(Object.keys(after.batches)).toHaveLength(0);
   });
 
-  test('two identical orders persisted twice differ only in their batch ID', () => {
-    const fx = fixture();
+  awaitTest('two identical orders persisted twice differ only in their batch ID', function* () {
+    const fx = yield* fixture();
     const rev = revision(7);
-    ingest(fx, legalPage(rev, [descriptor(rev, ACTION_ONE)]));
+    yield* ingest(fx, legalPage(rev, [descriptor(rev, ACTION_ONE)]));
     const args = { name: 'London', ready: true };
     const first = ok(
-      fx.run(
+      yield* fx.run(
         persistBatchForAction(fx.sessionPath, fx.session, ACTION_ONE, args, {
           token: () => 'A'.repeat(24),
         })
       )
     );
     const second = ok(
-      fx.run(
+      yield* fx.run(
         persistBatchForAction(
           fx.sessionPath,
           fx.session,
@@ -468,35 +476,37 @@ describe('persistBatchForAction', () => {
         )
       )
     );
-    expect(persistedBody(fx, first).replace(first, 'ID')).toBe(
-      persistedBody(fx, second).replace(second, 'ID')
+    expect((yield* persistedBody(fx, first)).replace(first, 'ID')).toBe(
+      (yield* persistedBody(fx, second)).replace(second, 'ID')
     );
   });
 
-  test('a colliding token is re-minted rather than overwriting a live batch', () => {
-    const fx = fixture();
+  awaitTest('a colliding token is re-minted rather than overwriting a live batch', function* () {
+    const fx = yield* fixture();
     const rev = revision(7);
-    ingest(fx, legalPage(rev, [descriptor(rev, ACTION_ONE)]));
+    yield* ingest(fx, legalPage(rev, [descriptor(rev, ACTION_ONE)]));
     const tokens = ['A'.repeat(24), 'A'.repeat(24), 'C'.repeat(24)];
     let index = 0;
-    const token = (): string => tokens[Math.min(index++, tokens.length - 1)] as string;
+    const token = (): string => observedAt(tokens, Math.min(index++, tokens.length - 1));
     const first = ok(
-      fx.run(persistBatchForAction(fx.sessionPath, fx.session, ACTION_ONE, {}, { token }))
+      yield* fx.run(persistBatchForAction(fx.sessionPath, fx.session, ACTION_ONE, {}, { token }))
     );
     const second = ok(
-      fx.run(persistBatchForAction(fx.sessionPath, fx.session, ACTION_ONE, {}, { token }))
+      yield* fx.run(persistBatchForAction(fx.sessionPath, fx.session, ACTION_ONE, {}, { token }))
     );
     expect(first).toBe(`batch_${'A'.repeat(24)}`);
     expect(second).toBe(`batch_${'C'.repeat(24)}`);
-    const state = ok(fx.run(fx.store.readState(fx.sessionPath, fx.session)));
-    expect(Object.keys(state.batches).sort()).toEqual([first, second].sort());
+    const state = ok(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session)));
+    expect(Object.keys(state.batches).toSorted((left, right) => left.localeCompare(right))).toEqual(
+      [first, second].toSorted((left, right) => left.localeCompare(right))
+    );
   });
 
-  test('an unknown action ID names the enumeration that would make it real', () => {
-    const fx = fixture();
+  awaitTest('an unknown action ID names the enumeration that would make it real', function* () {
+    const fx = yield* fixture();
     const rev = revision(7);
-    ingest(fx, legalPage(rev, [descriptor(rev, ACTION_ONE)]));
-    const outcome = fx.run(
+    yield* ingest(fx, legalPage(rev, [descriptor(rev, ACTION_ONE)]));
+    const outcome = yield* fx.run(
       persistBatchForAction(fx.sessionPath, fx.session, ACTION_TWO, {})
     );
     expect(failure(outcome)).toBe(
@@ -504,12 +514,12 @@ describe('persistBatchForAction', () => {
     );
   });
 
-  test('a staged action is told apart from an expired one, and names its drain', () => {
-    const fx = fixture();
+  awaitTest('a staged action is told apart from an expired one, and names its drain', function* () {
+    const fx = yield* fixture();
     const rev = revision(7);
     // One page of a two-item catalog: the descriptor is cached but not
     // executable, because only a complete catalog is.
-    ingest(
+    yield* ingest(
       fx,
       legalPage(rev, [descriptor(rev, ACTION_ONE)], {
         total_items: 2,
@@ -520,7 +530,7 @@ describe('persistBatchForAction', () => {
         catalog_complete: false,
       })
     );
-    const outcome = fx.run(
+    const outcome = yield* fx.run(
       persistBatchForAction(fx.sessionPath, fx.session, ACTION_ONE, {})
     );
     expect(failure(outcome)).toBe(
@@ -530,15 +540,15 @@ describe('persistBatchForAction', () => {
     );
   });
 
-  test('a descriptor from an older revision is refused, not sent hopefully', () => {
-    const fx = fixture();
+  awaitTest('a descriptor from an older revision is refused, not sent hopefully', function* () {
+    const fx = yield* fixture();
     const old = revision(7);
-    ingest(fx, legalPage(old, [descriptor(old, ACTION_ONE)]));
+    yield* ingest(fx, legalPage(old, [descriptor(old, ACTION_ONE)]));
     // A newer page retires the old catalog; force the stale descriptor back in
     // to prove the revision check, not the cache eviction.
-    const state = ok(fx.run(fx.store.readState(fx.sessionPath, fx.session)));
+    const state = ok(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session)));
     ok(
-      fx.run(
+      yield* fx.run(
         fx.store.writeState(fx.sessionPath, {
           ...state,
           last_revision: { turn: 3, revision: 9, state_token: revision(9).state_token },
@@ -546,7 +556,7 @@ describe('persistBatchForAction', () => {
         })
       )
     );
-    const outcome = fx.run(
+    const outcome = yield* fx.run(
       persistBatchForAction(fx.sessionPath, fx.session, ACTION_ONE, {})
     );
     expect(failure(outcome)).toBe('the cached action is not from the latest revision');

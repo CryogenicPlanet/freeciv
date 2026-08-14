@@ -16,16 +16,25 @@
  * Named with a leading underscore so `bun test`'s `*.test.ts` glob does not
  * pick it up (PORT_MAP §7.1 records the file).
  */
-import * as path from 'node:path';
-import { Effect, Layer } from 'effect';
+import { Data, Effect, Layer, Option, Schema } from 'effect';
 import { FULL_CONTROL_V2, V2_PAGE_MAX_ITEMS } from 'src/constants';
 import { playerError, type PlayError } from 'src/errors';
+import { ExitCodeSignal } from 'src/exit';
 import type { BatchDisposition } from 'src/schema/batch';
 import { decodeLegalPage } from 'src/schema/legal-page';
 import type { PageScope } from 'src/schema/page';
-import { field, isJsonObject, type JsonObject, type JsonValue } from 'src/schema/primitives';
+import {
+  field,
+  isJsonObject,
+  type JsonObject,
+  type JsonValue,
+  type MutableJsonObject,
+} from 'src/schema/primitives';
 import type { ReceiptState } from 'src/schema/receipt';
 import type { Revision } from 'src/schema/revision';
+import { captureEffect } from 'test/_capture';
+import { provideTestLayer } from 'test/_effect-test';
+import { path } from 'test/_test-platform';
 import { revisionLabel, scalar, table } from 'src/render/primitives';
 import {
   runDo,
@@ -269,7 +278,7 @@ export const dispositionOf = (
   error: null,
 });
 
-export class SimulatedKill extends Error {}
+export class SimulatedKill extends Data.TaggedError('SimulatedKill')<{}> {}
 
 export const world = (): World => ({
   catalogs: new Map(),
@@ -301,14 +310,18 @@ export interface Bench {
   readonly world: World;
   readonly hooks: DoHooksFor;
   /** Drain one actor into `.v2-state` up front, as `just legal --all` would. */
-  readonly seed: (actorId: string, actions: ReadonlyArray<FakeAction>, at?: Revision) => void;
+  readonly seed: (
+    actorId: string,
+    actions: ReadonlyArray<FakeAction>,
+    at?: Revision
+  ) => Effect.Effect<void, PlayError>;
   /**
    * Retire every cached capability at a newer revision, exactly as a receipt
    * does — the entity aliases survive, the catalogs and the drain record do
    * not.  That is the state a first `do` of a turn is really in.
    */
-  readonly bump: (to: Revision) => void;
-  readonly readState: () => V2ClientState;
+  readonly bump: (to: Revision) => Effect.Effect<void, PlayError>;
+  readonly readState: () => Effect.Effect<V2ClientState, PlayError>;
 }
 
 const stateSchema = {
@@ -329,113 +342,125 @@ export interface BenchOptions {
   readonly files?: (api: PrivateFsApi) => PrivateFsApi;
 }
 
-export const bench = (options: BenchOptions = {}): Bench => {
-  const scratch = scratchWorkspace();
-  const sessionPath = path.join(scratch.workspace.stateRoot, 'session-codex-gpt-5.6-sol.json');
-  Effect.runSync(scratch.files.writeJson(sessionPath, sessionFile()));
-  // The store captures its file api and re-provides it inside the request
-  // lock, so the wrapper has to reach it too or `do`'s whole locked body would
-  // silently run against the unwrapped one.
-  const files = options.files === undefined ? scratch.files : options.files(scratch.files);
-  const store = sessionStoreFor(scratch.workspace, files, stateSchema, {});
-  const loaded = Effect.runSync(store.resolveV2(sessionPath));
-  const session = loaded.session;
-  const state = world();
-  // The bench never reaches the wire — every hook that would is scripted — so
-  // the client is present only to satisfy `runDo`'s requirement, and refuses
-  // loudly if anything ever does reach it.
-  const refusingFetch = fakeFetch([]);
-  const layer = Layer.mergeAll(
-    Layer.succeed(SessionStore, store),
-    Layer.succeed(V2Client, v2ClientFor(httpFor(refusingFetch))),
-    scratch.layer,
-    // Last: `Layer.mergeAll` folds left to right and the later context wins, so
-    // this is what overrides `scratch.layer`'s own `PrivateFs`.
-    Layer.succeed(PrivateFs, files)
-  );
+const buildBench = (
+  scratch: Scratch,
+  options: BenchOptions
+): Effect.Effect<Bench, PlayError> =>
+  Effect.gen(function* () {
+    const sessionPath = path.join(scratch.workspace.stateRoot, 'session-codex-gpt-5.6-sol.json');
+    yield* scratch.files.writeJson(sessionPath, sessionFile());
+    // The store captures its file api and re-provides it inside the request
+    // lock, so the wrapper has to reach it too or `do`'s whole locked body would
+    // silently run against the unwrapped one.
+    const files = options.files === undefined ? scratch.files : options.files(scratch.files);
+    const store = sessionStoreFor(scratch.workspace, files, stateSchema, {});
+    const loaded = yield* store.resolveV2(sessionPath);
+    const session = loaded.session;
+    const state = world();
+    // The bench never reaches the wire — every hook that would is scripted — so
+    // the client is present only to satisfy `runDo`'s requirement, and refuses
+    // loudly if anything ever does reach it.
+    const refusingFetch = fakeFetch([]);
+    const layer = Layer.mergeAll(
+      Layer.succeed(SessionStore, store),
+      Layer.succeed(V2Client, v2ClientFor(httpFor(refusingFetch))),
+      scratch.layer,
+      // Last: `Layer.mergeAll` folds left to right and the later context wins, so
+      // this is what overrides `scratch.layer`'s own `PrivateFs`.
+      Layer.succeed(PrivateFs, files)
+    );
 
-  /**
-   * One whole catalog, served the way the wire serves it: `V2_PAGE_MAX_ITEMS`
-   * descriptors a page, cursors followed to the end, and only the terminal
-   * page promoting the accumulation into `.v2-state`.  A single-page shortcut
-   * would skip the staged-catalog path that `refusedActorOptions` depends on.
-   */
-  const ingest = (
-    actorId: string,
-    actions: ReadonlyArray<FakeAction>,
-    at: Revision
-  ): Effect.Effect<Revision, PlayError, PrivateFs | SessionStore> =>
-    Effect.gen(function* () {
-      const all = actions.map((action) => descriptorOf(action, at));
-      const identifier = catalogId();
-      const pages = Math.max(1, Math.ceil(all.length / V2_PAGE_MAX_ITEMS));
-      for (let index = 0; index < pages; index += 1) {
-        const items = all.slice(index * V2_PAGE_MAX_ITEMS, (index + 1) * V2_PAGE_MAX_ITEMS);
-        const last = index + 1 === pages;
-        const cursor = last ? null : `cursor_${String(index + 1).padStart(32, 'c')}`;
-        const scope = scopeOf(actorId);
-        const payload = legalPagePayload(items, {
-          state_revision: { ...at },
-          page: {
+    /**
+     * One whole catalog, served the way the wire serves it: `V2_PAGE_MAX_ITEMS`
+     * descriptors a page, cursors followed to the end, and only the terminal
+     * page promoting the accumulation into `.v2-state`.  A single-page shortcut
+     * would skip the staged-catalog path that `refusedActorOptions` depends on.
+     */
+    const ingest = (
+      actorId: string,
+      actions: ReadonlyArray<FakeAction>,
+      at: Revision
+    ): Effect.Effect<Revision, PlayError, PrivateFs | SessionStore> =>
+      Effect.gen(function* () {
+        const all = actions.map((action) => descriptorOf(action, at));
+        const identifier = catalogId();
+        const pages = Math.max(1, Math.ceil(all.length / V2_PAGE_MAX_ITEMS));
+        for (let index = 0; index < pages; index += 1) {
+          const items = all.slice(index * V2_PAGE_MAX_ITEMS, (index + 1) * V2_PAGE_MAX_ITEMS);
+          const last = index + 1 === pages;
+          const cursor = last ? null : `cursor_${String(index + 1).padStart(32, 'c')}`;
+          const scope = scopeOf(actorId);
+          const pagePayload: MutableJsonObject = {
             section: 'legal_actions',
             items,
             total_items: all.length,
             next_cursor: cursor,
             cursor_expires_at: cursor === null ? null : '2099-01-01T00:00:00Z',
-            // A global drain's page carries none of the scoped-catalog keys:
-            // the envelope's *field set* is validated, and `scope`,
-            // `catalog_id` and `catalog_complete` only exist together
-            // (`decodePageShape`).  So the actorless catalog is learned
-            // descriptor by descriptor, exactly as the wire serves it.
-            ...(scope === undefined
-              ? {}
-              : { scope, catalog_id: identifier, catalog_complete: last }),
-          },
+          };
+          // A global drain's page carries none of the scoped-catalog keys: the
+          // envelope's field set is validated, and the three scoped keys only
+          // exist together (`decodePageShape`).
+          if (scope !== undefined) {
+            pagePayload['scope'] = scope;
+            pagePayload['catalog_id'] = identifier;
+            pagePayload['catalog_complete'] = last;
+          }
+          const payload = legalPagePayload(items, {
+            state_revision: { ...at },
+            page: pagePayload,
+          });
+          const page = yield* Effect.mapError(decodeLegalPage(payload, session), (drift) =>
+            playerError(drift.message)
+          );
+          yield* rememberPage(sessionPath, session, { legal: true, page });
+        }
+        const current = yield* store.readState(sessionPath, session);
+        const next = yield* rememberDrainedActor(current, actorId);
+        yield* store.writeState(sessionPath, next);
+        return at;
+      });
+
+    const seed = (
+      actorId: string,
+      actions: ReadonlyArray<FakeAction>,
+      at?: Revision
+    ): Effect.Effect<void, PlayError> =>
+      Effect.asVoid(provideTestLayer(ingest(actorId, actions, at ?? state.revision), layer));
+
+    const readState = (): Effect.Effect<V2ClientState, PlayError> =>
+      store.readState(sessionPath, session);
+
+    const bump = (to: Revision): Effect.Effect<void, PlayError> =>
+      Effect.gen(function* () {
+        const current = yield* readState();
+        yield* store.writeState(sessionPath, {
+          ...current,
+          last_revision: to,
+          actions: {},
+          pending_catalogs: {},
+          drained_actors: [],
         });
-        const page = yield* Effect.mapError(decodeLegalPage(payload, session), (drift) =>
-          playerError(drift.message)
-        );
-        yield* rememberPage(sessionPath, session, { legal: true, page });
-      }
-      const current = yield* store.readState(sessionPath, session);
-      const next = yield* rememberDrainedActor(current, actorId);
-      yield* store.writeState(sessionPath, next);
-      return at;
-    });
+        state.revision = to;
+      });
 
-  const seed = (actorId: string, actions: ReadonlyArray<FakeAction>, at?: Revision): void => {
-    Effect.runSync(Effect.provide(ingest(actorId, actions, at ?? state.revision), layer));
-  };
+    return {
+      scratch,
+      sessionPath,
+      session,
+      store,
+      layer,
+      world: state,
+      hooks: makeHooks(sessionPath, session, store, state, ingest),
+      seed,
+      bump,
+      readState,
+    };
+  });
 
-  const readState = (): V2ClientState => Effect.runSync(store.readState(sessionPath, session));
-
-  const bump = (to: Revision): void => {
-    const current = readState();
-    Effect.runSync(
-      store.writeState(sessionPath, {
-        ...current,
-        last_revision: to,
-        actions: {},
-        pending_catalogs: {},
-        drained_actors: [],
-      })
-    );
-    state.revision = to;
-  };
-
-  return {
-    scratch,
-    sessionPath,
-    session,
-    store,
-    layer,
-    world: state,
-    hooks: makeHooks(sessionPath, session, store, state, ingest),
-    seed,
-    bump,
-    readState,
-  };
-};
+export const bench = (options: BenchOptions = {}): Effect.Effect<Bench, PlayError> =>
+  Effect.flatMap(scratchWorkspace(), (scratch) =>
+    buildBench(scratch, options).pipe(Effect.onError(() => scratch.cleanup))
+  );
 
 // ---------------------------------------------------------------------------
 // The stand-ins
@@ -447,7 +472,8 @@ const sameRevision = (left: JsonValue, right: Revision): boolean =>
   field(left, 'revision') === right.revision &&
   field(left, 'state_token') === right.state_token;
 
-const textOf = (value: JsonValue): string => (typeof value === 'string' ? value : '');
+const textOf = (value: JsonValue | undefined): string =>
+  Option.getOrElse(Schema.decodeUnknownOption(Schema.String)(value), () => '');
 
 /** `_order_actor` — `""` whenever the subject names no actor at all. */
 const descriptorActor = (descriptor: JsonObject): string => {
@@ -493,7 +519,7 @@ const requiredArgument = (descriptor: JsonObject): string => {
   const required = field(schema, 'required');
   if (!Array.isArray(required)) return '';
   const first = required[0];
-  return typeof first === 'string' ? first : '';
+  return textOf(first);
 };
 
 const resolutionOf = (descriptor: JsonObject, order: string, args: JsonObject): ResolvedOrder => ({
@@ -509,8 +535,7 @@ const resolutionOf = (descriptor: JsonObject, order: string, args: JsonObject): 
 
 /** `_expand_alias` over the real entity-alias table `rememberPage` wrote. */
 const expandActor = (state: V2ClientState, token: string): string => {
-  const identifier = state.entity_aliases[token];
-  return typeof identifier === 'string' ? identifier : '';
+  return textOf(state.entity_aliases[token]);
 };
 
 const makeHooks =
@@ -659,7 +684,6 @@ const makeHooks =
           Effect.succeed({ state: current, notes: state.aliasNotes }),
 
         rebindOrder: (current, resolved) => {
-          // eslint-disable-next-line no-unused-expressions
           const matches = cachedFor(current, resolved.actor_id).filter(
             (descriptor) =>
               textOf(field(descriptor, 'kind')) === resolved.kind &&
@@ -679,10 +703,10 @@ const makeHooks =
             // as U11's `readLegalPage` places `LegalCtx.gate`.
             yield* delay('drain', actorId);
             const failure = state.drainFailure(actorId);
-            if (failure !== null) return yield* Effect.fail(failure);
+            if (failure !== null) return yield* failure;
             const actions = state.catalogs.get(actorId) ?? [];
             return yield* gate(
-              Effect.provide(ingest(actorId, actions, state.revision), provided)
+              provideTestLayer(ingest(actorId, actions, state.revision), provided)
             );
           }),
 
@@ -693,10 +717,10 @@ const makeHooks =
             // receipt and the next order's batch, which is exactly the window
             // the streamed ledger exists for.
             if (state.killAfterReceipt !== 0 && batches > state.killAfterReceipt) {
-              return yield* Effect.die(new SimulatedKill('SIGKILL'));
+              return yield* Effect.die(new SimulatedKill());
             }
             const failure = state.persistFailure(batches - 1, actionId);
-            if (failure !== null) return yield* Effect.fail(failure);
+            if (failure !== null) return yield* failure;
             return `batch_${String(batches).padStart(8, '0')}`;
           }),
 
@@ -706,7 +730,7 @@ const makeHooks =
             submitted += 1;
             yield* delay('submit', batchId);
             const failure = state.submitFailure(index, batchId);
-            if (failure !== null) return yield* Effect.fail(failure);
+            if (failure !== null) return yield* failure;
             const script = state.receipt(index, batchId);
             const disposition: BatchDisposition = {
               schema_version: 2,
@@ -735,7 +759,7 @@ const makeHooks =
             // "is this actor still drained" question is answered honestly.
             const receipt = disposition.receipt;
             if (receipt !== null) {
-              yield* Effect.provide(rememberReceipt(sessionPath, session, receipt), provided);
+              yield* provideTestLayer(rememberReceipt(sessionPath, session, receipt), provided);
             }
             if (script.revision.revision !== state.revision.revision) {
               state.revision = script.revision;
@@ -810,49 +834,36 @@ export interface Captured {
   readonly killed: boolean;
 }
 
-const property = (value: unknown, key: string): unknown =>
-  typeof value === 'object' && value !== null ? Reflect.get(value, key) : undefined;
-
 /**
  * Run one `do` with stdout and stderr collected and the exit status mapped the
  * way `cli-main.handleError` maps it: `ExitCodeSignal` is the status, anything
  * else is `error: …` on stderr and status 2.
  */
-export const runDoCaptured = async (
+export const runDoCaptured = (
   target: Bench,
   args: DoArguments
-): Promise<Captured> => {
-  const out: Array<string> = [];
-  const err: Array<string> = [];
-  const originalLog = console.log;
-  const originalError = console.error;
-  console.log = (...parts: ReadonlyArray<unknown>) => out.push(parts.join(' '));
-  console.error = (...parts: ReadonlyArray<unknown>) => err.push(parts.join(' '));
-  try {
-    const result = await Effect.runPromise(
-      Effect.either(
-        Effect.provide(runDo({ ...args, session: target.sessionPath }, target.hooks), target.layer)
-      )
-    ).catch((cause: unknown) => {
-      if (String(cause).includes('SIGKILL')) return 'killed' as const;
-      throw cause;
-    });
-    if (result === 'killed') return { out, err, code: 137, error: '', killed: true };
-    if (result._tag === 'Right') return { out, err, code: 0, error: '', killed: false };
-    const failure: unknown = result.left;
-    if (property(failure, '_tag') === 'ExitCodeSignal') {
-      const code = property(failure, 'code');
-      return { out, err, code: typeof code === 'number' ? code : 2, error: '', killed: false };
-    }
-    return {
-      out,
-      err,
-      code: 2,
-      error: String(property(failure, 'message') ?? failure),
-      killed: false,
-    };
-  } finally {
-    console.log = originalLog;
-    console.error = originalError;
-  }
+): Effect.Effect<Captured> => {
+  const execution = Effect.either(
+    provideTestLayer(runDo({ ...args, session: target.sessionPath }, target.hooks), target.layer)
+  ).pipe(
+    Effect.map((result) => result),
+    Effect.catchAllDefect((defect) =>
+      defect instanceof SimulatedKill ? Effect.succeed(null) : Effect.die(defect)
+    )
+  );
+  return captureEffect(execution).pipe(
+    Effect.map(({ value: result, captured }) => {
+      if (result === null) {
+        return { ...captured, code: 137, error: '', killed: true };
+      }
+      if (result._tag === 'Right') {
+        return { ...captured, code: 0, error: '', killed: false };
+      }
+      const failure = result.left;
+      if (failure instanceof ExitCodeSignal) {
+        return { ...captured, code: failure.code, error: '', killed: false };
+      }
+      return { ...captured, code: 2, error: failure.message, killed: false };
+    })
+  );
 };

@@ -14,7 +14,7 @@ import { drift } from 'src/render/primitives';
 import type { AliasMap } from 'src/render/primitives';
 import { Effect } from 'effect';
 import type { PlayerError } from 'src/errors';
-import { field, isJsonObject, type JsonObject } from 'src/schema/primitives';
+import { field, isJsonObject, isJsonString, type JsonObject } from 'src/schema/primitives';
 import type { PageScope } from 'src/schema/page';
 import { kindWithOperation } from 'src/render/legal/rows';
 import type { CompactAction, LegalCompactResult } from 'src/services/legal-compact';
@@ -24,7 +24,7 @@ export const actionKindKey = (compact: CompactAction): Effect.Effect<string, Pla
   const subject = field(compact, 'subject');
   if (!isJsonObject(subject)) return Effect.fail(drift('legal action subject'));
   const kind = field(compact, 'kind');
-  if (typeof kind !== 'string') return Effect.fail(drift('legal action kind'));
+  if (!isJsonString(kind)) return Effect.fail(drift('legal action kind'));
   return Effect.succeed(kindWithOperation(kind, field(subject, 'operation')));
 };
 
@@ -38,7 +38,7 @@ export const actionKindKey = (compact: CompactAction): Effect.Effect<string, Pla
  */
 export const descriptorKindKey = (descriptor: JsonObject): string => {
   const kind = field(descriptor, 'kind');
-  if (typeof kind !== 'string') return '';
+  if (!isJsonString(kind)) return '';
   const subject = field(descriptor, 'subject');
   return kindWithOperation(kind, isJsonObject(subject) ? field(subject, 'operation') : null);
 };

@@ -11,6 +11,7 @@ import { Effect } from 'effect';
 import type { PlayerError } from 'src/errors';
 import { drift, isJsonObject, scalar, type AliasMap, type JsonValue } from 'src/render/primitives';
 import { renderGenericItems } from 'src/render/state/generic';
+import { isWholeNumber } from 'src/schema/primitives';
 
 export const renderCityCitizens = (
   items: ReadonlyArray<JsonValue>,
@@ -24,10 +25,10 @@ export const renderCityCitizens = (
     const totals = new Map<string, number>();
     for (const item of worked) {
       const yields = isJsonObject(item) ? (item['yields'] ?? null) : null;
-      if (!isJsonObject(yields)) return yield* Effect.fail(drift('city citizen yields'));
+      if (!isJsonObject(yields)) return yield*drift('city citizen yields');
       for (const [key, value] of Object.entries(yields)) {
-        if (typeof value !== 'number' || !Number.isInteger(value)) {
-          return yield* Effect.fail(drift('city citizen yields'));
+        if (!isWholeNumber(value)) {
+          return yield*drift('city citizen yields');
         }
         totals.set(key, (totals.get(key) ?? 0) + value);
       }
@@ -46,7 +47,7 @@ export const renderCityCitizens = (
     const placed = items.filter((item) => {
       if (!isJsonObject(item) || item['kind'] !== 'specialist') return false;
       const count = item['count'] ?? null;
-      return typeof count === 'number' && Number.isInteger(count) && count > 0;
+      return isWholeNumber(count) && count > 0;
     });
     if (placed.length > 0) {
       lines.push(

@@ -26,6 +26,7 @@ import {
   showNamed,
   showSources,
   showStaleness,
+  type ShowGrepOptions,
 } from 'src/render/show';
 import { jsonRequested, printV2Json } from 'src/services/json-output';
 import { mirrorDir, strip } from 'src/services/mirror';
@@ -57,7 +58,14 @@ const NO_MAP = playerError(
 );
 
 /** The `--json` envelope, whose `selection` is `null` for the bare listing. */
-const showJson = (selection: string, lines: ReadonlyArray<string>): unknown => ({
+interface ShowJsonEnvelope {
+  readonly schema_version: 1;
+  readonly command: 'show';
+  readonly selection: string | null;
+  readonly lines: ReadonlyArray<string>;
+}
+
+const showJson = (selection: string, lines: ReadonlyArray<string>): ShowJsonEnvelope => ({
   schema_version: 1,
   command: 'show',
   selection: selection === '' ? null : selection,
@@ -88,21 +96,21 @@ export const runShow = (
     // `state/units.tsv` and one led by U+FEFF is refused by `SHOW_NAME_RE`.
     const pattern = strip(options.grep);
     const name = strip(options.name);
-    if (pattern !== '' && name !== '') return yield* Effect.fail(BOTH);
-    if (options.regex && pattern === '') return yield* Effect.fail(REGEX_WITHOUT_GREP);
+    if (pattern !== '' && name !== '') return yield*BOTH;
+    if (options.regex && pattern === '') return yield*REGEX_WITHOUT_GREP;
     if (options.yields) {
-      if (name !== 'map' || pattern !== '') return yield* Effect.fail(YIELDS_ELSEWHERE);
+      if (name !== 'map' || pattern !== '') return yield*YIELDS_ELSEWHERE;
       const overlay = yield* Effect.flatMap(mirrorDir(path), renderMapYields);
-      if (overlay.length === 0) return yield* Effect.fail(NO_MAP);
+      if (overlay.length === 0) return yield*NO_MAP;
       return yield* emit(options.json, 'map --yields', overlay);
     }
     const selection = pattern !== '' ? `grep ${pattern}` : name;
+    const grepOptions: ShowGrepOptions = options.clock === undefined
+      ? { regex: options.regex }
+      : { regex: options.regex, clock: options.clock };
     const lines =
       pattern !== ''
-        ? yield* showGrep(path, pattern, {
-            regex: options.regex,
-            ...(options.clock === undefined ? {} : { clock: options.clock }),
-          })
+        ? yield* showGrep(path, pattern, grepOptions)
         : name !== ''
           ? yield* showNamed(path, name)
           : yield* showDefault(path);

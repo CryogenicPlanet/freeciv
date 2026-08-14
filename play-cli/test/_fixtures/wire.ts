@@ -6,7 +6,7 @@
  * and nothing else.
  */
 import { FULL_CONTROL_V2 } from 'src/constants';
-import type { JsonObject, JsonValue, SessionIdentity } from 'src/schema/primitives';
+import { isJsonObject, type JsonObject, type JsonValue, type SessionIdentity } from 'src/schema/primitives';
 import type { Revision } from 'src/schema/revision';
 
 export const FIXTURE_GAME_ID = 'game_Hsit9YEuBjKdJPPouFoGVYlk';
@@ -67,21 +67,27 @@ export const errorPayload = (overrides: JsonObject = {}): JsonObject => ({
 export const pagePayload = (
   items: ReadonlyArray<JsonValue> = [{ id: 'unit_0', name: 'Warriors' }],
   overrides: JsonObject = {}
-): JsonObject => ({
-  schema_version: 2,
-  control_protocol: FULL_CONTROL_V2,
-  game_id: FIXTURE_GAME_ID,
-  agent_id: FIXTURE_AGENT_ID,
-  state_revision: { ...FIXTURE_REVISION },
-  page: (overrides['page'] as JsonObject | undefined) ?? {
-    section: 'units',
-    items,
-    total_items: items.length,
-    next_cursor: null,
-    cursor_expires_at: null,
-  },
-  ...Object.fromEntries(Object.entries(overrides).filter(([key]) => key !== 'page')),
-});
+): JsonObject => {
+  const overridePage = overrides['page'];
+  const page = isJsonObject(overridePage)
+    ? overridePage
+    : {
+        section: 'units',
+        items,
+        total_items: items.length,
+        next_cursor: null,
+        cursor_expires_at: null,
+      };
+  return {
+    schema_version: 2,
+    control_protocol: FULL_CONTROL_V2,
+    game_id: FIXTURE_GAME_ID,
+    agent_id: FIXTURE_AGENT_ID,
+    state_revision: { ...FIXTURE_REVISION },
+    page,
+    ...Object.fromEntries(Object.entries(overrides).filter(([key]) => key !== 'page')),
+  };
+};
 
 export const descriptor = (overrides: JsonObject = {}): JsonObject => ({
   action_id: 'action_found_city_0',
@@ -96,21 +102,27 @@ export const descriptor = (overrides: JsonObject = {}): JsonObject => ({
 export const legalPagePayload = (
   items: ReadonlyArray<JsonValue> = [descriptor()],
   overrides: JsonObject = {}
-): JsonObject => ({
-  schema_version: 2,
-  control_protocol: FULL_CONTROL_V2,
-  game_id: FIXTURE_GAME_ID,
-  agent_id: FIXTURE_AGENT_ID,
-  state_revision: { ...FIXTURE_REVISION },
-  page: (overrides['page'] as JsonObject | undefined) ?? {
-    section: 'legal_actions',
-    items,
-    total_items: items.length,
-    next_cursor: null,
-    cursor_expires_at: null,
-  },
-  ...Object.fromEntries(Object.entries(overrides).filter(([key]) => key !== 'page')),
-});
+): JsonObject => {
+  const overridePage = overrides['page'];
+  const page = isJsonObject(overridePage)
+    ? overridePage
+    : {
+        section: 'legal_actions',
+        items,
+        total_items: items.length,
+        next_cursor: null,
+        cursor_expires_at: null,
+      };
+  return {
+    schema_version: 2,
+    control_protocol: FULL_CONTROL_V2,
+    game_id: FIXTURE_GAME_ID,
+    agent_id: FIXTURE_AGENT_ID,
+    state_revision: { ...FIXTURE_REVISION },
+    page,
+    ...Object.fromEntries(Object.entries(overrides).filter(([key]) => key !== 'page')),
+  };
+};
 
 export const receiptPayload = (overrides: JsonObject = {}): JsonObject => ({
   schema_version: 2,

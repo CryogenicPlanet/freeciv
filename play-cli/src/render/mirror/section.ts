@@ -13,6 +13,7 @@
  */
 import type { Effect } from 'effect';
 import type { PlayerError } from 'src/errors';
+import type { JsonValueInput } from 'src/schema/primitives';
 import type { MirrorAliases } from 'src/services/mirror';
 
 /** One rendered mirror table: its column names and its rows, in page order. */
@@ -29,6 +30,6 @@ export interface RenderedSection {
  * instead of writing a row of dashes over it.
  */
 export type SectionRenderer = (
-  items: ReadonlyArray<unknown>,
+  items: ReadonlyArray<JsonValueInput>,
   aliases: MirrorAliases | null
 ) => Effect.Effect<RenderedSection, PlayerError>;

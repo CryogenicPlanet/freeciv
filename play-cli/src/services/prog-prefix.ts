@@ -25,6 +25,9 @@
  * only string containing it died with the justfile.
  */
 
+import { Config, Effect, Predicate } from 'effect';
+import { isJsonString } from 'src/schema/primitives';
+
 /** Every subcommand the CLI registers — the verbs a `just` mention can name. */
 const VERBS = [
   'prompt',
@@ -54,10 +57,13 @@ const MENTION_RE = new RegExp(`\\bjust (${VERBS.join('|')})\\b`, 'g');
 export const PROG_ENV = 'PLAY_PROG';
 
 /** The spelling in effect right now — read per call so tests can toggle it. */
-export const resolveProg = (): string => {
-  const raw = process.env[PROG_ENV]?.trim();
-  return raw !== undefined && raw !== '' ? raw : './play';
-};
+export const resolveProg = (): string =>
+  Effect.runSync(
+    Effect.map(Config.string(PROG_ENV).pipe(Config.withDefault('./play')), (configured) => {
+      const trimmed = configured.trim();
+      return trimmed === '' ? './play' : trimmed;
+    })
+  );
 
 /**
  * Rewrite every `just <verb>` mention to `<prog> <verb>`; identity in parity
@@ -86,12 +92,12 @@ const patchStream = (stream: NodeJS.WriteStream): void => {
     callback?: (error?: Error | null) => void
   ): boolean => {
     const rewritten =
-      typeof chunk === 'string'
+      isJsonString(chunk)
         ? rewriteProgMentions(chunk)
         : Buffer.from(rewriteProgMentions(Buffer.from(chunk).toString('utf8')), 'utf8');
     // The two overloads of `write` disagree on the second parameter; forward
     // exactly what arrived so neither loses its callback.
-    return typeof encodingOrCallback === 'function'
+    return Predicate.isFunction(encodingOrCallback)
       ? original(rewritten, encodingOrCallback)
       : original(rewritten, encodingOrCallback, callback);
   };
@@ -103,7 +109,7 @@ type ConsoleMethod = (...args: ReadonlyArray<unknown>) => void;
 const patchConsoleMethod = (name: 'log' | 'error' | 'warn' | 'info'): void => {
   const original: ConsoleMethod = console[name].bind(console);
   console[name] = (...args: ReadonlyArray<unknown>): void =>
-    original(...args.map((arg) => (typeof arg === 'string' ? rewriteProgMentions(arg) : arg)));
+    original(...args.map((arg) => (isJsonString(arg) ? rewriteProgMentions(arg) : arg)));
 };
 
 /**

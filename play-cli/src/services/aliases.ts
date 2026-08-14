@@ -54,7 +54,9 @@ import {
   field,
   hasField,
   isJsonObject,
+  isJsonString,
   isWholeNumber,
+  jsonValue,
   type JsonObject,
   type JsonValue,
 } from 'src/schema/primitives';
@@ -166,8 +168,15 @@ const descriptorJson = (descriptor: LegalActionDescriptor): JsonObject => ({
   state_revision: revisionJson(descriptor.state_revision),
 });
 
+interface ScopeJsonDraft extends JsonObject {
+  actor_id: string;
+  actor_type: string;
+  target_id?: string;
+  target_type?: string;
+}
+
 const scopeJson = (scope: PageScope): JsonObject => {
-  const base: Record<string, JsonValue> = {
+  const base: ScopeJsonDraft = {
     actor_id: scope.actor_id,
     actor_type: scope.actor_type,
   };
@@ -182,31 +191,16 @@ const aliasEntryJson = (entry: ActionAliasEntry): JsonObject => ({
   semantics: entry.semantics,
 });
 
-/**
- * Narrow an already-decoded wire object to plain JSON, cast-free.
- *
- * Every decoder in `src/schema/` builds its result out of JSON the wire
- * carried, so this walk only ever meets JSON — but it *proves* that at runtime
- * instead of asserting it, which is what keeps the private cache honest.
- */
-const toJsonValue = (value: unknown): JsonValue => {
-  if (value === null || value === undefined) return null;
-  if (typeof value === 'string' || typeof value === 'boolean') return value;
-  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
-  if (Array.isArray(value)) return value.map((item) => toJsonValue(item));
-  if (typeof value === 'object') {
-    const copied: Record<string, JsonValue> = {};
-    for (const [key, item] of Object.entries(value)) {
-      if (item !== undefined) copied[key] = toJsonValue(item);
-    }
-    return copied;
-  }
-  return null;
-};
-
 // ---------------------------------------------------------------------------
 // The working draft
 // ---------------------------------------------------------------------------
+
+interface PageScopeDraft {
+  actor_id: string;
+  actor_type: PageScope['actor_type'];
+  target_id?: string;
+  target_type?: string;
+}
 
 interface PendingDraft {
   readonly state_revision: Revision;
@@ -287,8 +281,8 @@ export const parseActionAliases = (
       const semantics = field(entry, 'semantics');
       if (
         !isOpaqueId(actionId) ||
-        typeof actorId !== 'string' ||
-        typeof semantics !== 'string' ||
+        !isJsonString(actorId) ||
+        !isJsonString(semantics) ||
         // CPython's `len()` counts code points, and so must this cap — the
         // producer below truncates to 1024 *code points*, so measuring the
         // loader's side in UTF-16 units would make this client refuse a
@@ -316,7 +310,7 @@ export const parseEntityAliases = (
   if (identifiers.size !== entries.length) return fail;
   const table: Record<string, string> = {};
   for (const [alias, identifier] of entries) {
-    if (!entityAliasIdMatches(alias, identifier) || typeof identifier !== 'string') return fail;
+    if (!entityAliasIdMatches(alias, identifier) || !isJsonString(identifier)) return fail;
     table[alias] = identifier;
   }
   return Effect.succeed(table);
@@ -332,7 +326,7 @@ export const parseTileAliases = (
   if (identifiers.size !== entries.length) return fail;
   const table: Record<string, string> = {};
   for (const [key, identifier] of entries) {
-    if (!TILE_KEY_RE.test(key) || typeof identifier !== 'string' || !TILE_ID_RE.test(identifier)) {
+    if (!TILE_KEY_RE.test(key) || !isJsonString(identifier) || !TILE_ID_RE.test(identifier)) {
       return fail;
     }
     table[key] = identifier;
@@ -378,9 +372,11 @@ export const v2StateSchema: V2StateSchemaApi = {
   empty: emptyV2ClientState,
   validate: (state) =>
     Effect.gen(function* () {
-      yield* validateAliasState(state);
-      yield* parseDrainedActors(state.drained_actors);
-      yield* validatePendingCatalogs(state.pending_catalogs);
+      yield* parseActionAliases(field(state, 'action_aliases'));
+      yield* parseEntityAliases(field(state, 'entity_aliases'));
+      yield* parseTileAliases(field(state, 'tile_aliases'));
+      yield* parseDrainedActors(field(state, 'drained_actors'));
+      yield* validatePendingCatalogs(field(state, 'pending_catalogs'));
     }),
   cursorExpired: (expiresAt) => cursorExpired(expiresAt),
 };
@@ -411,13 +407,13 @@ const readPending = (value: JsonValue): Effect.Effect<PendingDraft | null, Playe
       !isJsonObject(scope) ||
       !isWholeNumber(total) ||
       !isJsonObject(items) ||
-      typeof cursor !== 'string'
+      !isJsonString(cursor)
     ) {
       return null;
     }
     const actorId = field(scope, 'actor_id');
     const actorType = field(scope, 'actor_type');
-    if (typeof actorId !== 'string') return null;
+    if (!isJsonString(actorId)) return null;
     if (actorType !== 'player' && actorType !== 'city' && actorType !== 'unit') return null;
     const targetId = field(scope, 'target_id');
     const targetType = field(scope, 'target_type');
@@ -426,18 +422,16 @@ const readPending = (value: JsonValue): Effect.Effect<PendingDraft | null, Playe
       if (!isJsonObject(item)) return null;
       staged[actionId] = item;
     }
+    const cleanScope: PageScopeDraft = { actor_id: actorId, actor_type: actorType };
+    if (isJsonString(targetId)) cleanScope.target_id = targetId;
+    if (isJsonString(targetType)) cleanScope.target_type = targetType;
     return {
       state_revision: revision,
-      scope: {
-        actor_id: actorId,
-        actor_type: actorType,
-        ...(typeof targetId === 'string' ? { target_id: targetId } : {}),
-        ...(typeof targetType === 'string' ? { target_type: targetType } : {}),
-      },
+      scope: cleanScope,
       total_items: total,
       items: staged,
       next_cursor: cursor,
-      cursor_expires_at: typeof expiry === 'string' ? expiry : null,
+      cursor_expires_at: isJsonString(expiry) ? expiry : null,
     };
   });
 
@@ -522,7 +516,7 @@ export const tileReference = (value: JsonValue, identifierKey: string): TileRefe
   const identifier = field(value, identifierKey);
   const x = field(value, 'x');
   const y = field(value, 'y');
-  if (typeof identifier !== 'string' || !TILE_ID_RE.test(identifier)) return null;
+  if (!isJsonString(identifier) || !TILE_ID_RE.test(identifier)) return null;
   if (!isWholeNumber(x) || !isWholeNumber(y)) return null;
   return { identifier, x, y };
 };
@@ -554,6 +548,11 @@ export const actionTargetKey = (target: JsonValue): Effect.Effect<string, Player
  */
 const truncateCodePoints = (value: string, limit: number): string =>
   value.length <= limit ? value : codeSlice(value, 0, limit);
+
+const sortText = (values: ReadonlyArray<string>): string =>
+  [...values]
+    .toSorted((left, right) => (left < right ? -1 : left > right ? 1 : 0))
+    .join(',');
 
 /**
  * Name what an action *is*, with nothing revision-bound inside it.
@@ -589,14 +588,12 @@ export const actionSemantics = (
       properties === null || !Array.isArray(declared)
         ? []
         : declared.filter(
-            (name): name is string => typeof name === 'string' && hasField(properties, name)
+            (name): name is string => isJsonString(name) && hasField(properties, name)
           );
-    const sortText = (values: ReadonlyArray<string>): string =>
-      [...values].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0)).join(',');
     const joined = [
-      typeof actorId === 'string' ? actorId : '',
+      isJsonString(actorId) ? actorId : '',
       descriptor.kind,
-      typeof operation === 'string' ? operation : '',
+      isJsonString(operation) ? operation : '',
       targetKey,
       properties === null ? '' : sortText(Object.keys(properties)),
       sortText(required),
@@ -663,10 +660,15 @@ const assignActionAliases = (
  *
  * Returns how many numbers were carried across.
  */
+export interface ReboundActionAliases {
+  readonly table: Record<string, ActionAliasEntry>;
+  readonly rebound: number;
+}
+
 export const rebindActionAliases = (
   fresh: ActionAliasTable,
   previous: Readonly<Record<string, ActionAliasEntry>>
-): { readonly table: Record<string, ActionAliasEntry>; readonly rebound: number } => {
+): ReboundActionAliases => {
   const bySemantics = new Map<string, string[]>();
   for (const [alias, entry] of Object.entries(fresh.by_alias)) {
     if (entry.semantics === '') continue;
@@ -695,7 +697,7 @@ export const rebindActionAliases = (
     merged.set(`a${number}`, entry);
     number += 1;
   }
-  const ordered = [...merged.keys()].sort(
+  const ordered = [...merged.keys()].toSorted(
     (left, right) => Number.parseInt(left.slice(1), 10) - Number.parseInt(right.slice(1), 10)
   );
   const table: Record<string, ActionAliasEntry> = {};
@@ -708,8 +710,8 @@ export const rebindActionAliases = (
 
 /** Return the alias prefix an opaque entity ID may be numbered under. */
 export const entityAliasPrefix = (identifier: JsonValue): string | null => {
-  if (typeof identifier !== 'string') return null;
-  for (const [kind, prefix] of Object.entries(ALIAS_ENTITY_PREFIXES)) {
+  if (!isJsonString(identifier)) return null;
+  for (const [kind, prefix] of ALIAS_ENTITY_PREFIXES) {
     if (!identifier.startsWith(`${kind}_`)) continue;
     const pattern = kind === 'relation' ? RELATION_ID_RE : ACTOR_ID_RE;
     return pattern.test(identifier) ? prefix : null;
@@ -722,7 +724,7 @@ const assignEntityAliases = (draft: Draft, identifiers: ReadonlyArray<JsonValue>
   const entities = draft.entity_aliases;
   const known = new Set(Object.values(entities));
   const numbers = new Map<string, number>(
-    Object.keys(ALIAS_ENTITY_TYPES).map((prefix) => [prefix, 0])
+    [...ALIAS_ENTITY_TYPES.keys()].map((prefix) => [prefix, 0])
   );
   for (const alias of Object.keys(entities)) {
     const prefix = alias.slice(0, 1);
@@ -731,7 +733,7 @@ const assignEntityAliases = (draft: Draft, identifiers: ReadonlyArray<JsonValue>
   }
   for (const identifier of identifiers) {
     const prefix = entityAliasPrefix(identifier);
-    if (prefix === null || typeof identifier !== 'string' || known.has(identifier)) continue;
+    if (prefix === null || !isJsonString(identifier) || known.has(identifier)) continue;
     const used = numbers.get(prefix) ?? 0;
     if (Object.keys(entities).length >= V2_MAX_ENTITY_ALIASES || used >= 9999) continue;
     numbers.set(prefix, used + 1);
@@ -919,9 +921,8 @@ export const rememberPage = (
           draft.drained_actors = [];
         } else if (revisionIsSameOrder(revision, prior)) {
           if (!revisionsEqual(revision, prior)) {
-            return yield* Effect.fail(
-              playerError('state token changed without a newer revision')
-            );
+            return yield*
+              playerError('state token changed without a newer revision');
           }
         } else {
           // An older authenticated page can be displayed but can never revive
@@ -940,9 +941,8 @@ export const rememberPage = (
           for (const descriptor of body.items) {
             const existing = draft.actions[descriptor.action_id];
             if (existing !== undefined && !jsonEquals(existing, descriptorJson(descriptor))) {
-              return yield* Effect.fail(
-                playerError('one action ID described two different actions')
-              );
+              return yield*
+                playerError('one action ID described two different actions');
             }
             draft.actions[descriptor.action_id] = descriptorJson(descriptor);
           }
@@ -1066,7 +1066,7 @@ export const rememberPage = (
           delete draft.pending_catalogs[catalogId];
           return yield* saveAndFail('legal-action catalog completed before every item arrived');
         }
-        const promoted: Record<string, JsonValue> = { ...draft.actions };
+        const promoted = { ...draft.actions };
         for (const [actionId, descriptor] of accumulated) {
           const existing = promoted[actionId];
           if (existing !== undefined && !jsonEquals(existing, descriptorJson(descriptor))) {
@@ -1095,17 +1095,21 @@ export const rememberPage = (
 // _remember_receipt
 // ---------------------------------------------------------------------------
 
-const RECEIPT_TRANSITIONS: Readonly<Record<string, ReadonlySet<string>>> = {
-  accepted: new Set(['accepted', 'applied', 'rejected', 'ambiguous']),
-  applied: new Set(['applied']),
-  rejected: new Set(['rejected']),
-  ambiguous: new Set(['ambiguous']),
-};
+const RECEIPT_TRANSITIONS = new Map<string, ReadonlySet<string>>([
+  ['accepted', new Set(['accepted', 'applied', 'rejected', 'ambiguous'])],
+  ['applied', new Set(['applied'])],
+  ['rejected', new Set(['rejected'])],
+  ['ambiguous', new Set(['ambiguous'])],
+]);
 
-const receiptJson = (receipt: CommandReceipt): JsonObject => {
-  const value = toJsonValue(receipt);
-  return isJsonObject(value) ? value : {};
-};
+const receiptJson = (receipt: CommandReceipt): Effect.Effect<JsonObject, PlayerError> =>
+  Effect.flatMap(
+    Effect.mapError(jsonValue(receipt, 'command receipt'), (error) => playerError(error.message)),
+    (value) =>
+      isJsonObject(value)
+        ? Effect.succeed(value)
+        : Effect.fail(playerError('command receipt is not a JSON object'))
+  );
 
 /**
  * Record one validated receipt and retire every capability it outlived.
@@ -1130,17 +1134,15 @@ export const rememberReceipt = (
         const prior = draft.receipts[receipt.batch_id];
         if (prior !== undefined) {
           const priorState = isJsonObject(prior) ? field(prior, 'receipt_state') : null;
-          const allowed =
-            typeof priorState === 'string'
-              ? (RECEIPT_TRANSITIONS[priorState] ?? new Set<string>())
-              : new Set<string>();
+          const allowed = isJsonString(priorState)
+            ? (RECEIPT_TRANSITIONS.get(priorState) ?? new Set<string>())
+            : new Set<string>();
           if (!allowed.has(receipt.receipt_state)) {
-            return yield* Effect.fail(
-              playerError('a command receipt regressed or changed terminal state')
-            );
+            return yield*
+              playerError('a command receipt regressed or changed terminal state');
           }
         }
-        draft.receipts[receipt.batch_id] = receiptJson(receipt);
+        draft.receipts[receipt.batch_id] = yield* receiptJson(receipt);
         const revision = receipt.state_revision;
         const last = draft.last_revision;
         if (last === null || revisionIsNewer(revision, last)) {

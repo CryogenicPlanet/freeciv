@@ -23,6 +23,8 @@ import {
   hasField,
   isJsonArray,
   isJsonObject,
+  isJsonString,
+  isWholeNumber,
   type JsonObject,
   type JsonValue,
 } from 'src/schema/primitives';
@@ -136,7 +138,7 @@ export const orderProperties = (compact: JsonObject): OrderProperties => {
   }
   const declared = isJsonObject(schema) ? field(schema, 'required') : null;
   const required = (isJsonArray(declared) ? declared : []).filter(
-    (name): name is string => typeof name === 'string' && hasField(properties, name)
+    (name): name is string => isJsonString(name) && hasField(properties, name)
   );
   return { properties, required };
 };
@@ -147,8 +149,8 @@ export const orderArrayBounds = (specification: JsonValue): readonly [number, nu
   const minimum = field(specification, 'minItems');
   const maximum = field(specification, 'maxItems');
   return [
-    typeof minimum === 'number' && Number.isInteger(minimum) ? minimum : 0,
-    typeof maximum === 'number' && Number.isInteger(maximum) ? maximum : V2_MAX_ORDER_WORDS,
+    isWholeNumber(minimum) ? minimum : 0,
+    isWholeNumber(maximum) ? maximum : V2_MAX_ORDER_WORDS,
   ];
 };
 
@@ -187,24 +189,20 @@ export const orderArguments = (
   Effect.gen(function* () {
     const { properties, required } = orderProperties(compact);
     const supplied = defaults ?? {};
-    // Null-prototype throughout: every key here is server-supplied (the action's
-    // own `argument_schema`), and CPython's dicts have no inherited names.  A
-    // property called `toString` must bind like any other word, and a property
-    // called `__proto__` must be assignable as data rather than reparenting the
-    // object we are about to put on the wire.
-    const fixed = Object.create(null) as Record<string, JsonValue>;
+    // Maps preserve server-supplied names as data while the arguments are being
+    // assembled. Object.fromEntries then defines even `__proto__` as an own
+    // data property, never as a prototype mutation.
+    const fixed = new Map<string, JsonValue>();
     for (const [name, value] of Object.entries(supplied)) {
-      if (hasField(properties, name)) fixed[name] = value;
+      if (hasField(properties, name)) fixed.set(name, value);
     }
     const hasDefaults = Object.keys(supplied).length > 0;
     if (Object.keys(properties).length === 0) {
       return values.length === 0 && !hasDefaults ? {} : null;
     }
     const names = [
-      ...required.filter((name) => !Object.hasOwn(fixed, name)),
-      ...Object.keys(properties).filter(
-        (name) => !required.includes(name) && !Object.hasOwn(fixed, name)
-      ),
+      ...required.filter((name) => !fixed.has(name)),
+      ...Object.keys(properties).filter((name) => !required.includes(name) && !fixed.has(name)),
     ];
     const arrays = names.filter((name) => isArrayProperty(field(properties, name)));
     if (arrays.length > 1) {
@@ -212,20 +210,22 @@ export const orderArguments = (
       // `just batch --arguments JSON` form still expresses them exactly.
       return null;
     }
-    const args = Object.assign(Object.create(null), fixed) as Record<string, JsonValue>;
-    const tailName = arrays[0];
+    const args = new Map(fixed);
+    const tailName = arrays.at(0);
     if (tailName !== undefined) {
       const head = names.filter((name) => name !== tailName);
       if (values.length < head.length) return null;
       for (let index = 0; index < head.length; index += 1) {
-        const name = head[index] as string;
-        const converted = orderValue(field(properties, name), values[index] as string);
+        const name = head.at(index);
+        const word = values.at(index);
+        if (name === undefined || word === undefined) return null;
+        const converted = orderValue(field(properties, name), word);
         if (converted === ORDER_BAD) return null;
-        args[name] = converted;
+        args.set(name, converted);
       }
       const words = values.slice(head.length);
       const [minimum, maximum] = orderArrayBounds(field(properties, tailName));
-      if (!required.includes(tailName) && words.length === 0) return args;
+      if (!required.includes(tailName) && words.length === 0) return Object.fromEntries(args);
       if (!(minimum <= words.length && words.length <= maximum)) return null;
       const items: JsonValue[] = [];
       for (const word of words) {
@@ -233,18 +233,20 @@ export const orderArguments = (
         if (value === ORDER_BAD) return null;
         items.push(value);
       }
-      args[tailName] = items;
-      return args;
+      args.set(tailName, items);
+      return Object.fromEntries(args);
     }
-    const needed = required.filter((name) => !Object.hasOwn(fixed, name)).length;
+    const needed = required.filter((name) => !fixed.has(name)).length;
     if (!(needed <= values.length && values.length <= names.length)) return null;
     for (let index = 0; index < Math.min(names.length, values.length); index += 1) {
-      const name = names[index] as string;
-      const converted = orderValue(field(properties, name), values[index] as string);
+      const name = names.at(index);
+      const word = values.at(index);
+      if (name === undefined || word === undefined) return null;
+      const converted = orderValue(field(properties, name), word);
       if (converted === ORDER_BAD) return null;
-      args[name] = converted;
+      args.set(name, converted);
     }
-    return args;
+    return Object.fromEntries(args);
   });
 
 // ---------------------------------------------------------------------------
@@ -285,17 +287,15 @@ export const orderMatch = (
 /** Fill an action whose required arguments have exactly one legal value. */
 export const defaultArguments = (compact: JsonObject): JsonObject | null => {
   const { properties, required } = orderProperties(compact);
-  // Null-prototype for the same reason as `_order_arguments`: `required` is the
-  // server's own list, and a required property named `__proto__` must become a
-  // key rather than silently reparenting the arguments object.
-  const args = Object.create(null) as Record<string, JsonValue>;
+  const args = new Map<string, JsonValue>();
   for (const name of required) {
     const specification = field(properties, name);
     const choices = isJsonObject(specification) ? field(specification, 'enum') : null;
-    if (!isJsonArray(choices) || choices.length !== 1) return null;
-    args[name] = choices[0] as JsonValue;
+    const only = isJsonArray(choices) && choices.length === 1 ? choices.at(0) : undefined;
+    if (only === undefined) return null;
+    args.set(name, only);
   }
-  return args;
+  return Object.fromEntries(args);
 };
 
 // ---------------------------------------------------------------------------
@@ -326,9 +326,9 @@ export const namedTargetId = (
       const name = field(target, 'name');
       const identifier = field(target, 'id');
       if (
-        typeof name === 'string' &&
+        isJsonString(name) &&
         casefold(name) === wanted &&
-        typeof identifier === 'string' &&
+        isJsonString(identifier) &&
         identifier !== ''
       ) {
         found.add(identifier);
@@ -368,20 +368,19 @@ export const orderElementResolver = (
         const outcome = yield* Effect.either(expandTileAlias(state, x, y));
         if (Either.isRight(outcome)) return outcome.right;
         if (options.strict) {
-          return yield* Effect.fail(orderUnresolved(outcome.left.message, actorId));
+          return yield*orderUnresolved(outcome.left.message, actorId);
         }
         return ORDER_BAD;
       }
       const identifier = yield* namedTargetId(state, actorId, text, deps);
       if (identifier !== null) return identifier;
       if (options.strict) {
-        return yield* Effect.fail(
+        return yield*
           orderUnresolved(
             `\`${verb}\` takes items this seat has been offered by name; ` +
               `no cached target is named ${text}`,
             actorId
-          )
-        );
+          );
       }
       return ORDER_BAD;
     });

@@ -50,8 +50,10 @@ export const renderGenericItems = (
   if (first !== undefined && flattened.length > 1) {
     for (const key of columns) {
       if (!flattened.every((item) => item.has(key))) continue;
-      const value = first.get(key) as string;
-      if (flattened.every((item) => item.get(key) === value)) constants.set(key, value);
+      const value = first.get(key);
+      if (value !== undefined && flattened.every((item) => item.get(key) === value)) {
+        constants.set(key, value);
+      }
     }
   }
   // A column that is empty, zero or false everywhere carries no decision.
@@ -80,7 +82,7 @@ export const renderGenericItems = (
           `${index + 1}  ` +
           shown
             .filter((key) => item.has(key))
-            .map((key) => `${key}=${item.get(key) as string}`)
+            .map((key) => `${key}=${item.get(key) ?? ''}`)
             .join(' ')
       )
     );

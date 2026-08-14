@@ -15,14 +15,12 @@
  * - the announce line is **byte-compatible** with the header `just wait` printed
  *   before the PvP legibility work, because a harness parses exactly it.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { Command } from '@effect/cli';
 import { BunContext } from '@effect/platform-bun';
 import { afterEach, describe, expect, test } from 'bun:test';
-import { Cause, Effect, Either, Exit, Layer, Option } from 'effect';
+import { Cause, DateTime, Effect, Either, Exit, Layer, Option, Schema } from 'effect';
 import { V2_WAIT_EXIT_RETRY, V2_WAIT_EXIT_TERMINAL } from 'src/exit';
-import { playerError, type PlayerError } from 'src/errors';
+import { PlayerError, playerError } from 'src/errors';
 import {
   commandMonitor,
   holderSince,
@@ -50,7 +48,7 @@ import {
   liveMonitorSeams,
   type MonitorSeams,
 } from 'src/services/monitor-loop';
-import { PrivateFs, type PrivateFsApi } from 'src/services/private-fs';
+import { type PrivateFs, type PrivateFsApi } from 'src/services/private-fs';
 import { httpFor } from 'src/services/http';
 import {
   SessionStore,
@@ -70,16 +68,31 @@ import {
   type Scratch,
 } from 'test/_fixtures';
 import { phaseHealthPayload } from 'test/_fixtures/phase-goldens';
+import { captureEffect } from 'test/_capture';
+import { awaitTest, effectTest, provideTestLayer } from 'test/_effect-test';
+import { fileSystem, path } from 'test/_test-platform';
 
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
 
+type FetchInput = Parameters<typeof fetch>[0];
+type FetchArguments = Parameters<typeof fetch>;
+
+const urlOf = (input: FetchInput): string =>
+  input instanceof Request ? input.url : new URL(input).href;
+
+const completeFetch = (
+  handler: (...args: FetchArguments) => ReturnType<typeof fetch>
+): typeof fetch => Object.assign(handler, { preconnect: fetch.preconnect });
+
 const scratches: Scratch[] = [];
 
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() =>
+  Effect.runPromise(
+    Effect.asVoid(Effect.all(scratches.splice(0).map((scratch) => scratch.cleanup)))
+  )
+);
 
 const stateSchema = {
   empty: emptyV2ClientState,
@@ -96,22 +109,26 @@ interface Bench {
   readonly mirror: string;
 }
 
-const bench = (): Bench => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const sessionPath = path.join(scratch.workspace.stateRoot, 'session-codex-gpt-5.6-sol.json');
-  Effect.runSync(scratch.files.writeJson(sessionPath, sessionFile()));
-  const store = sessionStoreFor(scratch.workspace, scratch.files, stateSchema, {});
-  const loaded = Effect.runSync(store.resolveV2(sessionPath));
-  return {
-    scratch,
-    sessionPath,
-    session: loaded.session,
-    store,
-    files: scratch.files,
-    mirror: Effect.runSync(mirrorDir(sessionPath)),
-  };
-};
+const bench = (): Effect.Effect<Bench> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const sessionPath = path.join(
+      scratch.workspace.stateRoot,
+      'session-codex-gpt-5.6-sol.json'
+    );
+    yield* scratch.files.writeJson(sessionPath, sessionFile());
+    const store = sessionStoreFor(scratch.workspace, scratch.files, stateSchema, {});
+    const loaded = yield* store.resolveV2(sessionPath);
+    return {
+      scratch,
+      sessionPath,
+      session: loaded.session,
+      store,
+      files: scratch.files,
+      mirror: yield* mirrorDir(sessionPath),
+    };
+  }).pipe(Effect.orDie);
 
 /** `PvPWaitInteropTests.wake`, ported. */
 const wakePayload = (
@@ -221,9 +238,7 @@ const scripted = (
             return Effect.die(new Error('the monitor asked for one wake too many'));
           }
           now.seconds += options.advanceS ?? 0;
-          return '_tag' in next && next._tag === 'PlayerError'
-            ? Effect.fail(next)
-            : Effect.succeed(next as WaitEnvelope);
+          return next instanceof PlayerError ? Effect.fail(next) : Effect.succeed(next);
         }),
       runHook: (command, environment) =>
         Effect.sync((): HookOutcome => {
@@ -246,20 +261,16 @@ const scripted = (
  */
 const PROCESS_EXIT = 'monitor-test:process-exit';
 
-interface ProcessExitDefect {
-  readonly _tag: typeof PROCESS_EXIT;
-  readonly status: number;
-}
+const ProcessExitDefectSchema = Schema.Struct({
+  _tag: Schema.Literal(PROCESS_EXIT),
+  status: Schema.Number,
+});
+
+type ProcessExitDefect = Schema.Schema.Type<typeof ProcessExitDefectSchema>;
 
 const exitDefect = (status: number): ProcessExitDefect => ({ _tag: PROCESS_EXIT, status });
 
-const isExitDefect = (value: unknown): value is ProcessExitDefect =>
-  typeof value === 'object' &&
-  value !== null &&
-  '_tag' in value &&
-  value._tag === PROCESS_EXIT &&
-  'status' in value &&
-  typeof value.status === 'number';
+const decodeProcessExitDefect = Schema.decodeUnknownOption(ProcessExitDefectSchema);
 
 const harnessFor = (seams: MonitorSeams, overrides: Partial<MonitorHarness> = {}): MonitorHarness => ({
   seams: () => seams,
@@ -280,11 +291,29 @@ const options = (overrides: Partial<MonitorOptions> = {}): MonitorOptions => ({
 const unusedClient = Layer.succeed(
   V2Client,
   v2ClientFor(
-    httpFor((async () => {
-      throw new Error('a scripted monitor must not touch the network');
-    }) as unknown as typeof fetch)
+    httpFor(
+      completeFetch(() =>
+        Promise.reject(new Error('a scripted monitor must not touch the network'))
+      )
+    )
   )
 );
+
+const wallClock = (
+  year: number,
+  month: number,
+  day: number,
+  hours: number,
+  minutes: number,
+  seconds: number
+): Date =>
+  DateTime.toDate(DateTime.unsafeMake({ year, month, day, hours, minutes, seconds }));
+
+const monitorLayers = (
+  seat: Bench,
+  store: SessionStoreApi
+): Layer.Layer<PrivateFs | SessionStore | V2Client> =>
+  Layer.mergeAll(seat.scratch.layer, Layer.succeed(SessionStore, store), unusedClient);
 
 interface Run {
   readonly code: number;
@@ -293,74 +322,63 @@ interface Run {
   readonly failure: string | null;
 }
 
-const runMonitor = async (
+const runMonitor = (
   seat: Bench,
   seams: MonitorSeams,
   monitorOptions: MonitorOptions,
   harnessOverrides: Partial<MonitorHarness> = {},
   store: SessionStoreApi = seat.store
-): Promise<Run> => {
-  const out: string[] = [];
-  const err: string[] = [];
-  const log = console.log;
-  const error = console.error;
-  console.log = (...parts: ReadonlyArray<unknown>) => out.push(parts.join(' '));
-  console.error = (...parts: ReadonlyArray<unknown>) => err.push(parts.join(' '));
-  try {
-    const either = await Effect.runPromise(
-      Effect.either(
-        Effect.provide(
-          commandMonitor(
-            { ...monitorOptions, session: seat.sessionPath },
-            harnessFor(seams, harnessOverrides),
-            {}
-          ),
-          Layer.mergeAll(
-            Layer.succeed(PrivateFs, seat.files),
-            Layer.succeed(SessionStore, store),
-            unusedClient
-          )
-        )
+): Effect.Effect<Run> =>
+  captureEffect(
+    Effect.either(
+      provideTestLayer(
+        commandMonitor(
+          { ...monitorOptions, session: seat.sessionPath },
+          harnessFor(seams, harnessOverrides),
+          {}
+        ),
+        monitorLayers(seat, store)
       )
-    );
-    return Either.isRight(either)
-      ? { code: either.right, out, err, failure: null }
-      : { code: 2, out, err, failure: either.left.message };
-  } finally {
-    console.log = log;
-    console.error = error;
-  }
-};
+    )
+  ).pipe(
+    Effect.map(({ value, captured }) =>
+      Either.isRight(value)
+        ? { code: value.right, out: captured.out, err: captured.err, failure: null }
+        : { code: 2, out: captured.out, err: captured.err, failure: value.left.message }
+    )
+  );
 
-const markerOf = (seat: Bench): JsonObject | null =>
-  Effect.runSync(Effect.provide(readPhaseMarker(seat.mirror), Layer.succeed(PrivateFs, seat.files)));
+const markerOf = (seat: Bench): Effect.Effect<JsonObject | null> =>
+  provideTestLayer(readPhaseMarker(seat.mirror), seat.scratch.layer).pipe(Effect.orDie);
 
-const monitorLog = (seat: Bench): string => {
-  const file = path.join(seat.mirror, 'state', 'monitor.log');
-  return fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
-};
+const monitorLog = (mirror: string): Effect.Effect<string> =>
+  Effect.gen(function* () {
+    const file = path.join(mirror, 'state', 'monitor.log');
+    if (!(yield* fileSystem.exists(file))) return '';
+    return yield* fileSystem.readFileString(file);
+  }).pipe(Effect.orDie);
 
 // ---------------------------------------------------------------------------
 // The two bindings
 // ---------------------------------------------------------------------------
 
 describe('monitor --once', () => {
-  test('announces the open phase and exits', async () => {
-    const seat = bench();
+  awaitTest('announces the open phase and exits', function* (wait) {
+    const seat = yield* bench();
     const script = scripted([decodedWake(wakePayload('phase_active', { mine: true }), seat.session)]);
-    const result = await runMonitor(seat, script.seams, options({ once: true }));
+    const result = yield* wait(runMonitor(seat, script.seams, options({ once: true })));
     expect(result.code).toBe(0);
     expect(result.out).toHaveLength(1);
   });
 
-  test('keeps the shape two harnesses already parse', async () => {
+  awaitTest('keeps the shape two harnesses already parse', function* (wait) {
     // Byte-identical to the header `just wait` printed before the PvP
     // legibility work, which redesigned the *waiting* line, not this one.
-    const seat = bench();
+    const seat = yield* bench();
     const payload = wakePayload('phase_active', { mine: true });
     const wake = decodedWake(payload, seat.session);
     const script = scripted([wake]);
-    const result = await runMonitor(seat, script.seams, options({ once: true }));
+    const result = yield* wait(runMonitor(seat, script.seams, options({ once: true })));
     expect(result.out[0]).toBe(
       'T3 | woke phase_active | running | ' +
         'phase awaiting_agent t3/p1 active 587s left | next: just turn'
@@ -373,70 +391,68 @@ describe('monitor --once', () => {
     expect(result.out[0]).toBe(monitorAnnounceLine(wake));
   });
 
-  test('a still-theirs wake is the monitors business, not the agents', async () => {
-    const seat = bench();
+  awaitTest('a still-theirs wake is the monitors business, not the agents', function* (wait) {
+    const seat = yield* bench();
     const script = scripted([
       decodedWake(wakePayload('timeout', { mine: false }), seat.session),
       decodedWake(wakePayload('timeout', { mine: false }), seat.session),
       decodedWake(wakePayload('phase_active', { mine: true }), seat.session),
     ]);
-    const result = await runMonitor(seat, script.seams, options({ once: true }));
+    const result = yield* wait(runMonitor(seat, script.seams, options({ once: true })));
     expect(result.code).toBe(0);
     expect(result.out).toHaveLength(1);
   });
 
-  test('--exit-code lets a harness declare how to be told', async () => {
+  awaitTest('--exit-code lets a harness declare how to be told', function* (wait) {
     // pi escalates on non-zero exit; guessing which status is not a plan.
-    const seat = bench();
+    const seat = yield* bench();
     const script = scripted([decodedWake(wakePayload('phase_active', { mine: true }), seat.session)]);
-    const result = await runMonitor(seat, script.seams, options({ once: true, exitCode: 75 }));
+    const result = yield* wait(runMonitor(seat, script.seams, options({ once: true, exitCode: 75 })));
     expect(result.code).toBe(75);
 
     // Any N in [0, 255], not only the four the exit contract names.
     for (const status of [1, 42, 255]) {
-      const again = bench();
+      const again = yield* bench();
       const wake = scripted([
         decodedWake(wakePayload('phase_active', { mine: true }), again.session),
       ]);
-      const escalated = await runMonitor(again, wake.seams, options({ once: true, exitCode: status }));
+      const escalated = yield* wait(runMonitor(again, wake.seams, options({ once: true, exitCode: status })));
       expect(escalated.code).toBe(status);
     }
 
-    const refused = await runMonitor(
+    const refused = yield* wait(runMonitor(
       seat,
       scripted([]).seams,
       options({ once: true, exitCode: 300 })
-    );
+    ));
     expect(refused.failure).toContain('--exit-code');
   });
 
-  test('always answers even on an already-announced phase', async () => {
+  awaitTest('always answers even on an already-announced phase', function* (wait) {
     // A wake-up call that stayed silent would hang the harness for ever.
-    const seat = bench();
+    const seat = yield* bench();
     const payload = wakePayload('phase_active', { mine: true });
-    Effect.runSync(
-      Effect.provide(
-        updatePhaseMarker(seat.mirror, payload['health'], { announced: [0, 3, 1] }),
-        Layer.succeed(PrivateFs, seat.files)
-      )
+    yield* provideTestLayer(
+      updatePhaseMarker(seat.mirror, payload['health'], { announced: [0, 3, 1] }),
+      seat.scratch.layer
     );
     const script = scripted([decodedWake(payload, seat.session)]);
-    const result = await runMonitor(seat, script.seams, options({ once: true }));
+    const result = yield* wait(runMonitor(seat, script.seams, options({ once: true })));
     expect(result.code).toBe(0);
     expect(result.out.join('\n')).toContain('woke phase_active');
   });
 });
 
 describe('the persistent monitor', () => {
-  test('announces every turn until terminal', async () => {
-    const seat = bench();
+  awaitTest('announces every turn until terminal', function* (wait) {
+    const seat = yield* bench();
     const script = scripted([
       decodedWake(wakePayload('phase_active', { mine: true }), seat.session),
       decodedWake(wakePayload('timeout', { mine: false }), seat.session),
       decodedWake(wakePayload('phase_active', { mine: true, turn: 4 }), seat.session),
       decodedWake(wakePayload('game_terminal', { mine: false, gameState: 'completed' }), seat.session),
     ]);
-    const result = await runMonitor(seat, script.seams, options());
+    const result = yield* wait(runMonitor(seat, script.seams, options()));
     expect(result.code).toBe(V2_WAIT_EXIT_TERMINAL);
     expect(result.out).toHaveLength(3);
     expect(result.out[0]).toContain('T3 | woke phase_active');
@@ -444,18 +460,18 @@ describe('the persistent monitor', () => {
     expect(result.out[2]).toContain('GAME OVER');
   });
 
-  test('a second one is a no-op that reports the first', async () => {
+  awaitTest('a second one is a no-op that reports the first', function* (wait) {
     // Singleton by kernel lock, not by bookkeeping.
-    const seat = bench();
-    const result = await Effect.runPromise(
-      Effect.provide(
+    const seat = yield* bench();
+    const result = yield* wait(
+      provideTestLayer(
         withMonitorLock(seat.sessionPath, { pid: 41207, since: '16:21:04', game_id: 'g' }, (first) =>
-          Effect.promise(async () => {
+          Effect.gen(function* () {
             expect(first).toBeNull();
-            return runMonitor(seat, scripted([]).seams, options());
+            return yield* runMonitor(seat, scripted([]).seams, options());
           })
         ),
-        Layer.succeed(PrivateFs, seat.files)
+        seat.scratch.layer
       )
     );
     expect(result.code).toBe(0);
@@ -464,68 +480,66 @@ describe('the persistent monitor', () => {
     expect(result.out.join('\n')).toContain('since 16:21:04');
   });
 
-  test('--once takes no lock, so the two bindings compose', async () => {
-    const seat = bench();
+  awaitTest('--once takes no lock, so the two bindings compose', function* (wait) {
+    const seat = yield* bench();
     const script = scripted([decodedWake(wakePayload('phase_active', { mine: true }), seat.session)]);
-    const result = await Effect.runPromise(
-      Effect.provide(
+    const result = yield* wait(
+      provideTestLayer(
         withMonitorLock(seat.sessionPath, { pid: 4242 }, () =>
-          Effect.promise(async () => runMonitor(seat, script.seams, options({ once: true })))
+          runMonitor(seat, script.seams, options({ once: true }))
         ),
-        Layer.succeed(PrivateFs, seat.files)
+        seat.scratch.layer
       )
     );
     expect(result.code).toBe(0);
     expect(result.out.join('\n')).not.toContain('already running');
   });
 
-  test('a restarted one does not repeat a turn', async () => {
+  awaitTest('a restarted one does not repeat a turn', function* (wait) {
     // Process-singleton is not enough; the announcement must dedupe too.
-    const seat = bench();
+    const seat = yield* bench();
     const openPhase = wakePayload('phase_active', { mine: true });
     const terminal = wakePayload('game_terminal', { mine: false, gameState: 'completed' });
-    const first = await runMonitor(
+    const first = yield* wait(runMonitor(
       seat,
       scripted([decodedWake(openPhase, seat.session), decodedWake(terminal, seat.session)]).seams,
       options()
-    );
+    ));
     expect(first.out.join('\n')).toContain('T3 | woke phase_active');
-    expect(markerOf(seat)?.['announced']).toEqual([0, 3, 1]);
+    expect((yield* markerOf(seat))?.['announced']).toEqual([0, 3, 1]);
 
     // Restarted onto the same still-open phase, it says nothing about it and
     // waits for the next one.
-    const second = await runMonitor(
+    const second = yield* wait(runMonitor(
       seat,
       scripted([decodedWake(openPhase, seat.session), decodedWake(terminal, seat.session)]).seams,
       options()
-    );
+    ));
     expect(second.out.join('\n')).not.toContain('woke phase_active');
     expect(second.out.join('\n')).toContain('GAME OVER');
   });
 
-  test('a rollback replays the turn and is announced again', async () => {
+  awaitTest('a rollback replays the turn and is announced again', function* (wait) {
     // The incarnation is in the tuple because a replayed turn is new.
-    const seat = bench();
-    Effect.runSync(
-      Effect.provide(
-        updatePhaseMarker(seat.mirror, phaseHealthPayload({ mine: true }), {
-          announced: [0, 3, 1],
-        }),
-        Layer.succeed(PrivateFs, seat.files)
-      )
+    const seat = yield* bench();
+    yield* provideTestLayer(
+      updatePhaseMarker(seat.mirror, phaseHealthPayload({ mine: true }), {
+        announced: [0, 3, 1],
+      }),
+      seat.scratch.layer
     );
     const replayed = wakePayload(
       'phase_active',
       { mine: true },
       ownEnd({ incarnation: 1, turn: 2, phase: 1, source: 'agent', orders: 4 })
     );
-    const result = await runMonitor(
+    const result = yield* wait(runMonitor(
       seat,
       scripted([decodedWake(replayed, seat.session)]).seams,
       options({ once: true })
-    );
+    ));
     expect(result.out.join('\n')).toContain('woke phase_active');
-    expect(markerOf(seat)?.['announced']).toEqual([1, 3, 1]);
+    expect((yield* markerOf(seat))?.['announced']).toEqual([1, 3, 1]);
   });
 });
 
@@ -534,21 +548,21 @@ describe('the persistent monitor', () => {
 // ---------------------------------------------------------------------------
 
 describe('the missed-turn alarm', () => {
-  test('a turn that opened and died unplayed raises it', async () => {
+  awaitTest('a turn that opened and died unplayed raises it', function* (wait) {
     // The exact failure this whole surface exists for: a machine that slept
     // through a phase gets told so, and nothing else in the workspace is
     // positioned to notice.
-    const seat = bench();
+    const seat = yield* bench();
     const missed = wakePayload(
       'phase_active',
       { mine: true, turn: 6 },
       ownEnd({ turn: 5, phase: 1, source: 'timeout', orders: 0 })
     );
-    const result = await runMonitor(
+    const result = yield* wait(runMonitor(
       seat,
       scripted([decodedWake(missed, seat.session)]).seams,
       options({ once: true })
-    );
+    ));
     expect(result.out[0]).toBe(
       'T5 | MISSED | your phase t5/p1 opened and was ended by timeout after 600s — ' +
         'you issued no orders'
@@ -557,9 +571,9 @@ describe('the missed-turn alarm', () => {
     expect(result.out[1]).toContain('T6 | woke phase_active');
   });
 
-  test('a second consecutive miss escalates its wording', async () => {
+  awaitTest('a second consecutive miss escalates its wording', function* (wait) {
     // Two phases lost in a row means the notification path itself is broken.
-    const seat = bench();
+    const seat = yield* bench();
     const reconnect = (openTurn: number, endedTurn: number, source = 'timeout'): WaitEnvelope =>
       decodedWake(
         wakePayload(
@@ -584,7 +598,7 @@ describe('the missed-turn alarm', () => {
       reconnect(8, 7),
       decodedWake(wakePayload('game_terminal', { mine: false, gameState: 'completed' }), seat.session),
     ]);
-    const result = await runMonitor(seat, script.seams, options());
+    const result = yield* wait(runMonitor(seat, script.seams, options()));
     const text = result.out.join('\n');
     expect(text).toContain('T5 | MISSED | your phase t5/p1');
     expect(text).not.toContain('MISSED ×2 | your phase t5');
@@ -595,9 +609,9 @@ describe('the missed-turn alarm', () => {
     );
   });
 
-  test('a turn the agent was told about and ignored is not a miss', async () => {
+  awaitTest('a turn the agent was told about and ignored is not a miss', function* (wait) {
     // The alarm is "nothing reached you", not "you played badly".
-    const seat = bench();
+    const seat = yield* bench();
     const script = scripted([
       decodedWake(wakePayload('phase_active', { mine: true, turn: 6 }), seat.session),
       decodedWake(
@@ -610,23 +624,23 @@ describe('the missed-turn alarm', () => {
       ),
       decodedWake(wakePayload('game_terminal', { mine: false, gameState: 'completed' }), seat.session),
     ]);
-    const result = await runMonitor(seat, script.seams, options());
+    const result = yield* wait(runMonitor(seat, script.seams, options()));
     expect(result.out.join('\n')).not.toContain('MISSED');
   });
 
-  test('a phase this seat ended itself is never a missed turn', async () => {
+  awaitTest('a phase this seat ended itself is never a missed turn', function* (wait) {
     // `--await` opening a turn the monitor never announced is normal.
-    const seat = bench();
+    const seat = yield* bench();
     const played = wakePayload(
       'phase_active',
       { mine: true, turn: 6 },
       ownEnd({ turn: 5, phase: 1, source: 'agent', orders: 4, elapsedS: 32.0 })
     );
-    const result = await runMonitor(
+    const result = yield* wait(runMonitor(
       seat,
       scripted([decodedWake(played, seat.session)]).seams,
       options({ once: true })
-    );
+    ));
     expect(result.out.join('\n')).not.toContain('MISSED');
   });
 
@@ -652,47 +666,47 @@ describe('the missed-turn alarm', () => {
 // ---------------------------------------------------------------------------
 
 describe('a transport fault', () => {
-  test('is retried with backoff, not raised', async () => {
+  awaitTest('is retried with backoff, not raised', function* (wait) {
     // A laptop sleep is what a left-running monitor exists to survive.
-    const seat = bench();
+    const seat = yield* bench();
     const script = scripted([
       playerError('connection reset'),
       playerError('connection reset'),
       decodedWake(wakePayload('phase_active', { mine: true }), seat.session),
     ]);
-    const result = await runMonitor(seat, script.seams, options({ once: true }));
+    const result = yield* wait(runMonitor(seat, script.seams, options({ once: true })));
     expect(result.code).toBe(0);
     expect(script.slept).toEqual([V2_MONITOR_BACKOFF_START_S, V2_MONITOR_BACKOFF_START_S * 2]);
     expect(result.err.join('\n')).toContain('retrying after connection reset');
     expect(result.out.join('\n')).toContain('woke phase_active');
   });
 
-  test('the backoff is capped so a dead service is not hammered', async () => {
-    const seat = bench();
+  awaitTest('the backoff is capped so a dead service is not hammered', function* (wait) {
+    const seat = yield* bench();
     const script = scripted([
       ...Array.from({ length: 8 }, () => playerError('down')),
       decodedWake(wakePayload('phase_active', { mine: true }), seat.session),
     ]);
-    await runMonitor(seat, script.seams, options({ once: true }));
+    yield* wait(runMonitor(seat, script.seams, options({ once: true })));
     expect(Math.max(...script.slept)).toBe(V2_MONITOR_BACKOFF_MAX_S);
     expect(script.slept.at(-1)).toBe(V2_MONITOR_BACKOFF_MAX_S);
   });
 
-  test('a rebound workspace stops the monitor', async () => {
+  awaitTest('a rebound workspace stops the monitor', function* (wait) {
     // A monitor must never watch a game the workspace has left.
-    const seat = bench();
+    const seat = yield* bench();
     const other = path.join(seat.scratch.workspace.stateRoot, 'other-seat.json');
     const rebound: SessionStoreApi = {
       ...seat.store,
       resolve: () => Effect.succeed({ path: other, session: seat.session }),
     };
-    const result = await runMonitor(
+    const result = yield* wait(runMonitor(
       seat,
       scripted([]).seams,
       options({ once: true }),
       {},
       rebound
-    );
+    ));
     expect(result.code).toBe(0);
     expect(result.out.join('\n')).toContain('rebound to another seat');
   });
@@ -703,8 +717,8 @@ describe('a transport fault', () => {
 // ---------------------------------------------------------------------------
 
 describe('--max-s', () => {
-  test('gives up with EX_TEMPFAIL once the phase is still not yours', async () => {
-    const seat = bench();
+  awaitTest('gives up with EX_TEMPFAIL once the phase is still not yours', function* (wait) {
+    const seat = yield* bench();
     const script = scripted(
       [
         decodedWake(wakePayload('timeout', { mine: false }), seat.session),
@@ -712,10 +726,10 @@ describe('--max-s', () => {
       ],
       { advanceS: 20 }
     );
-    const result = await runMonitor(seat, script.seams, options({ maxS: 30 }));
+    const result = yield* wait(runMonitor(seat, script.seams, options({ maxS: 30 })));
     expect(result.code).toBe(V2_WAIT_EXIT_RETRY);
     expect(result.err.join('\n')).toContain('--max-s elapsed and the phase is still not yours');
-    expect(monitorLog(seat)).toContain('stopped: --max-s elapsed');
+    expect(yield* monitorLog(seat.mirror)).toContain('stopped: --max-s elapsed');
     // The remaining budget is handed to the wait as its cap, never exceeded.
     expect(script.calls[0]?.capS).toBe(30);
     expect(script.calls[1]?.capS).toBe(10);
@@ -727,57 +741,55 @@ describe('--max-s', () => {
 // ---------------------------------------------------------------------------
 
 describe('the channels', () => {
-  test('every announcement reaches the marker and the log', async () => {
-    const seat = bench();
-    await runMonitor(
+  awaitTest('every announcement reaches the marker and the log', function* (wait) {
+    const seat = yield* bench();
+    yield* wait(runMonitor(
       seat,
       scripted([decodedWake(wakePayload('phase_active', { mine: true }), seat.session)]).seams,
       options({ once: true })
-    );
-    const marker = markerOf(seat);
+    ));
+    const marker = yield* markerOf(seat);
     expect(marker?.['active']).toBe(true);
     expect(marker?.['announced']).toEqual([0, 3, 1]);
-    const log = monitorLog(seat);
+    const log = yield* monitorLog(seat.mirror);
     expect(log).toContain('monitor started --once');
     expect(log).toContain('woke phase_active');
 
     // Append-only: a second run adds to it rather than replacing it.
-    await runMonitor(
+    yield* wait(runMonitor(
       seat,
       scripted([
         decodedWake(wakePayload('game_terminal', { mine: false, gameState: 'completed' }), seat.session),
       ]).seams,
       options({ once: true })
-    );
-    const grown = monitorLog(seat);
+    ));
+    const grown = yield* monitorLog(seat.mirror);
     expect(grown.startsWith(log)).toBe(true);
     expect(grown).toContain('GAME OVER');
   });
 
-  test('the monitor writes the marker and nothing else', async () => {
+  awaitTest('the monitor writes the marker and nothing else', function* (wait) {
     // A process alive for the whole game is not a second writer of the
     // projections a real command owns.
-    const seat = bench();
-    await runMonitor(
+    const seat = yield* bench();
+    yield* wait(runMonitor(
       seat,
       scripted([decodedWake(wakePayload('phase_active', { mine: true }), seat.session)]).seams,
       options({ once: true })
-    );
-    expect(fs.readdirSync(path.join(seat.mirror, 'state')).sort()).toEqual([
-      'monitor.log',
-      'phase.json',
-    ]);
+    ));
+    const entries = yield* fileSystem.readDirectory(path.join(seat.mirror, 'state'));
+    expect([...entries].toSorted()).toEqual(['monitor.log', 'phase.json']);
   });
 
-  test('--json prints the wake object, byte-identical to wait --json', async () => {
-    const seat = bench();
+  awaitTest('--json prints the wake object, byte-identical to wait --json', function* (wait) {
+    const seat = yield* bench();
     const payload = wakePayload('phase_active', { mine: true });
     const wake = decodedWake(payload, seat.session);
-    const result = await runMonitor(
+    const result = yield* wait(runMonitor(
       seat,
       scripted([wake]).seams,
       options({ once: true, json: true })
-    );
+    ));
     expect(result.out).toHaveLength(1);
     expect(JSON.parse(result.out.join('\n'))).toEqual(payload);
     // The same bytes `printV2Json` gives `wait --json` for the same wake.
@@ -790,10 +802,10 @@ describe('the channels', () => {
 // ---------------------------------------------------------------------------
 
 describe('read-only', () => {
-  test('the loop asks for a stateless, for-turn wait and nothing else', async () => {
-    const seat = bench();
+  awaitTest('the loop asks for a stateless, for-turn wait and nothing else', function* (wait) {
+    const seat = yield* bench();
     const script = scripted([decodedWake(wakePayload('phase_active', { mine: true }), seat.session)]);
-    await runMonitor(seat, script.seams, options({ once: true }));
+    yield* wait(runMonitor(seat, script.seams, options({ once: true })));
     expect(script.calls).toHaveLength(1);
     // `stateless` is what makes it incapable of racing: no `.v2-state` read,
     // no revision cursor, no lock a real command needs.
@@ -802,26 +814,26 @@ describe('read-only', () => {
     expect(script.calls[0]?.mirror).toBeDefined();
   });
 
-  test('the live seams reach no write path at all', () => {
+  effectTest('the live seams reach no write path at all', () => Effect.gen(function* () {
     // The wait engine's three write hooks — remember the page (U03), mirror the
     // page (U04/U07), rewrite the header (U04) — are all inert for the monitor.
     // If a future edit wires one of them up, this fails.
-    const seat = bench();
+    const seat = yield* bench();
     const seams = liveMonitorSeams(seat.sessionPath, seat.session, systemWaitClock);
-    expect(typeof seams.waitUntilTurn).toBe('function');
+    expect(seams.waitUntilTurn).toEqual(expect.any(Function));
     expect(seams.clock).toBe(systemWaitClock);
-  });
+  }));
 
-  test('never reads or writes the revision cursor', async () => {
+  awaitTest('never reads or writes the revision cursor', function* () {
     // Staying in phase mode is what makes it incapable of racing.  This one
     // runs the *real* wait engine over a fake supervisor, so the request URL
     // and the state file are both observable.
-    const seat = bench();
+    const seat = yield* bench();
     const urls: string[] = [];
-    const fetchImpl = (async (input: Parameters<typeof fetch>[0]): Promise<Response> => {
-      urls.push(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
-      return jsonResponse(wakePayload('phase_active', { mine: true }));
-    }) as typeof fetch;
+    const fetchImpl = completeFetch((input) => {
+      urls.push(urlOf(input));
+      return Promise.resolve(jsonResponse(wakePayload('phase_active', { mine: true })));
+    });
 
     const reads: string[] = [];
     const guarded: SessionStoreApi = {
@@ -836,47 +848,39 @@ describe('read-only', () => {
       },
     };
 
-    const out: string[] = [];
-    const log = console.log;
-    const error = console.error;
-    console.log = (...parts: ReadonlyArray<unknown>) => out.push(parts.join(' '));
-    console.error = () => undefined;
-    try {
-      const code = await Effect.runPromise(
-        Effect.provide(
-          commandMonitor(
-            { ...options({ once: true }), session: seat.sessionPath },
-            {
-              seams: (sessionPath, session) => liveMonitorSeams(sessionPath, session, systemWaitClock),
-              kill: () => Effect.succeed('signalled'),
-              clock: systemWaitClock,
-              pid: () => 1,
-              since: () => holderSince(new Date(0)),
-              exitProcess: (status) => Effect.die(exitDefect(status)),
-            },
-            {}
-          ),
-          Layer.mergeAll(
-            Layer.succeed(PrivateFs, seat.files),
-            Layer.succeed(SessionStore, guarded),
-            Layer.succeed(V2Client, v2ClientFor(httpFor(fetchImpl), () => Effect.void))
-          )
+    const { value: code, captured } = yield* captureEffect(
+      provideTestLayer(
+        commandMonitor(
+          { ...options({ once: true }), session: seat.sessionPath },
+          {
+            seams: (sessionPath, session) => liveMonitorSeams(sessionPath, session, systemWaitClock),
+            kill: () => Effect.succeed('signalled'),
+            clock: systemWaitClock,
+            pid: () => 1,
+            since: () => holderSince(wallClock(1970, 1, 1, 0, 0, 0)),
+            exitProcess: (status) => Effect.die(exitDefect(status)),
+          },
+          {}
+        ),
+        Layer.mergeAll(
+          seat.scratch.layer,
+          Layer.succeed(SessionStore, guarded),
+          Layer.succeed(V2Client, v2ClientFor(httpFor(fetchImpl), () => Effect.void))
         )
-      );
-      expect(code).toBe(0);
-    } finally {
-      console.log = log;
-      console.error = error;
-    }
-    expect(out.join('\n')).toContain('woke phase_active');
+      )
+    );
+    expect(code).toBe(0);
+    expect(captured.out.join('\n')).toContain('woke phase_active');
     expect(urls[0]).toContain('until=phase');
     expect(urls.some((url) => url.includes('after_state_token'))).toBe(false);
     // `.v2-state` is neither read nor written: the cache the real commands
     // race over is never opened.
     expect(reads).toEqual([]);
-    expect(fs.existsSync(path.join(seat.scratch.workspace.stateRoot, 'session-codex-gpt-5.6-sol.v2-state'))).toBe(
-      false
-    );
+    expect(
+      yield* fileSystem.exists(
+        path.join(seat.scratch.workspace.stateRoot, 'session-codex-gpt-5.6-sol.v2-state')
+      )
+    ).toBe(false);
   });
 });
 
@@ -885,19 +889,19 @@ describe('read-only', () => {
 // ---------------------------------------------------------------------------
 
 /** Enough environment for `/bin/sh` and nothing this workspace cares about. */
-const quietEnvironment = (): Record<string, string> => ({
-  PATH: process.env['PATH'] ?? '/usr/bin:/bin',
-});
+const QUIET_PATH = '/usr/bin:/bin';
+
+const quietEnvironment = () => ({ PATH: QUIET_PATH } satisfies Readonly<Record<string, string>>);
 
 describe('--exec', () => {
-  test('runs a hook with the game in its environment', async () => {
-    const seat = bench();
+  awaitTest('runs a hook with the game in its environment', function* (wait) {
+    const seat = yield* bench();
     const script = scripted([decodedWake(wakePayload('phase_active', { mine: true }), seat.session)]);
-    const result = await runMonitor(
+    const result = yield* wait(runMonitor(
       seat,
       script.seams,
       options({ once: true, exec: 'notify-me' })
-    );
+    ));
     expect(result.code).toBe(0);
     expect(script.hooks).toHaveLength(1);
     expect(script.hooks[0]?.command).toBe('notify-me');
@@ -919,16 +923,16 @@ describe('--exec', () => {
     });
     // Every hook invocation is recorded with its string: the log is what makes
     // a contract violation auditable after the fact.
-    expect(monitorLog(seat)).toContain('exec notify-me');
+    expect(yield* monitorLog(seat.mirror)).toContain('exec notify-me');
   });
 
-  test('names the holder when the phase is somebody elses', async () => {
-    const seat = bench();
+  awaitTest('names the holder when the phase is somebody elses', function* (wait) {
+    const seat = yield* bench();
     const script = scripted([
       decodedWake(wakePayload('timeout', { mine: false }), seat.session),
       decodedWake(wakePayload('game_terminal', { mine: false, gameState: 'completed' }), seat.session),
     ]);
-    await runMonitor(seat, script.seams, options({ exec: 'notify-me' }));
+    yield* wait(runMonitor(seat, script.seams, options({ exec: 'notify-me' })));
     // Only the terminal wake reaches the hook: a still-theirs timeout is not an
     // announcement.
     expect(script.hooks).toHaveLength(1);
@@ -936,33 +940,33 @@ describe('--exec', () => {
     expect(script.hooks[0]?.environment['FREECIV_TURN']).toBe('');
   });
 
-  test('a failing hook is reported and never stops the monitor', async () => {
-    const seat = bench();
+  awaitTest('a failing hook is reported and never stops the monitor', function* (wait) {
+    const seat = yield* bench();
     const script = scripted([decodedWake(wakePayload('phase_active', { mine: true }), seat.session)], {
       hookStatus: 3,
     });
-    const result = await runMonitor(seat, script.seams, options({ once: true, exec: 'boom' }));
+    const result = yield* wait(runMonitor(seat, script.seams, options({ once: true, exec: 'boom' })));
     expect(result.code).toBe(0);
     expect(result.err.join('\n')).toContain('--exec exited 3');
-    expect(monitorLog(seat)).toContain('exec exited 3');
+    expect(yield* monitorLog(seat.mirror)).toContain('exec exited 3');
   });
 
-  test('a hook that cannot start is reported and never stops the monitor', async () => {
-    const seat = bench();
+  awaitTest('a hook that cannot start is reported and never stops the monitor', function* (wait) {
+    const seat = yield* bench();
     const script = scripted([decodedWake(wakePayload('phase_active', { mine: true }), seat.session)], {
       hookThrows: 'no such file',
     });
-    const result = await runMonitor(seat, script.seams, options({ once: true, exec: 'nope' }));
+    const result = yield* wait(runMonitor(seat, script.seams, options({ once: true, exec: 'nope' })));
     expect(result.code).toBe(0);
     expect(result.err.join('\n')).toContain('--exec did not run: no such file');
-    expect(monitorLog(seat)).toContain('exec failed to start: no such file');
+    expect(yield* monitorLog(seat.mirror)).toContain('exec failed to start: no such file');
   });
 
-  test('a hook that plays the game is refused', async () => {
+  awaitTest('a hook that plays the game is refused', function* (wait) {
     // `--exec 'just do ... --end'` is an autoplay bot in one flag.  Imperfect
     // by design — a wrapper script defeats it — but it turns a silent contract
     // violation into a deliberate bypass.
-    const seat = bench();
+    const seat = yield* bench();
     for (const hook of [
       'just do "u1 fortify" --end',
       'just turn --end --await',
@@ -970,7 +974,7 @@ describe('--exec', () => {
       'sleep 1; just retry --batch-id b',
       'notify && just start',
     ]) {
-      const result = await runMonitor(seat, scripted([]).seams, options({ once: true, exec: hook }));
+      const result = yield* wait(runMonitor(seat, scripted([]).seams, options({ once: true, exec: hook })));
       expect(result.failure).toContain('never plays');
     }
   });
@@ -986,46 +990,35 @@ describe('--exec', () => {
     }
   });
 
-  // -------------------------------------------------------------------------
-  // A hook killed by a signal
-  // -------------------------------------------------------------------------
-  //
-  // `_run_monitor_hook` reports `completed.returncode`, which CPython makes the
-  // *negated* signal number when the child dies by a signal.  A long-lived
-  // monitor meets this on ordinary paths — `timeout 5 notify-send …`, a SIGPIPE
-  // down a closed pager, an OOM kill, a segfaulting notifier — and `state/
-  // monitor.log` is the auditable record of every invocation, so a non-status
-  // written there defeats the file's purpose.
-
-  test('a signalled hook is reported as CPythons negative signal number', async () => {
+  awaitTest('a signalled hook is reported as CPythons negative signal number', function* (wait) {
     // python3 -c 'subprocess.run("kill -TERM $$", shell=True).returncode' → -15
-    const seat = bench();
+    const seat = yield* bench();
     const script = scripted([decodedWake(wakePayload('phase_active', { mine: true }), seat.session)], {
       hookStatus: -15,
     });
-    const result = await runMonitor(seat, script.seams, options({ once: true, exec: 'boom' }));
+    const result = yield* wait(runMonitor(seat, script.seams, options({ once: true, exec: 'boom' })));
     expect(result.code).toBe(0);
     expect(result.err.join('\n')).toContain('--exec exited -15');
-    expect(monitorLog(seat)).toContain('exec exited -15');
+    expect(yield* monitorLog(seat.mirror)).toContain('exec exited -15');
   });
 
-  test('shellHookRunner numbers a signalled hook the way subprocess.run does', async () => {
+  awaitTest('shellHookRunner numbers a signalled hook the way subprocess.run does', function* () {
     // Bun's `.d.ts` declares `exitCode: number`, but the runtime hands back
     // `null` with `signalCode: 'SIGTERM'` here, so `tsc` cannot catch a
     // straight passthrough — only this test can.
-    const outcome = await Effect.runPromise(shellHookRunner('kill -TERM $$', quietEnvironment()));
+    const outcome = yield* shellHookRunner('kill -TERM $$', quietEnvironment());
     expect(outcome).toEqual({ _tag: 'exited', status: -15 });
 
-    const segv = await Effect.runPromise(shellHookRunner('kill -SEGV $$', quietEnvironment()));
+    const segv = yield* shellHookRunner('kill -SEGV $$', quietEnvironment());
     expect(segv).toEqual({ _tag: 'exited', status: -11 });
   });
 
-  test('shellHookRunner still reports an ordinary exit as itself', async () => {
-    expect(await Effect.runPromise(shellHookRunner('exit 3', quietEnvironment()))).toEqual({
+  awaitTest('shellHookRunner still reports an ordinary exit as itself', function* () {
+    expect(yield* shellHookRunner('exit 3', quietEnvironment())).toEqual({
       _tag: 'exited',
       status: 3,
     });
-    expect(await Effect.runPromise(shellHookRunner('true', quietEnvironment()))).toEqual({
+    expect(yield* shellHookRunner('true', quietEnvironment())).toEqual({
       _tag: 'exited',
       status: 0,
     });
@@ -1051,24 +1044,22 @@ describe('--exec', () => {
 // ---------------------------------------------------------------------------
 
 describe('--status', () => {
-  test('reports the running monitor and what it watches', async () => {
-    const seat = bench();
-    const idle = await runMonitor(seat, scripted([]).seams, options({ status: true }));
+  awaitTest('reports the running monitor and what it watches', function* (wait) {
+    const seat = yield* bench();
+    const idle = yield* wait(runMonitor(seat, scripted([]).seams, options({ status: true })));
     expect(idle.code).toBe(V2_WAIT_EXIT_RETRY);
     expect(idle.out.join('\n')).toContain('monitor not running');
 
-    Effect.runSync(
-      Effect.provide(
-        updatePhaseMarker(seat.mirror, phaseHealthPayload({ mine: false })),
-        Layer.succeed(PrivateFs, seat.files)
-      )
+    yield* provideTestLayer(
+      updatePhaseMarker(seat.mirror, phaseHealthPayload({ mine: false })),
+      seat.scratch.layer
     );
-    const running = await Effect.runPromise(
-      Effect.provide(
+    const running = yield* wait(
+      provideTestLayer(
         withMonitorLock(seat.sessionPath, { pid: 41207, since: '16:21:04' }, () =>
-          Effect.promise(async () => runMonitor(seat, scripted([]).seams, options({ status: true })))
+          runMonitor(seat, scripted([]).seams, options({ status: true }))
         ),
-        Layer.succeed(PrivateFs, seat.files)
+        seat.scratch.layer
       )
     );
     expect(running.code).toBe(0);
@@ -1081,19 +1072,19 @@ describe('--status', () => {
 });
 
 describe('--stop', () => {
-  test('says so when nothing is running', async () => {
-    const seat = bench();
-    const result = await runMonitor(seat, scripted([]).seams, options({ stop: true }));
+  awaitTest('says so when nothing is running', function* (wait) {
+    const seat = yield* bench();
+    const result = yield* wait(runMonitor(seat, scripted([]).seams, options({ stop: true })));
     expect(result.code).toBe(0);
     expect(result.out.join('\n')).toContain('monitor not running');
   });
 
-  test('signals the monitor and confirms it released', async () => {
-    const seat = bench();
+  awaitTest('signals the monitor and confirms it released', function* (wait) {
+    const seat = yield* bench();
     const released: number[] = [];
-    const lock = Effect.provide(
-      withMonitorLock(seat.sessionPath, { pid: 4242 }, () =>
-        Effect.promise(async () =>
+    const held = yield* wait(
+      provideTestLayer(
+        withMonitorLock(seat.sessionPath, { pid: 4242 }, () =>
           runMonitor(seat, scripted([]).seams, options({ stop: true }), {
             // The real monitor exits on SIGTERM, which releases the flock; the
             // test releases it by leaving the `withMonitorLock` scope, so the
@@ -1105,64 +1096,59 @@ describe('--stop', () => {
                 return 'signalled';
               }),
           })
-        )
-      ),
-      Layer.succeed(PrivateFs, seat.files)
+        ),
+        seat.scratch.layer
+      )
     );
     // Inside the scope the lock is still held, so `--stop` must time out.
-    const held = await Effect.runPromise(lock);
     expect(released).toEqual([4242]);
     expect(held.failure).toContain('did not stop within 5s');
 
     // With the holder gone, the same call confirms the release.
-    const gone = await runMonitor(seat, scripted([]).seams, options({ stop: true }));
+    const gone = yield* wait(runMonitor(seat, scripted([]).seams, options({ stop: true })));
     expect(gone.code).toBe(0);
     expect(gone.out.join('\n')).toContain('monitor not running');
   }, 20_000);
 
-  test('stopping an already-dead monitor is not an error', async () => {
-    const seat = bench();
-    const result = await Effect.runPromise(
-      Effect.provide(
+  awaitTest('stopping an already-dead monitor is not an error', function* (wait) {
+    const seat = yield* bench();
+    const result = yield* wait(
+      provideTestLayer(
         withMonitorLock(seat.sessionPath, { pid: 4242 }, () =>
-          Effect.promise(async () =>
-            runMonitor(seat, scripted([]).seams, options({ stop: true }), {
-              kill: () => Effect.succeed('gone'),
-            })
-          )
+          runMonitor(seat, scripted([]).seams, options({ stop: true }), {
+            kill: () => Effect.succeed('gone'),
+          })
         ),
-        Layer.succeed(PrivateFs, seat.files)
+        seat.scratch.layer
       )
     );
     expect(result.code).toBe(0);
     expect(result.out.join('\n')).toContain('monitor not running');
   });
 
-  test('a lock that names no process refuses rather than guessing', async () => {
-    const seat = bench();
-    const result = await Effect.runPromise(
-      Effect.provide(
+  awaitTest('a lock that names no process refuses rather than guessing', function* (wait) {
+    const seat = yield* bench();
+    const result = yield* wait(
+      provideTestLayer(
         withMonitorLock(seat.sessionPath, { since: '16:21:04' }, () =>
-          Effect.promise(async () => runMonitor(seat, scripted([]).seams, options({ stop: true })))
+          runMonitor(seat, scripted([]).seams, options({ stop: true }))
         ),
-        Layer.succeed(PrivateFs, seat.files)
+        seat.scratch.layer
       )
     );
     expect(result.failure).toContain('does not name a process to stop');
   });
 
-  test('a monitor owned by another user is named, not silently ignored', async () => {
-    const seat = bench();
-    const result = await Effect.runPromise(
-      Effect.provide(
+  awaitTest('a monitor owned by another user is named, not silently ignored', function* (wait) {
+    const seat = yield* bench();
+    const result = yield* wait(
+      provideTestLayer(
         withMonitorLock(seat.sessionPath, { pid: 4242 }, () =>
-          Effect.promise(async () =>
-            runMonitor(seat, scripted([]).seams, options({ stop: true }), {
-              kill: () => Effect.succeed('forbidden'),
-            })
-          )
+          runMonitor(seat, scripted([]).seams, options({ stop: true }), {
+            kill: () => Effect.succeed('forbidden'),
+          })
         ),
-        Layer.succeed(PrivateFs, seat.files)
+        seat.scratch.layer
       )
     );
     expect(result.failure).toBe('the monitor (pid 4242) belongs to another user');
@@ -1178,41 +1164,39 @@ describe('--stop', () => {
 // ---------------------------------------------------------------------------
 
 describe('the wake lines', () => {
-  test('a wake that carries a revision stamps it after the turn', () => {
+  effectTest('a wake that carries a revision stamps it after the turn', () => Effect.gen(function* () {
     // The monitor itself can never reach this branch — it always waits in phase
     // mode, and `until=phase` with a non-null `state_revision` is a broken wake
     // contract — but the line is shared, so the stamp is pinned here.
-    const seat = bench();
-    const wake = Effect.runSync(
-      decodeWait(
-        waitPayload({
-          wake_reason: 'revision_changed',
-          health: phaseHealthPayload({ mine: true }),
-          state_revision: { turn: 5, revision: 12, state_token: 'token_5_12' },
-        }),
-        seat.session,
-        { until: 'revision', afterStateToken: 'token_5_11' }
-      )
+    const seat = yield* bench();
+    const wake = yield* decodeWait(
+      waitPayload({
+        wake_reason: 'revision_changed',
+        health: phaseHealthPayload({ mine: true }),
+        state_revision: { turn: 5, revision: 12, state_token: 'token_5_12' },
+      }),
+      seat.session,
+      { until: 'revision', afterStateToken: 'token_5_11' }
     );
     expect(monitorAnnounceLine(wake)).toBe(
       'T3 rev12/t5 | woke revision_changed | running | ' +
         'phase awaiting_agent t3/p1 active 587s left | next: just turn'
     );
-  });
+  }));
 
-  test('a terminal game has no phase, so the turn is unknown', () => {
-    const seat = bench();
+  effectTest('a terminal game has no phase, so the turn is unknown', () => Effect.gen(function* () {
+    const seat = yield* bench();
     const wake = decodedWake(
       wakePayload('game_terminal', { mine: false, gameState: 'completed' }),
       seat.session
     );
     expect(monitorTerminalLine(wake)).toBe('T? | GAME OVER | completed | next: just result');
-  });
+  }));
 });
 
 describe('the holder record', () => {
   test('stamps the wall clock the way CPython did', () => {
-    expect(holderSince(new Date(2026, 0, 2, 16, 21, 4))).toBe('16:21:04');
+    expect(holderSince(wallClock(2026, 1, 2, 16, 21, 4))).toBe('16:21:04');
   });
 });
 
@@ -1220,21 +1204,16 @@ describe('the holder record', () => {
 // The flag surface, through the real `@effect/cli` command
 // ---------------------------------------------------------------------------
 
-const runCommand = async (
+const runCommand = (
   seat: Bench,
   seams: MonitorSeams,
   flags: ReadonlyArray<string>,
   harnessOverrides: Partial<MonitorHarness> = {}
-): Promise<{ readonly code: number; readonly out: ReadonlyArray<string> }> => {
+): Effect.Effect<{ readonly code: number; readonly out: ReadonlyArray<string> }> => {
   const command = monitorCommandWith(harnessFor(seams, harnessOverrides));
-  const out: string[] = [];
-  const log = console.log;
-  const error = console.error;
-  console.log = (...parts: ReadonlyArray<unknown>) => out.push(parts.join(' '));
-  console.error = () => undefined;
-  try {
-    const exit = await Effect.runPromiseExit(
-      Effect.provide(
+  return captureEffect(
+    Effect.exit(
+      provideTestLayer(
         Command.run(command, { name: 'play', version: '0.1.0' })([
           'bun',
           'play',
@@ -1242,109 +1221,103 @@ const runCommand = async (
           seat.sessionPath,
           ...flags,
         ]),
-        Layer.mergeAll(
-          Layer.succeed(PrivateFs, seat.files),
-          Layer.succeed(SessionStore, seat.store),
-          unusedClient,
-          BunContext.layer
-        )
+        Layer.mergeAll(seat.scratch.layer, Layer.succeed(SessionStore, seat.store), unusedClient, BunContext.layer)
       )
-    );
-    if (Exit.isSuccess(exit)) return { code: 0, out };
-    // A status outside the four-code contract leaves through `process.exit`,
-    // which the harness models as a defect; everything else is the usual
-    // `ExitCodeSignal` (0/2/75/66) or a refusal.
-    const died = Option.getOrNull(Cause.dieOption(exit.cause));
-    if (isExitDefect(died)) return { code: died.status, out };
-    const failure = Option.getOrNull(Cause.failureOption(exit.cause));
-    return { code: failure !== null && failure._tag === 'ExitCodeSignal' ? failure.code : 2, out };
-  } finally {
-    console.log = log;
-    console.error = error;
-  }
+    )
+  ).pipe(
+    Effect.map(({ value: exit, captured }) => {
+      const out = captured.out;
+      if (Exit.isSuccess(exit)) return { code: 0, out };
+      const died = Option.getOrNull(Cause.dieOption(exit.cause));
+      const parsedExit = died === null ? Option.none() : decodeProcessExitDefect(died);
+      if (Option.isSome(parsedExit)) return { code: parsedExit.value.status, out };
+      const failure = Option.getOrNull(Cause.failureOption(exit.cause));
+      return { code: failure !== null && failure._tag === 'ExitCodeSignal' ? failure.code : 2, out };
+    })
+  );
 };
 
 describe('play monitor', () => {
-  test('--once announces and exits 0', async () => {
-    const seat = bench();
+  awaitTest('--once announces and exits 0', function* (wait) {
+    const seat = yield* bench();
     const script = scripted([decodedWake(wakePayload('phase_active', { mine: true }), seat.session)]);
-    const result = await runCommand(seat, script.seams, ['--once']);
+    const result = yield* wait(runCommand(seat, script.seams, ['--once']));
     expect(result.code).toBe(0);
     expect(result.out[0]).toContain('T3 | woke phase_active');
   });
 
-  test('--exit-code reaches the process status verbatim, in the contract and out of it', async () => {
+  awaitTest('--exit-code reaches the process status verbatim, in the contract and out of it', function* (wait) {
     // CPython's `main()` is `sys.exit(int(handler(args)))`, so every N the flag
     // accepts is the status the process carries. 75 rides the exit contract;
     // 42 and 1 do not, and must not be flattened onto it (NOTES.md §18.2).
     for (const status of [0, 1, 2, 42, 66, 75, 255]) {
-      const seat = bench();
+      const seat = yield* bench();
       const script = scripted([
         decodedWake(wakePayload('phase_active', { mine: true }), seat.session),
       ]);
-      const result = await runCommand(seat, script.seams, ['--once', '--exit-code', String(status)]);
+      const result = yield* wait(runCommand(seat, script.seams, ['--once', '--exit-code', String(status)]));
       expect(result.code).toBe(status);
       expect(result.out[0]).toContain('T3 | woke phase_active');
     }
   });
 
-  test('--exit-code 1 is never reported as this CLIs refusal status', async () => {
+  awaitTest('--exit-code 1 is never reported as this CLIs refusal status', function* (wait) {
     // The canonical escalate value for cron/systemd supervisors. Reading 2 here
     // would tell a harness its own invocation was rejected while stdout says
     // the phase opened — the incident the flag exists to prevent.
-    const seat = bench();
+    const seat = yield* bench();
     const script = scripted([decodedWake(wakePayload('phase_active', { mine: true }), seat.session)]);
-    const escalated = await runCommand(seat, script.seams, ['--once', '--exit-code', '1']);
+    const escalated = yield* wait(runCommand(seat, script.seams, ['--once', '--exit-code', '1']));
     expect(escalated.code).toBe(1);
     expect(escalated.code).not.toBe(2);
 
     // …and a real refusal still is 2, so the two remain distinguishable.
-    const refused = await runCommand(seat, scripted([]).seams, ['--once', '--exit-code', '300']);
+    const refused = yield* wait(runCommand(seat, scripted([]).seams, ['--once', '--exit-code', '300']));
     expect(refused.code).toBe(2);
   });
 
-  test('75 still leaves by the exit contract, not by process.exit', async () => {
-    const seat = bench();
+  awaitTest('75 still leaves by the exit contract, not by process.exit', function* (wait) {
+    const seat = yield* bench();
     const script = scripted([decodedWake(wakePayload('phase_active', { mine: true }), seat.session)]);
-    const result = await runCommand(seat, script.seams, ['--once', '--exit-code', '75'], {
+    const result = yield* wait(runCommand(seat, script.seams, ['--once', '--exit-code', '75'], {
       exitProcess: (status) =>
         Effect.die(new Error(`75 is in the contract; process.exit(${status}) is wrong`)),
-    });
+    }));
     expect(result.code).toBe(V2_WAIT_EXIT_RETRY);
   });
 
-  test('a terminal game exits EX_NOINPUT', async () => {
-    const seat = bench();
+  awaitTest('a terminal game exits EX_NOINPUT', function* (wait) {
+    const seat = yield* bench();
     const script = scripted([
       decodedWake(wakePayload('game_terminal', { mine: false, gameState: 'completed' }), seat.session),
     ]);
-    const result = await runCommand(seat, script.seams, ['--once']);
+    const result = yield* wait(runCommand(seat, script.seams, ['--once']));
     expect(result.code).toBe(V2_WAIT_EXIT_TERMINAL);
   });
 
-  test('--status with nothing running exits EX_TEMPFAIL', async () => {
-    const seat = bench();
-    const result = await runCommand(seat, scripted([]).seams, ['--status']);
+  awaitTest('--status with nothing running exits EX_TEMPFAIL', function* (wait) {
+    const seat = yield* bench();
+    const result = yield* wait(runCommand(seat, scripted([]).seams, ['--status']));
     expect(result.code).toBe(V2_WAIT_EXIT_RETRY);
     expect(result.out.join('\n')).toContain('monitor not running');
   });
 
-  test('both spellings of --wait-s are accepted, and never together', async () => {
-    const seat = bench();
+  awaitTest('both spellings of --wait-s are accepted, and never together', function* (wait) {
+    const seat = yield* bench();
     for (const spelling of ['--wait-s', '--wait_s']) {
       const script = scripted([
         decodedWake(wakePayload('phase_active', { mine: true }), seat.session),
       ]);
-      const result = await runCommand(seat, script.seams, ['--once', spelling, '30']);
+      const result = yield* wait(runCommand(seat, script.seams, ['--once', spelling, '30']));
       expect(result.code).toBe(0);
     }
-    const both = await runCommand(seat, scripted([]).seams, [
+    const both = yield* wait(runCommand(seat, scripted([]).seams, [
       '--once',
       '--wait-s',
       '30',
       '--wait_s',
       '30',
-    ]);
+    ]));
     expect(both.code).toBe(2);
   });
 });

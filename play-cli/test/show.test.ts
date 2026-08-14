@@ -15,16 +15,17 @@
  * `SessionStore | PrivateFs` and nothing else, so a request would not typecheck,
  * and the suite provides no `Http`/`V2Client` layer for one to reach.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect, Either, Layer } from 'effect';
 import { runShow, type ShowOptions } from 'src/commands/show.cmd';
 import { pyRepr, showOptionFiles, showSources, V2_SHOW_MAX_MATCHES } from 'src/render/show';
 import { v2StateSchema } from 'src/services/aliases';
-import { PrivateFs } from 'src/services/private-fs';
+import { type PrivateFs, type PrivateFsApi } from 'src/services/private-fs';
 import { SessionStore, sessionStoreFor } from 'src/services/session-store';
 import { FIXTURE_AGENT_ID, FIXTURE_GAME_ID, scratchWorkspace, sessionFile, type Scratch } from 'test/_fixtures';
+import { captureEffect } from 'test/_capture';
+import { effectTest, provideTestLayer } from 'test/_effect-test';
+import { path, withTestFileSystem } from 'test/_test-platform';
 
 // ---------------------------------------------------------------------------
 // The fixture mirror — the exact bytes CPython was run against
@@ -114,11 +115,13 @@ const GOLDEN = {
 // ---------------------------------------------------------------------------
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() =>
+  Effect.runPromise(
+    Effect.asVoid(Effect.all(scratches.splice(0).map((scratch) => scratch.cleanup)))
+  )
+);
 
-const clientState = (revision: number | null): unknown => ({
+const clientState = (revision: number | null) => ({
   schema_version: 5,
   game_id: FIXTURE_GAME_ID,
   agent_id: FIXTURE_AGENT_ID,
@@ -137,6 +140,7 @@ const clientState = (revision: number | null): unknown => ({
 interface Seat {
   readonly sessionPath: string;
   readonly mirror: string;
+  readonly files: PrivateFsApi;
   readonly layer: Layer.Layer<SessionStore | PrivateFs>;
 }
 
@@ -146,53 +150,49 @@ interface SeatOptions {
   readonly revision?: number | null;
 }
 
-const seat = (options: SeatOptions = {}): Seat => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const home = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID);
-  fs.mkdirSync(home, { mode: 0o700, recursive: true });
-  const sessionPath = path.join(home, 'codex-test.json');
-  fs.writeFileSync(sessionPath, `${JSON.stringify(sessionFile(), null, 2)}\n`, { mode: 0o600 });
-  const revision = options.revision === undefined ? 7 : options.revision;
-  if (revision !== null) {
-    fs.writeFileSync(
-      path.join(home, 'codex-test.v2-state'),
-      `${JSON.stringify(clientState(revision), null, 2)}\n`,
-      { mode: 0o600 }
-    );
-  }
-  const mirror = path.join(home, 'codex-test');
-  for (const [relative, text] of options.files ?? MIRROR) {
-    const target = path.join(mirror, relative);
-    fs.mkdirSync(path.dirname(target), { mode: 0o700, recursive: true });
-    fs.writeFileSync(target, text, { mode: 0o600 });
-  }
-  const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
-  return {
-    sessionPath,
-    mirror,
-    layer: Layer.merge(scratch.layer, Layer.succeed(SessionStore, store)),
-  };
-};
+const seat = (options: SeatOptions = {}): Effect.Effect<Seat> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const home = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID);
+    const sessionPath = path.join(home, 'codex-test.json');
+    yield* scratch.files.writeJson(sessionPath, sessionFile());
+    const revision = options.revision === undefined ? 7 : options.revision;
+    if (revision !== null) {
+      yield* scratch.files.writeJson(
+        path.join(home, 'codex-test.v2-state'),
+        clientState(revision)
+      );
+    }
+    const mirror = path.join(home, 'codex-test');
+    for (const [relative, text] of options.files ?? MIRROR) {
+      yield* scratch.files.writeText(path.join(mirror, relative), text);
+    }
+    const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
+    return {
+      sessionPath,
+      mirror,
+      files: scratch.files,
+      layer: Layer.merge(scratch.layer, Layer.succeed(SessionStore, store)),
+    };
+  }).pipe(Effect.orDie);
 
 interface Outcome {
   readonly stdout: string;
   readonly stderr: string;
 }
 
-const show = async (
-  fixture: Seat,
+const show = (
+  fixture: Seat | Effect.Effect<Seat>,
   overrides: Partial<ShowOptions> = {}
-): Promise<Outcome> => {
-  const out: string[] = [];
-  const originalLog = console.log;
-  console.log = (...parts: ReadonlyArray<unknown>) => out.push(parts.map(String).join(' '));
-  try {
-    const result = await Effect.runPromise(
+): Effect.Effect<Outcome> =>
+  Effect.gen(function* () {
+    const ready = Effect.isEffect(fixture) ? yield* fixture : fixture;
+    const { value: result, captured } = yield* captureEffect(
       Effect.either(
-        Effect.provide(
+        provideTestLayer(
           runShow({
-            session: fixture.sessionPath,
+            session: ready.sessionPath,
             name: '',
             grep: '',
             regex: false,
@@ -200,52 +200,51 @@ const show = async (
             json: false,
             ...overrides,
           }),
-          fixture.layer
+          ready.layer
         )
       )
     );
     return {
-      stdout: out.length === 0 ? '' : `${out.join('\n')}\n`,
+      stdout: captured.out.length === 0 ? '' : `${captured.out.join('\n')}\n`,
       stderr: Either.isLeft(result) ? `error: ${result.left.message}\n` : '',
     };
-  } finally {
-    console.log = originalLog;
-  }
-};
+  });
 
 /** Assert one whole stream against the CPython capture. */
-const golden = async (
+const golden = (
   key: keyof typeof GOLDEN,
-  fixture: Seat,
+  fixture: Seat | Effect.Effect<Seat>,
   overrides: Partial<ShowOptions> = {}
-): Promise<void> => {
-  const expected = GOLDEN[key];
-  const actual = await show(fixture, overrides);
-  expect(actual.stdout).toBe(expected.stdout);
-  expect(actual.stderr).toBe(expected.stderr);
-};
+): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    const expected = GOLDEN[key];
+    const ready = Effect.isEffect(fixture) ? yield* fixture : fixture;
+    const actual = yield* show(ready, overrides);
+    expect(actual.stdout).toBe(expected.stdout);
+    expect(actual.stderr).toBe(expected.stderr);
+  });
 
 // ---------------------------------------------------------------------------
 
 describe('the default listing', () => {
-  test('bare show prints the header, the delta and the catalog', async () => {
-    await golden('current/default', seat());
-  });
+  effectTest('bare show prints the header, the delta and the catalog', () =>
+    golden('current/default', seat())
+  );
 
-  test('--json wraps the same lines in the show envelope', async () => {
-    await golden('current/default_json', seat(), { json: true });
-  });
+  effectTest('--json wraps the same lines in the show envelope', () =>
+    golden('current/default_json', seat(), { json: true })
+  );
 
-  test('a mirror missing one file simply does not list it', async () => {
-    await golden(
+  effectTest('a mirror missing one file simply does not list it', () =>
+    golden(
       'nopriced/default',
       seat({ files: MIRROR.filter(([name]) => name !== 'state/yields.tsv') })
-    );
-  });
+    )
+  );
 
-  test('an empty mirror names `just state --section overview` before `just turn`', async () => {
-    const fixture = seat({ files: [] });
-    const { stdout, stderr } = await show(fixture);
+  effectTest('an empty mirror names `just state --section overview` before `just turn`', () => Effect.gen(function* () {
+    const fixture = yield* seat({ files: [] });
+    const { stdout, stderr } = yield* show(fixture);
     expect(stdout).toBe('');
     // The lobby has no units and no briefing to write, so `just turn` there
     // returns the lobby card without writing a file.
@@ -257,95 +256,95 @@ describe('the default listing', () => {
     expect(stderr.indexOf('just state --section overview')).toBeLessThan(
       stderr.indexOf('just turn')
     );
-  });
+  }));
 
-  test('--grep over an empty mirror earns the same refusal', async () => {
-    const fixture = seat({ files: [] });
-    const { stderr } = await show(fixture, { grep: 'anything' });
+  effectTest('--grep over an empty mirror earns the same refusal', () => Effect.gen(function* () {
+    const fixture = yield* seat({ files: [] });
+    const { stderr } = yield* show(fixture, { grep: 'anything' });
     expect(stderr).toContain('this seat has no local state mirror yet');
     expect(stderr).toContain(fixture.mirror);
-  });
+  }));
 });
 
 describe('a named section', () => {
-  test('one file prints byte for byte, and nothing else', async () => {
-    await golden('current/units', seat(), { name: 'units' });
-    await golden('current/map', seat(), { name: 'map' });
-    await golden('current/nations', seat(), { name: 'nations' });
+  effectTest('one file prints byte for byte, and nothing else', () => Effect.gen(function* () {
+    yield* golden('current/units', seat(), { name: 'units' });
+    yield* golden('current/map', seat(), { name: 'map' });
+    yield* golden('current/nations', seat(), { name: 'nations' });
     // `phase.json` carries no `# rev` stamp, so it is never banner-eligible.
-    await golden('current/phase', seat(), { name: 'phase' });
-  });
+    yield* golden('current/phase', seat(), { name: 'phase' });
+  }));
 
-  test('a file this seat has not written names `just turn`', async () => {
-    await golden('empty/units', seat({ files: [] }), { name: 'units' });
-  });
+  effectTest('a file this seat has not written names `just turn`', () =>
+    golden('empty/units', seat({ files: [] }), { name: 'units' })
+  );
 
-  test('an unknown name lists the file names, sorted', async () => {
-    await golden('current/unknown_name', seat(), { name: 'bogus' });
-  });
+  effectTest('an unknown name lists the file names, sorted', () =>
+    golden('current/unknown_name', seat(), { name: 'bogus' })
+  );
 
-  test('an alias-shaped name that is absent names its own repair', async () => {
-    await golden('current/alias_u9', seat(), { name: 'u9' });
-  });
+  effectTest('an alias-shaped name that is absent names its own repair', () =>
+    golden('current/alias_u9', seat(), { name: 'u9' })
+  );
 
-  test('a traversal attempt never reaches outside the mirror', async () => {
-    await golden('current/hostile_dotdot', seat(), { name: '../codex-test.v2-state' });
-    await golden('current/hostile_abs', seat(), { name: '/etc/passwd' });
-  });
+  effectTest('a traversal attempt never reaches outside the mirror', () => Effect.gen(function* () {
+    yield* golden('current/hostile_dotdot', seat(), { name: '../codex-test.v2-state' });
+    yield* golden('current/hostile_abs', seat(), { name: '/etc/passwd' });
+  }));
 });
 
 describe('an entity alias', () => {
-  test('u1 is its unit row followed by its option projection', async () => {
-    await golden('current/alias_u1', seat(), { name: 'u1' });
-  });
+  effectTest('u1 is its unit row followed by its option projection', () =>
+    golden('current/alias_u1', seat(), { name: 'u1' })
+  );
 
-  test('c1 and r1 reach the city and relation tables the same way', async () => {
-    await golden('current/alias_c1', seat(), { name: 'c1' });
-    await golden('current/alias_r1', seat(), { name: 'r1' });
-  });
+  effectTest('c1 and r1 reach the city and relation tables the same way', () => Effect.gen(function* () {
+    yield* golden('current/alias_c1', seat(), { name: 'c1' });
+    yield* golden('current/alias_r1', seat(), { name: 'r1' });
+  }));
 
-  test('an option projection with no row prints alone, with no leading blank', async () => {
-    await golden('current/alias_unscoped', seat(), { name: 'unscoped' });
-  });
+  effectTest('an option projection with no row prints alone, with no leading blank', () =>
+    golden('current/alias_unscoped', seat(), { name: 'unscoped' })
+  );
 
-  test('--json carries the alias as the selection', async () => {
-    await golden('current/alias_u1_json', seat(), { name: 'u1', json: true });
-  });
+  effectTest('--json carries the alias as the selection', () =>
+    golden('current/alias_u1_json', seat(), { name: 'u1', json: true })
+  );
 });
 
 describe('--grep', () => {
-  test('a literal match prints `label:line: text`', async () => {
-    await golden('current/grep_settlers', seat(), { grep: 'Settlers' });
-  });
+  effectTest('a literal match prints `label:line: text`', () =>
+    golden('current/grep_settlers', seat(), { grep: 'Settlers' })
+  );
 
-  test('the literal search is case-insensitive', async () => {
-    await golden('current/grep_case', seat(), { grep: 'settlers' });
-  });
+  effectTest('the literal search is case-insensitive', () =>
+    golden('current/grep_case', seat(), { grep: 'settlers' })
+  );
 
-  test('no match says so, with the pattern in CPython `repr` form', async () => {
-    await golden('current/grep_missing', seat(), { grep: 'zzz-not-here' });
-  });
+  effectTest('no match says so, with the pattern in CPython `repr` form', () =>
+    golden('current/grep_missing', seat(), { grep: 'zzz-not-here' })
+  );
 
-  test('literal means literal: a metacharacter stands for itself', async () => {
-    await golden('current/grep_literal_dot', seat(), { grep: 'Settl.rs' });
-  });
+  effectTest('literal means literal: a metacharacter stands for itself', () =>
+    golden('current/grep_literal_dot', seat(), { grep: 'Settl.rs' })
+  );
 
-  test('--regex opts into the engine', async () => {
-    await golden('current/grep_regex_dot', seat(), { grep: 'Settl.rs', regex: true });
-  });
+  effectTest('--regex opts into the engine', () =>
+    golden('current/grep_regex_dot', seat(), { grep: 'Settl.rs', regex: true })
+  );
 
-  test('a catastrophic pattern is just text without --regex, and answers at once', async () => {
+  effectTest('a catastrophic pattern is just text without --regex, and answers at once', () => Effect.gen(function* () {
     const started = performance.now();
-    await golden('current/grep_catastrophic', seat(), { grep: '(a|aa)+$' });
+    yield* golden('current/grep_catastrophic', seat(), { grep: '(a|aa)+$' });
     expect(performance.now() - started).toBeLessThan(1000);
-  });
+  }));
 
-  test('--regex refuses a quantifier applied to an already quantified group', async () => {
-    await golden('current/grep_regex_nested', seat(), { grep: '(a+)+$', regex: true });
-  });
+  effectTest('--regex refuses a quantifier applied to an already quantified group', () =>
+    golden('current/grep_regex_nested', seat(), { grep: '(a+)+$', regex: true })
+  );
 
-  test('--regex reports an uncompilable pattern and names the flagless form', async () => {
-    const { stdout, stderr } = await show(seat(), { grep: '(unbalanced', regex: true });
+  effectTest('--regex reports an uncompilable pattern and names the flagless form', () => Effect.gen(function* () {
+    const { stdout, stderr } = yield* show(seat(), { grep: '(unbalanced', regex: true });
     expect(stdout).toBe('');
     // The engine's own wording differs from CPython's `missing ),
     // unterminated subpattern at position 0`; NOTES.md §U09 records it.
@@ -353,7 +352,7 @@ describe('--grep', () => {
     expect(stderr.endsWith(
       '; drop --regex to search for the literal text `(unbalanced`\n'
     )).toBe(true);
-  });
+  }));
 
   /**
    * A pattern CPython compiles and this engine cannot: `\w` emits ~10 KB of
@@ -366,20 +365,20 @@ describe('--grep', () => {
    * assertion that matters is that this is a refusal at all: before it was a
    * `SyntaxError` out of the defect channel, printed as a stack trace.
    */
-  test('a pattern too large for the engine refuses in words, not in a stack trace', async () => {
+  effectTest('a pattern too large for the engine refuses in words, not in a stack trace', () => Effect.gen(function* () {
     for (const grep of ['\\w'.repeat(100), '\\b'.repeat(21)]) {
-      const { stdout, stderr } = await show(seat(), { grep, regex: true });
+      const { stdout, stderr } = yield* show(seat(), { grep, regex: true });
       expect(stdout).toBe('');
       expect(stderr).toBe(
         'error: just show --grep pattern is invalid: the emitted pattern is too large ' +
           `for this engine; drop --regex to search for the literal text \`${grep}\`\n`
       );
     }
-  });
+  }));
 
-  test('--regex gives up when it spends its wall-clock budget', async () => {
+  effectTest('--regex gives up when it spends its wall-clock budget', () => Effect.gen(function* () {
     const ticks = [0, 0, 99];
-    const { stderr } = await show(seat(), {
+    const { stderr } = yield* show(seat(), {
       grep: '(a|aa)+$',
       regex: true,
       clock: () => ticks.shift() ?? 99,
@@ -388,18 +387,18 @@ describe('--grep', () => {
       'error: just show --grep --regex took too long; narrow the pattern, or drop ' +
         '--regex to search for the literal text `(a|aa)+$`\n'
     );
-  });
+  }));
 
-  test('a pattern over 200 characters is refused before anything is read', async () => {
-    await golden('current/grep_long', seat(), { grep: 'x'.repeat(201) });
-  });
+  effectTest('a pattern over 200 characters is refused before anything is read', () =>
+    golden('current/grep_long', seat(), { grep: 'x'.repeat(201) })
+  );
 
-  test('the match list stops at 200 and says it stopped', async () => {
+  effectTest('the match list stops at 200 and says it stopped', () => Effect.gen(function* () {
     const rows = Array.from({ length: 250 }, (_unused, index) => `u${index}\tSettlers`);
-    const fixture = seat({
+    const fixture = yield* seat({
       files: [['state/units.tsv', `# rev 7 turn 3\n${rows.join('\n')}\n`]],
     });
-    const { stdout } = await show(fixture, { grep: 'Settlers' });
+    const { stdout } = yield* show(fixture, { grep: 'Settlers' });
     const lines = stdout.split('\n').slice(0, -1);
     expect(lines).toHaveLength(V2_SHOW_MAX_MATCHES + 1);
     expect(lines[0]).toBe('units:2: u0\tSettlers');
@@ -407,93 +406,96 @@ describe('--grep', () => {
     expect(lines[V2_SHOW_MAX_MATCHES]).toBe(
       '(stopped at 200 matches; narrow the pattern)'
     );
-  });
+  }));
 
-  test('exactly 200 matches is not truncated', async () => {
+  effectTest('exactly 200 matches is not truncated', () => Effect.gen(function* () {
     const rows = Array.from({ length: 199 }, (_unused, index) => `u${index}\tSettlers`);
-    const fixture = seat({
+    const fixture = yield* seat({
       files: [['state/units.tsv', `# Settlers rev 7 turn 3\n${rows.join('\n')}\n`]],
     });
-    const { stdout } = await show(fixture, { grep: 'Settlers' });
+    const { stdout } = yield* show(fixture, { grep: 'Settlers' });
     expect(stdout.split('\n').slice(0, -1)).toHaveLength(V2_SHOW_MAX_MATCHES);
     expect(stdout).not.toContain('stopped at');
-  });
+  }));
 
-  test('--json carries `grep PATTERN` as the selection', async () => {
-    await golden('current/grep_settlers_json', seat(), { grep: 'Settlers', json: true });
-  });
+  effectTest('--json carries `grep PATTERN` as the selection', () =>
+    golden('current/grep_settlers_json', seat(), { grep: 'Settlers', json: true })
+  );
 });
 
 describe('flag precedence', () => {
-  test('a name and --grep together are refused', async () => {
-    await golden('current/name_and_grep', seat(), { name: 'units', grep: 'Settlers' });
-  });
+  effectTest('a name and --grep together are refused', () =>
+    golden('current/name_and_grep', seat(), { name: 'units', grep: 'Settlers' })
+  );
 
-  test('--regex without --grep is refused', async () => {
-    await golden('current/regex_without_grep', seat(), { regex: true });
-  });
+  effectTest('--regex without --grep is refused', () =>
+    golden('current/regex_without_grep', seat(), { regex: true })
+  );
 });
 
 describe('the staleness banner', () => {
-  test('a current projection carries no banner', async () => {
-    await golden('current/units', seat({ revision: 7 }), { name: 'units' });
-  });
+  effectTest('a current projection carries no banner', () =>
+    golden('current/units', seat({ revision: 7 }), { name: 'units' })
+  );
 
-  test('a lagging projection leads with the re-verification line', async () => {
-    await golden('stale/units', seat({ revision: 12 }), { name: 'units' });
-    await golden('stale/map', seat({ revision: 12 }), { name: 'map' });
-    await golden('stale/nations', seat({ revision: 12 }), { name: 'nations' });
-  });
+  effectTest('a lagging projection leads with the re-verification line', () => Effect.gen(function* () {
+    yield* golden('stale/units', seat({ revision: 12 }), { name: 'units' });
+    yield* golden('stale/map', seat({ revision: 12 }), { name: 'map' });
+    yield* golden('stale/nations', seat({ revision: 12 }), { name: 'nations' });
+  }));
 
-  test('the option projection carries the banner and the file still says rev 7', async () => {
-    const fixture = seat({ revision: 12 });
-    await golden('stale/alias_u1', fixture, { name: 'u1' });
+  effectTest('the option projection carries the banner and the file still says rev 7', () => Effect.gen(function* () {
+    const fixture = yield* seat({ revision: 12 });
+    yield* golden('stale/alias_u1', fixture, { name: 'u1' });
     // Written at read time: the file itself is untouched.
-    const stored = fs.readFileSync(
+    const stored = yield* fixture.files.readText(
       path.join(fixture.mirror, 'state', 'options', 'u1.txt'),
-      'utf8'
+      'option projection'
     );
     expect(stored).not.toContain('stale:');
     expect(stored).toContain('# rev 7 turn 3');
-  });
+  }));
 
-  test('the default listing, the alias rows and --grep all carry it', async () => {
-    await golden('stale/default', seat({ revision: 12 }));
-    await golden('stale/alias_c1', seat({ revision: 12 }), { name: 'c1' });
-    await golden('stale/alias_r1', seat({ revision: 12 }), { name: 'r1' });
-    await golden('stale/alias_unscoped', seat({ revision: 12 }), { name: 'unscoped' });
-    await golden('stale/grep_settlers', seat({ revision: 12 }), { grep: 'Settlers' });
-    await golden('stale/grep_missing', seat({ revision: 12 }), { grep: 'zzz-not-here' });
-    await golden('stale/alias_u1_json', seat({ revision: 12 }), { name: 'u1', json: true });
-  });
+  effectTest('the default listing, the alias rows and --grep all carry it', () => Effect.gen(function* () {
+    yield* golden('stale/default', seat({ revision: 12 }));
+    yield* golden('stale/alias_c1', seat({ revision: 12 }), { name: 'c1' });
+    yield* golden('stale/alias_r1', seat({ revision: 12 }), { name: 'r1' });
+    yield* golden('stale/alias_unscoped', seat({ revision: 12 }), { name: 'unscoped' });
+    yield* golden('stale/grep_settlers', seat({ revision: 12 }), { grep: 'Settlers' });
+    yield* golden('stale/grep_missing', seat({ revision: 12 }), { grep: 'zzz-not-here' });
+    yield* golden('stale/alias_u1_json', seat({ revision: 12 }), { name: 'u1', json: true });
+  }));
 
-  test('a file with no revision stamp is never judged stale', async () => {
-    await golden('stale/phase', seat({ revision: 12 }), { name: 'phase' });
-  });
+  effectTest('a file with no revision stamp is never judged stale', () =>
+    golden('stale/phase', seat({ revision: 12 }), { name: 'phase' })
+  );
 
-  test('an unreadable private cache annotates nothing and blocks nothing', async () => {
-    await golden('nostate/default', seat({ revision: null }));
-    await golden('nostate/units', seat({ revision: null }), { name: 'units' });
+  effectTest('an unreadable private cache annotates nothing and blocks nothing', () => Effect.gen(function* () {
+    yield* golden('nostate/default', seat({ revision: null }));
+    yield* golden('nostate/units', seat({ revision: null }), { name: 'units' });
     // The same holds for a `.v2-state` that exists but does not parse.
-    const broken = seat({ revision: 12 });
-    fs.writeFileSync(`${broken.sessionPath.slice(0, -5)}.v2-state`, 'not json\n', {
-      mode: 0o600,
-    });
-    await golden('nostate/units', broken, { name: 'units' });
-  });
+    const broken = yield* seat({ revision: 12 });
+    yield* broken.files.writeText(
+      `${broken.sessionPath.slice(0, -5)}.v2-state`,
+      'not json\n'
+    );
+    yield* golden('nostate/units', broken, { name: 'units' });
+  }));
 
-  test('the sources of a bare listing are every present file', async () => {
-    const fixture = seat();
-    const sources = await Effect.runPromise(
-      Effect.provide(showSources(fixture.sessionPath, '', ''), fixture.layer)
+  effectTest('the sources of a bare listing are every present file', () => Effect.gen(function* () {
+    const fixture = yield* seat();
+    const sources = yield* provideTestLayer(
+      showSources(fixture.sessionPath, '', ''),
+      fixture.layer
     );
     expect(sources).toHaveLength(MIRROR.length);
-  });
+  }));
 
-  test('the sources of an alias are the three row tables plus its option file', async () => {
-    const fixture = seat();
-    const sources = await Effect.runPromise(
-      Effect.provide(showSources(fixture.sessionPath, 'u1', ''), fixture.layer)
+  effectTest('the sources of an alias are the three row tables plus its option file', () => Effect.gen(function* () {
+    const fixture = yield* seat();
+    const sources = yield* provideTestLayer(
+      showSources(fixture.sessionPath, 'u1', ''),
+      fixture.layer
     );
     expect(sources).toEqual([
       ['state', 'units.tsv'],
@@ -501,12 +503,12 @@ describe('the staleness banner', () => {
       ['state', 'diplomacy.tsv'],
       ['state', 'options', 'u1.txt'],
     ]);
-  });
+  }));
 });
 
 describe('the options listing', () => {
-  test('only `.txt` files count, dotfiles never do, and the order is sorted', async () => {
-    const fixture = seat({
+  effectTest('only `.txt` files count, dotfiles never do, and the order is sorted', () => Effect.gen(function* () {
+    const fixture = yield* seat({
       files: [
         ...MIRROR,
         ['state/options/.hidden.txt', 'x\n'],
@@ -514,22 +516,30 @@ describe('the options listing', () => {
         ['state/options/c1.txt', '# rev 7 turn 3\n'],
       ],
     });
-    const names = await Effect.runPromise(
-      Effect.provide(showOptionFiles(fixture.sessionPath), fixture.layer)
+    const names = yield* provideTestLayer(
+      showOptionFiles(fixture.sessionPath),
+      fixture.layer
     );
     expect(names).toEqual(['c1.txt', 'u1.txt', 'unscoped.txt']);
-  });
+  }));
 
-  test('a symlinked options directory lists nothing rather than following it', async () => {
-    const fixture = seat();
-    const options = path.join(fixture.mirror, 'state', 'options');
-    fs.rmSync(options, { recursive: true, force: true });
-    fs.symlinkSync('/etc', options);
-    const names = await Effect.runPromise(
-      Effect.provide(showOptionFiles(fixture.sessionPath), fixture.layer)
-    );
-    expect(names).toEqual([]);
-  });
+  effectTest('a symlinked options directory lists nothing rather than following it', () =>
+    Effect.gen(function* () {
+      const fixture = yield* seat();
+      const options = path.join(fixture.mirror, 'state', 'options');
+      yield* withTestFileSystem((files) =>
+        Effect.gen(function* () {
+          yield* files.remove(options, { recursive: true, force: true });
+          yield* files.symlink('/etc', options);
+        })
+      );
+      const names = yield* provideTestLayer(
+        showOptionFiles(fixture.sessionPath),
+        fixture.layer
+      );
+      expect(names).toEqual([]);
+    }).pipe(Effect.orDie)
+  );
 });
 
 describe('pyRepr', () => {
@@ -575,36 +585,36 @@ describe('pyRepr', () => {
  * against the same mirror.
  */
 describe('CPython `str.strip()`, not `String.trim()`', () => {
-  test('U+0085 and U+001C-U+001F are stripped from a name', async () => {
-    await golden('current/name_x85_lead', seat(), { name: '\x85units' });
-    await golden('current/name_x1c_lead', seat(), { name: '\x1cunits' });
-    await golden('current/name_x1f_lead', seat(), { name: '\x1funits' });
+  effectTest('U+0085 and U+001C-U+001F are stripped from a name', () => Effect.gen(function* () {
+    yield* golden('current/name_x85_lead', seat(), { name: '\x85units' });
+    yield* golden('current/name_x1c_lead', seat(), { name: '\x1cunits' });
+    yield* golden('current/name_x1f_lead', seat(), { name: '\x1funits' });
     // The characters both classes agree about still work, of course.
-    await golden('current/name_nbsp_lead', seat(), { name: '\xa0units' });
-    await golden('current/name_space_lead', seat(), { name: '  units  ' });
-  });
+    yield* golden('current/name_nbsp_lead', seat(), { name: '\xa0units' });
+    yield* golden('current/name_space_lead', seat(), { name: '  units  ' });
+  }));
 
-  test('U+FEFF is not stripped, so SHOW_NAME_RE refuses the name', async () => {
-    await golden('current/name_bom_lead', seat(), { name: '\ufeffunits' });
+  effectTest('U+FEFF is not stripped, so SHOW_NAME_RE refuses the name', () => Effect.gen(function* () {
+    yield* golden('current/name_bom_lead', seat(), { name: '\ufeffunits' });
     // Trailing, too: `u1` with a trailing U+FEFF is not the alias `u1`.
-    await golden('current/name_bom_trail', seat(), { name: 'u1\ufeff' });
-  });
+    yield* golden('current/name_bom_trail', seat(), { name: 'u1\ufeff' });
+  }));
 
-  test('the same class decides what --grep actually searches for', async () => {
+  effectTest('the same class decides what --grep actually searches for', () => Effect.gen(function* () {
     // Stripped: the needle is `Settlers`, and the row is found.
-    await golden('current/grep_x85_settlers', seat(), { grep: '\x85Settlers' });
+    yield* golden('current/grep_x85_settlers', seat(), { grep: '\x85Settlers' });
     // Not stripped: the needle keeps the BOM and matches nothing.
-    await golden('current/grep_bom_settlers', seat(), { grep: '\ufeffSettlers' });
-  });
+    yield* golden('current/grep_bom_settlers', seat(), { grep: '\ufeffSettlers' });
+  }));
 
-  test('a pattern of nothing but whitespace strips to empty and is no --grep at all', async () => {
-    await golden('current/grep_x85_only', seat(), { grep: '\x85' });
-    await golden('current/grep_nbsp_only', seat(), { grep: '\xa0' });
+  effectTest('a pattern of nothing but whitespace strips to empty and is no --grep at all', () => Effect.gen(function* () {
+    yield* golden('current/grep_x85_only', seat(), { grep: '\x85' });
+    yield* golden('current/grep_nbsp_only', seat(), { grep: '\xa0' });
     // …which is what makes `--regex` with it a refusal rather than a search.
-    await golden('current/grep_x85_only_regex', seat(), { grep: '\x85', regex: true });
+    yield* golden('current/grep_x85_only_regex', seat(), { grep: '\x85', regex: true });
     // A BOM survives the strip, so it *is* a pattern — and it matches nothing.
-    await golden('current/grep_bom_only', seat(), { grep: '\ufeff' });
-  });
+    yield* golden('current/grep_bom_only', seat(), { grep: '\ufeff' });
+  }));
 
   /**
    * `_show_rows` compares `line.split("\t", 1)[0].strip()` with the alias, so
@@ -617,7 +627,7 @@ describe('CPython `str.strip()`, not `String.trim()`', () => {
    * U+001C and U+0085, so `\x1cu1\x85\tSettlers` is three lines to CPython and
    * the alias cell it matches is the bare `u1` on the second of them.
    */
-  test('the alias column is compared after CPython’s strip', async () => {
+  effectTest('the alias column is compared after CPython’s strip', () => Effect.gen(function* () {
     const rows =
       '# rev 7 turn 3\n# units 3/3 complete\nalias\tunit\n' +
       '\x1cu1\x85\tSettlers\n' +
@@ -628,21 +638,21 @@ describe('CPython `str.strip()`, not `String.trim()`', () => {
       ['state/units.tsv', rows],
     ];
     const options = MIRROR.find(([name]) => name === 'state/options/u1.txt')?.[1] ?? '';
-    expect((await show(seat({ files }), { name: 'u1' })).stdout).toBe(`units: u1\n\n${options}`);
-    expect((await show(seat({ files }), { name: 'u2' })).stderr).toBe(
+    expect((yield* show(seat({ files }), { name: 'u1' })).stdout).toBe(`units: u1\n\n${options}`);
+    expect((yield* show(seat({ files }), { name: 'u2' })).stderr).toBe(
       'error: the mirror holds nothing named u2; run `just legal --actor_id u2 --all` ' +
         'to write state/options/u2.txt, or `just show` to list what is there\n'
     );
-    expect((await show(seat({ files }), { name: 'u3' })).stdout).toBe('units:   u3  \tExplorer\n');
-  });
+    expect((yield* show(seat({ files }), { name: 'u3' })).stdout).toBe('units:   u3  \tExplorer\n');
+  }));
 
-  test('a name of nothing but whitespace is no name, so it is not "both"', async () => {
-    await golden('current/grep_bom_and_name', seat(), { name: '\ufeff', grep: 'Settlers' });
-  });
+  effectTest('a name of nothing but whitespace is no name, so it is not "both"', () =>
+    golden('current/grep_bom_and_name', seat(), { name: '\ufeff', grep: 'Settlers' })
+  );
 
-  test('an unprintable needle is echoed through CPython `repr`', async () => {
-    await golden('current/grep_interior_nonprintable', seat(), { grep: 'Set\u0378tlers' });
-    await golden('current/grep_nbsp_interior', seat(), { grep: 'Set\xa0tlers' });
-    await golden('current/grep_astral_nonprintable', seat(), { grep: 'a\u{e0001}b' });
-  });
+  effectTest('an unprintable needle is echoed through CPython `repr`', () => Effect.gen(function* () {
+    yield* golden('current/grep_interior_nonprintable', seat(), { grep: 'Set\u0378tlers' });
+    yield* golden('current/grep_nbsp_interior', seat(), { grep: 'Set\xa0tlers' });
+    yield* golden('current/grep_astral_nonprintable', seat(), { grep: 'a\u{e0001}b' });
+  }));
 });

@@ -40,7 +40,7 @@ import {
 import { legalQuery, readLegalPage, type LegalCtx } from 'src/services/legal-query';
 import { jsonRequested, printV2Json } from 'src/services/json-output';
 import { cachedPhaseNote } from 'src/services/mirror';
-import { PrivateFs } from 'src/services/private-fs';
+import { type PrivateFs } from 'src/services/private-fs';
 import { SessionStore } from 'src/services/session-store';
 import { V2Client } from 'src/services/v2-client';
 
@@ -130,10 +130,10 @@ export const runLegal = (
         const kind = options.kind.trim();
 
         if (kind !== '' && !options.all) {
-          return yield* Effect.fail(playerError(KIND_NEEDS_ALL));
+          return yield*playerError(KIND_NEEDS_ALL);
         }
         if (options.all && kind === '' && actorId === '') {
-          return yield* Effect.fail(playerError(ALL_NEEDS_SCOPE));
+          return yield*playerError(ALL_NEEDS_SCOPE);
         }
         if (kind !== '' && !ACTION_KIND_SELECTOR_RE.test(kind)) {
           return yield* Effect.flatMap(unknownKind(ctx, kind), Effect.fail);
@@ -142,7 +142,7 @@ export const runLegal = (
           return yield* runLegalAll(ctx, options, actorId, targetId, kind);
         }
         if (options.offset !== '') {
-          return yield* Effect.fail(playerError(OFFSET_NEEDS_ALL));
+          return yield*playerError(OFFSET_NEEDS_ALL);
         }
         const cursor = options.cursor.trim();
         const query = yield* legalQuery({
@@ -202,7 +202,7 @@ const runLegalAll = (
       );
     }
     const result = outcome.result;
-    if (result === null) return yield* Effect.fail(playerError('legal drained nothing'));
+    if (result === null) return yield*playerError('legal drained nothing');
     if (jsonRequested('legal', options.json)) {
       return yield* printV2Json(result);
     }

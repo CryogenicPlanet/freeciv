@@ -21,7 +21,14 @@
  */
 import { Effect } from 'effect';
 import type { PlayerError } from 'src/errors';
-import { isJsonObject, type JsonObject } from 'src/schema/primitives';
+import {
+  isJsonObject,
+  isJsonString,
+  isWholeNumber,
+  type JsonObject,
+  type JsonValue,
+  type JsonValueInput,
+} from 'src/schema/primitives';
 import type { PrivateFs } from 'src/services/private-fs';
 import {
   OPTIONS_DIR,
@@ -56,11 +63,11 @@ interface CatalogScope {
 }
 
 const catalogScope = (
-  scope: unknown,
+  scope: JsonValueInput,
   aliases: MirrorAliases | null | undefined
 ): CatalogScope => {
   const actorId = isJsonObject(scope) ? scope['actor_id'] : undefined;
-  const actor = typeof actorId === 'string' ? actorId : null;
+  const actor = isJsonString(actorId) ? actorId : null;
   if (actor === null) {
     return { actor, name: UNSCOPED_NAME, heading: UNSCOPED_HEADING };
   }
@@ -72,8 +79,7 @@ const catalogScope = (
 };
 
 /** `isinstance(total_items, int)` — a JSON integer, never a bool. */
-const isCount = (value: unknown): value is number =>
-  typeof value === 'number' && Number.isInteger(value);
+const isCount = (value: JsonValueInput): value is number => isWholeNumber(value);
 
 /** The merge key of a catalog row: everything but its alias column. */
 const rowKey = (row: ReadonlyArray<string>): string => JSON.stringify(row.slice(1));
@@ -92,11 +98,11 @@ export const updateOptions = (
   command: string,
   revision: MirrorRevision,
   inner: JsonObject,
-  items: ReadonlyArray<unknown>,
+  items: ReadonlyArray<JsonValue>,
   aliases: MirrorAliases | null | undefined
 ): Effect.Effect<ReadonlyArray<string>, PlayerError, PrivateFs> =>
   Effect.gen(function* () {
-    const scope = inner['scope'];
+    const scope = inner['scope'] ?? null;
     const catalog = catalogScope(scope, aliases);
     const target = [STATE_DIR, OPTIONS_DIR, `${yield* fileName(catalog.name)}.txt`];
     const prior = parseTable(yield* readMirror(dir, target));

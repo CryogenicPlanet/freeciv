@@ -9,6 +9,7 @@ import { describe, expect, test } from 'bun:test';
 import { Effect, Either } from 'effect';
 import { encodeRequestBody, httpFor, serviceUrl, v1ErrorMessage } from 'src/services/http';
 import { fakeFetch, recordingFetch } from 'test/_fixtures';
+import { awaitTest } from 'test/_effect-test';
 
 const run = <A, E>(effect: Effect.Effect<A, E>): Either.Either<A, E> =>
   Effect.runSync(Effect.either(effect));
@@ -50,11 +51,11 @@ describe('request encoding', () => {
     expect(encodeRequestBody({ b: 1, a: 2 })).toBe('{"a":2,"b":1}');
   });
 
-  test('the bearer token and content type ride on the request', async () => {
+  awaitTest('the bearer token and content type ride on the request', function* (wait) {
     const recorder = recordingFetch([{ body: { ok: true } }]);
     const http = httpFor(recorder.fetch);
-    await runPromise(
-      http.requestJson('POST', 'http://host/v1/x', { token: 'shhh', body: { a: 1 } })
+    yield* wait(
+      runPromise(http.requestJson('POST', 'http://host/v1/x', { token: 'shhh', body: { a: 1 } }))
     );
     const sent = recorder.requests[0];
     expect(sent?.headers['authorization']).toBe('Bearer shhh');
@@ -62,19 +63,19 @@ describe('request encoding', () => {
     expect(sent?.body).toBe('{"a":1}');
   });
 
-  test('two bodies at once is a refusal, not a silent pick', async () => {
+  awaitTest('two bodies at once is a refusal, not a silent pick', function* (wait) {
     const http = httpFor(fakeFetch([{ body: {} }]));
-    const either = await runPromise(
-      http.requestJsonResponse('POST', 'http://host/x', { body: {}, encodedBody: '{}' })
+    const either = yield* wait(
+      runPromise(http.requestJsonResponse('POST', 'http://host/x', { body: {}, encodedBody: '{}' }))
     );
     expect(Either.isLeft(either)).toBe(true);
   });
 });
 
 describe('responses', () => {
-  test('requestJsonResponse hands back the body of a 4xx', async () => {
+  awaitTest('requestJsonResponse hands back the body of a 4xx', function* (wait) {
     const http = httpFor(fakeFetch([{ status: 409, body: { error: { code: 'conflict' } } }]));
-    const either = await runPromise(http.requestJsonResponse('GET', 'http://host/x'));
+    const either = yield* wait(runPromise(http.requestJsonResponse('GET', 'http://host/x')));
     expect(Either.isRight(either)).toBe(true);
     if (Either.isRight(either)) {
       expect(either.right.status).toBe(409);
@@ -82,18 +83,18 @@ describe('responses', () => {
     }
   });
 
-  test('requestJson raises on a 4xx with the Python message shape', async () => {
+  awaitTest('requestJson raises on a 4xx with the Python message shape', function* (wait) {
     const http = httpFor(
       fakeFetch([{ status: 400, body: { error: { message: 'bad turn', code: 'invalid_request' } } }])
     );
-    const either = await runPromise(http.requestJson('GET', 'http://host/x'));
+    const either = yield* wait(runPromise(http.requestJson('GET', 'http://host/x')));
     expect(Either.isLeft(either)).toBe(true);
     if (Either.isLeft(either)) expect(either.left.message).toBe('HTTP 400: bad turn');
   });
 
-  test('a non-object JSON response is refused', async () => {
+  awaitTest('a non-object JSON response is refused', function* (wait) {
     const http = httpFor(fakeFetch([{ body: [1, 2, 3] }]));
-    const either = await runPromise(http.requestJsonResponse('GET', 'http://host/x'));
+    const either = yield* wait(runPromise(http.requestJsonResponse('GET', 'http://host/x')));
     expect(Either.isLeft(either)).toBe(true);
     if (Either.isLeft(either)) {
       expect(either.left.message).toBe('the supervisor returned a non-object JSON response');

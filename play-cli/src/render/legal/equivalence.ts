@@ -13,7 +13,7 @@ import { Effect } from 'effect';
 import type { PlayerError } from 'src/errors';
 import { ACTION_ALIAS_RE } from 'src/constants';
 import type { AliasMap } from 'src/render/primitives';
-import { field, type JsonObject } from 'src/schema/primitives';
+import { field, isJsonString, type JsonObject } from 'src/schema/primitives';
 import type { PageScope } from 'src/schema/page';
 import type { CatalogEquivalence } from 'src/services/catalog-cache';
 import type { LegalCompactResult } from 'src/services/legal-compact';
@@ -51,7 +51,7 @@ export const equivalenceLines = (
       `(rev${result.state_revision.revision})`;
     const own = result.actions.map((compact) => {
       const actionId = field(compact, 'action_id');
-      const identifier = typeof actionId === 'string' ? actionId : '';
+      const identifier = isJsonString(actionId) ? actionId : '';
       return lookup[identifier] ?? identifier;
     });
     if (own.length > 0) line += ` ${aliasSpan(own)}`;

@@ -13,7 +13,7 @@
  */
 import { Data, Effect } from 'effect';
 import { playerError, type PlayerError } from 'src/errors';
-import type { JsonValue } from 'src/schema/primitives';
+import { isJsonString, type JsonValue, type JsonValueInput } from 'src/schema/primitives';
 
 // ---------------------------------------------------------------------------
 // Vocabulary (client.py:8633-8676)
@@ -63,14 +63,14 @@ export interface Tier1Verb {
  * the enumeration command — nothing here invents a synonym, and nothing here
  * can name an action the server did not offer.
  */
-export const V2_TIER1_VERBS: Readonly<Record<string, Tier1Verb>> = {
+export const V2_TIER1_VERBS = {
   route: { kind: 'unit.order', operation: 'set_route', arguments: { mode: 'goto' } },
   patrol: { kind: 'unit.order', operation: 'set_route', arguments: { mode: 'patrol' } },
   build: { kind: 'city.set_production', operation: 'set_production', arguments: {} },
   queue: { kind: 'city.set_worklist', operation: 'set_worklist', arguments: {} },
   rally: { kind: 'city.set_rally', operation: 'set_rally', arguments: { persistent: false } },
   goal: { kind: 'research.set_goal', operation: 'set_goal', arguments: {} },
-};
+} satisfies Readonly<Record<string, Tier1Verb>>;
 
 // ---------------------------------------------------------------------------
 // _OrderUnresolved
@@ -180,6 +180,10 @@ export const parseOrdersMessage = (failure: ParseOrdersFailure): string => {
       return `just do accepts 1 through ${V2_MAX_ORDERS} orders; this line has ${failure.count}`;
     case 'TooManyWords':
       return `order ${pyRepr(failure.order)} has more than ${V2_MAX_ORDER_WORDS} words`;
+    default: {
+      const exhaustive: never = failure;
+      return exhaustive;
+    }
   }
 };
 
@@ -192,12 +196,12 @@ export const parseOrdersMessage = (failure: ParseOrdersFailure): string => {
  * refused whole rather than truncated.
  */
 export const parseOrdersEither = (
-  text: unknown
+  text: JsonValueInput
 ): { readonly ok: true; readonly orders: ReadonlyArray<string> } | {
   readonly ok: false;
   readonly failure: ParseOrdersFailure;
 } => {
-  if (typeof text !== 'string') return { ok: false, failure: { _tag: 'NotAString' } };
+  if (!isJsonString(text)) return { ok: false, failure: { _tag: 'NotAString' } };
   const orders = text
     .split(';')
     .map((part) => part.trim())
@@ -220,7 +224,9 @@ export const parseOrdersEither = (
  * The failure is a `PlayerError`, which `cli-main` renders as `error: …` on
  * stderr with exit 2, exactly as CPython's `PlayerError` did.
  */
-export const parseOrders = (text: unknown): Effect.Effect<ReadonlyArray<string>, PlayerError> => {
+export const parseOrders = (
+  text: JsonValueInput
+): Effect.Effect<ReadonlyArray<string>, PlayerError> => {
   const outcome = parseOrdersEither(text);
   return outcome.ok
     ? Effect.succeed(outcome.orders)

@@ -38,8 +38,8 @@
  * core's own `v1ErrorMessage` for a non-2xx — so the two transports cannot
  * drift on anything but the number model.  See NOTES §11.9.
  */
-import { Console, Context, Effect, Layer, Option } from 'effect';
-import { PlayerError, attemptOr, playerError } from 'src/errors';
+import { Console, Context, Effect, Either, Layer, Option, Schema } from 'effect';
+import { type PlayerError, attemptOr, playerError } from 'src/errors';
 import {
   PyFloat,
   PyInt,
@@ -52,7 +52,15 @@ import {
 } from 'src/services/canonical-body';
 import { encodeStringAscii } from 'src/services/json-output';
 import { caTrustedFetch, v1ErrorMessage } from 'src/services/http';
-import { isJsonObject, type JsonObject, type JsonValue } from 'src/schema/primitives';
+import {
+  JsonValueSchema,
+  isJsonBoolean,
+  isJsonNumber,
+  isJsonObject,
+  isJsonString,
+  type JsonObject,
+  type JsonValue,
+} from 'src/schema/primitives';
 
 // ---------------------------------------------------------------------------
 // json.dumps(indent=2, sort_keys=True) over the Python number model
@@ -78,15 +86,15 @@ const isPyNumber = (value: PyValue): value is PyInt | PyFloat =>
   value instanceof PyInt || value instanceof PyFloat;
 
 const sortKeysAscii = (keys: ReadonlyArray<string>): ReadonlyArray<string> =>
-  [...keys].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+  [...keys].toSorted((left, right) => (left < right ? -1 : left > right ? 1 : 0));
 
 const INDENT = '  ';
 
 const dump = (value: PyValue, depth: number): string => {
   if (value === null || value === undefined) return 'null';
-  if (typeof value === 'boolean') return value ? 'true' : 'false';
-  if (typeof value === 'number' || isPyNumber(value)) return numberText(value);
-  if (typeof value === 'string') return encodeStringAscii(value, true);
+  if (isJsonBoolean(value)) return value ? 'true' : 'false';
+  if (isJsonNumber(value) || isPyNumber(value)) return numberText(value);
+  if (isJsonString(value)) return encodeStringAscii(value, true);
   const outer = `\n${INDENT.repeat(depth)}`;
   const inner = `\n${INDENT.repeat(depth + 1)}`;
   if (Array.isArray(value)) {
@@ -142,17 +150,15 @@ export const pyToJson = (value: PyValue): JsonValue => {
   if (value === null || value === undefined) return null;
   if (value instanceof PyInt) return Number(value.value);
   if (value instanceof PyFloat) return value.value;
-  if (typeof value === 'boolean' || typeof value === 'number' || typeof value === 'string') {
-    return value;
-  }
+  if (isJsonBoolean(value) || isJsonNumber(value) || isJsonString(value)) return value;
   if (Array.isArray(value)) return value.map((item) => pyToJson(item));
   if (isPyMapping(value)) {
-    const out: Record<string, JsonValue> = {};
-    for (const key of Object.keys(value)) {
-      const item = value[key];
-      out[key] = pyToJson(item === undefined ? null : item);
-    }
-    return out;
+    return Object.fromEntries(
+      Object.keys(value).map((key) => {
+        const item = value[key];
+        return [key, pyToJson(item === undefined ? null : item)];
+      })
+    );
   }
   return null;
 };
@@ -186,44 +192,45 @@ const decodeMessage = (failure: { readonly _tag: string; readonly message?: stri
 export const parsePyArgument = (text: string): PyArgument => {
   const parsed = parsePython(text);
   if (parsed.failure === null) return { ok: true, value: parsed.value };
-  return attemptOr(
-    (): PyArgument => ({ ok: true, value: jsonToPy(JSON.parse(text) as unknown) }),
-    (cause): PyArgument => ({
-      ok: false,
-      message:
-        (parsed.failure === null ? null : decodeMessage(parsed.failure)) ??
-        (cause instanceof Error ? cause.message : String(cause)),
-    })
-  );
+  const fallback = Schema.decodeUnknownEither(Schema.parseJson(JsonValueSchema))(text);
+  if (Either.isRight(fallback)) return { ok: true, value: jsonToPy(fallback.right) };
+  return {
+    ok: false,
+    message: decodeMessage(parsed.failure) ?? String(fallback.left),
+  };
 };
 
 /** The response-body form: the caller has already proved the text is JSON. */
 export const parsePyText = (text: string): PyValue => {
   const parsed = parsePython(text);
   // `parsePython` gives up past its own depth cap where CPython's scanner
-  // would still answer.  Falling back keeps the *value* right; only the
+  // would still answer. Falling back keeps the value right; only the
   // int/float spelling is lost, on a document no supervisor sends.
-  return parsed.failure === null ? parsed.value : jsonToPy(JSON.parse(text) as unknown);
+  if (parsed.failure === null) return parsed.value;
+  const fallback = Schema.decodeUnknownEither(Schema.parseJson(JsonValueSchema))(text);
+  return Either.isRight(fallback) ? jsonToPy(fallback.right) : null;
 };
 
-/** Narrow a `JSON.parse` result into the model, without a cast. */
-const jsonToPy = (value: unknown): PyValue => {
-  if (value === null || value === undefined) return null;
-  if (typeof value === 'boolean' || typeof value === 'number' || typeof value === 'string') {
+/** Copy a parsed JSON value into the Python-number model. */
+const jsonToPy = (value: JsonValue): PyValue => {
+  if (isJsonBoolean(value) || isJsonNumber(value) || isJsonString(value) || value === null) {
     return value;
   }
-  if (Array.isArray(value)) return value.map((item: unknown) => jsonToPy(item));
-  if (typeof value === 'object') {
-    const out: Record<string, PyValue> = {};
-    for (const [key, item] of Object.entries(value)) out[key] = jsonToPy(item);
-    return out;
-  }
-  return null;
+  if (Array.isArray(value)) return value.map((item) => jsonToPy(item));
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [key, jsonToPy(item)])
+  );
 };
 
 // ---------------------------------------------------------------------------
 // The transport
 // ---------------------------------------------------------------------------
+
+interface V1Headers extends Record<string, string> {
+  Accept: string;
+  'Content-Type'?: string;
+  Authorization?: string;
+}
 
 export interface V1RequestOptions {
   readonly token?: string | undefined;
@@ -274,7 +281,7 @@ export const v1JsonFor = (fetchImpl: typeof fetch): V1JsonApi => ({
   requestPyJson: (method, url, options = {}) =>
     Effect.gen(function* () {
       const data = options.body === undefined ? null : pyDumps(options.body, true);
-      const headers: Record<string, string> = { Accept: 'application/json' };
+      const headers: V1Headers = { Accept: 'application/json' };
       if (data !== null) headers['Content-Type'] = 'application/json';
       if (options.token !== undefined && options.token !== '') {
         headers['Authorization'] = `Bearer ${options.token}`;
@@ -282,16 +289,18 @@ export const v1JsonFor = (fetchImpl: typeof fetch): V1JsonApi => ({
       const timeoutMillis = (options.timeout ?? DEFAULT_TIMEOUT_S) * 1000;
 
       const response = yield* Effect.tryPromise({
-        try: (signal) =>
-          fetchImpl(url, {
+        try: (signal) => {
+          const init: RequestInit = {
             method,
             headers,
-            ...(data === null ? {} : { body: data }),
             // A redirect is a refusal, not a hop: the bearer credential stays
             // on the exact configured supervisor origin.
             redirect: 'error',
             signal,
-          }),
+          };
+          if (data !== null) init.body = data;
+          return fetchImpl(url, init);
+        },
         catch: (cause) => unreachable(url, cause instanceof Error ? cause.message : String(cause)),
       }).pipe(
         Effect.timeoutFail({
@@ -304,19 +313,24 @@ export const v1JsonFor = (fetchImpl: typeof fetch): V1JsonApi => ({
         try: () => response.text(),
         catch: invalidResponse,
       });
-      // `JSON.parse` is still the syntax verdict — its message is the one the
-      // refusal carries — and `parsePython` supplies the value.
-      yield* Effect.try({ try: () => JSON.parse(text) as unknown, catch: invalidResponse });
-      const value = parsePyText(text);
+      // The schema parser is the strict syntax verdict; the pinned Python
+      // scanner preserves both numeric spelling and the concise decode reason.
+      const parsed = parsePython(text);
+      yield* Effect.mapError(
+        Schema.decodeUnknown(Schema.parseJson(JsonValueSchema))(text),
+        (cause) => invalidResponse(
+          parsed.failure === null ? cause : (decodeMessage(parsed.failure) ?? cause)
+        )
+      );
+      const value = parsed.failure === null ? parsed.value : parsePyText(text);
       if (!isPyMapping(value)) {
-        return yield* Effect.fail(
-          playerError('the supervisor returned a non-object JSON response')
-        );
+        return yield*
+          playerError('the supervisor returned a non-object JSON response');
       }
       if (response.status >= 200 && response.status < 300) return value;
       const plain = pyToJson(value);
       const body: JsonObject = isJsonObject(plain) ? plain : {};
-      return yield* Effect.fail(playerError(v1ErrorMessage(response.status, body)));
+      return yield*playerError(v1ErrorMessage(response.status, body));
     }),
 });
 

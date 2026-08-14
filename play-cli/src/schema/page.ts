@@ -6,9 +6,8 @@
  */
 import { createHash } from 'node:crypto';
 import { Effect } from 'effect';
-import { DriftError, invalid } from 'src/errors';
+import { type DriftError, invalid } from 'src/errors';
 import {
-  CURSOR_RE,
   FULL_CONTROL_V2,
   V2_PAGE_MAX_ITEMS,
   V2_SECTIONS,
@@ -18,7 +17,9 @@ import {
   exact,
   field,
   hasField,
+  isJsonBoolean,
   isJsonObject,
+  isJsonString,
   isWholeNumber,
   jsonValue,
   type JsonValue,
@@ -27,7 +28,15 @@ import {
 import { decodeV2Header } from 'src/schema/error';
 import { decodeRevision, type Revision } from 'src/schema/revision';
 import { decodeDescriptor, type LegalActionDescriptor } from 'src/schema/descriptor';
-import { isActorId, isCatalogId, isRelationId, isTileId, type ActorType } from 'src/schema/ids';
+import {
+  isActorId,
+  isActorType,
+  isCatalogId,
+  isCursor,
+  isRelationId,
+  isTileId,
+  type ActorType,
+} from 'src/schema/ids';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -73,8 +82,8 @@ const ISO_UTC_RE = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d{1,6})?)?Z$/;
  * Accept exactly the `…Z` ISO-8601 spellings `datetime.fromisoformat` takes
  * once the trailing `Z` is rewritten to `+00:00`, and nothing else.
  */
-export const cursorExpiry = (value: unknown): Effect.Effect<string, DriftError> => {
-  if (typeof value !== 'string' || !value.endsWith('Z') || !ISO_UTC_RE.test(value)) {
+export const cursorExpiry = (value: JsonValue): Effect.Effect<string, DriftError> => {
+  if (!isJsonString(value) || !value.endsWith('Z') || !ISO_UTC_RE.test(value)) {
     return Effect.fail(invalid('v2 page cursor expiry'));
   }
   const parsed = Date.parse(value);
@@ -127,11 +136,9 @@ const decodeScope = (raw: JsonValue): Effect.Effect<PageScope, DriftError> =>
       const scope = yield* exact(raw, SCOPE_ACTOR_FIELDS, 'page scope');
       const actorId = field(scope, 'actor_id');
       const actorType = field(scope, 'actor_type');
-      const valid =
-        isActorId(actorId) &&
-        (actorType === 'player' || actorType === 'city' || actorType === 'unit');
+      const valid = isActorId(actorId) && isActorType(actorType);
       if (!valid) {
-        return yield* Effect.fail(invalid('legal-actions page scope'));
+        return yield*invalid('legal-actions page scope');
       }
       return { actor_id: actorId, actor_type: actorType };
     }
@@ -143,8 +150,8 @@ const decodeScope = (raw: JsonValue): Effect.Effect<PageScope, DriftError> =>
       const targetType = field(scope, 'target_type');
       const valid =
         isActorId(actorId) &&
-        (actorType === 'player' || actorType === 'unit' || actorType === 'city') &&
-        typeof targetId === 'string' &&
+        isActorType(actorType) &&
+        isJsonString(targetId) &&
         ((actorType === 'player' &&
           isRelationId(targetId) &&
           targetType === 'diplomatic_relation') ||
@@ -152,7 +159,7 @@ const decodeScope = (raw: JsonValue): Effect.Effect<PageScope, DriftError> =>
             isTileId(targetId) &&
             targetType === 'tile'));
       if (!valid) {
-        return yield* Effect.fail(invalid('legal-actions page scope'));
+        return yield*invalid('legal-actions page scope');
       }
       return {
         actor_id: actorId,
@@ -161,7 +168,7 @@ const decodeScope = (raw: JsonValue): Effect.Effect<PageScope, DriftError> =>
         target_type: targetType,
       };
     }
-    return yield* Effect.fail(invalid('legal-actions page scope'));
+    return yield*invalid('legal-actions page scope');
   });
 
 // ---------------------------------------------------------------------------
@@ -179,8 +186,14 @@ const ENVELOPE_FIELDS: ReadonlySet<string> = new Set([
 
 const LEGACY_BASE = ['section', 'items', 'total_items', 'next_cursor'] as const;
 
-const decodePageShape = <Item>(
-  value: unknown,
+interface PageBodyDraft<Item> extends PageBody<Item> {
+  scope?: PageScope;
+  catalog_id?: string;
+  catalog_complete?: boolean;
+}
+
+const decodePageEnvelope = <Item>(
+  value: JsonValue,
   session: SessionIdentity,
   legal: boolean,
   decodeItem: (item: JsonValue, revision: Revision) => Effect.Effect<Item, DriftError>
@@ -190,7 +203,7 @@ const decodePageShape = <Item>(
     const revision = yield* decodeRevision(field(raw, 'state_revision'));
     const page = field(raw, 'page');
     if (!isJsonObject(page)) {
-      return yield* Effect.fail(invalid('v2 page envelope'));
+      return yield*invalid('v2 page envelope');
     }
     const present = new Set(Object.keys(page));
     const legacyBase = new Set<string>(LEGACY_BASE);
@@ -202,16 +215,16 @@ const decodePageShape = <Item>(
     );
     const bare = setsEqual(present, legacyBase) || setsEqual(present, currentBase);
     if (!bare && !legacyScoped && !currentScoped) {
-      return yield* Effect.fail(invalid('v2 page envelope'));
+      return yield*invalid('v2 page envelope');
     }
 
     const section = field(page, 'section');
     if (legal) {
       if (section !== 'legal_actions') {
-        return yield* Effect.fail(invalid('legal-actions page section'));
+        return yield*invalid('legal-actions page section');
       }
-    } else if (typeof section !== 'string' || !V2_SECTIONS.has(section)) {
-      return yield* Effect.fail(invalid('state page section'));
+    } else if (!isJsonString(section) || !V2_SECTIONS.has(section)) {
+      return yield*invalid('state page section');
     }
 
     const items = field(page, 'items');
@@ -222,10 +235,10 @@ const decodePageShape = <Item>(
       items.length > V2_PAGE_MAX_ITEMS ||
       !isWholeNumber(total) ||
       total < items.length ||
-      (cursor !== null && (typeof cursor !== 'string' || !CURSOR_RE.test(cursor))) ||
+      (cursor !== null && !isCursor(cursor)) ||
       (cursor !== null && total <= items.length)
     ) {
-      return yield* Effect.fail(invalid('v2 page pagination'));
+      return yield*invalid('v2 page pagination');
     }
 
     let expiry: string | null = null;
@@ -233,7 +246,7 @@ const decodePageShape = <Item>(
       const declared = field(page, 'cursor_expires_at');
       if (cursor === null) {
         if (declared !== null) {
-          return yield* Effect.fail(invalid('v2 page cursor expiry'));
+          return yield*invalid('v2 page cursor expiry');
         }
       } else {
         expiry = yield* cursorExpiry(declared);
@@ -245,9 +258,7 @@ const decodePageShape = <Item>(
       cleanItems.push(yield* decodeItem(item, revision));
     }
 
-    const body: {
-      -readonly [K in keyof PageBody<Item>]: PageBody<Item>[K];
-    } = {
+    const body: PageBodyDraft<Item> = {
       section: section,
       items: cleanItems,
       total_items: total,
@@ -257,7 +268,7 @@ const decodePageShape = <Item>(
 
     if (hasField(page, 'scope')) {
       if (!legal) {
-        return yield* Effect.fail(invalid('state page scope'));
+        return yield*invalid('state page scope');
       }
       const scope = yield* decodeScope(field(page, 'scope'));
       body.scope = scope;
@@ -266,10 +277,10 @@ const decodePageShape = <Item>(
         const complete = field(page, 'catalog_complete');
         if (
           !isCatalogId(catalogId) ||
-          typeof complete !== 'boolean' ||
+          !isJsonBoolean(complete) ||
           complete !== (cursor === null)
         ) {
-          return yield* Effect.fail(invalid('legal-actions catalog metadata'));
+          return yield*invalid('legal-actions catalog metadata');
         }
         body.catalog_id = catalogId;
         body.catalog_complete = complete;
@@ -291,19 +302,19 @@ const decodePageShape = <Item>(
 
 /** A state page: items are opaque JSON, copied through unchanged. */
 export const decodePage = (
-  value: unknown,
+  value: JsonValue,
   session: SessionIdentity
 ): Effect.Effect<PageEnvelope, DriftError> =>
-  decodePageShape<JsonValue>(value, session, false, (item) =>
+  decodePageEnvelope<JsonValue>(value, session, false, (item) =>
     jsonValue(item, 'state page item')
   );
 
 /** A legal-actions page: every item is a validated descriptor. */
 export const decodeLegalPage = (
-  value: unknown,
+  value: JsonValue,
   session: SessionIdentity
 ): Effect.Effect<LegalActionPageEnvelope, DriftError> =>
-  decodePageShape<LegalActionDescriptor>(value, session, true, (item, revision) =>
+  decodePageEnvelope<LegalActionDescriptor>(value, session, true, (item, revision) =>
     decodeDescriptor(item, revision)
   );
 

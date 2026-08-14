@@ -4,32 +4,22 @@
  * Ports `_monitor_lock_path` (client.py:592-594), `_monitor_lock` (596-662),
  * `_read_monitor_holder` (665-673) and `_monitor_holder` (676-711).
  *
- * Two properties come free from the kernel rather than from bookkeeping, and
- * both matter for a process meant to outlive individual turns:
- *
- * - **idempotency by construction** — a second `play monitor` cannot start, so
- *   there is no PID file, no liveness heuristic and no reaping;
- * - **crash recovery by construction** — an `flock` is released when the holder
- *   dies, so a monitor killed by `kill -9`, a crash or a laptop shutdown leaves
- *   nothing stale behind and the next one simply acquires.
- *
- * The lock file doubles as the holder record, written *after* the lock is won,
- * so `--status` and `--stop` read it without a second file to keep in step
- * with it.
- *
- * DIVERGENCE (NOTES.md §15.1): `src/services/locks.ts` binds `flock(2)` through
- * `bun:ffi` for its own use and exports only `hasNativeFlock`, so the binding is
- * repeated here rather than reached into.  Core owns that file; U17 does not
- * edit it.
+ * The kernel-backed `flock(2)` provides idempotency and crash recovery: a
+ * second monitor cannot acquire the lock, and process death closes the scoped
+ * descriptor automatically. The lock file doubles as the holder record,
+ * written only after acquisition, so `--status` and `--stop` need no PID file.
+ * A bounded `O_EXCL` sentinel remains the fallback where libc cannot bind.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import { Effect } from 'effect';
-import { PlayerError, playerError, attemptOr } from 'src/errors';
-import { isJsonObject, type JsonObject } from 'src/schema/primitives';
+import type { FileSystem } from '@effect/platform';
+import type * as Scope from 'effect/Scope';
+import { dlopen, FFIType } from 'bun:ffi';
+import { Effect, Either, Schema } from 'effect';
+import { type PlayerError, playerError, attemptOr } from 'src/errors';
+import { JsonObjectSchema, type JsonObject } from 'src/schema/primitives';
 import { pyJsonDumps } from 'src/services/json-output';
 import { monitorLockPath } from 'src/services/locks';
 import { PrivateFs, type PrivateFsApi } from 'src/services/private-fs';
+import { fileSystem, path } from 'src/services/platform';
 
 export { monitorLockPath };
 
@@ -37,85 +27,54 @@ const LOCK_EX = 2;
 const LOCK_SH = 1;
 const LOCK_NB = 4;
 const LOCK_UN = 8;
-
-/** The most of the holder record CPython ever read back. */
 const HOLDER_BYTES = 4096;
 
 type FlockFn = (descriptor: number, operation: number) => number;
-
 const LIBC_CANDIDATES = ['libc.dylib', 'libc.so.6', 'libc.so', 'libSystem.dylib'] as const;
 
+interface FlockCache {
+  resolved: boolean;
+  value: FlockFn | null;
+}
+
 const flockBinding = ((): (() => FlockFn | null) => {
-  const cache: { resolved: boolean; value: FlockFn | null } = { resolved: false, value: null };
+  const cache: FlockCache = { resolved: false, value: null };
   return () => {
     if (cache.resolved) return cache.value;
     cache.resolved = true;
     const bound = LIBC_CANDIDATES.flatMap((candidate) =>
       attemptOr(
         (): ReadonlyArray<FlockFn> => {
-          const ffi = require('bun:ffi') as {
-            readonly dlopen: (
-              name: string,
-              symbols: Record<string, { args: ReadonlyArray<unknown>; returns: unknown }>
-            ) => { readonly symbols: Record<string, FlockFn> };
-            readonly FFIType: Record<string, unknown>;
-          };
-          const library = ffi.dlopen(candidate, {
-            flock: { args: [ffi.FFIType['i32'], ffi.FFIType['i32']], returns: ffi.FFIType['i32'] },
+          const library = dlopen(candidate, {
+            flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
           });
-          const symbol = library.symbols['flock'];
-          return typeof symbol === 'function' ? [symbol] : [];
+          return [library.symbols.flock];
         },
-        (): ReadonlyArray<FlockFn> => [] /* this libc spelling is absent here */
+        (): ReadonlyArray<FlockFn> => []
       )
     );
     cache.value = bound[0] ?? null;
-    if (cache.value !== null) return cache.value;
     return cache.value;
   };
 })();
 
-const openFlag = (name: string): number => {
-  const table = fs.constants as unknown as Readonly<Record<string, number | undefined>>;
-  return table[name] ?? 0;
-};
-
-const NOFOLLOW = openFlag('O_NOFOLLOW');
-const CLOEXEC = openFlag('O_CLOEXEC');
-
-// ---------------------------------------------------------------------------
-// _read_monitor_holder
-// ---------------------------------------------------------------------------
-
-/**
- * Read the running monitor's own record of itself, or an empty one.
- *
- * Anything unreadable is `{}` rather than an error: the record is a courtesy
- * for `--status`, and a monitor that is demonstrably alive must not be reported
- * as absent because its own JSON was truncated by a crash mid-write.
- */
-export const readMonitorHolder = (descriptor: number): JsonObject =>
-  attemptOr(
-    () => {
-      const buffer = Buffer.alloc(HOLDER_BYTES);
-      const read = fs.readSync(descriptor, buffer, 0, HOLDER_BYTES, 0);
-      const value = JSON.parse(buffer.subarray(0, read).toString('utf8')) as unknown;
-      return isJsonObject(value) ? value : {};
-    },
+/** Read a monitor holder record from an already-open lock file. */
+export const readMonitorHolder = (
+  opened: FileSystem.File
+): Effect.Effect<JsonObject> =>
+  Effect.orElseSucceed(
+    Effect.gen(function* () {
+      yield* opened.seek(0, 'start');
+      const content = yield* opened.readAlloc(HOLDER_BYTES);
+      if (content._tag === 'None') return {};
+      const value = Schema.decodeUnknownEither(Schema.parseJson(JsonObjectSchema))(
+        new TextDecoder().decode(content.value)
+      );
+      return Either.isRight(value) ? value.right : {};
+    }),
     (): JsonObject => ({})
   );
 
-// ---------------------------------------------------------------------------
-// The lock file, as a path inside the private-state sandbox
-// ---------------------------------------------------------------------------
-
-/**
- * Resolve the lock file, creating its directory only when asked.
- *
- * `_monitor_lock` walks with `create=True`; `_monitor_holder` walks with
- * `create=False` and answers "nobody" when the walk fails, because a workspace
- * with no state directory plainly has no monitor in it.
- */
 const lockFile = (
   files: PrivateFsApi,
   sessionPath: string,
@@ -124,10 +83,14 @@ const lockFile = (
   Effect.gen(function* () {
     const { relative } = yield* files.resolve(monitorLockPath(sessionPath));
     const parent = yield* files.openDirectory(relative.slice(0, -1), { create });
-    return path.join(parent, relative[relative.length - 1] as string);
+    const leaf = relative.at(-1);
+    return leaf === undefined
+      ? yield* playerError('the monitor lock path is invalid')
+      : path.join(parent, leaf);
   });
 
 const sentinelOf = (file: string): string => `${file}.held`;
+const ErrnoSchema = Schema.Struct({ code: Schema.String });
 
 const isLive = (pid: number): boolean =>
   attemptOr(
@@ -135,171 +98,139 @@ const isLive = (pid: number): boolean =>
       process.kill(pid, 0);
       return true;
     },
-    (cause) => (cause as NodeJS.ErrnoException).code === 'EPERM'
+    (cause) => Schema.is(ErrnoSchema)(cause) && cause.code === 'EPERM'
   );
 
-// ---------------------------------------------------------------------------
-// _monitor_lock
-// ---------------------------------------------------------------------------
+const refuseSymbolicLink = (target: string): Effect.Effect<void, PlayerError> =>
+  Effect.flatMap(Effect.either(fileSystem.readLink(target)), (link) =>
+    Either.isRight(link)
+      ? Effect.fail(playerError('the monitor lock must be a mode-0600 file'))
+      : Effect.void
+  );
 
-interface HeldMonitorLock {
-  /** The recorded holder when the lock was already taken; `null` when we own it. */
-  readonly running: JsonObject | null;
-  readonly release: () => void;
-}
+const openMonitorFile = (
+  file: string,
+  create: boolean
+): Effect.Effect<FileSystem.File, PlayerError, Scope.Scope> =>
+  Effect.gen(function* () {
+    yield* refuseSymbolicLink(file);
+    if (create) {
+      const existing = yield* Effect.either(fileSystem.stat(file));
+      if (Either.isLeft(existing)) {
+        yield* Effect.ignore(
+          fileSystem.writeFile(file, new Uint8Array(), { flag: 'wx', mode: 0o600 })
+        );
+      }
+      yield* refuseSymbolicLink(file);
+    }
+    const opened = yield* Effect.mapError(
+      fileSystem.open(file, { flag: create ? 'r+' : 'r' }),
+      () => playerError('cannot safely lock the monitor')
+    );
+    const info = yield* Effect.mapError(
+      opened.stat,
+      () => playerError('cannot safely lock the monitor')
+    );
+    if (info.type !== 'File' || (info.mode & 0o777) !== 0o600) {
+      return yield* playerError('the monitor lock must be a mode-0600 file');
+    }
+    return opened;
+  });
 
-const writeHolder = (descriptor: number, holder: JsonObject): void => {
-  const record = Buffer.from(pyJsonDumps(holder, { sortKeys: true }), 'utf8');
-  fs.ftruncateSync(descriptor, 0);
-  fs.writeSync(descriptor, record, 0, record.length, 0);
-  fs.fsyncSync(descriptor);
-};
+const writeHolder = (
+  opened: FileSystem.File,
+  holder: JsonObject
+): Effect.Effect<void, PlayerError> =>
+  Effect.gen(function* () {
+    const record = new TextEncoder().encode(pyJsonDumps(holder, { sortKeys: true }));
+    yield* opened.truncate(0);
+    yield* opened.seek(0, 'start');
+    yield* opened.writeAll(record);
+    yield* opened.sync;
+  }).pipe(
+    Effect.mapError(() => playerError('cannot safely lock the monitor'))
+  );
 
-const openLockFile = (file: string): number =>
-  fs.openSync(file, fs.constants.O_RDWR | fs.constants.O_CREAT | NOFOLLOW | CLOEXEC, 0o600);
+const clearHolder = (opened: FileSystem.File): Effect.Effect<void> =>
+  Effect.ignore(opened.truncate(0));
 
-const acquireNative = (
+const runNative = <A, E, R>(
   flock: FlockFn,
   file: string,
-  holder: JsonObject
-): Effect.Effect<HeldMonitorLock, PlayerError> =>
-  Effect.suspend<HeldMonitorLock, PlayerError, never>(() => {
-    const opened = ((): number | PlayerError => {
-      return attemptOr(
-          () => openLockFile(file),
-          () => playerError('cannot safely lock the monitor')
-      );
-    })();
-    if (typeof opened !== 'number') return Effect.fail(opened);
-    const stat = fs.fstatSync(opened);
-    if (!stat.isFile() || (stat.mode & 0o777) !== 0o600) {
-      fs.closeSync(opened);
-      return Effect.fail(playerError('the monitor lock must be a mode-0600 file'));
+  holder: JsonObject,
+  body: (running: JsonObject | null) => Effect.Effect<A, E, R>
+): Effect.Effect<A, E | PlayerError, R | Scope.Scope> =>
+  Effect.gen(function* () {
+    const opened = yield* openMonitorFile(file, true);
+    const descriptor = Number(opened.fd);
+    if (flock(descriptor, LOCK_EX | LOCK_NB) !== 0) {
+      return yield* body(yield* readMonitorHolder(opened));
     }
-    if (flock(opened, LOCK_EX | LOCK_NB) !== 0) {
-      // Somebody else holds it; say who, and take nothing.
-      const running = readMonitorHolder(opened);
-      return Effect.succeed({
-        running,
-        release: () => {
-          fs.closeSync(opened);
-        },
-      });
-    }
-    const held = attemptOr(
-      () => {
-        writeHolder(opened, holder);
-        return true;
-      },
-      () => false
+    yield* Effect.onError(writeHolder(opened, holder), () =>
+      Effect.sync(() => {
+        attemptOr(() => flock(descriptor, LOCK_UN), () => 0);
+      })
     );
-    if (!held) {
-      attemptOr(
-        () => flock(opened, LOCK_UN),
-        () => undefined /* the close below releases it anyway */
-      );
-      fs.closeSync(opened);
-      return Effect.fail(playerError('cannot safely lock the monitor'));
-    }
-    return Effect.succeed({
-      running: null,
-      release: () => {
-        attemptOr(
-          () => {
-            fs.ftruncateSync(opened, 0);
-            flock(opened, LOCK_UN);
-          },
-          () => undefined /* the kernel releases on close anyway */
-        );
-        fs.closeSync(opened);
-      },
-    });
+    return yield* Effect.ensuring(
+      body(null),
+      Effect.zipRight(
+        clearHolder(opened),
+        Effect.sync(() => {
+          attemptOr(() => flock(descriptor, LOCK_UN), () => 0);
+        })
+      )
+    );
   });
 
-/**
- * The `flock`-less fallback, for a platform where `bun:ffi` cannot bind libc.
- *
- * Mutual exclusion survives (an `O_EXCL` sentinel), crash recovery does not —
- * it is paid for with the liveness probe the Python was deliberately avoiding.
- * NOTES.md §4 already records the same divergence for the state locks.
- */
-const acquireSentinel = (file: string, holder: JsonObject): Effect.Effect<HeldMonitorLock, PlayerError> =>
-  Effect.suspend<HeldMonitorLock, PlayerError, never>(() => {
-    const sentinel = sentinelOf(file);
-    const opened = ((): number | PlayerError => {
-      return attemptOr(
-          () => openLockFile(file),
-          () => playerError('cannot safely lock the monitor')
-      );
-    })();
-    if (typeof opened !== 'number') return Effect.fail(opened);
-    const stat = fs.fstatSync(opened);
-    if (!stat.isFile() || (stat.mode & 0o777) !== 0o600) {
-      fs.closeSync(opened);
-      return Effect.fail(playerError('the monitor lock must be a mode-0600 file'));
+const sentinelPid = (sentinel: string): Effect.Effect<number | null> =>
+  Effect.map(
+    Effect.either(fileSystem.readFileString(sentinel)),
+    (content) => {
+      if (Either.isLeft(content)) return null;
+      const pid = Number.parseInt(content.right.trim(), 10);
+      return Number.isInteger(pid) ? pid : null;
     }
-    const acquireSentinel = (): HeldMonitorLock | null =>
-      attemptOr(
-        (): HeldMonitorLock => {
-          const guard = fs.openSync(
-            sentinel,
-            fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NOFOLLOW | CLOEXEC,
-            0o600
+  );
+
+const runSentinel = <A, E, R>(
+  file: string,
+  holder: JsonObject,
+  body: (running: JsonObject | null) => Effect.Effect<A, E, R>
+): Effect.Effect<A, E | PlayerError, R | Scope.Scope> =>
+  Effect.gen(function* () {
+    const sentinel = sentinelOf(file);
+    const opened = yield* openMonitorFile(file, true);
+    const claim = () =>
+      Effect.orElseSucceed(
+        Effect.gen(function* () {
+          const guard = yield* fileSystem.open(sentinel, { flag: 'wx', mode: 0o600 });
+          return yield* Effect.onError(
+            Effect.as(guard.writeAll(new TextEncoder().encode(`${process.pid}\n`)), true),
+            () => Effect.ignore(fileSystem.remove(sentinel, { force: true }))
           );
-          fs.writeSync(guard, Buffer.from(`${process.pid}\n`, 'utf8'));
-          fs.closeSync(guard);
-          writeHolder(opened, holder);
-          return {
-            running: null,
-            release: () => {
-              attemptOr(
-                () => {
-                  fs.ftruncateSync(opened, 0);
-                  fs.unlinkSync(sentinel);
-                },
-                () => undefined /* already gone */
-              );
-              fs.closeSync(opened);
-            },
-          };
-        },
-        () => null
-      );
-    const sentinelIsStale = (): boolean =>
-      attemptOr(
-        () => {
-          const pid = Number.parseInt(fs.readFileSync(sentinel, 'utf8').trim(), 10);
-          return Number.isInteger(pid) && !isLive(pid);
-        },
+        }),
         () => false
       );
-    // Two attempts at most: the retry only exists to reap one stale sentinel.
-    const acquired =
-      acquireSentinel() ??
-      (sentinelIsStale()
-        ? (attemptOr(
-            () => fs.unlinkSync(sentinel),
-            () => undefined /* another process reaped it first */
-          ),
-          acquireSentinel())
-        : null);
-    if (acquired !== null) return Effect.succeed(acquired);
-    const running = readMonitorHolder(opened);
-    return Effect.succeed({
-      running,
-      release: () => {
-        fs.closeSync(opened);
-      },
-    });
+    const acquired = yield* Effect.flatMap(claim(), (claimed) =>
+      claimed
+        ? Effect.succeed(true)
+        : Effect.flatMap(sentinelPid(sentinel), (pid) =>
+            pid !== null && !isLive(pid)
+              ? Effect.zipRight(Effect.ignore(fileSystem.remove(sentinel)), claim())
+              : Effect.succeed(false)
+          )
+    );
+    if (!acquired) return yield* body(yield* readMonitorHolder(opened));
+    return yield* Effect.ensuring(
+      Effect.zipRight(writeHolder(opened, holder), body(null)),
+      Effect.zipRight(
+        clearHolder(opened),
+        Effect.ignore(fileSystem.remove(sentinel, { force: true }))
+      )
+    );
   });
 
-/**
- * Hold the persistent monitor's singleton lock, or report who does.
- *
- * `body` is handed the lock file's recorded holder when the lock is already
- * taken, and `null` when this process now owns it — the exact shape of the
- * Python contextmanager's yield.
- */
+/** Hold the monitor singleton lock, or report the recorded current holder. */
 export const withMonitorLock = <A, E, R>(
   sessionPath: string,
   holder: JsonObject,
@@ -309,58 +240,38 @@ export const withMonitorLock = <A, E, R>(
     const files = yield* PrivateFs;
     const file = yield* lockFile(files, sessionPath, true);
     const flock = flockBinding();
-    return yield* Effect.acquireUseRelease(
-      flock === null ? acquireSentinel(file, holder) : acquireNative(flock, file, holder),
-      (held) => body(held.running),
-      (held) => Effect.sync(held.release)
+    return yield* Effect.scoped(
+      flock === null
+        ? runSentinel(file, holder, body)
+        : runNative(flock, file, holder, body)
     );
   });
 
-// ---------------------------------------------------------------------------
-// _monitor_holder
-// ---------------------------------------------------------------------------
-
-/**
- * Report the running monitor, or `null` when the lock is free.
- *
- * Probing is the same non-blocking `flock`: if a shared lock can be taken then
- * nobody holds it exclusively, which is a stronger answer than any PID file
- * could give.
- */
+/** Report the running monitor, or `null` when the lock is free. */
 export const monitorHolder = (
   sessionPath: string
 ): Effect.Effect<JsonObject | null, never, PrivateFs> =>
   Effect.gen(function* () {
     const files = yield* PrivateFs;
     const resolved = yield* Effect.either(lockFile(files, sessionPath, false));
-    if (resolved._tag === 'Left') return null;
-    const file = resolved.right;
-    return yield* Effect.sync(() => {
-      const opened = attemptOr(
-        () => fs.openSync(file, fs.constants.O_RDONLY | NOFOLLOW | CLOEXEC),
-        () => null
-      );
-      if (opened === null) return null;
-      const probe = (): JsonObject | null => {
-        const flock = flockBinding();
-        if (flock === null) {
-          const sentinel = sentinelOf(file);
-          const pid = attemptOr(
-            () => {
-              const value = Number.parseInt(fs.readFileSync(sentinel, 'utf8').trim(), 10);
-              return Number.isInteger(value) ? value : null;
-            },
-            () => null
-          );
-          if (pid === null || !isLive(pid)) return null;
-          return readMonitorHolder(opened);
-        }
-        if (flock(opened, LOCK_SH | LOCK_NB) !== 0) return readMonitorHolder(opened);
-        flock(opened, LOCK_UN);
-        return null;
-      };
-      const holder = attemptOr(probe, () => null);
-      fs.closeSync(opened);
-      return holder;
-    });
+    if (Either.isLeft(resolved)) return null;
+    return yield* Effect.orElseSucceed(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const opened = yield* openMonitorFile(resolved.right, false);
+          const flock = flockBinding();
+          if (flock === null) {
+            const pid = yield* sentinelPid(sentinelOf(resolved.right));
+            return pid === null || !isLive(pid) ? null : yield* readMonitorHolder(opened);
+          }
+          const descriptor = Number(opened.fd);
+          if (flock(descriptor, LOCK_SH | LOCK_NB) !== 0) {
+            return yield* readMonitorHolder(opened);
+          }
+          flock(descriptor, LOCK_UN);
+          return null;
+        })
+      ),
+      () => null
+    );
   });

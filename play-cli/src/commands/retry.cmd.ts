@@ -31,7 +31,7 @@ import type {
   SessionMissingError,
 } from 'src/errors';
 import { V2ResponseError } from 'src/errors';
-import { ExitCodeSignal, exitWith } from 'src/exit';
+import { type ExitCodeSignal, exitWith } from 'src/exit';
 import { dualText, resolveDualRequired } from 'src/options';
 import { render } from 'src/render/primitives';
 import { renderDisposition, renderReceipt } from 'src/render/receipt';
@@ -41,7 +41,7 @@ import { decodeReceipt, type CommandReceipt } from 'src/schema/receipt';
 import { warnIfAmbiguous } from 'src/commands/receipt.cmd';
 import { isTerminalReceipt } from 'src/services/disposition';
 import { jsonRequested, printV2Json } from 'src/services/json-output';
-import { PrivateFs } from 'src/services/private-fs';
+import { type PrivateFs } from 'src/services/private-fs';
 import {
   ACCEPTED_RECEIPT_VANISHED,
   RETRY_POLL_DEADLINE_S,
@@ -55,7 +55,7 @@ import {
   type RetryClock,
 } from 'src/services/receipts';
 import { SessionStore, type Session } from 'src/services/session-store';
-import { V2Client } from 'src/services/v2-client';
+import { type V2Client } from 'src/services/v2-client';
 
 export interface RetryOptions {
   readonly session: string;
@@ -90,7 +90,7 @@ export const retryLocked = (
     // Nothing was ever persisted for this ID, so there is nothing to resolve
     // and — crucially — nothing this command could legitimately send.
     if (!Object.prototype.hasOwnProperty.call(state.batches, batchId)) {
-      return yield* Effect.fail(noPersistedBatch(batchId));
+      return yield*noPersistedBatch(batchId);
     }
     const hooks = yield* makeHooks(path, session);
     const intent = hooks.batchIntent(state, batchId);
@@ -139,13 +139,12 @@ export const retryLocked = (
         // Only "this batch does not exist" is a licence to submit. Every other
         // refusal is raised as-is, because it says nothing about acceptance.
         if (response.status !== 404 || error.error.code !== 'invalid_request') {
-          return yield* Effect.fail(
+          return yield*
             new V2ResponseError({
               message: v2ErrorMessage(response.status, error),
               status: response.status,
               payload: error,
-            })
-          );
+            });
         }
         if (accepted !== null) {
           const terminal = yield* missingAcceptedReceipt(session, accepted, batchId);
@@ -189,7 +188,8 @@ export const runRetry = (
     );
     // A non-zero status here is a disposition already printed and a warning
     // already on stderr — not an error, so it must not print `error: …`.
-    if (code !== 0) return yield* Effect.fail(exitWith(code));
+    if (code !== 0) return yield*exitWith(code);
+    return undefined;
   });
 
 // ---------------------------------------------------------------------------

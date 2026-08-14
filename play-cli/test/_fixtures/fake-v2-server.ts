@@ -1,3 +1,6 @@
+import { Effect } from 'effect';
+import type { JsonValue } from 'src/schema/primitives';
+
 /**
  * The fake supervisor every unit's tests talk to.
  *
@@ -15,31 +18,42 @@ export interface RecordedRequest {
 
 export interface FakeRoute {
   readonly status?: number;
-  readonly body: unknown;
+  readonly body: JsonValue;
   readonly headers?: Readonly<Record<string, string>>;
   /** Seconds of simulated latency, for the concurrency-determinism tests. */
   readonly delayS?: number;
 }
 
-/** The first parameter `fetch` accepts, without depending on lib.dom. */
-type FetchInput = Parameters<typeof fetch>[0];
+export interface RecordingServer {
+  readonly fetch: typeof fetch;
+  readonly requests: ReadonlyArray<RecordedRequest>;
+}
 
-export const jsonResponse = (body: unknown, status = 200): Response =>
+type FakePlan = ReadonlyArray<FakeRoute> | ReadonlyMap<string, FakeRoute>;
+type FetchInput = Parameters<typeof fetch>[0];
+type FetchArguments = Parameters<typeof fetch>;
+
+const completeFetch = (
+  handler: (...args: FetchArguments) => ReturnType<typeof fetch>
+): typeof fetch => Object.assign(handler, { preconnect: fetch.preconnect });
+
+export const jsonResponse = (body: JsonValue, status = 200): Response =>
   new Response(JSON.stringify(body), {
     status,
     headers: { 'content-type': 'application/json' },
   });
 
 const urlOf = (input: FetchInput): string =>
-  typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+  input instanceof Request ? input.url : new URL(input).href;
 
-const requestBody = async (init: RequestInit | undefined): Promise<string | null> => {
+const requestBody = (init: RequestInit | undefined): Effect.Effect<string | null> => {
   const body = init?.body;
-  if (body === undefined || body === null) return null;
-  return typeof body === 'string' ? body : new Response(body).text();
+  return body === undefined || body === null
+    ? Effect.succeed(null)
+    : Effect.promise(() => new Response(body).text());
 };
 
-const headerRecord = (init: RequestInit | undefined): Readonly<Record<string, string>> => {
+const headerRecord = (init: RequestInit | undefined) => {
   const out: Record<string, string> = {};
   const headers = init?.headers;
   if (headers === undefined) return out;
@@ -49,52 +63,61 @@ const headerRecord = (init: RequestInit | undefined): Readonly<Record<string, st
   return out;
 };
 
+const isRouteQueue = (plan: FakePlan): plan is ReadonlyArray<FakeRoute> => Array.isArray(plan);
+
+const responseFor = (route: FakeRoute): Response =>
+  new Response(JSON.stringify(route.body), {
+    status: route.status ?? 200,
+    headers: { 'content-type': 'application/json', ...route.headers },
+  });
+
 /**
  * Serve a queue of responses, or one response per matching URL substring.
  *
  * A queue drains in order and is how a busy-retry test proves the second GET
  * happened; a map is how a multi-route command test stays readable.
  */
-export const fakeFetch = (
-  plan: ReadonlyArray<FakeRoute> | ReadonlyMap<string, FakeRoute>
-): typeof fetch => {
-  const queue = Array.isArray(plan) ? [...(plan as ReadonlyArray<FakeRoute>)] : null;
-  const routes = queue === null ? (plan as ReadonlyMap<string, FakeRoute>) : null;
-  return (async (input: FetchInput, _init?: RequestInit): Promise<Response> => {
-    const url = urlOf(input);
-    const route =
-      queue !== null
-        ? queue.shift()
-        : [...(routes ?? new Map<string, FakeRoute>())].find(([match]) => url.includes(match))?.[1];
-    if (route === undefined) {
-      return jsonResponse({ error: { code: 'not_implemented', message: `no route for ${url}` } }, 404);
-    }
-    const delayS = route.delayS ?? 0;
-    if (delayS > 0) {
-      await new Promise((resolve) => setTimeout(resolve, delayS * 1000));
-    }
-    return new Response(JSON.stringify(route.body), {
-      status: route.status ?? 200,
-      headers: { 'content-type': 'application/json', ...route.headers },
-    });
-  }) as typeof fetch;
+export const fakeFetch = (plan: FakePlan): typeof fetch => {
+  const queue: Array<FakeRoute> = isRouteQueue(plan) ? [...plan] : [];
+  const routes: ReadonlyMap<string, FakeRoute> = isRouteQueue(plan) ? new Map() : plan;
+  return completeFetch((input, _init) =>
+    Effect.runPromise(
+      Effect.gen(function* () {
+        const url = urlOf(input);
+        const route = isRouteQueue(plan)
+          ? queue.shift()
+          : [...routes].find(([match]) => url.includes(match))?.[1];
+        if (route === undefined) {
+          return jsonResponse(
+            { error: { code: 'not_implemented', message: `no route for ${url}` } },
+            404
+          );
+        }
+        const delayS = route.delayS ?? 0;
+        if (delayS > 0) yield* Effect.sleep(`${delayS} seconds`);
+        return responseFor(route);
+      })
+    )
+  );
 };
 
 /** The same, plus a log of everything that was sent. */
-export const recordingFetch = (
-  plan: ReadonlyArray<FakeRoute> | ReadonlyMap<string, FakeRoute>
-): { readonly fetch: typeof fetch; readonly requests: ReadonlyArray<RecordedRequest> } => {
+export const recordingFetch = (plan: FakePlan): RecordingServer => {
   const requests: RecordedRequest[] = [];
   const inner = fakeFetch(plan);
-  const wrapped = (async (input: FetchInput, init?: RequestInit): Promise<Response> => {
-    const url = urlOf(input);
-    requests.push({
-      method: init?.method ?? 'GET',
-      url,
-      headers: headerRecord(init),
-      body: await requestBody(init),
-    });
-    return inner(input, init);
-  }) as typeof fetch;
+  const wrapped = completeFetch((input, init) =>
+    Effect.runPromise(
+      Effect.gen(function* () {
+        const url = urlOf(input);
+        requests.push({
+          method: init?.method ?? 'GET',
+          url,
+          headers: headerRecord(init),
+          body: yield* requestBody(init),
+        });
+        return yield* Effect.promise(() => inner(input, init));
+      })
+    )
+  );
   return { fetch: wrapped, requests };
 };

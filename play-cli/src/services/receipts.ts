@@ -13,7 +13,7 @@
  * validator, so the ambiguity is recorded in `.v2-state` exactly as a
  * server-sent one would be.
  */
-import { Effect, Layer } from 'effect';
+import { Effect } from 'effect';
 import { FULL_CONTROL_V2 } from 'src/constants';
 import type { DriftError, LockTimeoutError, PlayerError, V2ResponseError } from 'src/errors';
 import { playerError } from 'src/errors';
@@ -198,18 +198,25 @@ export const liveReceiptHooks: ReceiptHooksFor = (sessionPath, session) =>
     const files = yield* PrivateFs;
     const store = yield* SessionStore;
     const client = yield* V2Client;
-    const provided = Layer.mergeAll(
-      Layer.succeed(PrivateFs, files),
-      Layer.succeed(SessionStore, store),
-      Layer.succeed(V2Client, client)
-    );
+    const give = <A, E>(
+      body: Effect.Effect<A, E, PrivateFs | SessionStore | V2Client>
+    ): Effect.Effect<A, E> =>
+      Effect.provideService(
+        Effect.provideService(
+          Effect.provideService(body, PrivateFs, files),
+          SessionStore,
+          store
+        ),
+        V2Client,
+        client
+      );
     return {
       batchIntent,
       rememberReceipt: (receipt) =>
-        Effect.provide(Effect.asVoid(rememberReceipt(sessionPath, session, receipt)), provided),
+        give(Effect.asVoid(rememberReceipt(sessionPath, session, receipt))),
       mirrorReceipt: (receipt, command) =>
         Effect.provideService(mirrorReceipt(sessionPath, receipt, command), PrivateFs, files),
       submitPersistedBatch: (batchId) =>
-        Effect.provide(submitBatch(sessionPath, session, batchId), provided),
+        give(submitBatch(sessionPath, session, batchId)),
     };
   });

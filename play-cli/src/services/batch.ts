@@ -25,16 +25,22 @@
  * disposition machinery exists to prevent.
  */
 import { Effect, Either } from 'effect';
-import { FULL_CONTROL_V2, V2_DISPOSITIONS, V2_TERMINAL_RECEIPTS } from 'src/constants';
+import { FULL_CONTROL_V2, V2_TERMINAL_RECEIPTS } from 'src/constants';
 import {
   playerError,
   type DriftError,
   type LockTimeoutError,
   type PlayerError,
 } from 'src/errors';
-import type { BatchDisposition, Disposition } from 'src/schema/batch';
+import { isDisposition, type BatchDisposition } from 'src/schema/batch';
 import { decodeError, type StructuredError } from 'src/schema/error';
-import { isJsonObject, opaque } from 'src/schema/primitives';
+import {
+  isJsonObject,
+  isJsonString,
+  jsonValue,
+  opaque,
+  type JsonValueInput,
+} from 'src/schema/primitives';
 import {
   isPyMapping,
   parsePython,
@@ -50,7 +56,7 @@ import { rememberReceipt } from 'src/services/aliases';
 // U04's barrel does not re-export the receipt bridge; the module that owns
 // `update_from_receipt` does (PORT_MAP §8's U07 addendum).
 import { mirrorReceipt } from 'src/services/mirror/update-receipt';
-import { PrivateFs } from 'src/services/private-fs';
+import { type PrivateFs } from 'src/services/private-fs';
 import {
   SessionStore,
   credentialsOf,
@@ -118,6 +124,8 @@ const failureText = (failure: PyParseFailure, label: string): string => {
     // pathological document costs a refusal and not a stack.
     case 'too_deep':
       return `invalid ${label}: JSON is nested too deeply`;
+    default:
+      return `${label} must be valid strict JSON`;
   }
 };
 
@@ -128,10 +136,10 @@ export const parseJsonObject = (
   Effect.gen(function* () {
     const parsed = parsePython(value, { hooks: true });
     if (parsed.failure !== null) {
-      return yield* Effect.fail(playerError(failureText(parsed.failure, label)));
+      return yield*playerError(failureText(parsed.failure, label));
     }
     if (!isPyMapping(parsed.value)) {
-      return yield* Effect.fail(playerError(`${label} must be a JSON object`));
+      return yield*playerError(`${label} must be a JSON object`);
     }
     return yield* pyJsonObject(parsed.value, label);
   });
@@ -156,7 +164,7 @@ export const parseJsonObject = (
  */
 export const batchIntent = (state: V2ClientState, batchId: string): string => {
   const encoded = state.batches[batchId];
-  if (typeof encoded !== 'string') return 'batch';
+  if (!isJsonString(encoded)) return 'batch';
   // `_batch_intent` is `json.loads` with no hook: a repeated key is last-wins
   // here, because refusing one would only lose a name it could have printed.
   const parsed = parsePython(encoded);
@@ -166,12 +174,12 @@ export const batchIntent = (state: V2ClientState, batchId: string): string => {
   const command = commands[0];
   if (command === undefined || !isPyMapping(command)) return 'batch';
   const actionId = command['action_id'];
-  if (typeof actionId !== 'string') return 'batch';
+  if (!isJsonString(actionId)) return 'batch';
   const descriptor = state.actions[actionId];
   const kind = isJsonObject(descriptor) ? descriptor['kind'] : null;
   const descriptorLabel = isJsonObject(descriptor) ? descriptor['label'] : null;
   const named =
-    typeof kind === 'string' && typeof descriptorLabel === 'string'
+    isJsonString(kind) && isJsonString(descriptorLabel)
       ? `${kind} ${descriptorLabel}`
       : actionId;
   const args = command['arguments'] ?? null;
@@ -188,8 +196,8 @@ export const batchIntent = (state: V2ClientState, batchId: string): string => {
 // ---------------------------------------------------------------------------
 
 export interface DispositionParts {
-  readonly receipt?: unknown;
-  readonly error?: unknown;
+  readonly receipt?: JsonValueInput;
+  readonly error?: JsonValueInput;
 }
 
 const SAFE_NEXT: ReadonlySet<string> = new Set(['refresh', 'retry_exact', 'receipt_first']);
@@ -217,17 +225,23 @@ export const batchDisposition = (
 ): Effect.Effect<BatchDisposition, PlayerError | DriftError> =>
   Effect.gen(function* () {
     const identifier = yield* opaque(batchId, 'batch disposition ID');
-    if (!V2_DISPOSITIONS.has(disposition)) {
-      return yield* Effect.fail(playerError('invalid batch disposition'));
+    if (!isDisposition(disposition)) {
+      return yield*playerError('invalid batch disposition');
     }
     const rawReceipt = parts.receipt ?? null;
     const rawError = parts.error ?? null;
     const receipt: CommandReceipt | null =
       rawReceipt === null
         ? null
-        : yield* decodeReceipt(rawReceipt, session, { batchId: identifier });
+        : yield* decodeReceipt(
+            yield* jsonValue(rawReceipt, 'batch disposition receipt'),
+            session,
+            { batchId: identifier }
+          );
     const error: StructuredError | null =
-      rawError === null ? null : yield* decodeError(rawError);
+      rawError === null
+        ? null
+        : yield* decodeError(yield* jsonValue(rawError, 'batch disposition error'));
     const contradicts =
       (disposition === 'receipt_terminal' &&
         (receipt === null ||
@@ -239,7 +253,7 @@ export const batchDisposition = (
         (receipt !== null || error === null)) ||
       (disposition === 'receipt_first' && receipt !== null);
     if (contradicts) {
-      return yield* Effect.fail(playerError('invalid batch disposition payload'));
+      return yield*playerError('invalid batch disposition payload');
     }
     return {
       schema_version: 2,
@@ -247,7 +261,7 @@ export const batchDisposition = (
       game_id: session.gameId,
       agent_id: session.agentId,
       batch_id: identifier,
-      disposition: disposition as Disposition,
+      disposition,
       receipt,
       error,
     } as const;
@@ -280,10 +294,10 @@ export const batchErrorDisposition = (
     if (
       details['batch_id'] !== batchId ||
       details['acceptance'] !== 'not_accepted' ||
-      typeof safeNext !== 'string' ||
+      !isJsonString(safeNext) ||
       !SAFE_NEXT.has(safeNext)
     ) {
-      return yield* Effect.fail(playerError('batch error omitted its safe recovery contract'));
+      return yield*playerError('batch error omitted its safe recovery contract');
     }
     const code = body.code;
     const expected = RECEIPT_FIRST_CODES.has(code)
@@ -293,9 +307,8 @@ export const batchErrorDisposition = (
         ? 'retry_exact'
         : 'refresh';
     if (safeNext !== expected) {
-      return yield* Effect.fail(
-        playerError('batch error recovery contract contradicts its code')
-      );
+      return yield*
+        playerError('batch error recovery contract contradicts its code');
     }
     return yield* batchDisposition(session, batchId, safeNext, { error });
   });
@@ -379,8 +392,8 @@ export const submitBatch = (
         mirrorReceipt(sessionPath, receipt, command));
     const state = yield* store.readState(sessionPath, session);
     const encoded = state.batches[batchId];
-    if (typeof encoded !== 'string') {
-      return yield* Effect.fail(playerError(`no persisted command batch '${batchId}'`));
+    if (!isJsonString(encoded)) {
+      return yield*playerError(`no persisted command batch '${batchId}'`);
     }
     const credentials = credentialsOf(session);
     const sent = yield* Effect.either(
