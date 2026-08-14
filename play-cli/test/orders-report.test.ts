@@ -12,10 +12,10 @@
  * that reads a paraphrase learns to retry.  Every case below asserts the whole
  * sentence, never a substring, for exactly that reason.
  */
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect } from 'bun:test';
 import { Effect, Either, Equal, Layer } from 'effect';
 import { FULL_CONTROL_V2, V2_WITHHELD } from 'src/constants';
-import { playerError, type PlayerError } from 'src/errors';
+import { playerError, type PlayerError, type PlayError } from 'src/errors';
 import { decodeLegalPage, decodePage } from 'src/schema/page';
 import { isJsonObject, type JsonObject, type JsonValue, type MutableJsonObject } from 'src/schema/primitives';
 import { rememberPage, v2StateSchema } from 'src/services/aliases';
@@ -35,7 +35,7 @@ import {
   type OrdersDeps,
 } from 'src/services/orders';
 import { FIXTURE_GAME_ID, scratchWorkspace, sessionFile, type Scratch } from 'test/_fixtures';
-import { provideTestLayer } from 'test/_effect-test';
+import { awaitTest, provideTestLayer } from 'test/_effect-test';
 import { path } from 'test/_test-platform';
 
 // ---------------------------------------------------------------------------
@@ -90,7 +90,11 @@ const deps: OrdersDeps = { compactLegalAction };
 // ---------------------------------------------------------------------------
 
 const scratches: Scratch[] = [];
-afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
+afterEach(() =>
+  Effect.runPromise(
+    Effect.forEach(scratches.splice(0), (scratch) => scratch.cleanup, { discard: true })
+  )
+);
 
 interface TestRevision {
   readonly turn: number;
@@ -104,28 +108,30 @@ interface Fixture {
   readonly session: Session;
   readonly run: <A, E>(
     effect: Effect.Effect<A, E, SessionStore | PrivateFs>
-  ) => Either.Either<A, E>;
+  ) => Effect.Effect<Either.Either<A, E>>;
 }
 
-const fixture = (): Fixture => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
-  const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'codex-test.json');
-  Effect.runSync(
-    scratch.files.writeJson(sessionPath, sessionFile({ control_protocol: FULL_CONTROL_V2 }))
-  );
-  const loaded = Effect.runSync(store.resolveV2(sessionPath));
-  const layer = Layer.merge(
-    Layer.succeed(SessionStore, store),
-    Layer.succeed(PrivateFs, scratch.files)
-  );
-  return {
-    sessionPath,
-    session: loaded.session,
-    run: (effect) => Effect.runSync(Effect.either(provideTestLayer(effect, layer))),
-  };
-};
+const fixture = (): Effect.Effect<Fixture, PlayError> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
+    const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'codex-test.json');
+    yield* scratch.files.writeJson(
+      sessionPath,
+      sessionFile({ control_protocol: FULL_CONTROL_V2 })
+    );
+    const loaded = yield* store.resolveV2(sessionPath);
+    const layer = Layer.merge(
+      Layer.succeed(SessionStore, store),
+      Layer.succeed(PrivateFs, scratch.files)
+    );
+    return {
+      sessionPath,
+      session: loaded.session,
+      run: (effect) => Effect.either(provideTestLayer(effect, layer)),
+    };
+  });
 
 const ok = <A, E>(either: Either.Either<A, E>): A => {
   if (Either.isLeft(either)) {
@@ -220,35 +226,37 @@ const sectionPage = (
   page: { section, items, total_items: items.length, next_cursor: null },
 });
 
-const ingestLegal = (fx: Fixture, page: JsonObject): V2ClientState =>
-  ok(
+const ingestLegal = (fx: Fixture, page: JsonObject): Effect.Effect<V2ClientState> =>
+  Effect.map(
     fx.run(
       Effect.flatMap(
         Effect.mapError(decodeLegalPage(page, fx.session), (error) => playerError(error.message)),
         (decoded) => rememberPage(fx.sessionPath, fx.session, { legal: true, page: decoded })
       )
-    )
-  ).state;
+    ),
+    (result) => ok(result).state
+  );
 
-const ingestState = (fx: Fixture, page: JsonObject): V2ClientState =>
-  ok(
+const ingestState = (fx: Fixture, page: JsonObject): Effect.Effect<V2ClientState> =>
+  Effect.map(
     fx.run(
       Effect.flatMap(
         Effect.mapError(decodePage(page, fx.session), (error) => playerError(error.message)),
         (decoded) => rememberPage(fx.sessionPath, fx.session, { legal: false, page: decoded })
       )
-    )
-  ).state;
+    ),
+    (result) => ok(result).state
+  );
 
 /**
  * The world every matrix case shares: `u1` holds one move onto T(32,72) and one
  * onto T(31,71); `c1` holds one worklist action; `u2` and `r1` are known
  * entities this seat never enumerated.
  */
-const world = () => {
-  const fx = fixture();
+const world = () => Effect.gen(function* () {
+  const fx = yield* fixture();
   const at = revision(7);
-  ingestLegal(
+  yield* ingestLegal(
     fx,
     scopedLegalPage(
       at,
@@ -260,7 +268,7 @@ const world = () => {
       `catalog_${'a'.repeat(32)}`
     )
   );
-  ingestLegal(
+  yield* ingestLegal(
     fx,
     scopedLegalPage(
       at,
@@ -282,7 +290,7 @@ const world = () => {
       'city'
     )
   );
-  const state = ingestState(
+  const state = yield* ingestState(
     fx,
     sectionPage('units', at, [
       { id: UNIT_TWO, tile_id: tileId(30, 70), x: 30, y: 70 },
@@ -290,14 +298,19 @@ const world = () => {
     ])
   );
   return { fx, state };
-};
+});
 
-const reasonOf = (fx: Fixture, state: V2ClientState, order: string): string => {
-  const [outcome] = ok(fx.run(orderOutcomes(deps, state, fx.sessionPath, [order])));
-  if (outcome === undefined) throw new Error('no outcome');
-  expect(outcome.resolved).toBeNull();
-  return outcome.reason;
-};
+const reasonOf = (
+  fx: Fixture,
+  state: V2ClientState,
+  order: string
+): Effect.Effect<string> =>
+  Effect.map(fx.run(orderOutcomes(deps, state, fx.sessionPath, [order])), (result) => {
+    const [outcome] = ok(result);
+    if (outcome === undefined) throw new Error('no outcome');
+    expect(outcome.resolved).toBeNull();
+    return outcome.reason;
+  });
 
 // ---------------------------------------------------------------------------
 // The failure matrix
@@ -377,40 +390,40 @@ describe('every class of unresolvable order says exactly one sentence', () => {
   ];
 
   for (const [name, order, sentence] of cases) {
-    test(name, () => {
-      const { fx, state } = world();
-      expect(reasonOf(fx, state, order)).toBe(sentence);
+    awaitTest(name, function* () {
+      const { fx, state } = yield* world();
+      expect(yield* reasonOf(fx, state, order)).toBe(sentence);
     });
   }
 
-  test('an array bound the words overrun is a non-match, not a truncation', () => {
-    const { fx, state } = world();
+  awaitTest('an array bound the words overrun is a non-match, not a truncation', function* () {
+    const { fx, state } = yield* world();
     // `items` declares maxItems 2, and the bound is checked before any element
     // is resolved, so three words never reach the per-word refusal — the whole
     // action simply does not match, which is the sentence the agent gets.
-    expect(reasonOf(fx, state, 'c1 queue a b c')).toBe(
+    expect(yield* reasonOf(fx, state, 'c1 queue a b c')).toBe(
       'no cached action takes those arguments; 1 candidate(s) matched the verb'
     );
     // Under the bound, the failure is per word and names the word.
-    expect(reasonOf(fx, state, 'c1 queue a b')).toBe(
+    expect(yield* reasonOf(fx, state, 'c1 queue a b')).toBe(
       '`queue` takes items this seat has been offered by name; no cached target is named a'
     );
   });
 
-  test('a stale action alias keeps its own refusal, with the re-enumeration command', () => {
-    const { fx } = world();
-    const state = ingestState(fx, sectionPage('overview', revision(9), []));
-    expect(reasonOf(fx, state, 'a1')).toBe(
+  awaitTest('a stale action alias keeps its own refusal, with the re-enumeration command', function* () {
+    const { fx } = yield* world();
+    const state = yield* ingestState(fx, sectionPage('overview', revision(9), []));
+    expect(yield* reasonOf(fx, state, 'a1')).toBe(
       'action alias a1 was enumerated at rev7/t3 but this seat now knows rev9/t3; ' +
         'action aliases die with their revision. Re-enumerate with ' +
         '`just legal --actor_id u1 --all` and use the new a1..aN'
     );
   });
 
-  test('an alias that survived but names a retired action says so', () => {
-    const fx = fixture();
+  awaitTest('an alias that survived but names a retired action says so', function* () {
+    const fx = yield* fixture();
     const at = revision(7);
-    const state = ingestLegal(
+    const state = yield* ingestLegal(
       fx,
       scopedLegalPage(
         at,
@@ -422,15 +435,15 @@ describe('every class of unresolvable order says exactly one sentence', () => {
     // Drop the descriptor the alias names but keep the alias table intact: the
     // handle is still numbered, the capability is gone.
     const orphaned: V2ClientState = { ...state, actions: {} };
-    expect(reasonOf(fx, orphaned, 'a1')).toBe(
+    expect(yield* reasonOf(fx, orphaned, 'a1')).toBe(
       'a1 names an action this seat no longer holds'
     );
   });
 
-  test('no catalog read at all names the plain enumeration command', () => {
-    const fx = fixture();
-    const state = ingestState(fx, sectionPage('overview', revision(7), []));
-    expect(reasonOf(fx, state, 'a1')).toBe(
+  awaitTest('no catalog read at all names the plain enumeration command', function* () {
+    const fx = yield* fixture();
+    const state = yield* ingestState(fx, sectionPage('overview', revision(7), []));
+    expect(yield* reasonOf(fx, state, 'a1')).toBe(
       'unknown action alias a1: no legal-action catalog has been read yet; ' +
         'run `just legal`'
     );
@@ -442,29 +455,29 @@ describe('every class of unresolvable order says exactly one sentence', () => {
 // ---------------------------------------------------------------------------
 
 describe('_order_enumeration_command names the drain in the agent dialect', () => {
-  test('a known actor is named by its alias, an unknown one by its ID', () => {
-    const { fx, state } = world();
-    expect(ok(fx.run(orderEnumerationCommand(fx.sessionPath, state, UNIT_ONE)))).toBe(
+  awaitTest('a known actor is named by its alias, an unknown one by its ID', function* () {
+    const { fx, state } = yield* world();
+    expect(ok(yield* fx.run(orderEnumerationCommand(fx.sessionPath, state, UNIT_ONE)))).toBe(
       'just legal --actor_id u1 --all'
     );
     const stranger = `unit_${'9'.repeat(32)}`;
-    expect(ok(fx.run(orderEnumerationCommand(fx.sessionPath, state, stranger)))).toBe(
+    expect(ok(yield* fx.run(orderEnumerationCommand(fx.sessionPath, state, stranger)))).toBe(
       `just legal --actor_id ${stranger} --all`
     );
   });
 
-  test('an order that named no actor asks for the whole catalog', () => {
-    const { fx, state } = world();
-    expect(ok(fx.run(orderEnumerationCommand(fx.sessionPath, state, '')))).toBe('just legal');
+  awaitTest('an order that named no actor asks for the whole catalog', function* () {
+    const { fx, state } = yield* world();
+    expect(ok(yield* fx.run(orderEnumerationCommand(fx.sessionPath, state, '')))).toBe('just legal');
   });
 
-  test('an actor ID spelling an inherited name is still just an unknown ID', () => {
-    const { fx, state } = world();
+  awaitTest('an actor ID spelling an inherited name is still just an unknown ID', function* () {
+    const { fx, state } = yield* world();
     // CPython's `aliases.get(actor_id, actor_id)`: the fallback is the raw ID,
     // never whatever `Object.prototype` carries under that name.  A prototype
     // walk here would put a function body into the remedy line.
     for (const stranger of ['constructor', 'toString', '__proto__', 'valueOf']) {
-      expect(ok(fx.run(orderEnumerationCommand(fx.sessionPath, state, stranger)))).toBe(
+      expect(ok(yield* fx.run(orderEnumerationCommand(fx.sessionPath, state, stranger)))).toBe(
         `just legal --actor_id ${stranger} --all`
       );
     }
@@ -480,45 +493,46 @@ describe('_unresolved_report', () => {
     fx: Fixture,
     state: V2ClientState,
     orders: ReadonlyArray<string>
-  ): ReadonlyArray<string> => {
-    const outcomes = ok(fx.run(orderOutcomes(deps, state, fx.sessionPath, orders)));
-    return ok(fx.run(unresolvedReport(fx.sessionPath, state, outcomes)));
-  };
+  ): Effect.Effect<ReadonlyArray<string>> =>
+    Effect.gen(function* () {
+      const outcomes = ok(yield* fx.run(orderOutcomes(deps, state, fx.sessionPath, orders)));
+      return ok(yield* fx.run(unresolvedReport(fx.sessionPath, state, outcomes)));
+    });
 
-  test('the header counts the failures against the revision the cache holds', () => {
-    const { fx, state } = world();
-    const lines = report(fx, state, ['u1 move 32,72', 'u1 teleport 9,9', 'c9 build X']);
+  awaitTest('the header counts the failures against the revision the cache holds', function* () {
+    const { fx, state } = yield* world();
+    const lines = yield* report(fx, state, ['u1 move 32,72', 'u1 teleport 9,9', 'c9 build X']);
     expect(lines[0]).toBe(
       '2 of 3 orders did not resolve against the cached rev7/t3 catalog; nothing was sent'
     );
   });
 
-  test('a resolved order is shown with the capability it bound to', () => {
-    const { fx, state } = world();
-    const lines = report(fx, state, ['u1 move 32,72', 'u1 teleport 9,9']);
+  awaitTest('a resolved order is shown with the capability it bound to', function* () {
+    const { fx, state } = yield* world();
+    const lines = yield* report(fx, state, ['u1 move 32,72', 'u1 teleport 9,9']);
     expect(lines[1]).toBe('  1 resolved    u1 move 32,72  ->  unit.order Move');
     expect(lines[2]).toBe(
       '  2 unresolved  u1 teleport 9,9  --  no cached action advertises the verb `teleport`'
     );
   });
 
-  test('every unresolved order contributes its remedy, deduplicated in first-seen order', () => {
-    const { fx, state } = world();
-    const lines = report(fx, state, ['u1 teleport 9,9', 'u1 warp 1,1', 'c1 teleport 2,2']);
+  awaitTest('every unresolved order contributes its remedy, deduplicated in first-seen order', function* () {
+    const { fx, state } = yield* world();
+    const lines = yield* report(fx, state, ['u1 teleport 9,9', 'u1 warp 1,1', 'c1 teleport 2,2']);
     expect(lines.filter((line) => line.startsWith('enumerate with:'))).toEqual([
       'enumerate with: just legal --actor_id u1 --all',
       'enumerate with: just legal --actor_id c1 --all',
     ]);
   });
 
-  test('an order that named no actor asks for the whole catalog', () => {
-    const { fx, state } = world();
-    const lines = report(fx, state, ['set_goal Currency']);
+  awaitTest('an order that named no actor asks for the whole catalog', function* () {
+    const { fx, state } = yield* world();
+    const lines = yield* report(fx, state, ['set_goal Currency']);
     expect(lines[lines.length - 1]).toBe('enumerate with: just legal');
   });
 
-  test('an empty cache says "no revision" rather than inventing one', () => {
-    const fx = fixture();
+  awaitTest('an empty cache says "no revision" rather than inventing one', function* () {
+    const fx = yield* fixture();
     const empty: V2ClientState = {
       schema_version: 5,
       game_id: FIXTURE_GAME_ID,
@@ -533,17 +547,17 @@ describe('_unresolved_report', () => {
       tile_aliases: {},
       drained_actors: [],
     };
-    const lines = report(fx, empty, ['u1 sentry']);
+    const lines = yield* report(fx, empty, ['u1 sentry']);
     expect(lines[0]).toBe(
       '1 of 1 orders did not resolve against the cached no revision catalog; nothing was sent'
     );
   });
 
-  test('a phase that is already over suppresses the remedies and leads with the note', () => {
-    const { fx, state } = world();
-    const dir = ok(fx.run(Effect.mapError(mirrorDir(fx.sessionPath), (error) => error)));
+  awaitTest('a phase that is already over suppresses the remedies and leads with the note', function* () {
+    const { fx, state } = yield* world();
+    const dir = ok(yield* fx.run(Effect.mapError(mirrorDir(fx.sessionPath), (error) => error)));
     ok(
-      fx.run(
+      yield* fx.run(
         writeMirror(
           dir,
           HEADER_FILE,
@@ -551,19 +565,21 @@ describe('_unresolved_report', () => {
         )
       )
     );
-    const lines = report(fx, state, ['u1 teleport 9,9']);
+    const lines = yield* report(fx, state, ['u1 teleport 9,9']);
     expect(lines[0]).toBe('your phase is not active (state inactive_done) — just wait');
     expect(lines[1]).toContain('1 of 1 orders did not resolve');
     // Re-enumerating would only produce a fresh catalog this seat cannot act on.
     expect(lines.some((line) => line.startsWith('enumerate with:'))).toBe(false);
   });
 
-  test('a batch that fully resolved still renders every row', () => {
-    const { fx, state } = world();
+  awaitTest('a batch that fully resolved still renders every row', function* () {
+    const { fx, state } = yield* world();
     const outcomes: ReadonlyArray<OrderOutcome> = ok(
-      fx.run(orderOutcomes(deps, state, fx.sessionPath, ['u1 move 32,72', 'u1 move 31,71']))
+      yield* fx.run(
+        orderOutcomes(deps, state, fx.sessionPath, ['u1 move 32,72', 'u1 move 31,71'])
+      )
     );
-    const lines = ok(fx.run(unresolvedReport(fx.sessionPath, state, outcomes)));
+    const lines = ok(yield* fx.run(unresolvedReport(fx.sessionPath, state, outcomes)));
     expect(lines).toEqual([
       '0 of 2 orders did not resolve against the cached rev7/t3 catalog; nothing was sent',
       '  1 resolved    u1 move 32,72  ->  unit.order Move',

@@ -126,8 +126,8 @@ export const batchBody = (batchId: string, args: JsonObject = { ready: true }): 
 const scratches: Scratch[] = [];
 
 /** Call from an `afterEach`. */
-export const cleanupScratches = (): Promise<ReadonlyArray<void>> =>
-  Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup()));
+export const cleanupScratches = (): Effect.Effect<void> =>
+  Effect.forEach(scratches.splice(0), (scratch) => scratch.cleanup, { discard: true });
 
 export interface Fixture {
   readonly scratch: Scratch;
@@ -137,41 +137,41 @@ export interface Fixture {
   readonly layer: Layer.Layer<SessionStore | V2Client | PrivateFs>;
   /** Everything that reached the wire — "it made no request" is an assertion. */
   readonly requests: ReadonlyArray<RecordedRequest>;
-  readonly seed: (state: Partial<V2ClientState>) => void;
-  readonly readState: () => V2ClientState;
+  readonly seed: (state: Partial<V2ClientState>) => Effect.Effect<void, PlayError>;
+  readonly readState: () => Effect.Effect<V2ClientState, PlayError>;
 }
 
 export const buildFixture = (
   routes: ReadonlyMap<string, FakeRoute> | ReadonlyArray<FakeRoute>
-): Fixture => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
-  const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'seat.json');
-  Effect.runSync(
-    scratch.files.writeJson(sessionPath, sessionFile({ control_protocol: FULL_CONTROL_V2 }))
-  );
-  const session = Effect.runSync(store.resolveV2(sessionPath)).session;
-  const server = recordingFetch(routes);
-  const client = v2ClientFor(httpFor(server.fetch), () => Effect.void);
-  return {
-    scratch,
-    store,
-    sessionPath,
-    session,
-    requests: server.requests,
-    layer: Layer.mergeAll(
-      Layer.succeed(SessionStore, store),
-      Layer.succeed(V2Client, client),
-      Layer.succeed(PrivateFs, scratch.files)
-    ),
-    seed: (overrides) =>
-      Effect.runSync(
-        store.writeState(sessionPath, { ...emptyV2ClientState(session), ...overrides })
+): Effect.Effect<Fixture, PlayError> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
+    const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'seat.json');
+    yield* scratch.files.writeJson(
+      sessionPath,
+      sessionFile({ control_protocol: FULL_CONTROL_V2 })
+    );
+    const session = (yield* store.resolveV2(sessionPath)).session;
+    const server = recordingFetch(routes);
+    const client = v2ClientFor(httpFor(server.fetch), () => Effect.void);
+    return {
+      scratch,
+      store,
+      sessionPath,
+      session,
+      requests: server.requests,
+      layer: Layer.mergeAll(
+        Layer.succeed(SessionStore, store),
+        Layer.succeed(V2Client, client),
+        Layer.succeed(PrivateFs, scratch.files)
       ),
-    readState: () => Effect.runSync(store.readState(sessionPath, session)),
-  };
-};
+      seed: (overrides) =>
+        store.writeState(sessionPath, { ...emptyV2ClientState(session), ...overrides }),
+      readState: () => store.readState(sessionPath, session),
+    };
+  });
 
 /**
  * A clock the test drives by hand.
@@ -234,15 +234,13 @@ export interface Recorded<A, E> {
 export const capture = <A, E>(
   effect: Effect.Effect<A, E, SessionStore | V2Client | PrivateFs>,
   fixture: Fixture
-): Promise<Recorded<A, E>> =>
-  Effect.runPromise(
-    captureEffect(Effect.either(provideTestLayer(effect, fixture.layer))).pipe(
-      Effect.map(({ value, captured }) => ({
-        out: captured.out,
-        err: captured.err,
-        result: value,
-      }))
-    )
+): Effect.Effect<Recorded<A, E>> =>
+  captureEffect(Effect.either(provideTestLayer(effect, fixture.layer))).pipe(
+    Effect.map(({ value, captured }) => ({
+      out: captured.out,
+      err: captured.err,
+      result: value,
+    }))
   );
 
 type CommandFailure = PlayError | ExitCodeSignal;

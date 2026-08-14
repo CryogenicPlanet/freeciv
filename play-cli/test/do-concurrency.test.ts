@@ -22,7 +22,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect, Layer, Option, Schema } from 'effect';
 import { ledgerEntry, readSessionLedger, recordReceipt } from 'src/services/receipt-ledger';
 import { distinctActors, drainActors, fetchedOptionsNote } from 'src/services/do-drain';
-import { playerError } from 'src/errors';
+import { playerError, type PlayError } from 'src/errors';
 import { isJsonObject, type JsonObject } from 'src/schema/primitives';
 import type { Revision } from 'src/schema/revision';
 import { PrivateFs, type PrivateFsApi } from 'src/services/private-fs';
@@ -57,14 +57,17 @@ const explodingAppend = (api: PrivateFsApi): PrivateFsApi => ({
 
 const benches: Bench[] = [];
 
-const fresh = (): Bench => {
-  const made = bench();
-  benches.push(made);
-  return made;
-};
+const fresh = (): Effect.Effect<Bench, PlayError> =>
+  Effect.tap(bench(), (made) =>
+    Effect.sync(() => {
+      benches.push(made);
+    })
+  );
 
 afterEach(() =>
-  Promise.all(benches.splice(0).map((kit) => kit.scratch.cleanup()))
+  Effect.runPromise(
+    Effect.forEach(benches.splice(0), (kit) => kit.scratch.cleanup, { discard: true })
+  )
 );
 
 /** Four units, `u1`..`u4`, each with one distinguishable move. */
@@ -83,11 +86,10 @@ const ORDERS = ACTORS.map((_actor, index) => `u${index + 1} move ${30 + index},$
 );
 
 const runCaptured = (kit: Bench, args: ReturnType<typeof doArgs>) =>
-  Effect.promise(() => runDoCaptured(kit, args));
+  runDoCaptured(kit, args);
 
-/** Run one drain effect on its own runtime, like the original `Effect.runPromise` tests. */
-const runDrain = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, E> =>
-  Effect.promise(() => Effect.runPromise(effect));
+/** Keep drains inside the test Effect runtime. */
+const runDrain = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, E> => effect;
 
 /**
  * Stage four seats whose *aliases* are known and whose *catalogs* are not.
@@ -97,19 +99,21 @@ const runDrain = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, E> =>
  * reached here the way it is reached live — a revision bump retires the cached
  * actions and the drain record while the entity aliases survive.
  */
-const coldSeats = (kit: Bench): void => {
+const coldSeats = (kit: Bench): Effect.Effect<void, PlayError> => Effect.gen(function* () {
   const learning = rev(7);
   kit.world.revision = learning;
-  ACTORS.forEach((actor, index) => {
-    kit.seed(actor, [actionFor(index)], learning);
-  });
+  yield* Effect.forEach(
+    ACTORS,
+    (actor, index) => kit.seed(actor, [actionFor(index)], learning),
+    { concurrency: 1, discard: true }
+  );
   const now = rev(8);
-  kit.bump(now);
+  yield* kit.bump(now);
   ACTORS.forEach((actor, index) => {
     kit.world.catalogs.set(actor, [actionFor(index)]);
   });
   kit.world.receipt = () => ({ state: 'applied', revision: now });
-};
+});
 
 /** A small deterministic PRNG, so a failing seed is a reproducible failure. */
 const rng = (seed: number): (() => number) => {
@@ -241,8 +245,8 @@ describe('do — determinism under randomised latency', () => {
     const issueOrders = new Set<string>();
 
     for (let attempt = 0; attempt < 24; attempt += 1) {
-      const kit = fresh();
-      coldSeats(kit);
+      const kit = yield* fresh();
+      yield* coldSeats(kit);
       const random = rng(attempt * 7919 + 13);
       kit.world.latency = () => Math.floor(random() * 6);
 
@@ -280,16 +284,22 @@ describe('do — determinism under randomised latency', () => {
   awaitTest('a refusal renders its inline options in the orders’ order, not the responses’', function* () {
     const transcripts = new Set<string>();
     for (let attempt = 0; attempt < 12; attempt += 1) {
-      const kit = fresh();
+      const kit = yield* fresh();
       const before = rev(7);
       const after = rev(9);
       kit.world.revision = before;
       // Three seats, all refused, all with catalogs the refusal must re-read
       // because the rejection carried a newer revision.
-      ACTORS.slice(0, 3).forEach((actor, index) => {
-        kit.seed(actor, [actionFor(index)], before);
-        kit.world.catalogs.set(actor, [actionFor(index)]);
-      });
+      yield* Effect.forEach(
+        ACTORS.slice(0, 3),
+        (actor, index) =>
+          Effect.tap(kit.seed(actor, [actionFor(index)], before), () =>
+            Effect.sync(() => {
+              kit.world.catalogs.set(actor, [actionFor(index)]);
+            })
+          ),
+        { concurrency: 1, discard: true }
+      );
       kit.world.receipt = () => ({ state: 'rejected', revision: after });
       const random = rng(attempt * 104729 + 5);
       kit.world.latency = () => Math.floor(random() * 6);
@@ -347,8 +357,8 @@ describe('do — determinism under randomised latency', () => {
   });
 
   awaitTest('the concurrent pre-fetch never sends an order before every drain is in', function* () {
-    const kit = fresh();
-    coldSeats(kit);
+    const kit = yield* fresh();
+    yield* coldSeats(kit);
     kit.world.latency = (kind) => (kind === 'drain' ? 4 : 0);
 
     const run = yield* runCaptured(kit, doArgs(ORDERS, { continueOnError: true }));
@@ -379,8 +389,8 @@ const byAlias = (state: { readonly action_aliases: JsonObject }): ReadonlyArray<
 
 describe('do — a failed drain leaves the cache where CPython’s raise left it', () => {
   awaitTest('the actors after the failing one are neither drained nor numbered', function* () {
-    const kit = fresh();
-    coldSeats(kit);
+    const kit = yield* fresh();
+    yield* coldSeats(kit);
     // Three cold seats and a transient error on the middle one.  CPython's
     // `for actor_id in targets:` raises on u2 having fetched only u1, so u3 is
     // never fetched, never ingested, never in `drained_actors`, and consumes
@@ -400,7 +410,7 @@ describe('do — a failed drain leaves the cache where CPython’s raise left it
     expect(first.out).toEqual([]);
     expect(kit.world.trace.some((entry) => entry.startsWith('submit:'))).toBe(false);
 
-    const after = kit.readState();
+    const after = yield* kit.readState();
     expect(after.drained_actors).toEqual([three[0] ?? '']);
     // One action cached, holding `a1` — u3's would have taken `a2`.
     expect(byAlias(after)).toEqual([`a1=${actionFor(0).actionId}`]);
@@ -420,24 +430,30 @@ describe('do — a failed drain leaves the cache where CPython’s raise left it
   });
 
   awaitTest('a mid-batch re-enumeration that fails stops at the failing actor too', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     const before = rev(7);
     const after = rev(9);
     kit.world.revision = before;
     // Three seats whose catalogs are already read, so nothing is pre-fetched;
     // the first receipt bumps the revision and `_refresh_orders` re-drains the
     // two remaining actors — sequentially, raising on the first failure.
-    ACTORS.slice(0, 3).forEach((actor, index) => {
-      kit.seed(actor, [actionFor(index)], before);
-      kit.world.catalogs.set(actor, [actionFor(index)]);
-    });
+    yield* Effect.forEach(
+      ACTORS.slice(0, 3),
+      (actor, index) =>
+        Effect.tap(kit.seed(actor, [actionFor(index)], before), () =>
+          Effect.sync(() => {
+            kit.world.catalogs.set(actor, [actionFor(index)]);
+          })
+        ),
+      { concurrency: 1, discard: true }
+    );
     kit.world.receipt = () => ({ state: 'applied', revision: after });
     kit.world.drainFailure = (actorId) => (actorId === ACTORS[1] ? playerError('gone') : null);
 
     const orders = ACTORS.slice(0, 3)
       .map((_actor, index) => `u${index + 1} move ${30 + index},${70 + index}`)
       .join('; ');
-    const numbered = byAlias(kit.readState());
+    const numbered = byAlias(yield* kit.readState());
     const run = yield* runCaptured(kit, doArgs(orders));
 
     expect(run.code).toBe(2);
@@ -448,15 +464,15 @@ describe('do — a failed drain leaves the cache where CPython’s raise left it
     // drained at rev9 and not one alias was re-numbered, so the table is still
     // the retired rev7 one CPython's raise would have left behind.  A
     // committed u3 would have taken `a1` at rev9 and moved every later digit.
-    expect(kit.readState().drained_actors).toEqual([]);
-    expect(byAlias(kit.readState())).toEqual(numbered);
+    expect((yield* kit.readState()).drained_actors).toEqual([]);
+    expect(byAlias(yield* kit.readState())).toEqual(numbered);
   });
 });
 
 describe('do — the streamed receipt ledger survives a kill', () => {
   awaitTest('a SIGKILL after order 2 of 4 leaves exactly two well-formed lines', function* () {
-    const kit = fresh();
-    coldSeats(kit);
+    const kit = yield* fresh();
+    yield* coldSeats(kit);
     kit.world.killAfterReceipt = 2;
 
     const run = yield* runCaptured(kit, doArgs(ORDERS, { continueOnError: true }));
@@ -484,8 +500,8 @@ describe('do — the streamed receipt ledger survives a kill', () => {
   });
 
   awaitTest('every line is complete JSON, terminated, and 4 KiB or under', function* () {
-    const kit = fresh();
-    coldSeats(kit);
+    const kit = yield* fresh();
+    yield* coldSeats(kit);
     kit.world.killAfterReceipt = 3;
 
     yield* runCaptured(kit, doArgs(ORDERS, { continueOnError: true }));
@@ -505,8 +521,8 @@ describe('do — the streamed receipt ledger survives a kill', () => {
   });
 
   awaitTest('a ledger that cannot be written never fails the command', function* () {
-    const kit = fresh();
-    coldSeats(kit);
+    const kit = yield* fresh();
+    yield* coldSeats(kit);
     // A file where the directory has to go: the append cannot succeed.
     const dir = kit.sessionPath.replace(/\.json$/, '');
     yield* provideTestLayer(kit.scratch.files.writeText(dir, 'not a dir'), kit.layer);
@@ -520,7 +536,7 @@ describe('do — the streamed receipt ledger survives a kill', () => {
   });
 
   awaitTest('a ledger write that throws is swallowed as completely as one that fails', function* () {
-    const kit = bench({ files: explodingAppend });
+    const kit = yield* bench({ files: explodingAppend });
     benches.push(kit);
 
     const recorded = yield* Effect.exit(
@@ -538,9 +554,9 @@ describe('do — the streamed receipt ledger survives a kill', () => {
   });
 
   awaitTest('a throwing ledger still prints every applied batch_id and exits 0', function* () {
-    const kit = bench({ files: explodingAppend });
+    const kit = yield* bench({ files: explodingAppend });
     benches.push(kit);
-    coldSeats(kit);
+    yield* coldSeats(kit);
 
     const run = yield* runCaptured(kit, doArgs(ORDERS, { continueOnError: true }));
 
@@ -566,7 +582,7 @@ describe('do — the streamed receipt ledger survives a kill', () => {
   });
 
   awaitTest('a reader whose file layer throws answers with an empty ledger, not a crash', function* () {
-    const kit = bench({ files: explodingAppend });
+    const kit = yield* bench({ files: explodingAppend });
     benches.push(kit);
     const exploding: PrivateFsApi = {
       ...kit.scratch.files,

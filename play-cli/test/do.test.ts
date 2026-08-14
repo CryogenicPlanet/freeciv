@@ -19,7 +19,7 @@ import { afterEach, describe, expect } from 'bun:test';
 import { Command, ValidationError } from '@effect/cli';
 import { BunContext } from '@effect/platform-bun';
 import { Cause, Effect, Exit, Layer, Option } from 'effect';
-import { playerError, V2ResponseError } from 'src/errors';
+import { playerError, V2ResponseError, type PlayError } from 'src/errors';
 import { doCommandWith, liveDoHooks, type DoHooksFor } from 'src/commands/do.cmd';
 import { openGate } from 'src/services/do-drain';
 import { readSessionLedger } from 'src/services/receipt-ledger';
@@ -46,18 +46,21 @@ import { parseFixtureObject } from 'test/_expect';
 
 const benches: Bench[] = [];
 
-const fresh = (): Bench => {
-  const made = bench();
-  benches.push(made);
-  return made;
-};
+const fresh = (): Effect.Effect<Bench, PlayError> =>
+  Effect.tap(bench(), (made) =>
+    Effect.sync(() => {
+      benches.push(made);
+    })
+  );
 
 afterEach(() =>
-  Promise.all(benches.splice(0).map((kit) => kit.scratch.cleanup()))
+  Effect.runPromise(
+    Effect.forEach(benches.splice(0), (kit) => kit.scratch.cleanup, { discard: true })
+  )
 );
 
 const runCaptured = (kit: Bench, args: ReturnType<typeof doArgs>) =>
-  Effect.promise(() => runDoCaptured(kit, args));
+  runDoCaptured(kit, args);
 
 const explodingHooks: DoHooksFor = () =>
   Effect.die(new Error('no hook may be built for a refused invocation'));
@@ -99,11 +102,11 @@ const FOUND_FRESH = `action_${'4'.repeat(26)}`;
 
 describe('do — the batch', () => {
   awaitTest('sends one batch per order and rebinds after a revision bump', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     const first = rev(7);
     const later = rev(9);
     kit.world.revision = first;
-    kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72), foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
+    yield* kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72), foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
     // What the re-enumeration between the two orders would serve.
     kit.world.catalogs.set(UNIT_ONE, [
       move(MOVE_FRESH, UNIT_ONE, 32, 72),
@@ -129,14 +132,14 @@ describe('do — the batch', () => {
 
     // The second order went out against the *re-bound* handle, never the one
     // the first receipt expired.
-    const state = kit.readState();
+    const state = yield* kit.readState();
     expect(Object.keys(state.actions).toSorted()).toEqual([FOUND_FRESH, MOVE_FRESH].toSorted());
   });
 
   awaitTest('the summary never contradicts the receipt above it', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     kit.world.revision = rev(7);
-    kit.seed(UNIT_ONE, [foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
+    yield* kit.seed(UNIT_ONE, [foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
     kit.world.receipt = () => ({ state: 'applied', revision: rev(9) });
 
     const run = yield* runCaptured(kit, doArgs('u1 found_city London'));
@@ -150,9 +153,9 @@ describe('do — the batch', () => {
   });
 
   awaitTest('--json carries the receipt revision, not the pre-batch one', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     kit.world.revision = rev(7);
-    kit.seed(UNIT_ONE, [foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
+    yield* kit.seed(UNIT_ONE, [foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
     kit.world.receipt = () => ({ state: 'applied', revision: rev(9) });
 
     const run = yield* runCaptured(kit, doArgs('u1 found_city London', { json: true }));
@@ -172,9 +175,9 @@ describe('do — the batch', () => {
   });
 
   awaitTest('an outcome it already printed is never discarded', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     kit.world.revision = rev(7);
-    kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72), foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
+    yield* kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72), foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
     kit.world.receipt = () => ({ state: 'applied', revision: rev(9) });
     // The internal re-enumeration is where the wheels come off.
     kit.world.drainFailure = () =>
@@ -193,9 +196,9 @@ describe('do — the batch', () => {
   });
 
   awaitTest('a submit that fails names the batch the agent must resolve by hand', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     kit.world.revision = rev(7);
-    kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
+    yield* kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
     kit.world.submitFailure = () => playerError('the v2 request could not be sent: timeout');
 
     const run = yield* runCaptured(kit, doArgs('u1 move 32,72'));
@@ -209,9 +212,9 @@ describe('do — the batch', () => {
   });
 
   awaitTest('a persist that fails names no batch, because none exists', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     kit.world.revision = rev(7);
-    kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
+    yield* kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
     kit.world.persistFailure = () => playerError('unknown or expired action ID');
 
     const run = yield* runCaptured(kit, doArgs('u1 move 32,72'));
@@ -224,9 +227,9 @@ describe('do — the batch', () => {
 
 describe('do — refusal', () => {
   awaitTest('stops on the first rejection and prints that actor’s options', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     kit.world.revision = rev(7);
-    kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72), foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
+    yield* kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72), foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
     kit.world.receipt = (index) => ({
       state: index === 0 ? 'rejected' : 'applied',
       revision: rev(7),
@@ -249,9 +252,9 @@ describe('do — refusal', () => {
   });
 
   awaitTest('--continue-on-error keeps issuing the later orders', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     kit.world.revision = rev(7);
-    kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72), foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
+    yield* kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72), foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
     kit.world.receipt = (index) => ({
       state: index === 0 ? 'rejected' : 'applied',
       revision: rev(7),
@@ -274,10 +277,10 @@ describe('do — refusal', () => {
   });
 
   awaitTest('one options section per refused actor, capped at three', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     kit.world.revision = rev(7);
-    kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
-    kit.seed(UNIT_TWO, [move(`action_${'5'.repeat(26)}`, UNIT_TWO, 32, 72)]);
+    yield* kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
+    yield* kit.seed(UNIT_TWO, [move(`action_${'5'.repeat(26)}`, UNIT_TWO, 32, 72)]);
     kit.world.receipt = () => ({ state: 'rejected', revision: rev(7) });
 
     const run = yield* runCaptured(
@@ -294,10 +297,10 @@ describe('do — refusal', () => {
   });
 
   awaitTest('a refusal that moved the game re-reads the menu it hands back, bounded', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     const moved = rev(9);
     kit.world.revision = rev(7);
-    kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72), foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
+    yield* kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72), foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
     // Thirty-seven options at the newer revision: far more than the twelve a
     // refusal is allowed to print.
     kit.world.catalogs.set(
@@ -329,9 +332,9 @@ describe('do — refusal', () => {
   });
 
   awaitTest('an options lookup that fails leaves the refusal exactly as it was', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     kit.world.revision = rev(7);
-    kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
+    yield* kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
     kit.world.receipt = () => ({ state: 'rejected', revision: rev(9) });
     kit.world.drainFailure = () => playerError('the catalog could not be read');
 
@@ -353,9 +356,9 @@ describe('do — refusal', () => {
     // `cli-main`'s `catchAllCause` as `error: …` on stderr with an empty
     // stdout — losing an applied, server-issued `batch_id` from a command
     // CPython completed.
-    const kit = fresh();
+    const kit = yield* fresh();
     kit.world.revision = rev(7);
-    kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72), foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
+    yield* kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72), foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
     kit.world.receipt = (index) => ({
       state: index === 0 ? 'applied' : 'rejected',
       // The rejection moved the game on, so the refusal has to re-drain.
@@ -390,9 +393,9 @@ describe('do — refusal', () => {
   awaitTest('a state re-read that *throws* leaves the refusal exactly as it was', function* () {
     // The other half of the same `except OSError`: `_actor_options_section`
     // re-loads `.v2-state` before it renders, and that read defects too.
-    const kit = fresh();
+    const kit = yield* fresh();
     kit.world.revision = rev(7);
-    kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72), foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
+    yield* kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72), foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
     kit.world.receipt = (index) => ({
       state: index === 0 ? 'applied' : 'rejected',
       revision: rev(7),
@@ -435,9 +438,9 @@ describe('do — refusal', () => {
   });
 
   awaitTest('--json prints no inline options and no focus line', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     kit.world.revision = rev(7);
-    kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
+    yield* kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
     kit.world.receipt = () => ({ state: 'rejected', revision: rev(7) });
     kit.world.focus = () => 'next: never printed';
 
@@ -454,9 +457,9 @@ describe('do — refusal', () => {
 
 describe('do — resolution', () => {
   awaitTest('refuses every order when one cannot be resolved, before any request', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     kit.world.revision = rev(7);
-    kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
+    yield* kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
 
     const run = yield* runCaptured(kit, doArgs('u1 move 32,72; u1 teleport 99,99'));
 
@@ -476,9 +479,9 @@ describe('do — resolution', () => {
   });
 
   awaitTest('the order-count bounds are refused with no request either', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     kit.world.revision = rev(7);
-    kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
+    yield* kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
 
     const many = yield* runCaptured(
       kit,
@@ -495,12 +498,12 @@ describe('do — resolution', () => {
   });
 
   awaitTest('every unread actor is fetched before anything is sent', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     kit.world.revision = rev(7);
     // Learn the entity aliases without learning any capability: seed both
     // actors' catalogs and then let the revision bump wipe them.
-    kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
-    kit.seed(UNIT_TWO, [move(`action_${'5'.repeat(26)}`, UNIT_TWO, 32, 72)], rev(8));
+    yield* kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
+    yield* kit.seed(UNIT_TWO, [move(`action_${'5'.repeat(26)}`, UNIT_TWO, 32, 72)], rev(8));
     kit.world.revision = rev(8);
     kit.world.catalogs.set(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
     kit.world.catalogs.set(UNIT_TWO, [move(`action_${'5'.repeat(26)}`, UNIT_TWO, 32, 72)]);
@@ -519,9 +522,9 @@ describe('do — resolution', () => {
   });
 
   awaitTest('an actor already read is never re-fetched for a bad verb', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     kit.world.revision = rev(7);
-    kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
+    yield* kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
 
     const run = yield* runCaptured(kit, doArgs('u1 teleport 9,9'));
 
@@ -531,10 +534,10 @@ describe('do — resolution', () => {
   });
 
   awaitTest('--no-refresh keeps the plain refusal and fetches nothing', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     kit.world.revision = rev(7);
-    kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
-    kit.seed(UNIT_TWO, [move(`action_${'5'.repeat(26)}`, UNIT_TWO, 32, 72)], rev(8));
+    yield* kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
+    yield* kit.seed(UNIT_TWO, [move(`action_${'5'.repeat(26)}`, UNIT_TWO, 32, 72)], rev(8));
     kit.world.revision = rev(8);
     kit.world.catalogs.set(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
 
@@ -546,9 +549,9 @@ describe('do — resolution', () => {
   });
 
   awaitTest('a stale-alias rebind note prints above the receipt', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     kit.world.revision = rev(9);
-    kit.seed(UNIT_ONE, [foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
+    yield* kit.seed(UNIT_ONE, [foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
     kit.world.aliasNotes = ['a1 rebound at rev9'];
     kit.world.receipt = () => ({ state: 'applied', revision: rev(9) });
 
@@ -565,14 +568,14 @@ describe('do — the actorless order', () => {
   const END_FRESH = `action_${'8'.repeat(26)}`;
 
   awaitTest('a bump re-enumerates the global catalog for an order with no actor', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     const later = rev(9);
     kit.world.revision = rev(7);
-    kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
+    yield* kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
     // `phase.end` carries no `subject.actor`, so `_order_actor` reads it as
     // `""` and it lives in the global catalog — the one
     // `_drain_legal_unlocked(actor_id="")` fetches.
-    kit.seed('', [phaseEndAction(END_ONE)]);
+    yield* kit.seed('', [phaseEndAction(END_ONE)]);
     // What the global re-enumeration serves after the first receipt bumps the
     // revision and wipes every cached capability.
     kit.world.catalogs.set('', [phaseEndAction(END_FRESH)]);
@@ -595,14 +598,14 @@ describe('do — the actorless order', () => {
     expect(run.out[2]).toBe('2/2 applied rev9/t3');
     // It went out against the re-bound handle, not the one the first receipt
     // expired.
-    expect(Object.keys(kit.readState().actions)).toEqual([END_FRESH]);
+    expect(Object.keys((yield* kit.readState()).actions)).toEqual([END_FRESH]);
   });
 
   awaitTest('the global catalog is drained once, however many actorless orders name it', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     kit.world.revision = rev(7);
-    kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
-    kit.seed('', [phaseEndAction(END_ONE)]);
+    yield* kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
+    yield* kit.seed('', [phaseEndAction(END_ONE)]);
     kit.world.catalogs.set('', [phaseEndAction(END_FRESH)]);
     kit.world.receipt = (index) => ({ state: 'applied', revision: index === 0 ? rev(9) : rev(9) });
 
@@ -616,9 +619,9 @@ describe('do — the actorless order', () => {
 
 describe('do — the argparse surface', () => {
   awaitTest('--until is a choice, so a bad value is refused before any order is sent', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     kit.world.revision = rev(7);
-    kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
+    yield* kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
 
     expect(yield* parseArgv(kit, ['u1 move 32,72', '--until', 'bogus'])).toBe('validation-error');
     expect(kit.world.trace).toEqual([]);
@@ -627,9 +630,9 @@ describe('do — the argparse surface', () => {
 
     // Both accepted spellings still parse, and reach the handler.
     for (const value of ['phase', 'revision']) {
-      const kept = fresh();
+      const kept = yield* fresh();
       kept.world.revision = rev(7);
-      kept.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
+      yield* kept.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
       const run = yield* runCaptured(
         kept,
         doArgs('u1 move 32,72', { wait: { waitS: 120, pollS: 1, until: value } })
@@ -641,7 +644,7 @@ describe('do — the argparse surface', () => {
 
 describe('do — the drain refusal payload', () => {
   awaitTest('a supervisor refusal during the pre-send drain keeps its wire payload', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     const payload = errorPayload();
     // One route, one refusal: the very first legal page the pre-send drain
     // asks for comes back 409.
@@ -675,14 +678,14 @@ describe('do — the drain refusal payload', () => {
 
 describe('do — the two spellings', () => {
   awaitTest('positional orders equal --orders', function* () {
-    const positional = fresh();
+    const positional = yield* fresh();
     positional.world.revision = rev(7);
-    positional.seed(UNIT_ONE, [foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
+    yield* positional.seed(UNIT_ONE, [foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
     positional.world.receipt = () => ({ state: 'applied', revision: rev(7) });
 
-    const written = fresh();
+    const written = yield* fresh();
     written.world.revision = rev(7);
-    written.seed(UNIT_ONE, [foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
+    yield* written.seed(UNIT_ONE, [foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
     written.world.receipt = () => ({ state: 'applied', revision: rev(7) });
 
     const one = yield* runCaptured(
@@ -696,9 +699,9 @@ describe('do — the two spellings', () => {
   });
 
   awaitTest('orders given twice are refused by name', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     kit.world.revision = rev(7);
-    kit.seed(UNIT_ONE, [foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
+    yield* kit.seed(UNIT_ONE, [foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
 
     const run = yield* runCaptured(
       kit,
@@ -713,9 +716,9 @@ describe('do — the two spellings', () => {
 
 describe('do — the streamed receipt ledger', () => {
   awaitTest('every applied receipt is on disk before the command renders', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     kit.world.revision = rev(7);
-    kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72), foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
+    yield* kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72), foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
     kit.world.receipt = () => ({ state: 'applied', revision: rev(7) });
 
     const run = yield* runCaptured(
@@ -743,9 +746,9 @@ describe('do — the streamed receipt ledger', () => {
   });
 
   awaitTest('a rejected receipt is recorded too, marked not ok', function* () {
-    const kit = fresh();
+    const kit = yield* fresh();
     kit.world.revision = rev(7);
-    kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
+    yield* kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
     kit.world.receipt = () => ({ state: 'rejected', revision: rev(7) });
 
     yield* runCaptured(kit, doArgs('u1 move 32,72'));

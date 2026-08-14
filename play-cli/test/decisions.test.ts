@@ -37,7 +37,7 @@ import type { V2ClientState } from 'src/services/session-store';
 import { mirrorDir, writeMirror } from 'src/services/mirror';
 import { mirrorNumber } from 'src/services/turn-pages';
 import { scratchWorkspace, type Scratch } from 'test/_fixtures';
-import { provideTestLayer } from 'test/_effect-test';
+import { awaitTest, provideTestLayer } from 'test/_effect-test';
 import { observedAt } from 'test/_expect';
 import { path } from 'test/_test-platform';
 
@@ -224,26 +224,33 @@ const DIPLOMACY_TSV = [
 
 interface Seat {
   readonly sessionPath: string;
-  readonly run: <A, E>(effect: Effect.Effect<A, E, PrivateFs>) => A;
+  readonly run: <A, E>(effect: Effect.Effect<A, E, PrivateFs>) => Effect.Effect<A>;
 }
 
 const scratches: Scratch[] = [];
 afterEach(() =>
-  Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup()))
+  Effect.runPromise(
+    Effect.forEach(scratches.splice(0), (scratch) => scratch.cleanup, { discard: true })
+  )
 );
 
-const stageSeat = (files: ReadonlyArray<readonly [ReadonlyArray<string>, string]>): Seat => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const sessionPath = path.join(scratch.workspace.stateRoot, GAME_ID, 'codex-test.json');
-  const dir = Effect.runSync(Effect.orDie(mirrorDir(sessionPath)));
-  const run = <A, E>(effect: Effect.Effect<A, E, PrivateFs>): A =>
-    Effect.runSync(Effect.orDie(provideTestLayer(effect, scratch.layer)));
-  for (const [parts, text] of files) run(writeMirror(dir, parts, text));
-  return { sessionPath, run };
-};
+const stageSeat = (
+  files: ReadonlyArray<readonly [ReadonlyArray<string>, string]>
+): Effect.Effect<Seat> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const sessionPath = path.join(scratch.workspace.stateRoot, GAME_ID, 'codex-test.json');
+    const dir = yield* Effect.orDie(mirrorDir(sessionPath));
+    const run = <A, E>(effect: Effect.Effect<A, E, PrivateFs>): Effect.Effect<A> =>
+      Effect.orDie(provideTestLayer(effect, scratch.layer));
+    yield* Effect.forEach(files, ([parts, text]) => run(writeMirror(dir, parts, text)), {
+      discard: true,
+    });
+    return { sessionPath, run };
+  });
 
-const focusSeat = (): Seat =>
+const focusSeat = (): Effect.Effect<Seat> =>
   stageSeat([
     [['state', 'units.tsv'], UNITS_TSV],
     [['state', 'cities.tsv'], CITIES_TSV],
@@ -303,9 +310,9 @@ describe('_decision_verb / _decision_option_rank', () => {
 });
 
 describe('_decision_rows', () => {
-  test('walks units then cities, skips the unit with a standing route', () => {
-    const seat = focusSeat();
-    const rows = seat.run(decisionRows(seat.sessionPath, focusState(), liveDecisionDeps));
+  awaitTest('walks units then cities, skips the unit with a standing route', function* () {
+    const seat = yield* focusSeat();
+    const rows = yield* seat.run(decisionRows(seat.sessionPath, focusState(), liveDecisionDeps));
 
     expect(rows.map((row) => row.alias)).toEqual(['u1', 'u2', 'c1']);
     expect(rows[0]?.state).toBe('Settlers @31,72 idle');
@@ -315,9 +322,9 @@ describe('_decision_rows', () => {
     expect(rows.some((row) => row.state.includes('Explorer'))).toBe(false);
   });
 
-  test('each row carries the option aliases `do` accepts, best verb first', () => {
-    const seat = focusSeat();
-    const rows = seat.run(decisionRows(seat.sessionPath, focusState(), liveDecisionDeps));
+  awaitTest('each row carries the option aliases `do` accepts, best verb first', function* () {
+    const seat = yield* focusSeat();
+    const rows = yield* seat.run(decisionRows(seat.sessionPath, focusState(), liveDecisionDeps));
 
     expect(rows[0]?.options).toEqual(['a1 found_city T(31,72)', 'a2 move T(31,72)']);
     expect(rows[1]?.options).toEqual(['a4 road T(31,72)', 'a3 sentry T(31,72)']);
@@ -327,18 +334,18 @@ describe('_decision_rows', () => {
     expect(rows[0]?.remedy).toBe('just legal --actor_id u1 --all');
   });
 
-  test('every printed line stays inside the 120-column budget', () => {
-    const seat = focusSeat();
-    const rows = seat.run(decisionRows(seat.sessionPath, focusState(), liveDecisionDeps));
+  awaitTest('every printed line stays inside the 120-column budget', function* () {
+    const seat = yield* focusSeat();
+    const rows = yield* seat.run(decisionRows(seat.sessionPath, focusState(), liveDecisionDeps));
     for (const row of rows) expect(decisionLine(row).length).toBeLessThanOrEqual(120);
     expect(decisionLine(observedAt(rows, 0))).toContain('a1 found_city');
   });
 
-  test('a catalog that died with its revision degrades to the enumeration command', () => {
-    const seat = focusSeat();
+  awaitTest('a catalog that died with its revision degrades to the enumeration command', function* () {
+    const seat = yield* focusSeat();
     // The receipt bumped the revision; every cached descriptor is now stale.
     const bumped: Revision = { turn: 3, revision: 9, state_token: 'token_3_9' };
-    const rows = seat.run(
+    const rows = yield* seat.run(
       decisionRows(seat.sessionPath, focusState(bumped), liveDecisionDeps)
     );
     expect(rows[1]?.options).toEqual([]);
@@ -347,9 +354,9 @@ describe('_decision_rows', () => {
     );
   });
 
-  test('an actor already ordered is never offered back', () => {
-    const seat = focusSeat();
-    const rows = seat.run(
+  awaitTest('an actor already ordered is never offered back', function* () {
+    const seat = yield* focusSeat();
+    const rows = yield* seat.run(
       decisionRows(seat.sessionPath, focusState(), liveDecisionDeps, {
         done: new Set([UNIT_ONE]),
       })
@@ -431,9 +438,9 @@ describe('_decision_order', () => {
 });
 
 describe('_batch_focus_command', () => {
-  test('every actor with a composable order becomes one `just do` line', () => {
-    const seat = focusSeat();
-    const rows = seat.run(decisionRows(seat.sessionPath, focusState(), liveDecisionDeps));
+  awaitTest('every actor with a composable order becomes one `just do` line', function* () {
+    const seat = yield* focusSeat();
+    const rows = yield* seat.run(decisionRows(seat.sessionPath, focusState(), liveDecisionDeps));
     expect(batchFocusCommand(rows)).toBe(
       'next 3 actors: just do "u1 found_city T(31,72); u2 road T(31,72); c1 build Warriors"'
     );
@@ -509,16 +516,16 @@ describe('_decision_line', () => {
 });
 
 describe('_next_focus_line / _briefing_decision_lines', () => {
-  test('an empty seat teaches the one-call ending', () => {
-    const seat = stageSeat([]);
+  awaitTest('an empty seat teaches the one-call ending', function* () {
+    const seat = yield* stageSeat([]);
     expect(
-      seat.run(nextFocusLine(seat.sessionPath, focusState(), new Set(), liveDecisionDeps))
+      yield* seat.run(nextFocusLine(seat.sessionPath, focusState(), new Set(), liveDecisionDeps))
     ).toBe('next: no actors need orders — just turn --end --await --brief');
   });
 
-  test('one remaining actor degrades to the single-actor row', () => {
-    const seat = focusSeat();
-    const line = seat.run(
+  awaitTest('one remaining actor degrades to the single-actor row', function* () {
+    const seat = yield* focusSeat();
+    const line = yield* seat.run(
       nextFocusLine(
         seat.sessionPath,
         focusState({ turn: 3, revision: 9, state_token: 'token_3_9' }),
@@ -529,9 +536,9 @@ describe('_next_focus_line / _briefing_decision_lines', () => {
     expect(line).toBe('next: u2 Workers @31,72 idle — just legal --actor_id u2 --all');
   });
 
-  test('the briefing block closes with the composed batch', () => {
-    const seat = focusSeat();
-    const lines = seat.run(
+  awaitTest('the briefing block closes with the composed batch', function* () {
+    const seat = yield* focusSeat();
+    const lines = yield* seat.run(
       briefingDecisionLines(seat.sessionPath, focusState(), liveDecisionDeps)
     );
     expect(lines).toHaveLength(4);
@@ -541,9 +548,9 @@ describe('_next_focus_line / _briefing_decision_lines', () => {
 });
 
 describe('open meetings', () => {
-  test('only relations still waiting on this seat are returned', () => {
-    const seat = stageSeat([[['state', 'diplomacy.tsv'], DIPLOMACY_TSV]]);
-    expect(seat.run(openMeetings(seat.sessionPath))).toEqual({
+  awaitTest('only relations still waiting on this seat are returned', function* () {
+    const seat = yield* stageSeat([[['state', 'diplomacy.tsv'], DIPLOMACY_TSV]]);
+    expect(yield* seat.run(openMeetings(seat.sessionPath))).toEqual({
       r1: 'meeting pending: Spain, cease-fire, 2 clauses',
     });
   });
@@ -557,13 +564,13 @@ describe('open meetings', () => {
     );
   });
 
-  test('a relation with an open meeting is a row of its own', () => {
-    const seat = stageSeat([
+  awaitTest('a relation with an open meeting is a row of its own', function* () {
+    const seat = yield* stageSeat([
       [['state', 'units.tsv'], UNITS_TSV],
       [['state', 'cities.tsv'], CITIES_TSV],
       [['state', 'diplomacy.tsv'], DIPLOMACY_TSV],
     ]);
-    const rows = seat.run(decisionRows(seat.sessionPath, focusState(), liveDecisionDeps));
+    const rows = yield* seat.run(decisionRows(seat.sessionPath, focusState(), liveDecisionDeps));
     const meeting = rows.find((entry) => entry.alias === 'r1');
     expect(meeting?.state).toBe('meeting pending: Spain, cease-fire, 2 clauses');
     // A meeting's actor is this seat's own player, so no order can compose.
@@ -596,8 +603,8 @@ describe('an inherited member name is a miss, not a hit', () => {
     expect(runDecisionOrder([protoAction('move')], 'u1')).toBe('u1 move T(31,72)');
   });
 
-  test('the same operation still reaches the briefing and the focus line', () => {
-    const seat = focusSeat();
+  awaitTest('the same operation still reaches the briefing and the focus line', function* () {
+    const seat = yield* focusSeat();
     // `_next_focus_line` and `_briefing_decision_lines` promise never to turn a
     // successful receipt into an error; a thrown `TypeError` is not something
     // their `orElseSucceed` can absorb, so this asserts they still print.
@@ -609,11 +616,11 @@ describe('an inherited member name is a miss, not a hit', () => {
         },
       },
     };
-    expect(seat.run(briefingDecisionLines(seat.sessionPath, state, liveDecisionDeps))[0]).toBe(
+    expect((yield* seat.run(briefingDecisionLines(seat.sessionPath, state, liveDecisionDeps)))[0]).toBe(
       'u1 Settlers @31,72 idle — a2 toString T(31,72)'
     );
     expect(
-      seat.run(nextFocusLine(seat.sessionPath, state, new Set([UNIT_TWO, CITY_ONE]), liveDecisionDeps))
+      yield* seat.run(nextFocusLine(seat.sessionPath, state, new Set([UNIT_TWO, CITY_ONE]), liveDecisionDeps))
     ).toBe('next: u1 Settlers @31,72 idle — a2 toString T(31,72)');
   });
 

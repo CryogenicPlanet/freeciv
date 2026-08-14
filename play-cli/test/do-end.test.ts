@@ -14,7 +14,7 @@
  */
 import { afterEach, describe, expect } from 'bun:test';
 import { Console, Effect, Schema } from 'effect';
-import { playerError } from 'src/errors';
+import { playerError, type PlayError } from 'src/errors';
 import {
   bench,
   dispositionOf,
@@ -30,14 +30,17 @@ import { awaitTest } from 'test/_effect-test';
 
 const benches: Bench[] = [];
 
-const fresh = (): Bench => {
-  const made = bench();
-  benches.push(made);
-  return made;
-};
+const fresh = (): Effect.Effect<Bench, PlayError> =>
+  Effect.tap(bench(), (made) =>
+    Effect.sync(() => {
+      benches.push(made);
+    })
+  );
 
 afterEach(() =>
-  Promise.all(benches.splice(0).map((kit) => kit.scratch.cleanup()))
+  Effect.runPromise(
+    Effect.forEach(benches.splice(0), (kit) => kit.scratch.cleanup, { discard: true })
+  )
 );
 
 const MOVE_ONE = `action_${'1'.repeat(26)}`;
@@ -45,7 +48,7 @@ const FOUND_ONE = `action_${'2'.repeat(26)}`;
 const END_BATCH = 'batch_phase_end_1';
 
 const runCaptured = (kit: Bench, args: ReturnType<typeof doArgs>) =>
-  Effect.promise(() => runDoCaptured(kit, args));
+  runDoCaptured(kit, args);
 
 const doCompositeSchema = Schema.parseJson(
   Schema.Struct({
@@ -61,14 +64,15 @@ const doCompositeSchema = Schema.parseJson(
 );
 
 /** One seat with a two-action catalog, staged at `revision`. */
-const seat = (kit: Bench, revision = rev(7)): void => {
-  kit.world.revision = revision;
-  kit.seed(UNIT_ONE, [
-    move(MOVE_ONE, UNIT_ONE, 32, 72),
-    foundCity(FOUND_ONE, UNIT_ONE, 31, 72),
-  ]);
-  kit.world.receipt = () => ({ state: 'applied', revision });
-};
+const seat = (kit: Bench, revision = rev(7)): Effect.Effect<void, PlayError> =>
+  Effect.gen(function* () {
+    kit.world.revision = revision;
+    yield* kit.seed(UNIT_ONE, [
+      move(MOVE_ONE, UNIT_ONE, 32, 72),
+      foundCity(FOUND_ONE, UNIT_ONE, 31, 72),
+    ]);
+    kit.world.receipt = () => ({ state: 'applied', revision });
+  });
 
 /** `_phase_end_locked` succeeding with `state`. */
 const endsWith = (kit: Bench, state: 'applied' | 'rejected', revision = rev(7)): void => {
@@ -83,8 +87,8 @@ const endsWith = (kit: Bench, state: 'applied' | 'rejected', revision = rev(7)):
 
 describe('the flag matrix', () => {
   awaitTest('--await without --end is refused, and sends nothing', function* () {
-    const kit = fresh();
-    seat(kit);
+    const kit = yield* fresh();
+    yield* seat(kit);
     const run = yield* runCaptured(kit, doArgs('u1 move 32,72', { awaitPhase: true }));
     expect(run.code).toBe(2);
     expect(run.error).toContain('just do --await');
@@ -92,8 +96,8 @@ describe('the flag matrix', () => {
   });
 
   awaitTest('--brief without a wake names the form that works', function* () {
-    const kit = fresh();
-    seat(kit);
+    const kit = yield* fresh();
+    yield* seat(kit);
     for (const overrides of [
       { endPhase: true, brief: true },
       { brief: true },
@@ -108,8 +112,8 @@ describe('the flag matrix', () => {
 
 describe('--end', () => {
   awaitTest('never ends a phase whose batch stopped', function* () {
-    const kit = fresh();
-    seat(kit);
+    const kit = yield* fresh();
+    yield* seat(kit);
     kit.world.receipt = () => ({ state: 'rejected', revision: rev(7) });
     kit.world.phaseEnd = () => Effect.die(new Error('a stopped batch ended its phase'));
     kit.world.awaitBrief = () => Effect.die(new Error('a stopped batch awaited'));
@@ -134,8 +138,8 @@ describe('--end', () => {
   });
 
   awaitTest('prints the receipts, then the end failure, then the tail', function* () {
-    const kit = fresh();
-    seat(kit);
+    const kit = yield* fresh();
+    yield* seat(kit);
     kit.world.phaseEnd = () =>
       Effect.fail(
         playerError(
@@ -161,8 +165,8 @@ describe('--end', () => {
   });
 
   awaitTest('an end that was not accepted says so, and says it was not awaited', function* () {
-    const kit = fresh();
-    seat(kit);
+    const kit = yield* fresh();
+    yield* seat(kit);
     endsWith(kit, 'rejected');
     kit.world.awaitBrief = () => Effect.die(new Error('awaited an unaccepted end'));
 
@@ -176,8 +180,8 @@ describe('--end', () => {
   });
 
   awaitTest('an applied end without --await teaches the one-call ending', function* () {
-    const kit = fresh();
-    seat(kit);
+    const kit = yield* fresh();
+    yield* seat(kit);
     endsWith(kit, 'applied');
 
     const run = yield* runCaptured(kit, doArgs('u1 found_city London', { endPhase: true }));
@@ -196,8 +200,8 @@ describe('--end', () => {
 
 describe('--end --await', () => {
   awaitTest('the wake lines follow the receipts', function* () {
-    const kit = fresh();
-    seat(kit);
+    const kit = yield* fresh();
+    yield* seat(kit);
     endsWith(kit, 'applied');
     kit.world.awaitBrief = () =>
       Effect.succeed({
@@ -223,8 +227,8 @@ describe('--end --await', () => {
   });
 
   awaitTest('the prelude flushes ahead of the first progress line and is not reprinted', function* () {
-    const kit = fresh();
-    seat(kit);
+    const kit = yield* fresh();
+    yield* seat(kit);
     endsWith(kit, 'applied');
     // The real wait prints its own tick lines; flushing the prelude is what
     // keeps the phase end from appearing after ten minutes of waiting.
@@ -261,8 +265,8 @@ describe('--end --await', () => {
   });
 
   awaitTest('an await failure never hides an applied phase end', function* () {
-    const kit = fresh();
-    seat(kit);
+    const kit = yield* fresh();
+    yield* seat(kit);
     endsWith(kit, 'applied');
     kit.world.awaitBrief = () =>
       Effect.fail(playerError('invalid v2 health: unexpected future_field'));
@@ -283,8 +287,8 @@ describe('--end --await', () => {
   });
 
   awaitTest('a briefing that failed is an exit-2 note, not a lost wake', function* () {
-    const kit = fresh();
-    seat(kit);
+    const kit = yield* fresh();
+    yield* seat(kit);
     endsWith(kit, 'applied');
     kit.world.awaitBrief = () =>
       Effect.succeed({
@@ -306,8 +310,8 @@ describe('--end --await', () => {
 
 describe('--end --json', () => {
   awaitTest('the composite carries end, wait, turn and turn_error', function* () {
-    const kit = fresh();
-    seat(kit);
+    const kit = yield* fresh();
+    yield* seat(kit);
     endsWith(kit, 'applied');
     kit.world.awaitBrief = () =>
       Effect.succeed({
@@ -343,8 +347,8 @@ describe('--end --json', () => {
   });
 
   awaitTest('--json keeps the whole rendering for one payload, so no prelude is passed', function* () {
-    const kit = fresh();
-    seat(kit);
+    const kit = yield* fresh();
+    yield* seat(kit);
     endsWith(kit, 'applied');
     kit.world.awaitBrief = (options) => {
       expect(options.prelude).toBeNull();
@@ -365,8 +369,8 @@ describe('--end --json', () => {
   });
 
   awaitTest('--json re-raises an await failure instead of turning it into lines', function* () {
-    const kit = fresh();
-    seat(kit);
+    const kit = yield* fresh();
+    yield* seat(kit);
     endsWith(kit, 'applied');
     kit.world.awaitBrief = () => Effect.fail(playerError('invalid v2 health'));
 

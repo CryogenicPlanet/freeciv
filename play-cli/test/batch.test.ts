@@ -13,7 +13,7 @@
  * to decide whether another request is allowed at all.
  */
 import { afterEach, describe, expect, test } from 'bun:test';
-import { Effect, Either, Layer, Schema } from 'effect';
+import { Effect, Either, Layer, Runtime, Schema } from 'effect';
 import type { PlayError } from 'src/errors';
 import type { ExitCodeSignal } from 'src/exit';
 import { FULL_CONTROL_V2 } from 'src/constants';
@@ -64,7 +64,9 @@ import { fileSystem, path } from 'test/_test-platform';
 
 const scratches: Scratch[] = [];
 afterEach(() =>
-  Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup()))
+  Effect.runPromise(
+    Effect.forEach(scratches.splice(0), (scratch) => scratch.cleanup, { discard: true })
+  )
 );
 
 interface TestRevision {
@@ -150,7 +152,15 @@ const errorBody = (
 });
 
 /** A `fetch` the test drives directly, so a POST body can be inspected. */
-type Responder = (url: string, body: string | null) => { status: number; body: JsonValue };
+interface ResponderAnswer {
+  readonly status: number;
+  readonly body: JsonValue;
+}
+
+type Responder = (
+  url: string,
+  body: string | null
+) => ResponderAnswer | Effect.Effect<ResponderAnswer, PlayError>;
 
 type FetchInput = Parameters<typeof fetch>[0];
 type FetchArguments = Parameters<typeof fetch>;
@@ -176,10 +186,8 @@ const postBatchId = (body: string | null): string =>
     body ?? '{}'
   ).batch_id;
 
-const batchKeysOnDisk = (f: Fixture): ReadonlyArray<string> => {
-  const state = Effect.runSync(f.store.readState(f.sessionPath, f.session));
-  return Object.keys(state.batches);
-};
+const batchKeysOnDisk = (f: Fixture): Effect.Effect<ReadonlyArray<string>, PlayError> =>
+  Effect.map(f.store.readState(f.sessionPath, f.session), (state) => Object.keys(state.batches));
 
 const parseArguments = (text: string): Either.Either<PyObject, { readonly message: string }> =>
   Effect.runSync(Effect.either(parseJsonObject(text, '--arguments')));
@@ -241,46 +249,53 @@ interface Fixture {
   readonly statePath: string;
   readonly posts: ReadonlyArray<string>;
   readonly layer: Layer.Layer<BatchServices>;
-  readonly run: <A, E>(effect: Effect.Effect<A, E, BatchServices>) => Promise<Either.Either<A, E>>;
+  readonly run: <A, E>(
+    effect: Effect.Effect<A, E, BatchServices>
+  ) => Effect.Effect<Either.Either<A, E>>;
 }
 
-const fixture = (responder: Responder = () => ({ status: 200, body: {} })): Fixture => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
-  const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'seat.json');
-  Effect.runSync(scratch.files.writeJson(sessionPath, sessionFile()));
-  const loaded = Effect.runSync(store.resolveV2(sessionPath));
-  const posts: string[] = [];
-  const fakeFetch = completeFetch((input, init) =>
-    Effect.runPromise(
-      Effect.gen(function* () {
-        const body = yield* requestBodyText(init);
-        if (body !== null) posts.push(body);
-        const answer = responder(urlOf(input), body);
-        return new Response(compactJson(answer.body), {
-          status: answer.status,
-          headers: { 'content-type': 'application/json' },
-        });
-      })
-    )
-  );
-  const client = v2ClientFor(httpFor(fakeFetch), () => Effect.void);
-  const layer = Layer.mergeAll(
-    Layer.succeed(SessionStore, store),
-    Layer.succeed(PrivateFs, scratch.files),
-    Layer.succeed(V2Client, client)
-  );
-  return {
-    store,
-    sessionPath,
-    session: loaded.session,
-    statePath: store.statePath(sessionPath),
-    posts,
-    layer,
-    run: (effect) => Effect.runPromise(Effect.either(provideTestLayer(effect, layer))),
-  };
-};
+const fixture = (
+  responder: Responder = () => ({ status: 200, body: {} })
+): Effect.Effect<Fixture, PlayError> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
+    const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'seat.json');
+    yield* scratch.files.writeJson(sessionPath, sessionFile());
+    const loaded = yield* store.resolveV2(sessionPath);
+    const posts: string[] = [];
+    const runPromise = Runtime.runPromise(yield* Effect.runtime());
+    const fakeFetch = completeFetch((input, init) =>
+      runPromise(
+        Effect.gen(function* () {
+          const body = yield* requestBodyText(init);
+          if (body !== null) posts.push(body);
+          const response = responder(urlOf(input), body);
+          const answer = yield* Effect.isEffect(response) ? response : Effect.succeed(response);
+          return new Response(compactJson(answer.body), {
+            status: answer.status,
+            headers: { 'content-type': 'application/json' },
+          });
+        })
+      )
+    );
+    const client = v2ClientFor(httpFor(fakeFetch), () => Effect.void);
+    const layer = Layer.mergeAll(
+      Layer.succeed(SessionStore, store),
+      Layer.succeed(PrivateFs, scratch.files),
+      Layer.succeed(V2Client, client)
+    );
+    return {
+      store,
+      sessionPath,
+      session: loaded.session,
+      statePath: store.statePath(sessionPath),
+      posts,
+      layer,
+      run: (effect) => Effect.either(provideTestLayer(effect, layer)),
+    };
+  });
 
 const ok = <A, E>(either: Either.Either<A, E>): A => {
   if (Either.isLeft(either)) {
@@ -294,9 +309,9 @@ const failure = <A>(either: Either.Either<A, { readonly message: string }>): str
   return Either.isLeft(either) ? either.left.message : '';
 };
 
-const seed = (fx: Fixture, stateRevision: TestRevision): Promise<void> =>
-  fx
-    .run(
+const seed = (fx: Fixture, stateRevision: TestRevision): Effect.Effect<void> =>
+  Effect.map(
+    fx.run(
       Effect.flatMap(
         Effect.mapError(
           decodeLegalPage(legalPage(stateRevision, [descriptor(stateRevision)]), fx.session),
@@ -304,29 +319,28 @@ const seed = (fx: Fixture, stateRevision: TestRevision): Promise<void> =>
         ),
         (decoded) => rememberPage(fx.sessionPath, fx.session, { legal: true, page: decoded })
       )
-    )
-    .then((result) => {
+    ),
+    (result) => {
       ok(result);
-    });
-
-const stale = (fx: Fixture): Promise<void> =>
-  seed(fx, revision(7)).then(() =>
-    fx
-      .run(
-        Effect.flatMap(
-          Effect.mapError(
-            decodeReceipt(receiptBody(`batch_${'Z'.repeat(24)}`, 'applied'), fx.session, {
-              batchId: `batch_${'Z'.repeat(24)}`,
-            }),
-            (error) => ({ message: error.message })
-          ),
-          (receipt) => rememberReceipt(fx.sessionPath, fx.session, receipt)
-        )
-      )
-      .then((result) => {
-        ok(result);
-      })
+    }
   );
+
+const stale = (fx: Fixture): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    yield* seed(fx, revision(7));
+    const result = yield* fx.run(
+      Effect.flatMap(
+        Effect.mapError(
+          decodeReceipt(receiptBody(`batch_${'Z'.repeat(24)}`, 'applied'), fx.session, {
+            batchId: `batch_${'Z'.repeat(24)}`,
+          }),
+          (error) => ({ message: error.message })
+        ),
+        (receipt) => rememberReceipt(fx.sessionPath, fx.session, receipt)
+      )
+    );
+    ok(result);
+  });
 
 interface Captured {
   readonly out: ReadonlyArray<string>;
@@ -599,16 +613,16 @@ describe('batchIntent', () => {
 // ---------------------------------------------------------------------------
 
 describe('batchDisposition', () => {
-  const fx = (): Fixture => fixture();
+  const fx = (): Effect.Effect<Fixture, PlayError> => fixture();
 
   awaitTest('a disposition outside the closed set is refused', function* (wait) {
-    const f = fx();
+    const f = yield* fx();
     const outcome = yield* wait(f.run(batchDisposition(f.session, 'batch_x', 'looks_fine')));
     expect(failure(outcome)).toBe('invalid batch disposition');
   });
 
   awaitTest('every disposition whose payload would lie about the outcome is refused', function* (wait) {
-    const f = fx();
+    const f = yield* fx();
     const applied = receiptBody('batch_x', 'applied');
     const accepted = receiptBody('batch_x', 'accepted');
     const error = errorBody('conflict', {});
@@ -663,7 +677,7 @@ describe('batchDisposition', () => {
 describe('batchErrorDisposition', () => {
 
   awaitTest('a refusal that never claimed the batch was unaccepted proves nothing', function* (wait) {
-    const f = fixture();
+    const f = yield* fixture();
     for (const details of [
       {},
       { batch_id: 'batch_other', acceptance: 'not_accepted', safe_next: 'refresh' },
@@ -682,7 +696,7 @@ describe('batchErrorDisposition', () => {
   });
 
   awaitTest('a contract that contradicts its own error code is refused', function* (wait) {
-    const f = fixture();
+    const f = yield* fixture();
     const outcome = yield* wait(f.run(
       batchErrorDisposition(
         jsonResponse(503, errorBody('sidecar_unavailable', recoveryContract('batch_x', 'retry_exact'), false)),
@@ -694,7 +708,7 @@ describe('batchErrorDisposition', () => {
   });
 
   awaitTest('the code decides the safe next step, and the server has to agree with it', function* (wait) {
-    const f = fixture();
+    const f = yield* fixture();
     const cases: ReadonlyArray<readonly [number, string, boolean, Disposition]> = [
       [409, 'conflict', false, 'receipt_first'],
       [500, 'internal_error', false, 'receipt_first'],
@@ -730,14 +744,14 @@ describe('batchErrorDisposition', () => {
 
 describe('submitBatch', () => {
   awaitTest('a batch that was never persisted is refused before any request', function* (wait) {
-    const f = fixture();
+    const f = yield* fixture();
     const outcome = yield* wait(f.run(submitBatch(f.sessionPath, f.session, 'batch_missing')));
     expect(failure(outcome)).toBe("no persisted command batch 'batch_missing'");
     expect(f.posts).toHaveLength(0);
   });
 
   awaitTest('the exact persisted bytes are what goes on the wire', function* (wait) {
-    const f = fixture((_url, body) => ({
+    const f = yield* fixture((_url, body) => ({
       status: 200,
       body: receiptBody(
         postBatchId(body),
@@ -761,7 +775,7 @@ describe('submitBatch', () => {
   });
 
   awaitTest('an unreadable success response is receipt-first, never a retry', function* (wait) {
-    const f = fixture(() => ({ status: 200, body: { fine: true } }));
+    const f = yield* fixture(() => ({ status: 200, body: { fine: true } }));
     yield* wait(seed(f, revision(7)));
     const batchId = ok(
       yield* wait(f.run(
@@ -780,7 +794,7 @@ describe('submitBatch', () => {
   });
 
   awaitTest('a refusal without its recovery contract is receipt-first too', function* (wait) {
-    const f = fixture(() => ({ status: 503, body: errorBody('sidecar_unavailable', {}, true) }));
+    const f = yield* fixture(() => ({ status: 503, body: errorBody('sidecar_unavailable', {}, true) }));
     yield* wait(seed(f, revision(7)));
     const batchId = ok(
       yield* wait(f.run(
@@ -798,7 +812,7 @@ describe('submitBatch', () => {
   });
 
   awaitTest('an accepted receipt is pollable, not terminal', function* (wait) {
-    const f = fixture((_url, body) => ({
+    const f = yield* fixture((_url, body) => ({
       status: 202,
       body: receiptBody(
         postBatchId(body),
@@ -827,7 +841,7 @@ describe('submitBatch', () => {
 
 describe('play batch', () => {
   awaitTest('the batch is on disk before the request, so a dead transport is recoverable', function* (wait) {
-    const dying = fixture((): never => {
+    const dying = yield* fixture((): never => {
       throw new Error('connection reset');
     });
     yield* wait(seed(dying, revision(7)));
@@ -841,16 +855,26 @@ describe('play batch', () => {
     expect(printed.disposition).toBe('receipt_first');
     expect(captured.err[0]).toContain('transport outcome is unknown for batch');
     // The record survived the failure: `retry` has something to resolve.
-    const persisted = batchKeysOnDisk(dying);
+    const persisted = yield* batchKeysOnDisk(dying);
     expect(persisted).toEqual([`batch_${'A'.repeat(24)}`]);
   });
 
   awaitTest('the state file already holds the batch when the request is made', function* (wait) {
     let onDisk: ReadonlyArray<string> = [];
-    const f: Fixture = fixture((_url, _body) => {
-      onDisk = batchKeysOnDisk(f);
-      throw new Error('connection reset');
-    });
+    let observed: Fixture | null = null;
+    const f = yield* fixture(() =>
+      observed === null
+        ? Effect.die(new Error('fixture was not ready'))
+        : Effect.flatMap(batchKeysOnDisk(observed), (keys) =>
+            Effect.flatMap(
+              Effect.sync(() => {
+                onDisk = keys;
+              }),
+              () => Effect.die(new Error('connection reset'))
+            )
+          )
+    );
+    observed = f;
     yield* wait(seed(f, revision(7)));
     yield* wait(capture(runBatch(args(), pinned('B'.repeat(24))), f));
     expect(onDisk).toEqual([`batch_${'B'.repeat(24)}`]);
@@ -887,7 +911,7 @@ describe('play batch', () => {
           code === 'rate_limited' || label === 'busy'
         );
       }
-      const f = fixture(() => ({ status, body: responseBody }));
+      const f = yield* fixture(() => ({ status, body: responseBody }));
       yield* wait(seed(f, revision(7)));
       const captured = yield* wait(capture(runBatch(args(), pinned(token)), f));
       expect(captured.out).toHaveLength(1);
@@ -904,9 +928,10 @@ describe('play batch', () => {
   awaitTest('--json prints exactly one canonical object, and the text form is a projection', function* (wait) {
     const token = 'J'.repeat(24);
     const batchId = `batch_${token}`;
-    const build = () => fixture(() => ({ status: 200, body: receiptBody(batchId, 'applied') }));
+    const build = (): Effect.Effect<Fixture, PlayError> =>
+      fixture(() => ({ status: 200, body: receiptBody(batchId, 'applied') }));
 
-    const jsonRun = build();
+    const jsonRun = yield* build();
     yield* wait(seed(jsonRun, revision(7)));
     const raw = yield* wait(capture(
       runBatch(args({ arguments: '{"ready":true}' }), pinned(token)),
@@ -918,7 +943,7 @@ describe('play batch', () => {
     const parsed = parseFixtureObject(raw.out[0] ?? '');
     expect(raw.out[0]).toBe(compactJson(parsed));
 
-    const textRun = build();
+    const textRun = yield* build();
     yield* wait(seed(textRun, revision(7)));
     const text = yield* wait(capture(
       runBatch(args({ arguments: '{"ready":true}', json: false }), pinned(token)),
@@ -946,13 +971,13 @@ describe('play batch', () => {
   awaitTest('the receipt is projected into state/delta.md, as _submit_persisted_batch does', function* (wait) {
     const token = 'P'.repeat(24);
     const batchId = `batch_${token}`;
-    const f = fixture(() => ({ status: 200, body: receiptBody(batchId, 'applied') }));
+    const f = yield* fixture(() => ({ status: 200, body: receiptBody(batchId, 'applied') }));
     yield* wait(seed(f, revision(7)));
     const captured = yield* wait(capture(runBatch(args(), pinned(token)), f));
     expect(exitCodeOf(captured.outcome)).toBe(0);
-    const delta = path.join(Effect.runSync(mirrorDir(f.sessionPath)), 'state', 'delta.md');
-    expect(yield* wait(Effect.runPromise(fileSystem.exists(delta)))).toBe(true);
-    expect(yield* wait(Effect.runPromise(fileSystem.readFileString(delta)))).toContain(
+    const delta = path.join(yield* mirrorDir(f.sessionPath), 'state', 'delta.md');
+    expect(yield* fileSystem.exists(delta)).toBe(true);
+    expect(yield* fileSystem.readFileString(delta)).toContain(
       `applied batch ${batchId.slice(0, 16)} at rev 8`
     );
   });
@@ -968,23 +993,24 @@ describe('play batch', () => {
     const token = 'R'.repeat(24);
     const batchId = `batch_${token}`;
     const rebound = `action_${'2'.repeat(26)}`;
-    const build = () => {
-      const urls: string[] = [];
-      const fx = fixture((url) => {
-        urls.push(url);
-        return url.includes('legal-actions')
-          ? {
-              status: 200,
-              body: legalPage(revision(8), [descriptor(revision(8), rebound)]),
-            }
-          : { status: 200, body: receiptBody(batchId, 'applied', revision(8)) };
+    const build = () =>
+      Effect.gen(function* () {
+        const urls: string[] = [];
+        const fx = yield* fixture((url) => {
+          urls.push(url);
+          return url.includes('legal-actions')
+            ? {
+                status: 200,
+                body: legalPage(revision(8), [descriptor(revision(8), rebound)]),
+              }
+            : { status: 200, body: receiptBody(batchId, 'applied', revision(8)) };
+        });
+        return { fx, urls };
       });
-      return { fx, urls };
-    };
 
     // The alias table is pinned at rev7 while a receipt has moved the seat to
     // rev8: `a1` still names an action, but not one this revision knows.
-    const refreshing = build();
+    const refreshing = yield* build();
     yield* wait(stale(refreshing.fx));
     const captured = yield* wait(capture(
       runBatch(args({ actionId: 'a1', json: false }), pinned(token)),
@@ -995,7 +1021,7 @@ describe('play batch', () => {
     expect(captured.out[0]).toBe('a1 rebound at rev8');
     expect(refreshing.fx.posts[0]).toContain(rebound);
 
-    const refusing = build();
+    const refusing = yield* build();
     yield* wait(stale(refusing.fx));
     const refused = yield* wait(capture(
       runBatch(args({ actionId: 'a1', noRefresh: true, json: false }), pinned(token)),
@@ -1016,7 +1042,7 @@ describe('play batch', () => {
   awaitTest('a refused batch prints what its actor can still do', function* (wait) {
     const token = 'S'.repeat(24);
     const batchId = `batch_${token}`;
-    const f = fixture((url) =>
+    const f = yield* fixture((url) =>
       url.includes('legal-actions')
         ? { status: 200, body: legalPage(revision(7), [descriptor(revision(7))]) }
         : {
@@ -1037,7 +1063,7 @@ describe('play batch', () => {
     const token = 'M'.repeat(24);
     const batchId = `batch_${token}`;
     const ambiguousRevision = revision(8);
-    const f = fixture(() => ({
+    const f = yield* fixture(() => ({
       status: 200,
       body: receiptBody(batchId, 'ambiguous', ambiguousRevision, {
         error: errorBody(
@@ -1055,7 +1081,7 @@ describe('play batch', () => {
   });
 
   awaitTest('an unknown action is refused before anything is sent', function* (wait) {
-    const f = fixture(() => ({ status: 200, body: {} }));
+    const f = yield* fixture(() => ({ status: 200, body: {} }));
     yield* wait(seed(f, revision(7)));
     const captured = yield* wait(capture(
       runBatch(args({ actionId: `action_${'9'.repeat(26)}` }), pinned('N'.repeat(24))),
@@ -1066,7 +1092,7 @@ describe('play batch', () => {
   });
 
   awaitTest('a stale action alias keeps its plain refusal when no drain is available', function* (wait) {
-    const f = fixture(() => ({ status: 200, body: {} }));
+    const f = yield* fixture(() => ({ status: 200, body: {} }));
     yield* wait(seed(f, revision(7)));
     // A newer state page retires the catalog, so `a1` names an expired handle.
     const state = ok(yield* wait(f.run(f.store.readState(f.sessionPath, f.session))));
@@ -1104,14 +1130,14 @@ describe('play batch', () => {
 describe('a refusal after the phase ended', () => {
   const STALLED = 'your phase is not active (state ending) — just wait';
 
-  const stall = (f: Fixture): Promise<void> =>
-    f.run(mirrorDir(f.sessionPath)).then((either) => {
-      const dir = ok(either);
-      return f
-        .run(writeMirror(dir, HEADER_FILE, 'phase     ending · turn 3 phase 0 · active yes\n'))
-        .then((result) => {
-          ok(result);
-        });
+  const stall = (f: Fixture): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      const dir = ok(yield* f.run(mirrorDir(f.sessionPath)));
+      ok(
+        yield* f.run(
+          writeMirror(dir, HEADER_FILE, 'phase     ending · turn 3 phase 0 · active yes\n')
+        )
+      );
     });
 
   const refusal = (
@@ -1125,7 +1151,7 @@ describe('a refusal after the phase ended', () => {
     });
 
   awaitTest('leads an invalid action ID, which is a DriftError here and a PlayerError there', function* (wait) {
-    const f = fixture();
+    const f = yield* fixture();
     yield* wait(seed(f, revision(7)));
     yield* wait(stall(f));
     expect(yield* wait(refusal(f, args({ actionId: '' })))).toBe(`${STALLED}\ninvalid action ID`);
@@ -1136,7 +1162,7 @@ describe('a refusal after the phase ended', () => {
   });
 
   awaitTest('leads a plain PlayerError too, and says the phase fact exactly once', function* (wait) {
-    const f = fixture();
+    const f = yield* fixture();
     yield* wait(seed(f, revision(7)));
     yield* wait(stall(f));
     expect(yield* wait(refusal(f, args({ actionId: `action_${'9'.repeat(26)}` })))).toBe(
@@ -1156,7 +1182,7 @@ describe('a refusal after the phase ended', () => {
    * `_canonical_body`'s `.encode("utf-8")` stands between it and the wire.
    */
   awaitTest('a lone --arguments surrogate never reaches .v2-state or the wire', function* (wait) {
-    const f = fixture();
+    const f = yield* fixture();
     yield* wait(seed(f, revision(7)));
     expect(yield* wait(refusal(f, args({ arguments: '{"name":"\\ud800"}' })))).toContain(
       "command batch is not canonical JSON: 'utf-8' codec can't encode character " +
@@ -1166,7 +1192,7 @@ describe('a refusal after the phase ended', () => {
   });
 
   awaitTest('says nothing extra while the mirror does not claim the phase is dead', function* (wait) {
-    const f = fixture();
+    const f = yield* fixture();
     yield* wait(seed(f, revision(7)));
     expect(yield* wait(refusal(f, args({ actionId: '' })))).toBe('invalid action ID');
   });
@@ -1174,7 +1200,7 @@ describe('a refusal after the phase ended', () => {
   awaitTest('never touches the quiet exit-2 signal a reported disposition carries', function* (wait) {
     const token = 'R'.repeat(24);
     const batchId = `batch_${token}`;
-    const f = fixture(() => ({
+    const f = yield* fixture(() => ({
       status: 409,
       body: errorBody('conflict', {
         batch_id: batchId,
@@ -1203,7 +1229,7 @@ describe('a refusal after the phase ended', () => {
 
 describe('the disposition line', () => {
   awaitTest('a receipt-carrying disposition renders the receipt', function* (wait) {
-    const f = fixture();
+    const f = yield* fixture();
     const built = ok(
       yield* wait(f.run(
         batchDisposition(f.session, 'batch_x', 'receipt_poll', {
@@ -1218,7 +1244,7 @@ describe('the disposition line', () => {
   });
 
   awaitTest('a not-accepted disposition names the error and the safe next step', function* (wait) {
-    const f = fixture();
+    const f = yield* fixture();
     const built = ok(
       yield* wait(f.run(
         batchDisposition(f.session, 'batch_x', 'refresh', {
@@ -1233,7 +1259,7 @@ describe('the disposition line', () => {
   });
 
   awaitTest('an unknown outcome says so rather than implying a retry is safe', function* (wait) {
-    const f = fixture();
+    const f = yield* fixture();
     const built = ok(yield* wait(f.run(batchDisposition(f.session, 'batch_x', 'receipt_first'))));
     expect(renderDisposition(built, 'a1')).toEqual([
       'a1 → outcome unknown next=receipt_first  batch_x',

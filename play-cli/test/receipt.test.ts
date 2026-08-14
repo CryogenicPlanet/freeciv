@@ -41,7 +41,7 @@ import {
 } from 'test/receipt-harness';
 import { awaitTest } from 'test/_effect-test';
 
-afterEach(cleanupScratches);
+afterEach(() => Effect.runPromise(cleanupScratches()));
 
 const investigation = (
   surplus: number,
@@ -282,8 +282,8 @@ describe('batchIntent', () => {
 describe('play receipt', () => {
 
   awaitTest('it prints one line, and the batch ID is the tail of it', function* (wait) {
-    const fixture = buildFixture(route(receiptWire(BATCH_ID)));
-    fixture.seed({
+    const fixture = yield* buildFixture(route(receiptWire(BATCH_ID)));
+    yield* fixture.seed({
       actions: { action_opaque: DESCRIPTOR },
       batches: { [BATCH_ID]: batchBody(BATCH_ID) },
     });
@@ -298,7 +298,7 @@ describe('play receipt', () => {
 
   awaitTest('an unknown batch still renders, with "batch" as the intent', function* (wait) {
     const other = `batch_${'S'.repeat(24)}`;
-    const fixture = buildFixture(route(receiptWire(other, 'rejected')));
+    const fixture = yield* buildFixture(route(receiptWire(other, 'rejected')));
     const { out, result } = yield* wait(capture(
       runReceipt({ session: fixture.sessionPath, batchId: other, json: false }),
       fixture
@@ -311,8 +311,8 @@ describe('play receipt', () => {
   });
 
   awaitTest('the receipt is remembered and mirrored, tagged "receipt"', function* (wait) {
-    const fixture = buildFixture(route(receiptWire(BATCH_ID)));
-    fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
+    const fixture = yield* buildFixture(route(receiptWire(BATCH_ID)));
+    yield* fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
     const hooks = recordingHooks();
     yield* wait(capture(
       runReceipt({ session: fixture.sessionPath, batchId: BATCH_ID, json: false }, hooks.make),
@@ -321,12 +321,12 @@ describe('play receipt', () => {
     expect(hooks.remembered.map((receipt) => receipt.batch_id)).toEqual([BATCH_ID]);
     expect(hooks.mirrored).toEqual([[BATCH_ID, 'receipt']]);
     // And it landed in `.v2-state`, so `retry` can answer from the cache.
-    expect(fixture.readState().receipts[BATCH_ID]).not.toBeUndefined();
+    expect((yield* fixture.readState()).receipts[BATCH_ID]).not.toBeUndefined();
   });
 
   awaitTest('--json prints the validated envelope and nothing else on stdout', function* (wait) {
-    const fixture = buildFixture(route(receiptWire(BATCH_ID)));
-    fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
+    const fixture = yield* buildFixture(route(receiptWire(BATCH_ID)));
+    yield* fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
     const { out } = yield* wait(capture(
       runReceipt({ session: fixture.sessionPath, batchId: BATCH_ID, json: true }),
       fixture
@@ -339,7 +339,7 @@ describe('play receipt', () => {
   });
 
   awaitTest('a non-2xx body is raised as a validated refusal, not rendered', function* (wait) {
-    const fixture = buildFixture(route(errorEnvelope('invalid_request', null), 404));
+    const fixture = yield* buildFixture(route(errorEnvelope('invalid_request', null), 404));
     const { out, result } = yield* wait(capture(
       runReceipt({ session: fixture.sessionPath, batchId: BATCH_ID, json: false }),
       fixture
@@ -350,7 +350,7 @@ describe('play receipt', () => {
   });
 
   awaitTest('a malformed batch ID is refused before any request is made', function* (wait) {
-    const fixture = buildFixture(new Map<string, FakeRoute>());
+    const fixture = yield* buildFixture(new Map<string, FakeRoute>());
     const { result } = yield* wait(capture(
       runReceipt({ session: fixture.sessionPath, batchId: 'not a batch id', json: false }),
       fixture
@@ -360,7 +360,7 @@ describe('play receipt', () => {
   });
 
   awaitTest('a receipt naming a different batch than the one asked for is drift', function* (wait) {
-    const fixture = buildFixture(route(receiptWire(`batch_${'Z'.repeat(24)}`)));
+    const fixture = yield* buildFixture(route(receiptWire(`batch_${'Z'.repeat(24)}`)));
     const { result } = yield* wait(capture(
       runReceipt({ session: fixture.sessionPath, batchId: BATCH_ID, json: false }),
       fixture
@@ -372,8 +372,8 @@ describe('play receipt', () => {
   awaitTest('`receipt` never sends a batch, whatever it is handed', function* (wait) {
     // The command remedy `receipt_first` promises this: running it cannot make
     // anything worse. Every route but the receipt GET 404s loudly.
-    const fixture = buildFixture(new Map([['/receipts/', { body: receiptWire(BATCH_ID) }]]));
-    fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
+    const fixture = yield* buildFixture(new Map([['/receipts/', { body: receiptWire(BATCH_ID) }]]));
+    yield* fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
     const hooks = recordingHooks();
     const { result } = yield* wait(capture(
       runReceipt({ session: fixture.sessionPath, batchId: BATCH_ID, json: false }, hooks.make),
