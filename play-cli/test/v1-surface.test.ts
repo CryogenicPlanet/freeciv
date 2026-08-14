@@ -155,7 +155,7 @@ const seats: Scratch[] = [];
  */
 const rawSeat = (body: JsonObject): Effect.Effect<Seat, PlayerError> =>
   Effect.gen(function* () {
-    const scratch = scratchWorkspace();
+    const scratch = yield* scratchWorkspace();
     seats.push(scratch);
     const file = path.join(scratch.workspace.stateRoot, GAME_ID, 'agent.json');
     yield* scratch.files.writeJson(file, body);
@@ -167,9 +167,7 @@ const seat = (overrides: JsonObject = {}): Effect.Effect<Seat, PlayerError> =>
 
 afterEach(() =>
   Effect.runPromise(
-    Effect.forEach(seats.splice(0), (scratch) => Effect.promise(scratch.cleanup), {
-      discard: true,
-    })
+    Effect.forEach(seats.splice(0), (scratch) => scratch.cleanup, { discard: true })
   )
 );
 
@@ -868,10 +866,13 @@ describe('play act', () => {
     });
 
     awaitTest('a non-string game_id or agent_id still guards the identity', function* (wait) {
-      for (const [key, mine, theirs] of [
+      const cases: ReadonlyArray<
+        readonly ['game_id' | 'agent_id', number, number]
+      > = [
         ['game_id', 11, 12],
         ['agent_id', 11, 12],
-      ] as const) {
+      ];
+      for (const [key, mine, theirs] of cases) {
         const { scratch, path: file } = yield* wait(rawSeat({ ...MINIMAL, [key]: mine }));
         const fake = recordingFetch([
           { body: { accepted: true, game_id: GAME_ID, agent_id: 'agent-one', turn: 1, [key]: theirs } },
@@ -975,7 +976,7 @@ describe('play act', () => {
   awaitTest('test_wrong_current_session_act_fails_before_request', function* (wait) {
     // Two seats in one workspace and no binding: the refusal names the command
     // that makes the workspace unambiguous, and nothing is sent.
-    const scratch = scratchWorkspace();
+    const scratch = yield* scratchWorkspace();
     seats.push(scratch);
     const first = path.join(scratch.workspace.stateRoot, GAME_ID, 'pi-gpt.json');
     const second = path.join(scratch.workspace.stateRoot, GAME_ID, 'pi-claude.json');

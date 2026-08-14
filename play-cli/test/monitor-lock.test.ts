@@ -22,7 +22,9 @@ import { fileSystem, path } from 'test/_test-platform';
 const scratches: Scratch[] = [];
 
 afterEach(() =>
-  Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup()))
+  Effect.runPromise(
+    Effect.forEach(scratches.splice(0), (scratch) => scratch.cleanup, { discard: true })
+  )
 );
 
 interface Bench {
@@ -31,12 +33,15 @@ interface Bench {
   readonly lockPath: string;
 }
 
-const bench = (): Bench => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const sessionPath = path.join(scratch.workspace.stateRoot, 'session-codex-gpt-5.6-sol.json');
-  return { scratch, sessionPath, lockPath: monitorLockPath(sessionPath) };
-};
+const bench = (): Effect.Effect<Bench> =>
+  Effect.map(scratchWorkspace(), (scratch) => {
+    scratches.push(scratch);
+    const sessionPath = path.join(
+      scratch.workspace.stateRoot,
+      'session-codex-gpt-5.6-sol.json'
+    );
+    return { scratch, sessionPath, lockPath: monitorLockPath(sessionPath) };
+  });
 
 describe('the monitor lock', () => {
   test('is a real flock, not a bookkeeping approximation', () => {
@@ -47,7 +52,7 @@ describe('the monitor lock', () => {
   });
 
   awaitTest('the first acquires, and says so by yielding no holder', function* () {
-    const seat = bench();
+    const seat = yield* bench();
     const seen = yield* Effect.orDie(provideTestLayer(
       withMonitorLock(seat.sessionPath, { pid: 41207, since: '16:21:04', game_id: 'g' }, (running) =>
         Effect.gen(function* () {
@@ -66,7 +71,7 @@ describe('the monitor lock', () => {
   });
 
   awaitTest('a second persistent monitor is refused and told who holds it', function* () {
-    const seat = bench();
+    const seat = yield* bench();
     const running = yield* Effect.orDie(provideTestLayer(
       withMonitorLock(seat.sessionPath, { pid: 41207, since: '16:21:04' }, () =>
         withMonitorLock(seat.sessionPath, { pid: 999, since: '16:22:00' }, (second) =>
@@ -85,7 +90,7 @@ describe('the monitor lock', () => {
   });
 
   awaitTest('a released lock leaves nothing for the next monitor to reap', function* () {
-    const seat = bench();
+    const seat = yield* bench();
     const held = yield* Effect.orDie(provideTestLayer(
       withMonitorLock(seat.sessionPath, { pid: 1234 }, () => monitorHolder(seat.sessionPath)),
       seat.scratch.layer
@@ -100,7 +105,7 @@ describe('the monitor lock', () => {
   });
 
   awaitTest('the lock file is the holder record, and is emptied on release', function* () {
-    const seat = bench();
+    const seat = yield* bench();
     yield* Effect.orDie(provideTestLayer(
       withMonitorLock(seat.sessionPath, { pid: 4242, since: '09:00:00' }, () =>
         Effect.map(seat.scratch.files.readText(seat.lockPath, 'monitor lock'), (raw) => {
@@ -115,7 +120,7 @@ describe('the monitor lock', () => {
   });
 
   awaitTest('a monitor lock that is not mode 0600 is refused', function* () {
-    const seat = bench();
+    const seat = yield* bench();
     yield* Effect.orDie(fileSystem.makeDirectory(path.dirname(seat.lockPath), {
       recursive: true,
       mode: 0o700,
@@ -135,7 +140,7 @@ describe('the monitor lock', () => {
   });
 
   awaitTest('no lock file at all means no monitor', function* () {
-    const seat = bench();
+    const seat = yield* bench();
     expect(yield* Effect.orDie(
       provideTestLayer(monitorHolder(seat.sessionPath), seat.scratch.layer)
     )).toBeNull();
@@ -168,7 +173,7 @@ describe('the singleton', () => {
     // `flock` is per-open-file-description, so in-process agreement proves
     // nothing about the case that matters: two `play monitor` invocations from
     // a shell.
-    const seat = bench();
+    const seat = yield* bench();
     const cwd = path.resolve(import.meta.dir, '..');
     const first = Bun.spawn(['bun', '-e', holderScript(seat, 30)], {
       cwd,

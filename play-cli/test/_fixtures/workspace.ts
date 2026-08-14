@@ -21,48 +21,46 @@ export interface Scratch {
   readonly workspace: WorkspacePaths;
   readonly files: PrivateFsApi;
   readonly layer: Layer.Layer<Workspace | PrivateFs>;
-  readonly cleanup: () => Promise<void>;
+  readonly cleanup: Effect.Effect<void>;
 }
 
-const configuredTempRoot = Effect.runSync(
-  Config.string('PLAY_CLI_TEST_TMP').pipe(Config.withDefault('/tmp'))
-);
-const tempRoot = await Effect.runPromise(
-  withTestFileSystem((files) => files.realPath(configuredTempRoot)).pipe(Effect.orDie)
+const tempRoot = Config.string('PLAY_CLI_TEST_TMP').pipe(
+  Config.withDefault('/tmp'),
+  Effect.flatMap((configured) => withTestFileSystem((files) => files.realPath(configured))),
+  Effect.orDie
 );
 let workspaceSequence = 0;
 
-export const scratchWorkspace = (stateDir = '.sessions'): Scratch => {
-  const bootstrapWorkspace: WorkspacePaths = { root: tempRoot, stateRoot: tempRoot };
-  const bootstrapFiles = privateFsFor(bootstrapWorkspace);
-  const directory = `play-cli-${Effect.runSync(Clock.currentTimeNanos)}-${workspaceSequence}`;
-  workspaceSequence += 1;
-  const root = path.join(tempRoot, directory);
-  const stateRoot = path.join(root, stateDir);
-  Effect.runSync(
-    bootstrapFiles.openDirectory([directory, stateDir], { create: true })
-  );
-  const workspace: WorkspacePaths = { root, stateRoot };
-  const files = privateFsFor(workspace);
-  return {
-    workspace,
-    files,
-    layer: Layer.merge(workspaceLayer(root, stateDir), Layer.succeed(PrivateFs, files)),
-    cleanup: () =>
-      Effect.runPromise(
-        withTestFileSystem((platformFiles) =>
-          platformFiles.remove(root, { recursive: true, force: true })
-        )
-      ),
-  };
-};
+export const scratchWorkspace = (stateDir = '.sessions'): Effect.Effect<Scratch> =>
+  Effect.gen(function* () {
+    const resolvedTempRoot = yield* tempRoot;
+    const bootstrapWorkspace: WorkspacePaths = {
+      root: resolvedTempRoot,
+      stateRoot: resolvedTempRoot,
+    };
+    const bootstrapFiles = privateFsFor(bootstrapWorkspace);
+    const now = yield* Clock.currentTimeNanos;
+    const sequence = yield* Effect.sync(() => workspaceSequence++);
+    const directory = `play-cli-${now}-${sequence}`;
+    const root = path.join(resolvedTempRoot, directory);
+    const stateRoot = path.join(root, stateDir);
+    yield* Effect.orDie(
+      bootstrapFiles.openDirectory([directory, stateDir], { create: true })
+    );
+    const workspace: WorkspacePaths = { root, stateRoot };
+    const files = privateFsFor(workspace);
+    return {
+      workspace,
+      files,
+      layer: Layer.merge(workspaceLayer(root, stateDir), Layer.succeed(PrivateFs, files)),
+      cleanup: withTestFileSystem((platformFiles) =>
+        platformFiles.remove(root, { recursive: true, force: true })
+      ).pipe(Effect.orDie),
+    };
+  });
 
 /** Run one effect against a fresh workspace and always clean it up. */
 export const withScratchWorkspace = <A, E>(
   body: (scratch: Scratch) => Effect.Effect<A, E>
 ): Effect.Effect<A, E> =>
-  Effect.acquireUseRelease(
-    Effect.sync(() => scratchWorkspace()),
-    body,
-    (scratch) => Effect.promise(scratch.cleanup)
-  );
+  Effect.acquireUseRelease(scratchWorkspace(), body, (scratch) => scratch.cleanup);

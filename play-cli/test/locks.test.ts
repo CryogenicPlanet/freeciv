@@ -23,13 +23,18 @@ import { path, withTestFileSystem } from 'test/_test-platform';
 
 const scratches: Scratch[] = [];
 
-const fresh = (): Scratch => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  return scratch;
-};
+const fresh = (): Effect.Effect<Scratch> =>
+  Effect.tap(scratchWorkspace(), (scratch) =>
+    Effect.sync(() => {
+      scratches.push(scratch);
+    })
+  );
 
-afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
+afterEach(() =>
+  Effect.runPromise(
+    Effect.forEach(scratches.splice(0), (scratch) => scratch.cleanup, { discard: true })
+  )
+);
 
 describe('path derivation', () => {
   test('withSuffix mirrors pathlib.Path.with_suffix', () => {
@@ -56,7 +61,7 @@ describe('holding', () => {
   effectTest('the body runs and the lock file is left mode 0600', () =>
     withTestFileSystem((files) =>
       Effect.gen(function* () {
-        const scratch = fresh();
+        const scratch = yield* fresh();
         const target = path.join(scratch.workspace.stateRoot, 'seat.v2-state.lock');
         const result = yield* provideTestLayer(
           withAdvisoryLock(target, 1, Effect.succeed('done')),
@@ -70,11 +75,11 @@ describe('holding', () => {
 
   effectTest('the lock is released even when the body fails', () =>
     Effect.gen(function* () {
-      const scratch = fresh();
+      const scratch = yield* fresh();
       const target = path.join(scratch.workspace.stateRoot, 'seat.v2-state.lock');
       const provided = Layer.succeed(PrivateFs, scratch.files);
       const first = yield* Effect.either(
-        provideTestLayer(withAdvisoryLock(target, 1, Effect.fail('boom' as const)), provided)
+        provideTestLayer(withAdvisoryLock(target, 1, Effect.fail('boom')), provided)
       );
       expect(Either.isLeft(first)).toBe(true);
       // If the release had leaked, this second acquisition would time out.
@@ -88,7 +93,7 @@ describe('holding', () => {
 
   effectTest('a lock outside PLAY_STATE_DIR is refused before any file is opened', () =>
     Effect.gen(function* () {
-      const scratch = fresh();
+      const scratch = yield* fresh();
       const either = yield* Effect.either(
         provideTestLayer(
           withAdvisoryLock('/etc/play.lock', 1, Effect.succeed(0)),

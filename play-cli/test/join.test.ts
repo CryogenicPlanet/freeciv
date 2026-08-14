@@ -78,7 +78,9 @@ const TOKEN = 'agent-v2-secret';
 const scratches: Scratch[] = [];
 
 afterEach(() =>
-  Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup()))
+  Effect.runPromise(
+    Effect.forEach(scratches.splice(0), (scratch) => scratch.cleanup, { discard: true })
+  )
 );
 
 // ---------------------------------------------------------------------------
@@ -101,20 +103,20 @@ interface Bench {
   ) => Layer.Layer<Workspace | PrivateFs | SessionStore | Http>;
 }
 
-const bench = (): Bench => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const { workspace, files } = scratch;
-  const store = sessionStoreFor(workspace, files, schema, {});
-  return {
-    scratch,
-    root: workspace.root,
-    workspace,
-    files,
-    layer: (fetchImpl) =>
-      Layer.mergeAll(scratch.layer, Layer.succeed(SessionStore, store), httpLayer(fetchImpl)),
-  };
-};
+const bench = (): Effect.Effect<Bench> =>
+  Effect.map(scratchWorkspace(), (scratch) => {
+    scratches.push(scratch);
+    const { workspace, files } = scratch;
+    const store = sessionStoreFor(workspace, files, schema, {});
+    return {
+      scratch,
+      root: workspace.root,
+      workspace,
+      files,
+      layer: (fetchImpl) =>
+        Layer.mergeAll(scratch.layer, Layer.succeed(SessionStore, store), httpLayer(fetchImpl)),
+    };
+  });
 
 const stageInvite = (fixture: Bench, gameId: string): Effect.Effect<void> =>
   Effect.gen(function* () {
@@ -284,14 +286,14 @@ const writeInvalidUtf8PlayConfig = (fixture: Bench): Effect.Effect<void> =>
     .pipe(Effect.orDie, Effect.asVoid);
 
 const runPlayDefaults = (fixture: Bench, given = playConfigIdentity) =>
-  Effect.runSync(Effect.either(applyPlayDefaults(fixture.workspace, given)));
+  Effect.either(applyPlayDefaults(fixture.workspace, given));
 
 const stagedJoin = (
   body: JsonObject,
   status: FakeRoute = { body: {} }
 ): Effect.Effect<{ readonly fixture: Bench; readonly message: string }> =>
   Effect.gen(function* () {
-    const fixture = bench();
+    const fixture = yield* bench();
     yield* stageInvite(fixture, GAME_ID);
     const { result } = yield* join(fixture, { status, join: { body } });
     return { fixture, message: failure(result) };
@@ -510,14 +512,14 @@ describe('the deadline sentence', () => {
 describe('_apply_play_defaults', () => {
   effectTest('a pre-configured workspace fills game, name and place', () =>
     Effect.gen(function* () {
-      const fixture = bench();
+      const fixture = yield* bench();
       yield* writePlayConfig(fixture, {
         schema_version: 1,
         game_id: GAME_ID,
         name: CONTROLLER,
         place: 2,
       });
-      expect(runPlayDefaults(fixture)).toEqual(
+      expect(yield* runPlayDefaults(fixture)).toEqual(
         Either.right({ gameId: GAME_ID, name: CONTROLLER, place: '2' })
       );
     })
@@ -525,7 +527,7 @@ describe('_apply_play_defaults', () => {
 
   effectTest('explicit arguments always win', () =>
     Effect.gen(function* () {
-      const fixture = bench();
+      const fixture = yield* bench();
       yield* writePlayConfig(fixture, {
         schema_version: 1,
         game_id: GAME_ID,
@@ -533,33 +535,65 @@ describe('_apply_play_defaults', () => {
         place: 2,
       });
       expect(
-        runPlayDefaults(fixture, { gameId: SECOND_ID, name: 'pi-gpt-5.5', place: '' })
+        yield* runPlayDefaults(fixture, {
+          gameId: SECOND_ID,
+          name: 'pi-gpt-5.5',
+          place: '',
+        })
       ).toEqual(Either.right({ gameId: SECOND_ID, name: 'pi-gpt-5.5', place: '2' }));
     })
   );
 
-  test('a missing config leaves every argument untouched', () => {
-    expect(runPlayDefaults(bench())).toEqual(Either.right(playConfigIdentity));
-  });
+  effectTest('a missing config leaves every argument untouched', () =>
+    Effect.gen(function* () {
+      const fixture = yield* bench();
+      expect(yield* runPlayDefaults(fixture)).toEqual(Either.right(playConfigIdentity));
+    })
+  );
 
   effectTest('a malformed config fails closed rather than guessing', () =>
     Effect.gen(function* () {
-      const fixture = bench();
+      const fixture = yield* bench();
       yield* writePlayConfig(fixture, {
         schema_version: 1,
         game_id: 'nope',
         name: 'x',
         place: null,
       });
-      expect(failure(runPlayDefaults(fixture))).toContain('.playconfig.json');
+      expect(failure(yield* runPlayDefaults(fixture))).toContain('.playconfig.json');
     })
   );
 
   effectTest('unparseable JSON names the file too', () =>
     Effect.gen(function* () {
-      const fixture = bench();
+      const fixture = yield* bench();
       yield* writePlayConfig(fixture, '{');
-      expect(failure(runPlayDefaults(fixture))).toContain('invalid .playconfig.json:');
+      expect(failure(yield* runPlayDefaults(fixture))).toContain('invalid .playconfig.json:');
+    })
+  );
+
+  effectTest('inherited config fields are rejected', () =>
+    Effect.gen(function* () {
+      const fixture = yield* bench();
+      const inherited = Object.create({
+        schema_version: 1,
+        game_id: GAME_ID,
+        name: CONTROLLER,
+      });
+      Object.defineProperty(inherited, 'place', { value: null, enumerable: true });
+      yield* writePlayConfig(fixture, inherited);
+      expect(failure(yield* runPlayDefaults(fixture))).toContain('.playconfig.json');
+    })
+  );
+
+  effectTest('an own __proto__ payload cannot provide config fields', () =>
+    Effect.gen(function* () {
+      const fixture = yield* bench();
+      yield* writePlayConfig(
+        fixture,
+        `{"__proto__":{"schema_version":1,"game_id":"${GAME_ID}","name":"${CONTROLLER}"},"place":null}`
+      );
+      expect(failure(yield* runPlayDefaults(fixture))).toContain('.playconfig.json');
     })
   );
 
@@ -568,30 +602,30 @@ describe('_apply_play_defaults', () => {
       // `not raw["name"].strip()`.  `.trim()` calls `"\x1f"` non-blank and would
       // accept it as a controller name.
       for (const name of ['', '', '', ' \t\n']) {
-        const fixture = bench();
+        const fixture = yield* bench();
         yield* writePlayConfig(fixture, {
           schema_version: 1,
           game_id: GAME_ID,
           name,
           place: null,
         });
-        expect(failure(runPlayDefaults(fixture))).toContain('.playconfig.json');
+        expect(failure(yield* runPlayDefaults(fixture))).toContain('.playconfig.json');
       }
     })
   );
 
   effectTest('an argument that is only CPython whitespace is still omitted', () =>
     Effect.gen(function* () {
-      const fixture = bench();
+      const fixture = yield* bench();
       yield* writePlayConfig(fixture, {
         schema_version: 1,
         game_id: GAME_ID,
         name: CONTROLLER,
         place: 2,
       });
-      expect(runPlayDefaults(fixture, { gameId: '', name: '', place: '' })).toEqual(
-        Either.right({ gameId: GAME_ID, name: CONTROLLER, place: '2' })
-      );
+      expect(
+        yield* runPlayDefaults(fixture, { gameId: '', name: '', place: '' })
+      ).toEqual(Either.right({ gameId: GAME_ID, name: CONTROLLER, place: '2' }));
     })
   );
 
@@ -600,23 +634,23 @@ describe('_apply_play_defaults', () => {
       // `read_text(encoding="utf-8")` raises `UnicodeDecodeError`, which
       // `except ValueError` turns into the refusal.  Node's `'utf8'` reader
       // would substitute and accept a config CPython refuses.
-      const fixture = bench();
+      const fixture = yield* bench();
       yield* writeInvalidUtf8PlayConfig(fixture);
-      expect(failure(runPlayDefaults(fixture))).toContain('invalid .playconfig.json:');
+      expect(failure(yield* runPlayDefaults(fixture))).toContain('invalid .playconfig.json:');
     })
   );
 
   effectTest('place 0 and a boolean place are both refused', () =>
     Effect.gen(function* () {
       for (const place of [0, true, 'two']) {
-        const fixture = bench();
+        const fixture = yield* bench();
         yield* writePlayConfig(fixture, {
           schema_version: 1,
           game_id: GAME_ID,
           name: CONTROLLER,
           place,
         });
-        expect(failure(runPlayDefaults(fixture))).toContain('.playconfig.json');
+        expect(failure(yield* runPlayDefaults(fixture))).toContain('.playconfig.json');
       }
     })
   );
@@ -628,7 +662,7 @@ describe('_apply_play_defaults', () => {
 
 describe('a strategic-v1 join', () => {
   awaitTest('it reports and saves the exact timing contract', function* (wait) {
-    const fixture = bench();
+    const fixture = yield* bench();
     yield* stageInvite(fixture, GAME_ID);
     const joined: JsonObject = {
       schema_version: 1,
@@ -664,7 +698,7 @@ describe('a strategic-v1 join', () => {
   });
 
   awaitTest('the session file is named for the controller and written 0600', function* (wait) {
-    const fixture = bench();
+    const fixture = yield* bench();
     yield* stageInvite(fixture, GAME_ID);
     const { result } = yield* wait(
       join(fixture, {
@@ -740,7 +774,7 @@ describe('a join the supervisor answered wrongly', () => {
   });
 
   awaitTest('an unsupported preflight protocol names the value it saw', function* (wait) {
-    const fixture = bench();
+    const fixture = yield* bench();
     yield* stageInvite(fixture, GAME_ID);
     const { result } = yield* wait(
       join(fixture, {
@@ -756,7 +790,7 @@ describe('a join the supervisor answered wrongly', () => {
 
 describe('a full-control-v2 join', () => {
   awaitTest('a second join re-binds the held seat instead of claiming again', function* (wait) {
-    const fixture = bench();
+    const fixture = yield* bench();
     yield* stageInvite(fixture, GAME_ID);
     const first = yield* wait(join(fixture, v2Plan()));
     ok(first.result);
@@ -773,7 +807,7 @@ describe('a full-control-v2 join', () => {
   });
 
   awaitTest('a held-but-corrupt session refuses rather than silently re-claiming', function* (wait) {
-    const fixture = bench();
+    const fixture = yield* bench();
     yield* stageInvite(fixture, GAME_ID);
     const first = yield* wait(join(fixture, v2Plan()));
     ok(first.result);
@@ -788,7 +822,7 @@ describe('a full-control-v2 join', () => {
   });
 
   awaitTest('it advertises the capability and never prints the v1 loop', function* (wait) {
-    const fixture = bench();
+    const fixture = yield* bench();
     yield* stageInvite(fixture, GAME_ID);
     const { result, captured } = yield* wait(join(fixture, v2Plan()));
     ok(result);
@@ -817,7 +851,7 @@ describe('a full-control-v2 join', () => {
   });
 
   awaitTest('the conduct block leads with the capitalized binding sentence', function* (wait) {
-    const fixture = bench();
+    const fixture = yield* bench();
     yield* stageInvite(fixture, GAME_ID);
     const { captured } = yield* wait(join(fixture, v2Plan()));
     expect(captured.err).toContain(
@@ -828,7 +862,7 @@ describe('a full-control-v2 join', () => {
 
   for (const [name, override, expected] of unplayableJoinCases) {
     awaitTest(`an unplayable result (${name}) is refused and writes nothing`, function* (wait) {
-      const fixture = bench();
+      const fixture = yield* bench();
       yield* stageInvite(fixture, GAME_ID);
       const { result } = yield* wait(join(fixture, v2Plan(override)));
       expect(failure(result)).toBe(expected);
@@ -837,7 +871,7 @@ describe('a full-control-v2 join', () => {
   }
 
   awaitTest('a cross-origin endpoint is refused by name', function* (wait) {
-    const fixture = bench();
+    const fixture = yield* bench();
     yield* stageInvite(fixture, GAME_ID);
     const { result } = yield* wait(
       join(fixture, v2Plan({ state_url: 'http://evil.test/v2/state' }))
@@ -846,7 +880,7 @@ describe('a full-control-v2 join', () => {
   });
 
   awaitTest('a malformed evaluation frame is refused before the transport checks', function* (wait) {
-    const fixture = bench();
+    const fixture = yield* bench();
     yield* stageInvite(fixture, GAME_ID);
     const { result } = yield* wait(join(fixture, v2Plan({ max_turns: 0 })));
     expect(failure(result)).toBe('invalid v2 join result: evaluation context is malformed');
@@ -855,7 +889,7 @@ describe('a full-control-v2 join', () => {
 
 describe('the workspace binding', () => {
   awaitTest('a join binds this workspace and a second join rebinds it', function* (wait) {
-    const fixture = bench();
+    const fixture = yield* bench();
     yield* stageInvite(fixture, GAME_ID);
     yield* stageInvite(fixture, SECOND_ID);
 
@@ -903,7 +937,7 @@ describe('the workspace binding', () => {
 
 describe('a stale invitation', () => {
   awaitTest('a 401 from the join POST names the owner recovery command', function* (wait) {
-    const fixture = bench();
+    const fixture = yield* bench();
     yield* stageInvite(fixture, GAME_ID);
     const { result } = yield* wait(
       join(fixture, {
@@ -917,7 +951,7 @@ describe('a stale invitation', () => {
   });
 
   awaitTest('a 500 is passed through without the stale-invite advice', function* (wait) {
-    const fixture = bench();
+    const fixture = yield* bench();
     yield* stageInvite(fixture, GAME_ID);
     const { result } = yield* wait(
       join(fixture, {
@@ -928,7 +962,7 @@ describe('a stale invitation', () => {
   });
 
   awaitTest('an unreachable supervisor tells the user to stop', function* (wait) {
-    const fixture = bench();
+    const fixture = yield* bench();
     yield* stageInvite(fixture, GAME_ID);
     const failing = completeFetch(() => Promise.reject(new Error('connection refused')));
     const captured = yield* wait(
@@ -942,7 +976,7 @@ describe('a stale invitation', () => {
 
 describe('--json', () => {
   awaitTest('it prints the raw payload, minus the bearer, plus where it was saved', function* (wait) {
-    const fixture = bench();
+    const fixture = yield* bench();
     yield* stageInvite(fixture, GAME_ID);
     const { result, captured } = yield* wait(
       join(
@@ -967,7 +1001,7 @@ describe('--json', () => {
   });
 
   awaitTest('PLAY_JSON=1 is exactly --json', function* (wait) {
-    const fixture = bench();
+    const fixture = yield* bench();
     yield* stageInvite(fixture, GAME_ID);
     const recorder = recordingFetch(
       new Map<string, FakeRoute>([
@@ -995,7 +1029,7 @@ describe('--json', () => {
 
 describe('the flag surface', () => {
   awaitTest('the underscored spellings the protocol card prints are accepted', function* (wait) {
-    const fixture = bench();
+    const fixture = yield* bench();
     yield* stageInvite(fixture, GAME_ID);
     const run = yield* wait(joinCli(fixture, ['join', '--game_id', GAME_ID, '--name', CONTROLLER]));
     expect(run.failure).toBeNull();
@@ -1003,7 +1037,7 @@ describe('the flag surface', () => {
   });
 
   awaitTest('both spellings at once is a refusal, not a silent pick', function* (wait) {
-    const fixture = bench();
+    const fixture = yield* bench();
     yield* stageInvite(fixture, GAME_ID);
     const run = yield* wait(
       joinCli(fixture, [
@@ -1020,7 +1054,7 @@ describe('the flag surface', () => {
   });
 
   awaitTest('a pre-configured workspace joins with no arguments at all', function* (wait) {
-    const fixture = bench();
+    const fixture = yield* bench();
     yield* stageInvite(fixture, GAME_ID);
     yield* writePlayConfig(fixture, {
       schema_version: 1,
@@ -1034,7 +1068,8 @@ describe('the flag surface', () => {
   });
 
   awaitTest('a bare workspace with no arguments refuses on the game ID', function* (wait) {
-    const run = yield* wait(joinCli(bench(), ['join']));
+    const fixture = yield* bench();
+    const run = yield* wait(joinCli(fixture, ['join']));
     expect(run.failure).toBe('a valid assigned game ID is required');
   });
 });

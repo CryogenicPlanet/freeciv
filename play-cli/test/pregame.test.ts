@@ -42,14 +42,16 @@ import {
 } from 'src/services/pregame';
 import { FIXTURE_GAME_ID, scratchWorkspace, type Scratch } from 'test/_fixtures';
 import { dispositionOf, rev } from 'test/_do-harness';
-import { awaitTest } from 'test/_effect-test';
+import { awaitTest, effectTest } from 'test/_effect-test';
 import { observedFirst, observedLast } from 'test/_expect';
 import { path } from 'test/_test-platform';
 
 const scratches: Scratch[] = [];
 
 afterEach(() =>
-  Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup()))
+  Effect.runPromise(
+    Effect.forEach(scratches.splice(0), (scratch) => scratch.cleanup, { discard: true })
+  )
 );
 
 const NATION = `nation_${'a'.repeat(32)}`;
@@ -120,51 +122,63 @@ describe('defaultSex', () => {
 // _pregame_choice
 // ---------------------------------------------------------------------------
 
-const refusalOf = <A>(effect: Effect.Effect<A, PlayerError>): string => {
-  const outcome = Effect.runSync(Effect.either(effect));
-  if (Either.isRight(outcome)) throw new Error('expected a refusal');
-  return outcome.left.message;
-};
+const refusalOf = <A>(effect: Effect.Effect<A, PlayerError>): Effect.Effect<string> =>
+  Effect.map(Effect.either(effect), (outcome) => {
+    if (Either.isRight(outcome)) throw new Error('expected a refusal');
+    return outcome.left.message;
+  });
 
 describe('pregameChoice', () => {
   const catalog = [item(NATION, 'English', STYLE), item(ZULU, 'Zulu', STYLE)];
 
-  test('a name matches case-insensitively and exactly', () => {
-    expect(Effect.runSync(pregameChoice(catalog, 'eNgLiSh', 'nation')).id).toBe(NATION);
-  });
+  effectTest('a name matches case-insensitively and exactly', () =>
+    Effect.gen(function* () {
+      expect((yield* pregameChoice(catalog, 'eNgLiSh', 'nation')).id).toBe(NATION);
+    })
+  );
 
-  test('an unmatched name is refused with the catalog quoted back', () => {
-    const message = refusalOf(pregameChoice(catalog, 'Atlantean', 'nation'));
-    expect(message).toBe("no nation named 'Atlantean' is offered; try one of: English Zulu");
-  });
+  effectTest('an unmatched name is refused with the catalog quoted back', () =>
+    Effect.gen(function* () {
+      const message = yield* refusalOf(pregameChoice(catalog, 'Atlantean', 'nation'));
+      expect(message).toBe("no nation named 'Atlantean' is offered; try one of: English Zulu");
+    })
+  );
 
-  test('a near miss narrows the suggestion to the near misses', () => {
-    const message = refusalOf(pregameChoice(catalog, 'lish', 'nation'));
-    expect(message).toBe("no nation named 'lish' is offered; try one of: English");
-  });
+  effectTest('a near miss narrows the suggestion to the near misses', () =>
+    Effect.gen(function* () {
+      const message = yield* refusalOf(pregameChoice(catalog, 'lish', 'nation'));
+      expect(message).toBe("no nation named 'lish' is offered; try one of: English");
+    })
+  );
 
-  test('an empty catalog says so rather than trailing off', () => {
-    expect(refusalOf(pregameChoice([], 'English', 'nation'))).toBe(
-      "no nation named 'English' is offered; try one of: none were offered"
-    );
-  });
+  effectTest('an empty catalog says so rather than trailing off', () =>
+    Effect.gen(function* () {
+      expect(yield* refusalOf(pregameChoice([], 'English', 'nation'))).toBe(
+        "no nation named 'English' is offered; try one of: none were offered"
+      );
+    })
+  );
 
-  test('a duplicated name is the lobby catalog being broken, not the input', () => {
-    const doubled = [item(NATION, 'English'), item(ZULU, 'english')];
-    expect(refusalOf(pregameChoice(doubled, 'English', 'nation'))).toBe(
-      "nation 'English' is offered more than once; this lobby catalog is ambiguous"
-    );
-  });
+  effectTest('a duplicated name is the lobby catalog being broken, not the input', () =>
+    Effect.gen(function* () {
+      const doubled = [item(NATION, 'English'), item(ZULU, 'english')];
+      expect(yield* refusalOf(pregameChoice(doubled, 'English', 'nation'))).toBe(
+        "nation 'English' is offered more than once; this lobby catalog is ambiguous"
+      );
+    })
+  );
 
-  test('the suggestion list is capped, and sorted before it is cut', () => {
-    const many = Array.from({ length: 30 }, (_index, position) =>
-      item(`nation_${'z'.repeat(30)}${position}`, `N${String(position).padStart(2, '0')}`)
-    );
-    const message = refusalOf(pregameChoice(many, 'Atlantean', 'nation'));
-    const shown = message.split('try one of: ')[1] ?? '';
-    expect(shown.split(' ')).toHaveLength(PREGAME_SHOWN_MAX);
-    expect(shown.startsWith('N00 N01')).toBe(true);
-  });
+  effectTest('the suggestion list is capped, and sorted before it is cut', () =>
+    Effect.gen(function* () {
+      const many = Array.from({ length: 30 }, (_index, position) =>
+        item(`nation_${'z'.repeat(30)}${position}`, `N${String(position).padStart(2, '0')}`)
+      );
+      const message = yield* refusalOf(pregameChoice(many, 'Atlantean', 'nation'));
+      const shown = message.split('try one of: ')[1] ?? '';
+      expect(shown.split(' ')).toHaveLength(PREGAME_SHOWN_MAX);
+      expect(shown.startsWith('N00 N01')).toBe(true);
+    })
+  );
 
   test('a repr keeps CPython’s quoting choices', () => {
     expect(pyRepr('Atlantean')).toBe("'Atlantean'");
@@ -179,42 +193,44 @@ describe('pregameChoice', () => {
 // ---------------------------------------------------------------------------
 
 describe('pregameDefaultNation', () => {
-  test('the draw is made over the sorted catalog, so a seeded RNG reproduces it', () => {
-    const offered = [item(ZULU, 'Zulu', STYLE), item(NATION, 'English', STYLE)];
-    const seen: ReadonlyArray<string>[] = [];
-    const picked = Effect.runSync(
-      pregameDefaultNation(offered, (choices) => {
+  effectTest('the draw is made over the sorted catalog, so a seeded RNG reproduces it', () =>
+    Effect.gen(function* () {
+      const offered = [item(ZULU, 'Zulu', STYLE), item(NATION, 'English', STYLE)];
+      const seen: ReadonlyArray<string>[] = [];
+      const picked = yield* pregameDefaultNation(offered, (choices) => {
         seen.push(choices.map((choice) => choice.name));
         return observedLast(choices);
-      })
-    );
-    expect(seen[0]).toEqual(['English', 'Zulu']);
-    expect(picked.id).toBe(ZULU);
-  });
+      });
+      expect(seen[0]).toEqual(['English', 'Zulu']);
+      expect(picked.id).toBe(ZULU);
+    })
+  );
 
-  test('a row with no id or no name is never drawable', () => {
-    const offered = [item('', 'Nameless'), item(ZULU, ''), item(NATION, 'English', STYLE)];
-    const drawn = Effect.runSync(
-      pregameDefaultNation(offered, (choices) => {
+  effectTest('a row with no id or no name is never drawable', () =>
+    Effect.gen(function* () {
+      const offered = [item('', 'Nameless'), item(ZULU, ''), item(NATION, 'English', STYLE)];
+      const drawn = yield* pregameDefaultNation(offered, (choices) => {
         expect(choices.map((choice) => choice.name)).toEqual(['English']);
         return observedFirst(choices);
-      })
-    );
-    expect(drawn.id).toBe(NATION);
-  });
+      });
+      expect(drawn.id).toBe(NATION);
+    })
+  );
 
-  test('an empty lobby fails closed and names the catalog to read', () => {
-    expect(
-      refusalOf(
-        pregameDefaultNation([], () => {
-          throw new Error('the draw must not happen');
-        })
-      )
-    ).toBe(
-      'this lobby offers no selectable nation; read the catalog with ' +
-        '`just state --section pregame_nations`'
-    );
-  });
+  effectTest('an empty lobby fails closed and names the catalog to read', () =>
+    Effect.gen(function* () {
+      expect(
+        yield* refusalOf(
+          pregameDefaultNation([], () => {
+            throw new Error('the draw must not happen');
+          })
+        )
+      ).toBe(
+        'this lobby offers no selectable nation; read the catalog with ' +
+          '`just state --section pregame_nations`'
+      );
+    })
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -226,7 +242,7 @@ const withMirror = <A, E>(
   read: (sessionPath: string) => Effect.Effect<A, never, PrivateFs>
 ): Effect.Effect<A> =>
   Effect.gen(function* () {
-    const scratch = scratchWorkspace();
+    const scratch = yield* scratchWorkspace();
     scratches.push(scratch);
     const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'codex-test.json');
     const dir = yield* Effect.orDie(mirrorDir(sessionPath));
@@ -352,7 +368,7 @@ const underRefusal = (
   failure: PlayerError | V2ResponseError
 ): Effect.Effect<string> =>
   Effect.gen(function* () {
-    const scratch = scratchWorkspace();
+    const scratch = yield* scratchWorkspace();
     scratches.push(scratch);
     const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'codex-test.json');
     if (header !== null) {
@@ -436,26 +452,32 @@ describe('checkPregameArguments', () => {
   };
   const good = { nation_id: NATION, leader_name: 'Ada', is_male: false, style_id: STYLE };
 
-  test('the arguments this workspace builds are accepted', () => {
-    expect(Effect.runSync(Effect.either(checkPregameArguments(action, good)))).toEqual(
-      Either.right(undefined)
-    );
-  });
+  effectTest('the arguments this workspace builds are accepted', () =>
+    Effect.gen(function* () {
+      expect(yield* Effect.either(checkPregameArguments(action, good))).toEqual(
+        Either.right(undefined)
+      );
+    })
+  );
 
-  test('a schema that wants something else names the escape hatch', () => {
-    const { nation_id: _dropped, ...missing } = good;
-    expect(refusalOf(checkPregameArguments(action, missing))).toBe(
-      'the enumerated pregame.configure action does not take the arguments ' +
-        'this workspace builds; run `just legal --kind pregame.configure --all ' +
-        '--json` and submit it with `just batch`'
-    );
-  });
+  effectTest('a schema that wants something else names the escape hatch', () =>
+    Effect.gen(function* () {
+      const { nation_id: _dropped, ...missing } = good;
+      expect(yield* refusalOf(checkPregameArguments(action, missing))).toBe(
+        'the enumerated pregame.configure action does not take the arguments ' +
+          'this workspace builds; run `just legal --kind pregame.configure --all ' +
+          '--json` and submit it with `just batch`'
+      );
+    })
+  );
 
-  test('an argument the schema never declared is refused the same way', () => {
-    expect(refusalOf(checkPregameArguments(action, { ...good, colour: 'red' }))).toContain(
-      'does not take the arguments this workspace builds'
-    );
-  });
+  effectTest('an argument the schema never declared is refused the same way', () =>
+    Effect.gen(function* () {
+      expect(
+        yield* refusalOf(checkPregameArguments(action, { ...good, colour: 'red' }))
+      ).toContain('does not take the arguments this workspace builds');
+    })
+  );
 
   test('required names the schema does not declare as properties are ignored', () => {
     const drifted = {
