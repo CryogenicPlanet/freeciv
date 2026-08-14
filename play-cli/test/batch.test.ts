@@ -13,7 +13,7 @@
  * to decide whether another request is allowed at all.
  */
 import { afterEach, describe, expect, test } from 'bun:test';
-import { Effect, Either, Layer, Runtime, Schema } from 'effect';
+import { Effect, Either, Layer, Ref, Runtime, Schema } from 'effect';
 import type { PlayError } from 'src/errors';
 import type { ExitCodeSignal } from 'src/exit';
 import { FULL_CONTROL_V2 } from 'src/constants';
@@ -860,24 +860,24 @@ describe('play batch', () => {
   });
 
   awaitTest('the state file already holds the batch when the request is made', function* (wait) {
-    let onDisk: ReadonlyArray<string> = [];
-    let observed: Fixture | null = null;
+    const onDisk = yield* Ref.make<ReadonlyArray<string>>([]);
+    const observed = yield* Ref.make<Fixture | null>(null);
     const f = yield* fixture(() =>
-      observed === null
-        ? Effect.die(new Error('fixture was not ready'))
-        : Effect.flatMap(batchKeysOnDisk(observed), (keys) =>
-            Effect.flatMap(
-              Effect.sync(() => {
-                onDisk = keys;
-              }),
-              () => Effect.die(new Error('connection reset'))
+      Effect.flatMap(Ref.get(observed), (current) =>
+        current === null
+          ? Effect.die(new Error('fixture was not ready'))
+          : Effect.flatMap(batchKeysOnDisk(current), (keys) =>
+              Effect.zipRight(
+                Ref.set(onDisk, keys),
+                Effect.die(new Error('connection reset'))
+              )
             )
-          )
+      )
     );
-    observed = f;
+    yield* Ref.set(observed, f);
     yield* wait(seed(f, revision(7)));
     yield* wait(capture(runBatch(args(), pinned('B'.repeat(24))), f));
-    expect(onDisk).toEqual([`batch_${'B'.repeat(24)}`]);
+    expect(yield* Ref.get(onDisk)).toEqual([`batch_${'B'.repeat(24)}`]);
   });
 
   awaitTest('each closed disposition is reached exactly once, and printed as one object', function* (wait) {

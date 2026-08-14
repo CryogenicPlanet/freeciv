@@ -342,9 +342,11 @@ export interface BenchOptions {
   readonly files?: (api: PrivateFsApi) => PrivateFsApi;
 }
 
-export const bench = (options: BenchOptions = {}): Effect.Effect<Bench, PlayError> =>
+const buildBench = (
+  scratch: Scratch,
+  options: BenchOptions
+): Effect.Effect<Bench, PlayError> =>
   Effect.gen(function* () {
-    const scratch = yield* scratchWorkspace();
     const sessionPath = path.join(scratch.workspace.stateRoot, 'session-codex-gpt-5.6-sol.json');
     yield* scratch.files.writeJson(sessionPath, sessionFile());
     // The store captures its file api and re-provides it inside the request
@@ -454,6 +456,11 @@ export const bench = (options: BenchOptions = {}): Effect.Effect<Bench, PlayErro
       readState,
     };
   });
+
+export const bench = (options: BenchOptions = {}): Effect.Effect<Bench, PlayError> =>
+  Effect.flatMap(scratchWorkspace(), (scratch) =>
+    buildBench(scratch, options).pipe(Effect.onError(() => scratch.cleanup))
+  );
 
 // ---------------------------------------------------------------------------
 // The stand-ins
