@@ -337,12 +337,12 @@ describe('parseMap', () => {
   });
 });
 
-const run = <A, E>(effect: Effect.Effect<A, E>): Either.Either<A, E> =>
-  Effect.runSync(Effect.either(effect));
+const run = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<Either.Either<A, E>> =>
+  Effect.either(effect);
 
 describe('tileChars', () => {
-  test('visibility alone decides fog, and an unknown tile hides its terrain', () => {
-    const either = run(
+  effectTest('visibility alone decides fog, and an unknown tile hides its terrain', () => Effect.gen(function* () {
+    const either = yield* run(
       tileChars(
         [
           { id: 't1', x: 30, y: 71, visibility: 'visible', terrain: 'Grassland' },
@@ -364,29 +364,29 @@ describe('tileChars', () => {
       ['Grassland', 'G'],
       ['Ocean', 'O'],
     ]);
-  });
+  }));
 
-  test('a non-object item is refused rather than blanked', () => {
-    const either = run(tileChars(['oops'], new Map()));
+  effectTest('a non-object item is refused rather than blanked', () => Effect.gen(function* () {
+    const either = yield* run(tileChars(['oops'], new Map()));
     expect(Either.isLeft(either) ? either.left.message : '').toBe(
       'state mirror: tile item is not an object'
     );
-  });
+  }));
 
-  test('a tile without integer coordinates is refused', () => {
-    const either = run(
+  effectTest('a tile without integer coordinates is refused', () => Effect.gen(function* () {
+    const either = yield* run(
       tileChars([{ id: 't1', x: '30', y: 71, visibility: 'visible' }], new Map())
     );
     expect(Either.isLeft(either) ? either.left.message : '').toBe(
       'state mirror: tile item carries no coordinates'
     );
-  });
+  }));
 });
 
 describe('mapSize', () => {
   effectTest('the overview row named map supplies the size the map header prints', () =>
     Effect.acquireUseRelease(
-      Effect.sync(() => scratchWorkspace()),
+      scratchWorkspace(),
       (scratch) =>
         Effect.gen(function* () {
           const dir = `${scratch.workspace.stateRoot}/game_x/codex-test`;
@@ -408,13 +408,13 @@ describe('mapSize', () => {
           yield* write([['turn', '3']]);
           expect(yield* read()).toBe(null);
         }).pipe(Effect.orDie),
-      (scratch) => Effect.promise(scratch.cleanup)
+      (scratch) => scratch.cleanup
     )
   );
 
   effectTest('no overview at all is no size', () =>
     Effect.acquireUseRelease(
-      Effect.sync(() => scratchWorkspace()),
+      scratchWorkspace(),
       (scratch) =>
         Effect.gen(function* () {
           expect(
@@ -424,7 +424,7 @@ describe('mapSize', () => {
             )
           ).toBe(null);
         }).pipe(Effect.orDie),
-      (scratch) => Effect.promise(scratch.cleanup)
+      (scratch) => scratch.cleanup
     )
   );
 });

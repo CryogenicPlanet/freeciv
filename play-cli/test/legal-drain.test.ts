@@ -12,7 +12,7 @@
  * no concurrency: a randomized-latency run whose printed bytes must not move.
  */
 import { afterEach, describe, expect } from 'bun:test';
-import { Effect, Either, Layer, Option, Random } from 'effect';
+import { Effect, Either, Layer, MutableRef, Option, Random, Runtime } from 'effect';
 import { FULL_CONTROL_V2, V2_LEGAL_COMPACT_MAX_BYTES } from 'src/constants';
 import type { DualSpelling } from 'src/options';
 import { runLegal, type LegalOptions } from 'src/commands/legal.cmd';
@@ -58,7 +58,11 @@ import {
 import { path } from 'test/_test-platform';
 
 const scratches: Scratch[] = [];
-afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
+afterEach(() =>
+  Effect.runPromise(
+    Effect.forEach(scratches.splice(0), (scratch) => scratch.cleanup, { discard: true })
+  )
+);
 
 // ---------------------------------------------------------------------------
 // Wire fixtures
@@ -245,64 +249,77 @@ interface Fixture {
   readonly repeat: (route: FakeRoute) => void;
   readonly sessionPath: string;
   readonly session: Session;
-  readonly readState: () => V2ClientState;
+  readonly readState: Effect.Effect<V2ClientState>;
 }
 
-const fixture = (router?: (url: string) => FakeRoute | undefined): Fixture => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'seat.json');
-  Effect.runSync(scratch.files.writeJson(sessionPath, sessionFile()));
-  const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
-  const session = Effect.runSync(store.resolveV2(sessionPath)).session;
+const fixture = (
+  router?: (url: string) => FakeRoute | undefined
+): Effect.Effect<Fixture> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'seat.json');
+    yield* scratch.files.writeJson(sessionPath, sessionFile());
+    const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
+    const session = (yield* store.resolveV2(sessionPath)).session;
 
-  const queue: FakeRoute[] = [];
-  const urls: string[] = [];
-  let standing: FakeRoute | null = null;
-  const fetchImpl = completeFetch((input) =>
-    Effect.runPromise(
-      Effect.gen(function* () {
-        const url = urlOf(input);
-        urls.push(url);
-        const routed = router?.(url);
-        const next = routed ?? queue.shift() ?? standing;
-        if (next === null || next === undefined) return notFound(url);
-        const delayS = next.delayS ?? 0;
-        if (delayS > 0) yield* Effect.sleep(`${delayS} seconds`);
-        return jsonResponse(next.body, next.status ?? 200);
-      })
-    )
-  );
+    const queue: FakeRoute[] = [];
+    const urls: string[] = [];
+    const standing = MutableRef.make<FakeRoute | null>(null);
+    const runPromise = Runtime.runPromise(yield* Effect.runtime());
+    const fetchImpl = completeFetch((input) =>
+      runPromise(
+        Effect.gen(function* () {
+          const url = urlOf(input);
+          urls.push(url);
+          const routed = router?.(url);
+          const next = routed ?? queue.shift() ?? MutableRef.get(standing);
+          if (next === null || next === undefined) return notFound(url);
+          const delayS = next.delayS ?? 0;
+          if (delayS > 0) yield* Effect.sleep(`${delayS} seconds`);
+          return jsonResponse(next.body, next.status ?? 200);
+        })
+      )
+    );
 
-  return {
-    layer: Layer.mergeAll(
-      Layer.succeed(SessionStore, store),
-      Layer.succeed(PrivateFs, scratch.files),
-      Layer.succeed(V2Client, v2ClientFor(httpFor(fetchImpl), () => Effect.void))
-    ),
-    urls,
-    serve: (...routes) => {
-      queue.push(...routes);
-    },
-    repeat: (route) => {
-      standing = route;
-    },
-    sessionPath,
-    session,
-    readState: () => Effect.runSync(store.readState(sessionPath, session)),
-  };
-};
+    return {
+      layer: Layer.mergeAll(
+        Layer.succeed(SessionStore, store),
+        Layer.succeed(PrivateFs, scratch.files),
+        Layer.succeed(V2Client, v2ClientFor(httpFor(fetchImpl), () => Effect.void))
+      ),
+      urls,
+      serve: (...routes: ReadonlyArray<FakeRoute>) => {
+        queue.push(...routes);
+      },
+      repeat: (route: FakeRoute) => {
+        MutableRef.set(standing, route);
+      },
+      sessionPath,
+      session,
+      readState: store.readState(sessionPath, session).pipe(Effect.orDie),
+    };
+  }).pipe(Effect.orDie);
 
-const fixtureWith = (rev: JsonObject): Fixture => {
-  const target = fixture();
-  target.repeat({
-    body: legalPage(
-      [pregameAction(rev, `action_${'g'.repeat(26)}`, 'research.set_goal', 'set_goal', 'Goal', null)],
-      rev
-    ),
+const fixtureWith = (rev: JsonObject): Effect.Effect<Fixture> =>
+  Effect.map(fixture(), (target) => {
+    target.repeat({
+      body: legalPage(
+        [
+          pregameAction(
+            rev,
+            `action_${'g'.repeat(26)}`,
+            'research.set_goal',
+            'set_goal',
+            'Goal',
+            null
+          ),
+        ],
+        rev
+      ),
+    });
+    return target;
   });
-  return target;
-};
 
 const none = (): DualSpelling<string> => ({ dashed: Option.none(), underscored: Option.none() });
 const some = (value: string): DualSpelling<string> => ({
@@ -360,7 +377,7 @@ describe('legal --kind --all', () => {
       const three = researchAction(rev, 'action_target_three', 'Ceremonial Burial', EXACT);
       const cursorOne = `cursor_${'a'.repeat(32)}`;
       const cursorTwo = `cursor_${'b'.repeat(32)}`;
-      const target = fixture();
+      const target = yield* fixture();
       target.serve(
         { body: legalPage([one, phaseEnd], rev, cursorOne, 4) },
         { body: legalPage([two], rev, cursorTwo, 4) },
@@ -401,7 +418,7 @@ describe('legal --kind --all', () => {
 
       expect(observedAt(target.urls, 1)).toContain(`cursor=${cursorOne}`);
       expect(observedAt(target.urls, 2)).toContain(`cursor=${cursorTwo}`);
-      const cached = target.readState().actions;
+      const cached = (yield* target.readState).actions;
       expect(field(cached, 'action_target_one')).toEqual(one);
       expect(field(cached, 'action_phase_end')).toEqual(phaseEnd);
     })
@@ -421,7 +438,7 @@ describe('legal --kind --all', () => {
         'Set research goal',
         { type: 'technology', id: 'tech_1', name: 'Currency' }
       );
-      const target = fixture();
+      const target = yield* fixture();
       target.repeat({ body: legalPage([move, goal], rev) });
 
       // The kind column prints `unit.order/move`; both spellings select it.
@@ -447,7 +464,7 @@ describe('legal --kind --all', () => {
     Effect.gen(function* () {
       const rev = revision(7);
       const actor = `unit_${'a'.repeat(32)}`;
-      const target = fixture();
+      const target = yield* fixture();
       // Cache one actor catalog first, exactly as `cache_actor_catalog` does.
       target.serve({
         body: scopedLegalPage(
@@ -481,7 +498,7 @@ describe('legal --kind --all', () => {
   effectTest('a player-scoped kind is named from the taxonomy, not from the cache', () =>
     Effect.gen(function* () {
       const rev = revision(7);
-      const target = fixture();
+      const target = yield* fixture();
       target.repeat({
         body: legalPage(
           [
@@ -499,7 +516,7 @@ describe('legal --kind --all', () => {
 
       const diplomacy = yield* capture(
         legalOptions({ kind: 'diplomacy.propose', all: true }),
-        fixtureWith(rev)
+        yield* fixtureWith(rev)
       );
       expect(diplomacy.error).toContain('enumerated only against one relation');
       expect(diplomacy.error).toContain('just state --section diplomacy');
@@ -521,7 +538,7 @@ describe('the compact byte bound', () => {
       const results: JsonObject[] = [];
       const seenUrls: string[] = [];
       for (const offset of [0, 1, 2]) {
-        const target = fixture();
+        const target = yield* fixture();
         target.repeat({ body: legalPage(actions, rev) });
         const out = succeeded(
           yield* capture(
@@ -555,7 +572,7 @@ describe('the compact byte bound', () => {
     Effect.gen(function* () {
       const rev = revision(13);
       const actions = ['sentry', 'fortify'].map((order, index) => heavyAction(rev, index, order));
-      const target = fixture();
+      const target = yield* fixture();
       target.repeat({ body: legalPage(actions, rev) });
       const out = succeeded(
         yield* capture(legalOptions({ kind: 'unit.order', all: true }), target)
@@ -591,7 +608,7 @@ describe('legal --actor_id --all', () => {
       });
       const cursor = `cursor_${'a'.repeat(32)}`;
       const catalog = `catalog_${'1'.repeat(32)}`;
-      const target = fixture();
+      const target = yield* fixture();
       target.serve(
         { body: scopedLegalPage([first, second], rev, actor, { catalog, cursor, totalItems: 3 }) },
         { body: scopedLegalPage([third], rev, actor, { catalog, totalItems: 3 }) }
@@ -619,7 +636,7 @@ describe('legal --actor_id --all', () => {
       expect(observedAt(out, 1)).toContain('T(31,72)');
       expect(observedAt(out, 3)).toContain('unit.found_city/found');
 
-      const state = target.readState();
+      const state = yield* target.readState;
       expect(new Set(Object.keys(state.actions))).toEqual(
         new Set([first, second, third].map((action) => actionIdOf(action)))
       );
@@ -632,7 +649,7 @@ describe('legal --actor_id --all', () => {
     Effect.gen(function* () {
       const rev = revision(7);
       const actors = ['a', 'b', 'c', 'd'].map((letter) => `unit_${letter.repeat(32)}`);
-      const target = fixture();
+      const target = yield* fixture();
       const catalog = (
         actorId: string,
         tag: string,
@@ -686,7 +703,7 @@ describe('legal --actor_id --all', () => {
       expect(observedAt(third, 1)).toBe('u3 == u1 (rev7) a5..a6 except 1 row');
       expect(observedAt(third, 2)).toContain('!prob=0-100%/unknown');
       expect(observedAt(third, 2)).toContain('unit.found_city/found');
-      expect(target.readState().drained_actors).toEqual(actors.slice(0, 3));
+      expect((yield* target.readState).drained_actors).toEqual(actors.slice(0, 3));
 
       // The same options in a different order are not claimed equivalent.
       const reorderedActor = `unit_${'e'.repeat(32)}`;
@@ -709,7 +726,7 @@ describe('legal --actor_id --all', () => {
       expect(lines).toHaveLength(3);
       expect(lines.join('\n')).not.toContain('==');
       expect(observedAt(lines, 0)).toContain('rev9/t3 legal scope=unit u5');
-      expect(target.readState().drained_actors).toEqual([actors[3] ?? '']);
+      expect((yield* target.readState).drained_actors).toEqual([actors[3] ?? '']);
 
       // Re-reading the same actor at the new revision cannot borrow the expired
       // equivalence either.
@@ -723,7 +740,7 @@ describe('legal --actor_id --all', () => {
       const rev = revision(7);
       const actor = `unit_${'a'.repeat(32)}`;
       const cursor = `cursor_${'a'.repeat(32)}`;
-      const target = fixture();
+      const target = yield* fixture();
       // Same revision, different `total_items`: the catalog grew underneath the
       // drain, so the two pages describe two different menus.
       target.serve(
@@ -785,7 +802,7 @@ describe('determinism', () => {
     Effect.gen(function* () {
       const runs: string[] = [];
       for (let attempt = 0; attempt < 5; attempt += 1) {
-        const target = fixture();
+        const target = yield* fixture();
         const routes = yield* Effect.forEach(pages(), (body) =>
           Effect.gen(function* () {
             const delayS = yield* Random.nextRange(0, 0.02);
@@ -813,7 +830,7 @@ describe('determinism', () => {
       for (let attempt = 0; attempt < 4; attempt += 1) {
         const delays = yield* Effect.forEach(actors, () => Random.nextRange(0, 0.03));
         const delayByActor = new Map(actors.map((id, index) => [id, delays[index] ?? 0]));
-        const target = fixture((url) => {
+        const target = yield* fixture((url) => {
           const found = actors.find((id) => url.includes(id));
           if (found === undefined) return undefined;
           return {
@@ -847,7 +864,7 @@ describe('determinism', () => {
 
   effectTest('a single-actor drain is the sequential path and still ingests everything', () =>
     Effect.gen(function* () {
-      const target = fixture();
+      const target = yield* fixture();
       target.serve(...pages().map((body) => ({ body })));
       const ctx: LegalCtx = { sessionPath: target.sessionPath, session: target.session };
       const drained = yield* provideTestLayer(drainLegal(ctx, actor), target.layer);
@@ -856,7 +873,7 @@ describe('determinism', () => {
       if (drained.revision === null) throw new Error('expected revision');
       expect(revisionsEqual(drained.revision, expected)).toBe(true);
       expect(drained.actions).toHaveLength(4);
-      expect(Object.keys(target.readState().actions)).toHaveLength(4);
+      expect(Object.keys((yield* target.readState).actions)).toHaveLength(4);
     })
   );
 });

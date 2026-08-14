@@ -53,7 +53,11 @@ import { fixtureObject, fixtureString, observedAt } from 'test/_expect';
 import { fileSystem, path, withTestFileSystem } from 'test/_test-platform';
 
 const scratches: Scratch[] = [];
-afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
+afterEach(() =>
+  Effect.runPromise(
+    Effect.forEach(scratches.splice(0), (scratch) => scratch.cleanup, { discard: true })
+  )
+);
 
 // ---------------------------------------------------------------------------
 // Wire fixtures, ported from PlayerClientTests
@@ -564,24 +568,25 @@ interface Fixture {
   readonly mirror: string;
 }
 
-const commandFixture = (plan: ReadonlyArray<FakeRoute>): Fixture => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const target = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'seat.json');
-  Effect.runSync(scratch.files.writeJson(target, sessionFile()));
-  const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
-  const recorder = recordingFetch(plan);
-  const client = v2ClientFor(httpFor(recorder.fetch), () => Effect.void);
-  return {
-    layer: Layer.mergeAll(
-      Layer.succeed(SessionStore, store),
-      Layer.succeed(PrivateFs, scratch.files),
-      Layer.succeed(V2Client, client)
-    ),
-    requests: recorder.requests,
-    mirror: Effect.runSync(Effect.orDie(mirrorDir(target))),
-  };
-};
+const commandFixture = (plan: ReadonlyArray<FakeRoute>): Effect.Effect<Fixture> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const target = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'seat.json');
+    yield* scratch.files.writeJson(target, sessionFile());
+    const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
+    const recorder = recordingFetch(plan);
+    const client = v2ClientFor(httpFor(recorder.fetch), () => Effect.void);
+    return {
+      layer: Layer.mergeAll(
+        Layer.succeed(SessionStore, store),
+        Layer.succeed(PrivateFs, scratch.files),
+        Layer.succeed(V2Client, client)
+      ),
+      requests: recorder.requests,
+      mirror: yield* Effect.orDie(mirrorDir(target)),
+    };
+  }).pipe(Effect.orDie);
 
 const none = (): DualSpelling<string> => ({
   dashed: Option.none(),
@@ -639,14 +644,14 @@ describe('play legal', () => {
       );
       const expectedJson = Schema.decodeUnknownSync(jsonValue)(JSON.stringify(decode(payload)));
       return Effect.gen(function* () {
-        const text = yield* capture(legalOptions(), commandFixture([{ body: payload }]));
+        const text = yield* capture(legalOptions(), yield* commandFixture([{ body: payload }]));
         expect(text.error).toBeNull();
         expect(text.out[0]).toBe('rev7/t3 legal scope=all 1/1 complete');
         expect(text.out[0]?.startsWith('{')).toBe(false);
 
         const json = yield* capture(
           legalOptions({ json: true }),
-          commandFixture([{ body: payload }])
+          yield* commandFixture([{ body: payload }])
         );
         expect(json.error).toBeNull();
         expect(json.out).toHaveLength(1);
@@ -663,7 +668,7 @@ describe('play legal', () => {
       ];
       return Effect.gen(function* () {
         for (const [options, expected] of refusalCases) {
-          const fixture = commandFixture([]);
+          const fixture = yield* commandFixture([]);
           const { error } = yield* capture(options, fixture);
           expect(error).toContain(expected);
           expect(fixture.requests).toHaveLength(0);
@@ -674,7 +679,7 @@ describe('play legal', () => {
 
   effectTest('the unscoped --all refusal names both scoped forms', () =>
     Effect.gen(function* () {
-      const { error } = yield* capture(legalOptions({ all: true }), commandFixture([]));
+      const { error } = yield* capture(legalOptions({ all: true }), yield* commandFixture([]));
       expect(error).toContain('--kind ACTION_KIND --all');
       expect(error).toContain('--actor_id ACTOR_ID');
     })
@@ -682,7 +687,7 @@ describe('play legal', () => {
 
   effectTest('a malformed kind lists the kinds this seat has read, without a request', () =>
     Effect.gen(function* () {
-      const fixture = commandFixture([]);
+      const fixture = yield* commandFixture([]);
       const { error } = yield* capture(
         legalOptions({ kind: 'bogus', all: true }),
         fixture
@@ -696,12 +701,12 @@ describe('play legal', () => {
   effectTest('--cursor is passed through and is the only page option', () =>
     Effect.gen(function* () {
       const cursor = `cursor_${'a'.repeat(32)}`;
-      const fixture = commandFixture([{ body: legalPage([], rev) }]);
+      const fixture = yield* commandFixture([{ body: legalPage([], rev) }]);
       const { error } = yield* capture(legalOptions({ cursor }), fixture);
       expect(error).toBeNull();
       expect(fixture.requests[0]?.url).toContain(`cursor=${cursor}`);
 
-      const clash = commandFixture([]);
+      const clash = yield* commandFixture([]);
       const refused = yield* capture(
         legalOptions({ cursor, actorId: some(UNIT) }),
         clash
@@ -718,7 +723,7 @@ describe('play legal', () => {
           operation: 'sentry',
           label: 'Sentry',
         });
-        const fixture = commandFixture([
+        const fixture = yield* commandFixture([
           { body: scopedLegalPage([action], rev, UNIT) },
           { body: scopedLegalPage([action], rev, UNIT) },
         ]);

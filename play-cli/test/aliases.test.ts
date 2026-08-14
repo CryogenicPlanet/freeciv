@@ -63,7 +63,7 @@ import {
   type Scratch,
 } from 'test/_fixtures';
 import { fixtureString } from 'test/_expect';
-import { provideTestLayer } from 'test/_effect-test';
+import { effectTest, provideTestLayer } from 'test/_effect-test';
 import { path } from 'test/_test-platform';
 
 // ---------------------------------------------------------------------------
@@ -71,7 +71,11 @@ import { path } from 'test/_test-platform';
 // ---------------------------------------------------------------------------
 
 const scratches: Scratch[] = [];
-afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
+afterEach(() =>
+  Effect.runPromise(
+    Effect.forEach(scratches.splice(0), (scratch) => scratch.cleanup, { discard: true })
+  )
+);
 
 interface Fixture {
   readonly scratch: Scratch;
@@ -80,30 +84,30 @@ interface Fixture {
   readonly session: Session;
   readonly run: <A, E>(
     effect: Effect.Effect<A, E, SessionStore | PrivateFs>
-  ) => Either.Either<A, E>;
+  ) => Effect.Effect<Either.Either<A, E>>;
 }
 
-const fixture = (): Fixture => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
-  const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'codex-test.json');
-  Effect.runSync(
-    scratch.files.writeJson(sessionPath, sessionFile({ control_protocol: FULL_CONTROL_V2 }))
-  );
-  const loaded = Effect.runSync(store.resolveV2(sessionPath));
-  const layer = Layer.merge(
-    Layer.succeed(SessionStore, store),
-    Layer.succeed(PrivateFs, scratch.files)
-  );
-  return {
-    scratch,
-    store,
-    sessionPath,
-    session: loaded.session,
-    run: (effect) => Effect.runSync(Effect.either(provideTestLayer(effect, layer))),
-  };
-};
+const fixture = (): Effect.Effect<Fixture> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
+    const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'codex-test.json');
+    yield* scratch.files.writeJson(
+      sessionPath,
+      sessionFile({ control_protocol: FULL_CONTROL_V2 })
+    );
+    const loaded = yield* store.resolveV2(sessionPath);
+    const layer = Layer.merge(
+      Layer.succeed(SessionStore, store),
+      Layer.succeed(PrivateFs, scratch.files)
+    );
+    const run = <A, E>(
+      effect: Effect.Effect<A, E, SessionStore | PrivateFs>
+    ): Effect.Effect<Either.Either<A, E>> =>
+      Effect.either(provideTestLayer(effect, layer));
+    return { scratch, store, sessionPath, session: loaded.session, run };
+  }).pipe(Effect.orDie);
 
 const ok = <A, E>(either: Either.Either<A, E>): A => {
   if (Either.isLeft(either)) {
@@ -266,7 +270,9 @@ const receiptPayloadFor = (
 const ingestState = (
   fx: Fixture,
   page: JsonObject
-): Either.Either<{ readonly state: V2ClientState }, { readonly message: string }> =>
+): Effect.Effect<
+  Either.Either<{ readonly state: V2ClientState }, { readonly message: string }>
+> =>
   fx.run(
     Effect.flatMap(
       Effect.mapError(decodePage(page, fx.session), (error) => ({ message: error.message })),
@@ -277,9 +283,11 @@ const ingestState = (
 const ingestLegal = (
   fx: Fixture,
   page: JsonObject
-): Either.Either<
-  { readonly state: V2ClientState; readonly promoted: ReadonlyArray<unknown> | null },
-  { readonly message: string }
+): Effect.Effect<
+  Either.Either<
+    { readonly state: V2ClientState; readonly promoted: ReadonlyArray<unknown> | null },
+    { readonly message: string }
+  >
 > =>
   fx.run(
     Effect.flatMap(
@@ -308,12 +316,12 @@ const ACTOR = `unit_${'a'.repeat(32)}`;
 // ---------------------------------------------------------------------------
 
 describe('entity and tile aliases are assigned once, in first-seen order', () => {
-  test('a second page continues the count instead of restarting at u1', () => {
-    const fx = fixture();
+  effectTest('a second page continues the count instead of restarting at u1', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const first = revision(7);
     const second = revision(9);
     ok(
-      ingestState(
+      yield* ingestState(
         fx,
         sectionPage(
           'units',
@@ -327,13 +335,13 @@ describe('entity and tile aliases are assigned once, in first-seen order', () =>
       )
     );
     ok(
-      ingestState(
+      yield* ingestState(
         fx,
         sectionPage('units', first, [unitItem(UNITS[2] ?? '', TILES[2] ?? '', 29, 72)])
       )
     );
     const after = ok(
-      ingestState(
+      yield* ingestState(
         fx,
         sectionPage('cities', second, [
           {
@@ -368,70 +376,70 @@ describe('entity and tile aliases are assigned once, in first-seen order', () =>
 
     // Re-reading the same unit at the newer revision re-points nothing.
     const again = ok(
-      ingestState(
+      yield* ingestState(
         fx,
         sectionPage('units', second, [unitItem(UNITS[1] ?? '', TILES[1] ?? '', 30, 72)])
       )
     ).state;
     expect(again.entity_aliases['u2']).toBe(UNITS[1] ?? '');
     expect(Object.keys(again.entity_aliases)).toHaveLength(4);
-  });
+  }));
 
-  test('the alias map addresses units, cities and tiles at once', () => {
-    const fx = fixture();
+  effectTest('the alias map addresses units, cities and tiles at once', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     ok(
-      ingestState(
+      yield* ingestState(
         fx,
         sectionPage('units', revision(7), [unitItem(UNITS[0] ?? '', TILES[0] ?? '', 31, 72)])
       )
     );
-    const state = ok(fx.run(fx.store.readState(fx.sessionPath, fx.session)));
-    const map = ok(fx.run(aliasMap(state)));
+    const state = ok(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session)));
+    const map = ok(yield* fx.run(aliasMap(state)));
     expect(map[UNITS[0] ?? '']).toBe('u1');
     expect(map[TILES[0] ?? '']).toBe('T(31,72)');
-  });
+  }));
 
-  test('a tile ID that changed under a coordinate drops rather than lies', () => {
-    const fx = fixture();
+  effectTest('a tile ID that changed under a coordinate drops rather than lies', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     ok(
-      ingestState(
+      yield* ingestState(
         fx,
         sectionPage('units', revision(7), [unitItem(UNITS[0] ?? '', TILES[0] ?? '', 31, 72)])
       )
     );
     const state = ok(
-      ingestState(
+      yield* ingestState(
         fx,
         sectionPage('units', revision(7), [unitItem(UNITS[1] ?? '', TILES[1] ?? '', 31, 72)])
       )
     ).state;
     expect(state.tile_aliases['31,72']).toBeUndefined();
-  });
+  }));
 });
 
 describe('action aliases die with their revision', () => {
-  test('a1 fails closed after a bump and only re-enumeration re-uses it', () => {
-    const fx = fixture();
+  effectTest('a1 fails closed after a bump and only re-enumeration re-uses it', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const first = revision(7);
     const second = revision(9);
     const oldOne = descriptor(first, `action_${'1'.repeat(32)}`);
     const oldTwo = descriptor(first, `action_${'2'.repeat(32)}`);
     const newOne = descriptor(second, `action_${'9'.repeat(32)}`);
 
-    const staged = ok(ingestLegal(fx, scopedLegalPage(first, [oldOne, oldTwo], ACTOR))).state;
+    const staged = ok(yield* ingestLegal(fx, scopedLegalPage(first, [oldOne, oldTwo], ACTOR))).state;
     expect([...aliasEntries(staged)]).toEqual([
       ['a1', fixtureString(oldOne['action_id'])],
       ['a2', fixtureString(oldTwo['action_id'])],
     ]);
-    expect(ok(fx.run(expandAlias(staged, 'a2', fx.sessionPath)))).toBe(
+    expect(ok(yield* fx.run(expandAlias(staged, 'a2', fx.sessionPath)))).toBe(
       fixtureString(oldTwo['action_id'])
     );
 
     // The agent's own action bumps the revision.  The bucket still names the
     // revision it came from, so a1 fails closed instead of re-pointing.
-    const bumped = ok(ingestState(fx, sectionPage('overview', second, []))).state;
-    expect(ok(fx.run(freshActionAliases(bumped)))).toEqual({});
-    const message = failure(fx.run(expandAlias(bumped, 'a1', fx.sessionPath)));
+    const bumped = ok(yield* ingestState(fx, sectionPage('overview', second, []))).state;
+    expect(ok(yield* fx.run(freshActionAliases(bumped)))).toEqual({});
+    const message = failure(yield* fx.run(expandAlias(bumped, 'a1', fx.sessionPath)));
     expect(message).toContain('rev7/t3');
     expect(message).toContain('rev9/t3');
     expect(message).toContain('die with their revision');
@@ -441,41 +449,41 @@ describe('action aliases die with their revision', () => {
     expect(message).not.toContain('--session');
 
     const reenumerated = ok(
-      ingestLegal(
+      yield* ingestLegal(
         fx,
         scopedLegalPage(second, [newOne], ACTOR, { catalog: `catalog_${'f'.repeat(32)}` })
       )
     ).state;
-    expect(ok(fx.run(expandAlias(reenumerated, 'a1', fx.sessionPath)))).toBe(
+    expect(ok(yield* fx.run(expandAlias(reenumerated, 'a1', fx.sessionPath)))).toBe(
       fixtureString(newOne['action_id'])
     );
-    expect(failure(fx.run(expandAlias(reenumerated, 'a2', fx.sessionPath)))).toContain(
+    expect(failure(yield* fx.run(expandAlias(reenumerated, 'a2', fx.sessionPath)))).toContain(
       'unknown action alias a2'
     );
-    const reloaded = ok(fx.run(fx.store.readState(fx.sessionPath, fx.session)));
+    const reloaded = ok(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session)));
     expect(reloaded.action_aliases['state_revision']).toEqual(second);
-  });
+  }));
 
-  test('an alias that was never assigned is a typo, whatever the bucket age', () => {
-    const fx = fixture();
-    const cold = ok(fx.run(fx.store.readState(fx.sessionPath, fx.session)));
-    expect(failure(fx.run(expandAlias(cold, 'a3', fx.sessionPath)))).toContain(
+  effectTest('an alias that was never assigned is a typo, whatever the bucket age', () => Effect.gen(function* () {
+    const fx = yield* fixture();
+    const cold = ok(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session)));
+    expect(failure(yield* fx.run(expandAlias(cold, 'a3', fx.sessionPath)))).toContain(
       'no legal-action catalog has been read yet'
     );
 
     const first = revision(7);
     const staged = ok(
-      ingestLegal(fx, scopedLegalPage(first, [descriptor(first, `action_${'1'.repeat(32)}`)], ACTOR))
+      yield* ingestLegal(fx, scopedLegalPage(first, [descriptor(first, `action_${'1'.repeat(32)}`)], ACTOR))
     ).state;
-    expect(failure(fx.run(expandAlias(staged, 'a9', fx.sessionPath)))).toBe(
+    expect(failure(yield* fx.run(expandAlias(staged, 'a9', fx.sessionPath)))).toBe(
       'unknown action alias a9; this revision enumerated a1'
     );
 
-    const bumped = ok(ingestState(fx, sectionPage('overview', revision(9), []))).state;
-    const stale = failure(fx.run(expandAlias(bumped, 'a9', fx.sessionPath)));
+    const bumped = ok(yield* ingestState(fx, sectionPage('overview', revision(9), []))).state;
+    const stale = failure(yield* fx.run(expandAlias(bumped, 'a9', fx.sessionPath)));
     expect(stale).toContain('it was never enumerated, and the aliases that were (a1) died with');
     expect(stale).toContain('rev7/t3');
-  });
+  }));
 });
 
 describe('the alias vocabulary', () => {
@@ -491,27 +499,27 @@ describe('the alias vocabulary', () => {
     expect(shown).toBe('a3 a4 a5 a6 a7 a8 a9 a10 …');
   });
 
-  test('an unknown entity alias names its own kind and its neighbours', () => {
-    const fx = fixture();
+  effectTest('an unknown entity alias names its own kind and its neighbours', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     ok(
-      ingestState(
+      yield* ingestState(
         fx,
         sectionPage('units', revision(7), [unitItem(UNITS[0] ?? '', TILES[0] ?? '', 31, 72)])
       )
     );
-    const state = ok(fx.run(fx.store.readState(fx.sessionPath, fx.session)));
-    expect(failure(fx.run(expandAlias(state, 'u7', fx.sessionPath)))).toBe(
+    const state = ok(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session)));
+    expect(failure(yield* fx.run(expandAlias(state, 'u7', fx.sessionPath)))).toBe(
       'unknown unit alias u7; known unit aliases: u1'
     );
-    expect(failure(fx.run(expandAlias(state, 'c1', fx.sessionPath)))).toBe(
+    expect(failure(yield* fx.run(expandAlias(state, 'c1', fx.sessionPath)))).toBe(
       'unknown city alias c1; known city aliases: none are known yet'
     );
-  });
+  }));
 
-  test('an uncached tile names the nearest six by manhattan distance', () => {
-    const fx = fixture();
+  effectTest('an uncached tile names the nearest six by manhattan distance', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     ok(
-      ingestState(
+      yield* ingestState(
         fx,
         sectionPage('units', revision(7), [
           unitItem(UNITS[0] ?? '', TILES[0] ?? '', 31, 72),
@@ -519,25 +527,25 @@ describe('the alias vocabulary', () => {
         ])
       )
     );
-    const state = ok(fx.run(fx.store.readState(fx.sessionPath, fx.session)));
-    const message = failure(fx.run(expandAlias(state, 'T(40,72)', fx.sessionPath)));
+    const state = ok(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session)));
+    const message = failure(yield* fx.run(expandAlias(state, 'T(40,72)', fx.sessionPath)));
     expect(message).toBe(
       'unknown tile T(40,72): no page this seat has read named that coordinate. ' +
         'Nearest cached tiles: T(31,72) T(30,72)'
     );
-    const empty = fixture();
-    const cold = ok(empty.run(empty.store.readState(empty.sessionPath, empty.session)));
-    expect(failure(empty.run(expandAlias(cold, 'T(0,0)', empty.sessionPath)))).toContain(
-      'none are cached yet'
-    );
-  });
+    const empty = yield* fixture();
+    const cold = ok(yield* empty.run(empty.store.readState(empty.sessionPath, empty.session)));
+    expect(
+      failure(yield* empty.run(expandAlias(cold, 'T(0,0)', empty.sessionPath)))
+    ).toContain('none are cached yet');
+  }));
 
-  test('text that is not alias-shaped passes straight through', () => {
-    const fx = fixture();
-    const state = ok(fx.run(fx.store.readState(fx.sessionPath, fx.session)));
-    expect(ok(fx.run(expandAlias(state, ACTOR, fx.sessionPath)))).toBe(ACTOR);
-    expect(ok(fx.run(expandAlias(state, '', fx.sessionPath)))).toBe('');
-  });
+  effectTest('text that is not alias-shaped passes straight through', () => Effect.gen(function* () {
+    const fx = yield* fixture();
+    const state = ok(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session)));
+    expect(ok(yield* fx.run(expandAlias(state, ACTOR, fx.sessionPath)))).toBe(ACTOR);
+    expect(ok(yield* fx.run(expandAlias(state, '', fx.sessionPath)))).toBe('');
+  }));
 
   test('an entity alias prefix is only offered for its own ID shape', () => {
     expect(entityAliasPrefix(ACTOR)).toBe('u');
@@ -603,16 +611,16 @@ describe('the private tables fail closed on cache drift', () => {
   ];
 
   for (const [name, patch] of broken) {
-    test(name, () => {
-      const fx = fixture();
+    effectTest(name, () => Effect.gen(function* () {
+      const fx = yield* fixture();
       const empty = v2StateSchema.empty(fx.session);
-      Effect.runSync(
+      (yield*
         fx.scratch.files.writeJson(fx.store.statePath(fx.sessionPath), { ...empty, ...patch })
       );
-      expect(failure(fx.run(fx.store.readState(fx.sessionPath, fx.session)))).toContain(
+      expect(failure(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session)))).toContain(
         'aliases are invalid'
       );
-    });
+    }));
   }
 
   // CPython calls `_validate_revision` / `_validate_cursor_expiry` /
@@ -645,130 +653,130 @@ describe('the private tables fail closed on cache drift', () => {
       };
     };
 
-    test('the control fixture is accepted, so every refusal below is the patch', () => {
+    effectTest('the control fixture is accepted, so every refusal below is the patch', () => Effect.gen(function* () {
       expect(
-        Either.isRight(Effect.runSync(Effect.either(validatePendingCatalogs(staged({})))))
+        Either.isRight((yield* Effect.either(validatePendingCatalogs(staged({})))))
       ).toBe(true);
-    });
+    }));
 
-    test('an action-alias revision missing a field prints the revision sentence', () => {
-      const fx = fixture();
+    effectTest('an action-alias revision missing a field prints the revision sentence', () => Effect.gen(function* () {
+      const fx = yield* fixture();
       const empty = v2StateSchema.empty(fx.session);
-      Effect.runSync(
+      (yield*
         fx.scratch.files.writeJson(fx.store.statePath(fx.sessionPath), {
           ...empty,
           action_aliases: { state_revision: { turn: 3, revision: 7 }, by_alias: {} },
         })
       );
-      expect(failure(fx.run(fx.store.readState(fx.sessionPath, fx.session)))).toBe(REVISION_DRIFT);
-    });
+      expect(failure(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session)))).toBe(REVISION_DRIFT);
+    }));
 
-    test('the same drift inside a staged catalog prints the same revision sentence', () => {
+    effectTest('the same drift inside a staged catalog prints the same revision sentence', () => Effect.gen(function* () {
       expect(
         failure(
-          Effect.runSync(
+          (yield*
             Effect.either(validatePendingCatalogs(staged({ state_revision: { turn: 3, revision: 7 } })))
           )
         )
       ).toBe(REVISION_DRIFT);
-    });
+    }));
 
-    test('a drifted staged descriptor prints the descriptor sentence', () => {
+    effectTest('a drifted staged descriptor prints the descriptor sentence', () => Effect.gen(function* () {
       expect(
         failure(
-          Effect.runSync(
+          (yield*
             Effect.either(validatePendingCatalogs(staged({ items: { action_one: { nope: 1 } } })))
           )
         )
       ).toBe(DESCRIPTOR_DRIFT);
-    });
+    }));
 
-    test('an unparseable cursor expiry prints the cursor-expiry sentence', () => {
+    effectTest('an unparseable cursor expiry prints the cursor-expiry sentence', () => Effect.gen(function* () {
       expect(
         failure(
-          Effect.runSync(
+          (yield*
             Effect.either(validatePendingCatalogs(staged({ cursor_expires_at: 'not-a-timeZ' })))
           )
         )
       ).toBe('invalid v2 page cursor expiry');
-    });
+    }));
 
     // The generic sentences are still the answer for structural drift — the
     // field-level diagnosis only replaces them where CPython delegated.
-    test('structural drift keeps the generic sentences', () => {
+    effectTest('structural drift keeps the generic sentences', () => Effect.gen(function* () {
       expect(
-        failure(Effect.runSync(Effect.either(validatePendingCatalogs(staged({ total_items: 0 })))))
+        failure((yield* Effect.either(validatePendingCatalogs(staged({ total_items: 0 })))))
       ).toBe('private v2 pending catalogs are invalid');
-      const fx = fixture();
+      const fx = yield* fixture();
       const empty = v2StateSchema.empty(fx.session);
-      Effect.runSync(
+      (yield*
         fx.scratch.files.writeJson(fx.store.statePath(fx.sessionPath), {
           ...empty,
           action_aliases: { by_alias: {} },
         })
       );
-      expect(failure(fx.run(fx.store.readState(fx.sessionPath, fx.session)))).toBe(
+      expect(failure(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session)))).toBe(
         'private v2 action aliases are invalid'
       );
-    });
+    }));
   });
 
-  test('a drained-actor record that is not a list of actor IDs is refused', () => {
-    expect(failure(Effect.runSync(Effect.either(parseDrainedActors([ACTOR, ACTOR]))))).toBe(
+  effectTest('a drained-actor record that is not a list of actor IDs is refused', () => Effect.gen(function* () {
+    expect(failure((yield* Effect.either(parseDrainedActors([ACTOR, ACTOR]))))).toBe(
       'private v2 drained catalogs are invalid'
     );
-    expect(failure(Effect.runSync(Effect.either(parseDrainedActors([TILES[0] ?? '']))))).toBe(
+    expect(failure((yield* Effect.either(parseDrainedActors([TILES[0] ?? '']))))).toBe(
       'private v2 drained catalogs are invalid'
     );
-    expect(ok(Effect.runSync(Effect.either(parseDrainedActors([ACTOR]))))).toEqual([ACTOR]);
-  });
+    expect(ok((yield* Effect.either(parseDrainedActors([ACTOR]))))).toEqual([ACTOR]);
+  }));
 });
 
 describe('every V2_MAX_* cap is a boundary, not a suggestion', () => {
-  test('entity aliases stop at V2_MAX_ENTITY_ALIASES', () => {
-    const fx = fixture();
+  effectTest('entity aliases stop at V2_MAX_ENTITY_ALIASES', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const full: Record<string, string> = {};
     for (let index = 1; index <= V2_MAX_ENTITY_ALIASES; index += 1) {
       full[`u${index}`] = `unit_${index.toString(16).padStart(32, '0')}`;
     }
     // The cap itself is legal…
     const empty = v2StateSchema.empty(fx.session);
-    Effect.runSync(
+    (yield*
       fx.scratch.files.writeJson(fx.store.statePath(fx.sessionPath), {
         ...empty,
         entity_aliases: full,
       })
     );
-    expect(Object.keys(ok(fx.run(fx.store.readState(fx.sessionPath, fx.session))).entity_aliases))
+    expect(Object.keys(ok(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session))).entity_aliases))
       .toHaveLength(V2_MAX_ENTITY_ALIASES);
     // …one past it is not.
     full[`u${V2_MAX_ENTITY_ALIASES + 1}`] = `unit_${'f'.repeat(32)}`;
-    Effect.runSync(
+    (yield*
       fx.scratch.files.writeJson(fx.store.statePath(fx.sessionPath), {
         ...empty,
         entity_aliases: full,
       })
     );
-    expect(failure(fx.run(fx.store.readState(fx.sessionPath, fx.session)))).toBe(
+    expect(failure(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session)))).toBe(
       'private v2 entity aliases are invalid'
     );
-  });
+  }));
 
-  test('a full entity table learns nothing more from a page', () => {
-    const fx = fixture();
+  effectTest('a full entity table learns nothing more from a page', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const full: Record<string, string> = {};
     for (let index = 1; index <= V2_MAX_ENTITY_ALIASES; index += 1) {
       full[`u${index}`] = `unit_${index.toString(16).padStart(32, '0')}`;
     }
     const empty = v2StateSchema.empty(fx.session);
-    Effect.runSync(
+    (yield*
       fx.scratch.files.writeJson(fx.store.statePath(fx.sessionPath), {
         ...empty,
         entity_aliases: full,
       })
     );
     const after = ok(
-      ingestState(
+      yield* ingestState(
         fx,
         sectionPage('units', revision(7), [unitItem(ACTOR, TILES[0] ?? '', 31, 72)])
       )
@@ -777,50 +785,50 @@ describe('every V2_MAX_* cap is a boundary, not a suggestion', () => {
     expect(Object.values(after.entity_aliases)).not.toContain(ACTOR);
     // The tile table was not full, so it still learned.
     expect(after.tile_aliases['31,72']).toBe(TILES[0] ?? '');
-  });
+  }));
 
-  test('tile aliases stop at V2_MAX_TILE_ALIASES', () => {
-    const fx = fixture();
+  effectTest('tile aliases stop at V2_MAX_TILE_ALIASES', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const full: Record<string, string> = {};
     for (let index = 0; index < V2_MAX_TILE_ALIASES; index += 1) {
       full[`${index % 9999},${Math.floor(index / 9999)}`] =
         `tile_${index.toString(16).padStart(32, '0')}`;
     }
     const empty = v2StateSchema.empty(fx.session);
-    Effect.runSync(
+    (yield*
       fx.scratch.files.writeJson(fx.store.statePath(fx.sessionPath), {
         ...empty,
         tile_aliases: full,
       })
     );
     expect(
-      Object.keys(ok(fx.run(fx.store.readState(fx.sessionPath, fx.session))).tile_aliases)
+      Object.keys(ok(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session))).tile_aliases)
     ).toHaveLength(V2_MAX_TILE_ALIASES);
     full['9998,9998'] = `tile_${'f'.repeat(32)}`;
-    Effect.runSync(
+    (yield*
       fx.scratch.files.writeJson(fx.store.statePath(fx.sessionPath), {
         ...empty,
         tile_aliases: full,
       })
     );
-    expect(failure(fx.run(fx.store.readState(fx.sessionPath, fx.session)))).toBe(
+    expect(failure(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session)))).toBe(
       'private v2 tile aliases are invalid'
     );
-  });
+  }));
 
-  test('a tile outside ±9999 is never cached', () => {
-    const fx = fixture();
+  effectTest('a tile outside ±9999 is never cached', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const after = ok(
-      ingestState(
+      yield* ingestState(
         fx,
         sectionPage('units', revision(7), [unitItem(ACTOR, TILES[0] ?? '', 10000, 0)])
       )
     ).state;
     expect(after.tile_aliases).toEqual({});
-  });
+  }));
 
-  test('action aliases stop at V2_MAX_ACTION_ALIASES', () => {
-    const fx = fixture();
+  effectTest('action aliases stop at V2_MAX_ACTION_ALIASES', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const empty = v2StateSchema.empty(fx.session);
     const byAlias: Record<string, JsonValue> = {};
     for (let index = 1; index <= V2_MAX_ACTION_ALIASES; index += 1) {
@@ -830,33 +838,33 @@ describe('every V2_MAX_* cap is a boundary, not a suggestion', () => {
         semantics: '',
       };
     }
-    Effect.runSync(
+    (yield*
       fx.scratch.files.writeJson(fx.store.statePath(fx.sessionPath), {
         ...empty,
         action_aliases: { state_revision: revision(7), by_alias: byAlias },
       })
     );
-    expect(ok(fx.run(fx.store.readState(fx.sessionPath, fx.session)))).toBeTruthy();
+    expect(ok(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session)))).toBeTruthy();
     byAlias[`a${V2_MAX_ACTION_ALIASES + 1}`] = {
       action_id: 'action_overflow',
       actor_id: '',
       semantics: '',
     };
-    Effect.runSync(
+    (yield*
       fx.scratch.files.writeJson(fx.store.statePath(fx.sessionPath), {
         ...empty,
         action_aliases: { state_revision: revision(7), by_alias: byAlias },
       })
     );
-    expect(failure(fx.run(fx.store.readState(fx.sessionPath, fx.session)))).toBe(
+    expect(failure(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session)))).toBe(
       'private v2 action aliases are invalid'
     );
-  });
+  }));
 
-  test('semantics longer than V2_MAX_ALIAS_SEMANTICS are refused on load', () => {
-    const fx = fixture();
+  effectTest('semantics longer than V2_MAX_ALIAS_SEMANTICS are refused on load', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const empty = v2StateSchema.empty(fx.session);
-    Effect.runSync(
+    (yield*
       fx.scratch.files.writeJson(fx.store.statePath(fx.sessionPath), {
         ...empty,
         action_aliases: {
@@ -871,12 +879,12 @@ describe('every V2_MAX_* cap is a boundary, not a suggestion', () => {
         },
       })
     );
-    expect(failure(fx.run(fx.store.readState(fx.sessionPath, fx.session)))).toBe(
+    expect(failure(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session)))).toBe(
       'private v2 action aliases are invalid'
     );
-  });
+  }));
 
-  test('a computed semantics string is truncated to the cap, never past it', () => {
+  effectTest('a computed semantics string is truncated to the cap, never past it', () => Effect.gen(function* () {
     const stateRevision = revision(7);
     const properties: Record<string, JsonValue> = {};
     for (let index = 0; index < 400; index += 1) {
@@ -890,29 +898,25 @@ describe('every V2_MAX_* cap is a boundary, not a suggestion', () => {
       arguments_schema: { type: 'object', properties },
       state_revision: stateRevision,
     };
-    const decoded = Effect.runSync(
-      Effect.orDie(
-        Effect.map(
-          decodeLegalPage(scopedLegalPage(stateRevision, [wide], ACTOR), identity()),
-          (page) => page.page.items
-        )
-      )
+    const decoded = yield* Effect.map(
+      decodeLegalPage(scopedLegalPage(stateRevision, [wide], ACTOR), identity()),
+      (page) => page.page.items
     );
     const first = decoded[0];
     expect(first).toBeDefined();
     if (first === undefined) return;
-    const semantics = Effect.runSync(Effect.orDie(actionSemantics(first)));
+    const semantics = (yield* actionSemantics(first));
     expect(semantics.length).toBe(V2_MAX_ALIAS_SEMANTICS);
-  });
+  }));
 
-  test('a semantics capped at 1024 code points reloads, even past 1024 UTF-16 units', () => {
+  effectTest('a semantics capped at 1024 code points reloads, even past 1024 UTF-16 units', () => Effect.gen(function* () {
     // CPython caps by `len()`, which counts code points.  A single non-BMP
     // character anywhere in the surviving prefix makes the UTF-16 measurement
     // read 1025 for a string CPython calls 1024 — so a port that measures with
     // `.length` writes a `.v2-state` its own loader then refuses, bricking
     // every v2 command until a human deletes the private cache.  This is the
     // exact page that catches it.
-    const fx = fixture();
+    const fx = yield* fixture();
     const stateRevision = revision(7);
     const astral: JsonObject = {
       action_id: 'action_astral',
@@ -930,23 +934,23 @@ describe('every V2_MAX_* cap is a boundary, not a suggestion', () => {
     };
     const page = scopedLegalPage(stateRevision, [astral], ACTOR);
 
-    const decoded = Effect.runSync(
+    const decoded = (yield*
       Effect.orDie(Effect.map(decodeLegalPage(page, fx.session), (each) => each.page.items))
     );
     const first = decoded[0];
     expect(first).toBeDefined();
     if (first === undefined) return;
-    const semantics = Effect.runSync(Effect.orDie(actionSemantics(first)));
+    const semantics = (yield* actionSemantics(first));
     // The producer's cap is code points; the divergence this test guards is
     // real only when the two measurements actually disagree.
     expect([...semantics].length).toBe(V2_MAX_ALIAS_SEMANTICS);
     expect(semantics.length).toBeGreaterThan(V2_MAX_ALIAS_SEMANTICS);
 
     // Ingest writes it, and the cold reload must accept what ingest just wrote.
-    const ingested = ok(ingestLegal(fx, page));
+    const ingested = ok(yield* ingestLegal(fx, page));
     const stored = ingested.state.action_aliases['by_alias'];
     expect(isJsonObject(stored) && isJsonObject(stored['a1'])).toBe(true);
-    const reloaded = ok(fx.run(fx.store.readState(fx.sessionPath, fx.session)));
+    const reloaded = ok(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session)));
     const table = reloaded.action_aliases['by_alias'];
     expect(isJsonObject(table)).toBe(true);
     if (!isJsonObject(table)) return;
@@ -955,15 +959,15 @@ describe('every V2_MAX_* cap is a boundary, not a suggestion', () => {
     if (!isJsonObject(entry)) return;
     expect(entry['action_id']).toBe('action_astral');
     expect(entry['semantics']).toBe(semantics);
-  });
+  }));
 
-  test('a semantics of 1024 code points hand-written into the cache reloads', () => {
-    const fx = fixture();
+  effectTest('a semantics of 1024 code points hand-written into the cache reloads', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const empty = v2StateSchema.empty(fx.session);
     // 1024 code points exactly, 1025 UTF-16 units — the load must accept it.
     const semantics = `\u{1F3DB}${'x'.repeat(V2_MAX_ALIAS_SEMANTICS - 1)}`;
     expect([...semantics].length).toBe(V2_MAX_ALIAS_SEMANTICS);
-    Effect.runSync(
+    (yield*
       fx.scratch.files.writeJson(fx.store.statePath(fx.sessionPath), {
         ...empty,
         action_aliases: {
@@ -972,16 +976,16 @@ describe('every V2_MAX_* cap is a boundary, not a suggestion', () => {
         },
       })
     );
-    expect(ok(fx.run(fx.store.readState(fx.sessionPath, fx.session)))).toBeTruthy();
-  });
+    expect(ok(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session)))).toBeTruthy();
+  }));
 
-  test('a semantics of 1025 code points is still refused, however it is encoded', () => {
-    const fx = fixture();
+  effectTest('a semantics of 1025 code points is still refused, however it is encoded', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const empty = v2StateSchema.empty(fx.session);
     // 1025 code points, so over the cap by CPython's own measure.
     const semantics = `\u{1F3DB}${'x'.repeat(V2_MAX_ALIAS_SEMANTICS)}`;
     expect([...semantics].length).toBe(V2_MAX_ALIAS_SEMANTICS + 1);
-    Effect.runSync(
+    (yield*
       fx.scratch.files.writeJson(fx.store.statePath(fx.sessionPath), {
         ...empty,
         action_aliases: {
@@ -990,37 +994,37 @@ describe('every V2_MAX_* cap is a boundary, not a suggestion', () => {
         },
       })
     );
-    expect(failure(fx.run(fx.store.readState(fx.sessionPath, fx.session)))).toBe(
+    expect(failure(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session)))).toBe(
       'private v2 action aliases are invalid'
     );
-  });
+  }));
 
-  test('drained actors stop at V2_MAX_DRAINED_ACTORS', () => {
-    const fx = fixture();
+  effectTest('drained actors stop at V2_MAX_DRAINED_ACTORS', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const empty = v2StateSchema.empty(fx.session);
     const drained = Array.from(
       { length: V2_MAX_DRAINED_ACTORS },
       (_value, index) => `unit_${index.toString(16).padStart(32, '0')}`
     );
     const full: V2ClientState = { ...empty, drained_actors: drained };
-    expect(ok(Effect.runSync(Effect.either(rememberDrainedActor(full, ACTOR)))).drained_actors)
+    expect(ok((yield* Effect.either(rememberDrainedActor(full, ACTOR)))).drained_actors)
       .toHaveLength(V2_MAX_DRAINED_ACTORS);
     const nearlyFull: V2ClientState = { ...empty, drained_actors: drained.slice(0, -1) };
-    expect(ok(Effect.runSync(Effect.either(rememberDrainedActor(nearlyFull, ACTOR)))).drained_actors)
+    expect(ok((yield* Effect.either(rememberDrainedActor(nearlyFull, ACTOR)))).drained_actors)
       .toHaveLength(V2_MAX_DRAINED_ACTORS);
     // A record one past the cap never loads at all.
-    Effect.runSync(
+    (yield*
       fx.scratch.files.writeJson(fx.store.statePath(fx.sessionPath), {
         ...empty,
         drained_actors: [...drained, `unit_${'f'.repeat(32)}`],
       })
     );
-    expect(failure(fx.run(fx.store.readState(fx.sessionPath, fx.session)))).toBe(
+    expect(failure(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session)))).toBe(
       'private v2 drained catalogs are invalid'
     );
-  });
+  }));
 
-  test('pending catalogs stop at V2_MAX_PENDING_CATALOGS', () => {
+  effectTest('pending catalogs stop at V2_MAX_PENDING_CATALOGS', () => Effect.gen(function* () {
     const staged: Record<string, JsonValue> = {};
     const stateRevision = revision(7);
     for (let index = 0; index <= V2_MAX_PENDING_CATALOGS; index += 1) {
@@ -1033,12 +1037,12 @@ describe('every V2_MAX_* cap is a boundary, not a suggestion', () => {
         cursor_expires_at: null,
       };
     }
-    expect(failure(Effect.runSync(Effect.either(validatePendingCatalogs(staged))))).toBe(
+    expect(failure((yield* Effect.either(validatePendingCatalogs(staged))))).toBe(
       'private v2 pending catalogs are invalid'
     );
-  });
+  }));
 
-  test('a staged catalog must hold fewer items than its own total', () => {
+  effectTest('a staged catalog must hold fewer items than its own total', () => Effect.gen(function* () {
     const stateRevision = revision(7);
     const entry = (total: number): JsonValue => ({
       state_revision: stateRevision,
@@ -1050,12 +1054,12 @@ describe('every V2_MAX_* cap is a boundary, not a suggestion', () => {
     });
     const catalogId = `catalog_${'a'.repeat(32)}`;
     expect(
-      Either.isRight(Effect.runSync(Effect.either(validatePendingCatalogs({ [catalogId]: entry(2) }))))
+      Either.isRight((yield* Effect.either(validatePendingCatalogs({ [catalogId]: entry(2) }))))
     ).toBe(true);
     expect(
-      Either.isLeft(Effect.runSync(Effect.either(validatePendingCatalogs({ [catalogId]: entry(1) }))))
+      Either.isLeft((yield* Effect.either(validatePendingCatalogs({ [catalogId]: entry(1) }))))
     ).toBe(true);
-  });
+  }));
 
   test('a cursor expiry in the past is expired and one in the future is not', () => {
     expect(cursorExpired(null)).toBe(false);
@@ -1065,8 +1069,8 @@ describe('every V2_MAX_* cap is a boundary, not a suggestion', () => {
 });
 
 describe('a scoped catalog only earns its numbers when it is promoted', () => {
-  test('the staging page numbers nothing and the final page numbers all of it', () => {
-    const fx = fixture();
+  effectTest('the staging page numbers nothing and the final page numbers all of it', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const stateRevision = revision(7);
     const catalog = `catalog_${'a'.repeat(32)}`;
     const cursor = `cursor_${'c'.repeat(32)}`;
@@ -1078,7 +1082,7 @@ describe('a scoped catalog only earns its numbers when it is promoted', () => {
       })
     );
     const staged = ok(
-      ingestLegal(
+      yield* ingestLegal(
         fx,
         scopedLegalPage(stateRevision, items.slice(0, 2), ACTOR, {
           catalog,
@@ -1092,7 +1096,7 @@ describe('a scoped catalog only earns its numbers when it is promoted', () => {
     expect(Object.keys(staged.state.pending_catalogs)).toEqual([catalog]);
 
     const promoted = ok(
-      ingestLegal(
+      yield* ingestLegal(
         fx,
         scopedLegalPage(stateRevision, items.slice(2), ACTOR, { catalog, total: items.length })
       )
@@ -1102,10 +1106,10 @@ describe('a scoped catalog only earns its numbers when it is promoted', () => {
     expect(promoted.state.pending_catalogs).toEqual({});
     // Only a complete, actor-wide catalog is remembered as drained.
     expect(promoted.state.drained_actors).toEqual([ACTOR]);
-  });
+  }));
 
-  test('an expired cursor discards the staged catalog and names the restart', () => {
-    const fx = fixture();
+  effectTest('an expired cursor discards the staged catalog and names the restart', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const stateRevision = revision(7);
     const catalog = `catalog_${'a'.repeat(32)}`;
     const fresh = scopedLegalPage(stateRevision, [descriptor(stateRevision)], ACTOR, {
@@ -1117,19 +1121,19 @@ describe('a scoped catalog only earns its numbers when it is promoted', () => {
     const page: JsonObject = isJsonObject(body)
       ? { ...fresh, page: { ...body, cursor_expires_at: '2000-01-01T00:00:00.000Z' } }
       : fresh;
-    expect(failure(ingestLegal(fx, page))).toBe(
+    expect(failure(yield* ingestLegal(fx, page))).toBe(
       'legal-action catalog cursor expired; restart the scoped query'
     );
-    expect(ok(fx.run(fx.store.readState(fx.sessionPath, fx.session))).pending_catalogs).toEqual({});
-  });
+    expect(ok(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session))).pending_catalogs).toEqual({});
+  }));
 
-  test('a catalog that changed its metadata mid-drain is discarded', () => {
-    const fx = fixture();
+  effectTest('a catalog that changed its metadata mid-drain is discarded', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const stateRevision = revision(7);
     const catalog = `catalog_${'a'.repeat(32)}`;
     const cursor = `cursor_${'c'.repeat(32)}`;
     ok(
-      ingestLegal(
+      yield* ingestLegal(
         fx,
         scopedLegalPage(stateRevision, [descriptor(stateRevision, 'action_one')], ACTOR, {
           catalog,
@@ -1140,7 +1144,7 @@ describe('a scoped catalog only earns its numbers when it is promoted', () => {
     );
     expect(
       failure(
-        ingestLegal(
+        yield* ingestLegal(
           fx,
           scopedLegalPage(stateRevision, [descriptor(stateRevision, 'action_two')], ACTOR, {
             catalog,
@@ -1150,16 +1154,16 @@ describe('a scoped catalog only earns its numbers when it is promoted', () => {
         )
       )
     ).toBe('legal-action catalog metadata changed');
-    expect(ok(fx.run(fx.store.readState(fx.sessionPath, fx.session))).pending_catalogs).toEqual({});
-  });
+    expect(ok(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session))).pending_catalogs).toEqual({});
+  }));
 
-  test('a final page that arrives short of its total is refused', () => {
-    const fx = fixture();
+  effectTest('a final page that arrives short of its total is refused', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const stateRevision = revision(7);
     const catalog = `catalog_${'a'.repeat(32)}`;
     expect(
       failure(
-        ingestLegal(
+        yield* ingestLegal(
           fx,
           scopedLegalPage(stateRevision, [descriptor(stateRevision, 'action_one')], ACTOR, {
             catalog,
@@ -1168,15 +1172,15 @@ describe('a scoped catalog only earns its numbers when it is promoted', () => {
         )
       )
     ).toBe('legal-action catalog completed before every item arrived');
-  });
+  }));
 
-  test('one action ID describing two different actions is refused', () => {
-    const fx = fixture();
+  effectTest('one action ID describing two different actions is refused', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const stateRevision = revision(7);
     const catalog = `catalog_${'a'.repeat(32)}`;
     const cursor = `cursor_${'c'.repeat(32)}`;
     ok(
-      ingestLegal(
+      yield* ingestLegal(
         fx,
         scopedLegalPage(
           stateRevision,
@@ -1188,7 +1192,7 @@ describe('a scoped catalog only earns its numbers when it is promoted', () => {
     );
     expect(
       failure(
-        ingestLegal(
+        yield* ingestLegal(
           fx,
           scopedLegalPage(
             stateRevision,
@@ -1199,10 +1203,10 @@ describe('a scoped catalog only earns its numbers when it is promoted', () => {
         )
       )
     ).toBe('one catalog action ID described two different actions');
-  });
+  }));
 
-  test('a target-scoped catalog never claims to be a drained actor catalog', () => {
-    const fx = fixture();
+  effectTest('a target-scoped catalog never claims to be a drained actor catalog', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const stateRevision = revision(7);
     const tile = TILES[0] ?? '';
     const page = envelope(
@@ -1218,106 +1222,115 @@ describe('a scoped catalog only earns its numbers when it is promoted', () => {
       },
       stateRevision
     );
-    const after = ok(ingestLegal(fx, page)).state;
+    const after = ok(yield* ingestLegal(fx, page)).state;
     expect(after.drained_actors).toEqual([]);
     expect([...aliasEntries(after).keys()]).toEqual(['a1']);
-  });
+  }));
 });
 
 describe('dropping a staged catalog', () => {
-  const stage = (fx: Fixture, catalog: string, cursor: string, actor: string): void => {
+  const stage = (
+    fx: Fixture,
+    catalog: string,
+    cursor: string,
+    actor: string
+  ): Effect.Effect<void> => {
     const stateRevision = revision(7);
-    ok(
-      ingestLegal(
-        fx,
-        scopedLegalPage(stateRevision, [descriptor(stateRevision, `action_${catalog.slice(-3)}`)], actor, {
-          catalog,
-          cursor,
-          total: 4,
-        })
+    return Effect.asVoid(
+      Effect.map(
+        ingestLegal(
+          fx,
+          scopedLegalPage(
+            stateRevision,
+            [descriptor(stateRevision, `action_${catalog.slice(-3)}`)],
+            actor,
+            { catalog, cursor, total: 4 }
+          )
+        ),
+        ok
       )
     );
   };
 
-  test('a refused cursor discards exactly the catalog behind it', () => {
-    const fx = fixture();
+  effectTest('a refused cursor discards exactly the catalog behind it', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const one = `catalog_${'a'.repeat(32)}`;
     const two = `catalog_${'b'.repeat(32)}`;
     const cursorOne = `cursor_${'1'.repeat(32)}`;
     const cursorTwo = `cursor_${'2'.repeat(32)}`;
-    stage(fx, one, cursorOne, ACTOR);
-    stage(fx, two, cursorTwo, `unit_${'b'.repeat(32)}`);
-    const after = ok(fx.run(dropPendingForCursor(fx.sessionPath, fx.session, cursorOne)));
+    yield* stage(fx, one, cursorOne, ACTOR);
+    yield* stage(fx, two, cursorTwo, `unit_${'b'.repeat(32)}`);
+    const after = ok(yield* fx.run(dropPendingForCursor(fx.sessionPath, fx.session, cursorOne)));
     expect(Object.keys(after.pending_catalogs)).toEqual([two]);
     // The drop is durable, not just in memory.
     expect(
-      Object.keys(ok(fx.run(fx.store.readState(fx.sessionPath, fx.session))).pending_catalogs)
+      Object.keys(ok(yield* fx.run(fx.store.readState(fx.sessionPath, fx.session))).pending_catalogs)
     ).toEqual([two]);
-  });
+  }));
 
-  test('a cursor nothing is staged behind leaves the cache alone', () => {
-    const fx = fixture();
+  effectTest('a cursor nothing is staged behind leaves the cache alone', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const one = `catalog_${'a'.repeat(32)}`;
-    stage(fx, one, `cursor_${'1'.repeat(32)}`, ACTOR);
+    yield* stage(fx, one, `cursor_${'1'.repeat(32)}`, ACTOR);
     const after = ok(
-      fx.run(dropPendingForCursor(fx.sessionPath, fx.session, `cursor_${'9'.repeat(32)}`))
+      yield* fx.run(dropPendingForCursor(fx.sessionPath, fx.session, `cursor_${'9'.repeat(32)}`))
     );
     expect(Object.keys(after.pending_catalogs)).toEqual([one]);
-  });
+  }));
 
-  test('dropping by scope takes every catalog of one actor', () => {
-    const fx = fixture();
+  effectTest('dropping by scope takes every catalog of one actor', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const one = `catalog_${'a'.repeat(32)}`;
     const two = `catalog_${'b'.repeat(32)}`;
     const other = `unit_${'b'.repeat(32)}`;
-    stage(fx, one, `cursor_${'1'.repeat(32)}`, ACTOR);
-    stage(fx, two, `cursor_${'2'.repeat(32)}`, other);
-    const after = ok(fx.run(dropPendingForScope(fx.sessionPath, fx.session, ACTOR, '')));
+    yield* stage(fx, one, `cursor_${'1'.repeat(32)}`, ACTOR);
+    yield* stage(fx, two, `cursor_${'2'.repeat(32)}`, other);
+    const after = ok(yield* fx.run(dropPendingForScope(fx.sessionPath, fx.session, ACTOR, '')));
     expect(Object.keys(after.pending_catalogs)).toEqual([two]);
-  });
+  }));
 
-  test('an actor plus a target only drops that narrower question', () => {
-    const fx = fixture();
+  effectTest('an actor plus a target only drops that narrower question', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const one = `catalog_${'a'.repeat(32)}`;
-    stage(fx, one, `cursor_${'1'.repeat(32)}`, ACTOR);
+    yield* stage(fx, one, `cursor_${'1'.repeat(32)}`, ACTOR);
     const kept = ok(
-      fx.run(dropPendingForScope(fx.sessionPath, fx.session, ACTOR, TILES[0] ?? ''))
+      yield* fx.run(dropPendingForScope(fx.sessionPath, fx.session, ACTOR, TILES[0] ?? ''))
     );
     // The staged catalog is actor-wide, so a target-scoped drop does not name it.
     expect(Object.keys(kept.pending_catalogs)).toEqual([one]);
-  });
+  }));
 });
 
 describe('revision ordering', () => {
-  test('an older page is displayed but never revives a dead capability', () => {
-    const fx = fixture();
+  effectTest('an older page is displayed but never revives a dead capability', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const newer = revision(9);
-    ok(ingestLegal(fx, scopedLegalPage(newer, [descriptor(newer)], ACTOR)));
+    ok(yield* ingestLegal(fx, scopedLegalPage(newer, [descriptor(newer)], ACTOR)));
     const older = revision(7);
-    const after = ok(ingestLegal(fx, scopedLegalPage(older, [descriptor(older)], ACTOR))).state;
+    const after = ok(yield* ingestLegal(fx, scopedLegalPage(older, [descriptor(older)], ACTOR))).state;
     expect(after.last_revision).toEqual(newer);
     expect(Object.keys(after.actions)).toEqual(['action_opaque']);
-  });
+  }));
 
-  test('a state token that changed without a newer revision is refused', () => {
-    const fx = fixture();
-    ok(ingestState(fx, sectionPage('overview', revision(7), [])));
+  effectTest('a state token that changed without a newer revision is refused', () => Effect.gen(function* () {
+    const fx = yield* fixture();
+    ok(yield* ingestState(fx, sectionPage('overview', revision(7), [])));
     const forged: TestRevision = { turn: 3, revision: 7, state_token: 'state_forged' };
-    expect(failure(ingestState(fx, sectionPage('overview', forged, [])))).toBe(
+    expect(failure(yield* ingestState(fx, sectionPage('overview', forged, [])))).toBe(
       'state token changed without a newer revision'
     );
-  });
+  }));
 });
 
 describe('receipts retire capabilities the way a newer page does', () => {
-  test('an applied receipt clears actions but leaves the alias bucket to refuse', () => {
-    const fx = fixture();
+  effectTest('an applied receipt clears actions but leaves the alias bucket to refuse', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const first = revision(7);
-    const staged = ok(ingestLegal(fx, scopedLegalPage(first, [descriptor(first)], ACTOR))).state;
+    const staged = ok(yield* ingestLegal(fx, scopedLegalPage(first, [descriptor(first)], ACTOR))).state;
     expect([...aliasEntries(staged).keys()]).toEqual(['a1']);
 
     const applied = ok(
-      fx.run(
+      yield* fx.run(
         Effect.flatMap(
           Effect.mapError(
             decodeReceipt(receiptPayloadFor(`batch_${'A'.repeat(24)}`, 'applied', revision(9)), fx.session),
@@ -1331,13 +1344,13 @@ describe('receipts retire capabilities the way a newer page does', () => {
     expect(applied.drained_actors).toEqual([]);
     // The bucket survives so the refusal can name the revision it came from.
     expect([...aliasEntries(applied).keys()]).toEqual(['a1']);
-    expect(failure(fx.run(expandAlias(applied, 'a1', fx.sessionPath)))).toContain(
+    expect(failure(yield* fx.run(expandAlias(applied, 'a1', fx.sessionPath)))).toContain(
       'die with their revision'
     );
-  });
+  }));
 
-  test('a receipt may never regress or change terminal state', () => {
-    const fx = fixture();
+  effectTest('a receipt may never regress or change terminal state', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const batchId = `batch_${'A'.repeat(24)}`;
     const remember = (state: string, at: TestRevision) =>
       fx.run(
@@ -1348,15 +1361,15 @@ describe('receipts retire capabilities the way a newer page does', () => {
           (receipt) => rememberReceipt(fx.sessionPath, fx.session, receipt)
         )
       );
-    ok(remember('accepted', revision(7)));
-    ok(remember('applied', revision(8)));
-    expect(failure(remember('accepted', revision(9)))).toBe(
+    ok(yield* remember('accepted', revision(7)));
+    ok(yield* remember('applied', revision(8)));
+    expect(failure(yield* remember('accepted', revision(9)))).toBe(
       'a command receipt regressed or changed terminal state'
     );
-    expect(failure(remember('rejected', revision(9)))).toBe(
+    expect(failure(yield* remember('rejected', revision(9)))).toBe(
       'a command receipt regressed or changed terminal state'
     );
-  });
+  }));
 });
 
 describe('renumbering across revisions', () => {
@@ -1365,14 +1378,14 @@ describe('renumbering across revisions', () => {
    * entity alias never re-points, and the action bucket always names exactly
    * the revision it was built from.
    */
-  test('N revisions never re-use a live number and never move an entity alias', () => {
-    const fx = fixture();
+  effectTest('N revisions never re-use a live number and never move an entity alias', () => Effect.gen(function* () {
+    const fx = yield* fixture();
     const seenEntities = new Map<string, string>();
     for (let round = 0; round < 12; round += 1) {
       const stateRevision = revision(7 + round);
       const actor = `unit_${round.toString(16).padStart(32, '0')}`;
       ok(
-        ingestState(
+        yield* ingestState(
           fx,
           sectionPage('units', stateRevision, [
             unitItem(actor, `tile_${round.toString(16).padStart(32, '0')}`, round, 5),
@@ -1388,7 +1401,7 @@ describe('renumbering across revisions', () => {
         )
       );
       const state = ok(
-        ingestLegal(
+        yield* ingestLegal(
           fx,
           scopedLegalPage(stateRevision, actions, actor, {
             catalog: `catalog_${round.toString(16).padStart(32, '0')}`,
@@ -1402,7 +1415,7 @@ describe('renumbering across revisions', () => {
       expect([...live.keys()]).toEqual(['a1', 'a2', 'a3']);
       expect(new Set(live.values()).size).toBe(3);
       expect(state.action_aliases['state_revision']).toEqual(stateRevision);
-      expect(Object.keys(ok(fx.run(freshActionAliases(state))))).toEqual(['a1', 'a2', 'a3']);
+      expect(Object.keys(ok(yield* fx.run(freshActionAliases(state))))).toEqual(['a1', 'a2', 'a3']);
 
       // Entity aliases survive every bump and never re-point.
       for (const [alias, rawIdentifier] of Object.entries(state.entity_aliases)) {
@@ -1414,7 +1427,7 @@ describe('renumbering across revisions', () => {
       expect(Object.keys(state.entity_aliases)).toHaveLength(round + 1);
       for (const alias of live.keys()) expect(ACTION_ALIAS_RE.test(alias)).toBe(true);
     }
-  });
+  }));
 
   test('rebinding gives an unchanged action its previous number back', () => {
     const previous = {
@@ -1484,26 +1497,32 @@ describe('renumbering across revisions', () => {
 });
 
 describe('semantics is identity with nothing revision-bound inside it', () => {
-  test('two enumerations of the same move produce the same string', () => {
+  effectTest('two enumerations of the same move produce the same string', () => Effect.gen(function* () {
     const seat = identity();
-    const semanticsOf = (at: TestRevision, actionId: string): string => {
-      const page = scopedLegalPage(at, [actorAction(at, actionId, ACTOR, { x: 32, y: 73 })], ACTOR);
-      const items = Effect.runSync(
-        Effect.orDie(Effect.map(decodeLegalPage(page, seat), (decoded) => decoded.page.items))
-      );
-      const first = items[0];
-      if (first === undefined) throw new Error('no descriptor');
-      return Effect.runSync(Effect.orDie(actionSemantics(first)));
-    };
-    const older = semanticsOf(revision(7), `action_${'1'.repeat(26)}`);
-    const newer = semanticsOf(revision(9), `action_${'9'.repeat(26)}`);
+    const semanticsOf = (at: TestRevision, actionId: string): Effect.Effect<string> =>
+      Effect.gen(function* () {
+        const page = scopedLegalPage(
+          at,
+          [actorAction(at, actionId, ACTOR, { x: 32, y: 73 })],
+          ACTOR
+        );
+        const items = yield* Effect.map(
+          decodeLegalPage(page, seat),
+          (decoded) => decoded.page.items
+        );
+        const first = items[0];
+        if (first === undefined) throw new Error('no descriptor');
+        return yield* actionSemantics(first);
+      }).pipe(Effect.orDie);
+    const older = yield* semanticsOf(revision(7), `action_${'1'.repeat(26)}`);
+    const newer = yield* semanticsOf(revision(9), `action_${'9'.repeat(26)}`);
     expect(newer).toBe(older);
     // The target is named by coordinate, never by its hash.
     expect(older).toContain('T(32,73)');
     expect(older).not.toContain('action_');
-  });
+  }));
 
-  test('a different board position is a different identity', () => {
+  effectTest('a different board position is a different identity', () => Effect.gen(function* () {
     const seat = identity();
     const at = revision(7);
     const page = scopedLegalPage(
@@ -1514,15 +1533,14 @@ describe('semantics is identity with nothing revision-bound inside it', () => {
       ],
       ACTOR
     );
-    const items = Effect.runSync(
-      Effect.orDie(Effect.map(decodeLegalPage(page, seat), (decoded) => decoded.page.items))
+    const items = yield* Effect.map(
+      decodeLegalPage(page, seat),
+      (decoded) => decoded.page.items
     );
     const [left, right] = items;
     if (left === undefined || right === undefined) throw new Error('no descriptors');
-    expect(Effect.runSync(Effect.orDie(actionSemantics(left)))).not.toBe(
-      Effect.runSync(Effect.orDie(actionSemantics(right)))
-    );
-  });
+    expect(yield* actionSemantics(left)).not.toBe(yield* actionSemantics(right));
+  }));
 });
 
 describe('json equality is CPython dict equality', () => {

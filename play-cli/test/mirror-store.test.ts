@@ -43,7 +43,7 @@ import {
 } from 'src/services/mirror';
 import { playerError } from 'src/errors';
 import { scratchWorkspace, type Scratch } from 'test/_fixtures';
-import { awaitTest, provideTestLayer } from 'test/_effect-test';
+import { awaitTest, effectTest, provideTestLayer } from 'test/_effect-test';
 import { path, withTestFileSystem } from 'test/_test-platform';
 
 const GAME_ID = 'game_12345678901234567890';
@@ -52,25 +52,30 @@ const UNIT_B = `unit_${'b'.repeat(32)}`;
 
 const scratches: Scratch[] = [];
 afterEach(() =>
-  Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup()))
+  Effect.runPromise(
+    Effect.forEach(scratches.splice(0), (scratch) => scratch.cleanup, { discard: true })
+  )
 );
 
 interface Mirror {
   readonly dir: string;
   readonly sessionPath: string;
-  readonly run: <A, E>(effect: Effect.Effect<A, E, PrivateFs>) => Either.Either<A, E>;
+  readonly run: <A, E>(
+    effect: Effect.Effect<A, E, PrivateFs>
+  ) => Effect.Effect<Either.Either<A, E>>;
 }
 
-const freshMirror = (): Mirror => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const sessionPath = path.join(scratch.workspace.stateRoot, GAME_ID, 'codex-test.json');
-  return {
-    dir: Effect.runSync(mirrorDir(sessionPath)),
-    sessionPath,
-    run: (effect) => Effect.runSync(Effect.either(provideTestLayer(effect, scratch.layer))),
-  };
-};
+const freshMirror = (): Effect.Effect<Mirror> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const sessionPath = path.join(scratch.workspace.stateRoot, GAME_ID, 'codex-test.json');
+    return {
+      dir: yield* Effect.orDie(mirrorDir(sessionPath)),
+      sessionPath,
+      run: (effect) => Effect.either(provideTestLayer(effect, scratch.layer)),
+    };
+  });
 
 const right = <A, E>(either: Either.Either<A, E>): A => {
   expect(Either.isLeft(either) ? either.left : 'ok').toBe('ok');
@@ -176,34 +181,34 @@ const localTestDate = (
 // ---------------------------------------------------------------------------
 
 describe('mirror_dir', () => {
-  test('the mirror is a sibling directory of the session file', () => {
-    expect(Effect.runSync(mirrorDir('/w/play/.sessions/game_x/codex-test.json'))).toBe(
+  effectTest('the mirror is a sibling directory of the session file', () => Effect.gen(function* () {
+    expect((yield* mirrorDir('/w/play/.sessions/game_x/codex-test.json'))).toBe(
       '/w/play/.sessions/game_x/codex-test'
     );
-  });
+  }));
 
-  test('a suffixless session never collides with its own mirror', () => {
-    expect(Effect.runSync(mirrorDir('/w/play/.sessions/game_x/codex-test'))).toBe(
+  effectTest('a suffixless session never collides with its own mirror', () => Effect.gen(function* () {
+    expect((yield* mirrorDir('/w/play/.sessions/game_x/codex-test'))).toBe(
       '/w/play/.sessions/game_x/codex-test-mirror'
     );
-  });
+  }));
 
-  test('only the last suffix is dropped', () => {
-    expect(Effect.runSync(mirrorDir('/w/x/a.b.c'))).toBe('/w/x/a.b');
-  });
+  effectTest('only the last suffix is dropped', () => Effect.gen(function* () {
+    expect((yield* mirrorDir('/w/x/a.b.c'))).toBe('/w/x/a.b');
+  }));
 
-  test('a trailing slash still names the session', () => {
-    expect(Effect.runSync(mirrorDir('/w/x/'))).toBe('/w/x-mirror');
-  });
+  effectTest('a trailing slash still names the session', () => Effect.gen(function* () {
+    expect((yield* mirrorDir('/w/x/'))).toBe('/w/x-mirror');
+  }));
 
-  test('a session path with no name is refused as a value, not a raise', () => {
+  effectTest('a session path with no name is refused as a value, not a raise', () => Effect.gen(function* () {
     // CPython lets `Path.with_name` raise `ValueError` here; the port keeps the
     // refusal but makes it a `PlayerError` in the error channel (NOTES.md, U04).
-    const either = Effect.runSync(Effect.either(mirrorDir('/')));
+    const either = (yield* Effect.either(mirrorDir('/')));
     expect(Either.isLeft(either) ? either.left.message : '').toBe(
       'state mirror: the session file name has no mirror directory'
     );
-  });
+  }));
 
   /**
    * `mirror_dir` is `Path.stem if Path.suffix else Path.name + "-mirror"`, and
@@ -215,7 +220,7 @@ describe('mirror_dir', () => {
    * `state` or `_cached_phase_note` would ever read.  Every row below was
    * produced by running `state_mirror.mirror_dir` under the installed CPython.
    */
-  test('every dotted basename resolves exactly as CPython 3.14 resolves it', () => {
+  effectTest('every dotted basename resolves exactly as CPython 3.14 resolves it', () => Effect.gen(function* () {
     const golden: ReadonlyArray<readonly [string, string]> = [
       ['/w/x/session.', '/w/x/session'],
       ['/w/x/a.', '/w/x/a'],
@@ -240,10 +245,10 @@ describe('mirror_dir', () => {
       ['//w/x/a.json', '//w/x/a'],
       ['///w/x/a.json', '/w/x/a'],
     ];
-    expect(golden.map(([input]) => [input, Effect.runSync(mirrorDir(input))])).toEqual(
-      golden.map(([input, expected]) => [input, expected])
-    );
-  });
+    const actual: Array<[string, string]> = [];
+    for (const [input] of golden) actual.push([input, yield* mirrorDir(input)]);
+    expect(actual).toEqual(golden.map(([input, expected]) => [input, expected]));
+  }));
 });
 
 describe('cells', () => {
@@ -396,22 +401,22 @@ describe('handles and aliases', () => {
 });
 
 describe('file names', () => {
-  test('an alias can never escape the options directory', () => {
-    expect(Effect.runSync(fileName('u1'))).toBe('u1');
-    expect(Effect.runSync(fileName('../../etc/passwd'))).toBe('etc_passwd');
-    expect(Effect.runSync(fileName('..--__a.b'))).toBe('a.b');
-  });
+  effectTest('an alias can never escape the options directory', () => Effect.gen(function* () {
+    expect((yield* fileName('u1'))).toBe('u1');
+    expect((yield* fileName('../../etc/passwd'))).toBe('etc_passwd');
+    expect((yield* fileName('..--__a.b'))).toBe('a.b');
+  }));
 
-  test('one astral character becomes one underscore, not two', () => {
-    expect(Effect.runSync(fileName('a\u{1F600}b'))).toBe('a_b');
-  });
+  effectTest('one astral character becomes one underscore, not two', () => Effect.gen(function* () {
+    expect((yield* fileName('a\u{1F600}b'))).toBe('a_b');
+  }));
 
-  test('an alias with no usable name is refused', () => {
-    const either = Effect.runSync(Effect.either(fileName('///')));
+  effectTest('an alias with no usable name is refused', () => Effect.gen(function* () {
+    const either = (yield* Effect.either(fileName('///')));
     expect(Either.isLeft(either) ? either.left.message : '').toBe(
       'state mirror: an actor alias has no usable file name'
     );
-  });
+  }));
 });
 
 describe('revisions', () => {
@@ -442,33 +447,33 @@ describe('revisions', () => {
     expect(isBehind({ turn: 3, revision: 12 }, { turn: 3, revision: 12 })).toBe(false);
   });
 
-  test('a payload without integer counters is refused', () => {
-    const either = Effect.runSync(Effect.either(revisionPair({ state_token: 'x' })));
+  effectTest('a payload without integer counters is refused', () => Effect.gen(function* () {
+    const either = (yield* Effect.either(revisionPair({ state_token: 'x' })));
     expect(Either.isLeft(either) ? either.left.message : '').toBe(
       'state mirror: payload carries no state revision counters'
     );
-  });
+  }));
 
-  test('a boolean is not an integer counter', () => {
+  effectTest('a boolean is not an integer counter', () => Effect.gen(function* () {
     expect(
-      Either.isLeft(Effect.runSync(Effect.either(revisionPair({ turn: true, revision: 9 }))))
+      Either.isLeft((yield* Effect.either(revisionPair({ turn: true, revision: 9 }))))
     ).toBe(true);
-  });
+  }));
 
-  test('a valid pair keeps turn and revision apart', () => {
+  effectTest('a valid pair keeps turn and revision apart', () => Effect.gen(function* () {
     expect(
-      Effect.runSync(revisionPair({ turn: 3, revision: 9, state_token: 'ignored' }))
+      (yield* revisionPair({ turn: 3, revision: 9, state_token: 'ignored' }))
     ).toEqual({ turn: 3, revision: 9 });
-  });
+  }));
 });
 
 // ---------------------------------------------------------------------------
 
 describe('update_from_health', () => {
   awaitTest('the header is byte-identical to CPython and stamps the page revision', function* () {
-    const { dir, run } = freshMirror();
+    const { dir, run } = yield* freshMirror();
     const written = right(
-      run(updateFromHealth(dir, 'turn', HEALTH, { revision: { turn: 3, revision: 9 } }))
+      yield* run(updateFromHealth(dir, 'turn', HEALTH, { revision: { turn: 3, revision: 9 } }))
     );
     expect(written.map((file) => path.relative(dir, file))).toEqual([
       path.join('state', 'header.txt'),
@@ -480,15 +485,15 @@ describe('update_from_health', () => {
   });
 
   awaitTest('a header without a known revision is marked unknown', function* () {
-    const { dir, run } = freshMirror();
-    right(run(updateFromHealth(dir, 'health', HEALTH)));
+    const { dir, run } = yield* freshMirror();
+    right(yield* run(updateFromHealth(dir, 'health', HEALTH)));
     expect((yield* readFile(dir, HEADER_FILE)).startsWith('# rev ? turn ?')).toBe(true);
   });
 
   awaitTest('the header reuses the newest revision the mirror holds', function* () {
-    const { dir, run } = freshMirror();
+    const { dir, run } = yield* freshMirror();
     right(
-      run(
+      yield* run(
         writeMirror(
           dir,
           OVERVIEW_FILE,
@@ -498,14 +503,14 @@ describe('update_from_health', () => {
         )
       )
     );
-    right(run(updateFromHealth(dir, 'health', HEALTH)));
+    right(yield* run(updateFromHealth(dir, 'health', HEALTH)));
     expect((yield* readFile(dir, HEADER_FILE)).startsWith('# rev 11 turn 3')).toBe(true);
   });
 
   awaitTest('the command card is caller supplied', function* () {
-    const { dir, run } = freshMirror();
+    const { dir, run } = yield* freshMirror();
     right(
-      run(
+      yield* run(
         updateFromHealth(dir, 'turn', HEALTH, {
           revision: { turn: 3, revision: 9 },
           commands: ['just turn --end --await', 'just options u1'],
@@ -519,8 +524,8 @@ describe('update_from_health', () => {
   });
 
   awaitTest('a drifted revision refuses the whole projection', function* () {
-    const { dir, run } = freshMirror();
-    const either = run(
+    const { dir, run } = yield* freshMirror();
+    const either = yield* run(
       updateFromHealth(dir, 'turn', HEALTH, { revision: { state_token: 'x' } })
     );
     expect(Either.isLeft(either) ? either.left.message : '').toBe(
@@ -603,42 +608,42 @@ describe('phase.json', () => {
     }
   });
 
-  test('read_phase_marker refuses a marker it cannot parse', () => {
-    const { dir, run } = freshMirror();
-    expect(right(run(readPhaseMarker(dir)))).toBe(null);
-    right(run(writeMirror(dir, PHASE_FILE, 'not json')));
-    expect(right(run(readPhaseMarker(dir)))).toBe(null);
-    right(run(writeMirror(dir, PHASE_FILE, '{"schema_version": 99}')));
-    expect(right(run(readPhaseMarker(dir)))).toBe(null);
-  });
+  effectTest('read_phase_marker refuses a marker it cannot parse', () => Effect.gen(function* () {
+    const { dir, run } = yield* freshMirror();
+    expect(right(yield* run(readPhaseMarker(dir)))).toBe(null);
+    right(yield* run(writeMirror(dir, PHASE_FILE, 'not json')));
+    expect(right(yield* run(readPhaseMarker(dir)))).toBe(null);
+    right(yield* run(writeMirror(dir, PHASE_FILE, '{"schema_version": 99}')));
+    expect(right(yield* run(readPhaseMarker(dir)))).toBe(null);
+  }));
 
-  test('the monitor announcement survives an unrelated health write', () => {
-    const { dir, run } = freshMirror();
-    right(run(updatePhaseMarker(dir, HEALTH, { announced: [1, 5, 0] })));
-    right(run(updateFromHealth(dir, 'health', HEALTH)));
-    expect(right(run(readPhaseMarker(dir)))?.['announced']).toEqual([1, 5, 0]);
-  });
+  effectTest('the monitor announcement survives an unrelated health write', () => Effect.gen(function* () {
+    const { dir, run } = yield* freshMirror();
+    right(yield* run(updatePhaseMarker(dir, HEALTH, { announced: [1, 5, 0] })));
+    right(yield* run(updateFromHealth(dir, 'health', HEALTH)));
+    expect(right(yield* run(readPhaseMarker(dir)))?.['announced']).toEqual([1, 5, 0]);
+  }));
 
-  test('update_phase_marker inherits the announcement it is not given', () => {
-    const { dir, run } = freshMirror();
-    right(run(updatePhaseMarker(dir, HEALTH, { announced: [1, 5, 0] })));
-    right(run(updatePhaseMarker(dir, HEALTH)));
-    expect(right(run(readPhaseMarker(dir)))?.['announced']).toEqual([1, 5, 0]);
-  });
+  effectTest('update_phase_marker inherits the announcement it is not given', () => Effect.gen(function* () {
+    const { dir, run } = yield* freshMirror();
+    right(yield* run(updatePhaseMarker(dir, HEALTH, { announced: [1, 5, 0] })));
+    right(yield* run(updatePhaseMarker(dir, HEALTH)));
+    expect(right(yield* run(readPhaseMarker(dir)))?.['announced']).toEqual([1, 5, 0]);
+  }));
 
   awaitTest('the monitor write touches no other projection', function* () {
-    const { dir, run } = freshMirror();
-    right(run(updatePhaseMarker(dir, HEALTH)));
+    const { dir, run } = yield* freshMirror();
+    right(yield* run(updatePhaseMarker(dir, HEALTH)));
     expect(yield* directoryEntries(path.join(dir, 'state'))).toEqual(['phase.json']);
   });
 });
 
 describe('monitor.log', () => {
   awaitTest('a line is stamped, sanitized, capped and appended', function* () {
-    const { dir, run } = freshMirror();
+    const { dir, run } = yield* freshMirror();
     const at = localTestDate(2026, 7, 7, 9, 5, 3);
-    right(run(appendMonitorLog(dir, 'turn 5 opened', at)));
-    right(run(appendMonitorLog(dir, `exec\nrm -rf /\t${'x'.repeat(600)}`, at)));
+    right(yield* run(appendMonitorLog(dir, 'turn 5 opened', at)));
+    right(yield* run(appendMonitorLog(dir, `exec\nrm -rf /\t${'x'.repeat(600)}`, at)));
     const lines = (yield* readFile(dir, ['state', 'monitor.log'])).split('\n').slice(0, -1);
     expect(lines[0]).toBe('2026-08-07T09:05:03 turn 5 opened');
     expect(lines[1]?.startsWith('2026-08-07T09:05:03 exec rm -rf / xxx')).toBe(true);
@@ -649,9 +654,9 @@ describe('monitor.log', () => {
   // Regression: `[:_MAX_LOG_LINE]` counts code points.  A UTF-16 slice split a
   // surrogate pair in half in every logged `--exec` string that carried one.
   awaitTest('the 512 cap counts code points and never splits a surrogate pair', function* () {
-    const { dir, run } = freshMirror();
+    const { dir, run } = yield* freshMirror();
     const at = localTestDate(2026, 7, 7, 9, 5, 3);
-    right(run(appendMonitorLog(dir, `${'z'.repeat(500)}${'\u{1F600}'.repeat(20)}`, at)));
+    right(yield* run(appendMonitorLog(dir, `${'z'.repeat(500)}${'\u{1F600}'.repeat(20)}`, at)));
     const line = (yield* readFile(dir, ['state', 'monitor.log'])).split('\n')[0] ?? '';
     const body = line.slice('2026-08-07T09:05:03 '.length);
     expect(body).toBe(`${'z'.repeat(500)}${'\u{1F600}'.repeat(12)}`);
@@ -665,56 +670,56 @@ describe('monitor.log', () => {
 });
 
 describe('the client bridge', () => {
-  test('mirror_text reads a projection and nothing else', () => {
-    const { dir, sessionPath, run } = freshMirror();
-    expect(right(run(mirrorText(sessionPath, HEADER_FILE)))).toBe(null);
-    right(run(updateFromHealth(dir, 'turn', HEALTH, { revision: { turn: 3, revision: 9 } })));
-    expect(right(run(mirrorText(sessionPath, HEADER_FILE)))?.startsWith('# rev 9 turn 3')).toBe(
+  effectTest('mirror_text reads a projection and nothing else', () => Effect.gen(function* () {
+    const { dir, sessionPath, run } = yield* freshMirror();
+    expect(right(yield* run(mirrorText(sessionPath, HEADER_FILE)))).toBe(null);
+    right(yield* run(updateFromHealth(dir, 'turn', HEALTH, { revision: { turn: 3, revision: 9 } })));
+    expect(right(yield* run(mirrorText(sessionPath, HEADER_FILE)))?.startsWith('# rev 9 turn 3')).toBe(
       true
     );
-  });
+  }));
 
-  test('cached_phase_note is silent while the phase is this seat\'s', () => {
-    const { dir, sessionPath, run } = freshMirror();
-    right(run(updateFromHealth(dir, 'turn', HEALTH, { revision: { turn: 3, revision: 9 } })));
-    expect(right(run(cachedPhaseNote(sessionPath)))).toBe('');
-  });
+  effectTest('cached_phase_note is silent while the phase is this seat\'s', () => Effect.gen(function* () {
+    const { dir, sessionPath, run } = yield* freshMirror();
+    right(yield* run(updateFromHealth(dir, 'turn', HEALTH, { revision: { turn: 3, revision: 9 } })));
+    expect(right(yield* run(cachedPhaseNote(sessionPath)))).toBe('');
+  }));
 
-  test('cached_phase_note names an inactive awaiting_agent phase', () => {
-    const { dir, sessionPath, run } = freshMirror();
+  effectTest('cached_phase_note names an inactive awaiting_agent phase', () => Effect.gen(function* () {
+    const { dir, sessionPath, run } = yield* freshMirror();
     const idle = { ...HEALTH, phase: { ...HEALTH.phase, active: false } };
-    right(run(updateFromHealth(dir, 'turn', idle, { revision: { turn: 3, revision: 9 } })));
-    expect(right(run(cachedPhaseNote(sessionPath)))).toBe(
+    right(yield* run(updateFromHealth(dir, 'turn', idle, { revision: { turn: 3, revision: 9 } })));
+    expect(right(yield* run(cachedPhaseNote(sessionPath)))).toBe(
       'your phase is not active (state awaiting_agent) — just wait'
     );
-  });
+  }));
 
-  test('cached_phase_note names every stalled phase state, active or not', () => {
-    const { dir, sessionPath, run } = freshMirror();
+  effectTest('cached_phase_note names every stalled phase state, active or not', () => Effect.gen(function* () {
+    const { dir, sessionPath, run } = yield* freshMirror();
     const ending = { ...HEALTH, phase: { ...HEALTH.phase, state: 'ending' } };
-    right(run(updateFromHealth(dir, 'turn', ending, { revision: { turn: 3, revision: 9 } })));
-    expect(right(run(cachedPhaseNote(sessionPath)))).toBe(
+    right(yield* run(updateFromHealth(dir, 'turn', ending, { revision: { turn: 3, revision: 9 } })));
+    expect(right(yield* run(cachedPhaseNote(sessionPath)))).toBe(
       'your phase is not active (state ending) — just wait'
     );
-  });
+  }));
 
-  test('cached_phase_note stays silent on the lobby, where the remedy is start', () => {
-    const { dir, sessionPath, run } = freshMirror();
+  effectTest('cached_phase_note stays silent on the lobby, where the remedy is start', () => Effect.gen(function* () {
+    const { dir, sessionPath, run } = yield* freshMirror();
     const lobby = { ...HEALTH, phase: { ...HEALTH.phase, state: 'synchronizing', active: false } };
-    right(run(updateFromHealth(dir, 'turn', lobby, { revision: { turn: 3, revision: 9 } })));
-    expect(right(run(cachedPhaseNote(sessionPath)))).toBe('');
-  });
+    right(yield* run(updateFromHealth(dir, 'turn', lobby, { revision: { turn: 3, revision: 9 } })));
+    expect(right(yield* run(cachedPhaseNote(sessionPath)))).toBe('');
+  }));
 
-  test('cached_phase_note is silent when there is no mirror at all', () => {
-    const { sessionPath, run } = freshMirror();
-    expect(right(run(cachedPhaseNote(sessionPath)))).toBe('');
-  });
+  effectTest('cached_phase_note is silent when there is no mirror at all', () => Effect.gen(function* () {
+    const { sessionPath, run } = yield* freshMirror();
+    expect(right(yield* run(cachedPhaseNote(sessionPath)))).toBe('');
+  }));
 
-  test('a projection failure never fails the command', () => {
-    const { run } = freshMirror();
+  effectTest('a projection failure never fails the command', () => Effect.gen(function* () {
+    const { run } = yield* freshMirror();
     expect(
-      Either.isRight(run(mirrorGuard(Effect.fail(playerError('state mirror: injected')))))
+      Either.isRight(yield* run(mirrorGuard(Effect.fail(playerError('state mirror: injected')))))
     ).toBe(true);
-    expect(Either.isRight(run(mirrorGuard(Effect.die(new Error('boom')))))).toBe(true);
-  });
+    expect(Either.isRight(yield* run(mirrorGuard(Effect.die(new Error('boom')))))).toBe(true);
+  }));
 });
