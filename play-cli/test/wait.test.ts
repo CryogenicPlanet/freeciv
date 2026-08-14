@@ -58,7 +58,7 @@ import {
   waitPayload,
   type Scratch,
 } from 'test/_fixtures';
-import { awaitTest, provideTestLayer } from 'test/_effect-test';
+import { awaitTest, effectTest, provideTestLayer } from 'test/_effect-test';
 import { leftValue, rightValue } from 'test/_expect';
 import { fileSystem, path } from 'test/_test-platform';
 
@@ -79,7 +79,9 @@ const completeFetch = (
 const scratches: Scratch[] = [];
 
 afterEach(() =>
-  Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup()))
+  Effect.runPromise(
+    Effect.asVoid(Effect.all(scratches.splice(0).map((scratch) => scratch.cleanup)))
+  )
 );
 
 /** The core placeholder for the U03 seam; alias behaviour is U03's to prove. */
@@ -96,15 +98,19 @@ interface Bench {
   readonly store: SessionStoreApi;
 }
 
-const bench = (): Bench => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const sessionPath = path.join(scratch.workspace.stateRoot, 'session-codex-gpt-5.6-sol.json');
-  Effect.runSync(scratch.files.writeJson(sessionPath, sessionFile()));
-  const store = sessionStoreFor(scratch.workspace, scratch.files, stateSchema, {});
-  const loaded = Effect.runSync(store.resolveV2(sessionPath));
-  return { scratch, sessionPath, session: loaded.session, store };
-};
+const bench = (): Effect.Effect<Bench> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const sessionPath = path.join(
+      scratch.workspace.stateRoot,
+      'session-codex-gpt-5.6-sol.json'
+    );
+    yield* scratch.files.writeJson(sessionPath, sessionFile());
+    const store = sessionStoreFor(scratch.workspace, scratch.files, stateSchema, {});
+    const loaded = yield* store.resolveV2(sessionPath);
+    return { scratch, sessionPath, session: loaded.session, store };
+  }).pipe(Effect.orDie);
 
 /**
  * `_holder_seat` (client.py:5350-5367).
@@ -183,8 +189,8 @@ const run = <A, E>(
   effect: Effect.Effect<A, E, V2Client | SessionStore>,
   fetchImpl: typeof fetch,
   store: SessionStoreApi
-): Promise<Either.Either<A, E>> =>
-  Effect.runPromise(Effect.either(provideTestLayer(effect, layers(fetchImpl, store))));
+): Effect.Effect<Either.Either<A, E>> =>
+  Effect.either(provideTestLayer(effect, layers(fetchImpl, store)));
 
 const right = <A, E>(either: Either.Either<A, E>): A => rightValue(either);
 
@@ -306,7 +312,7 @@ describe('waitArgs', () => {
 
 describe('waitValue', () => {
   awaitTest('uses the server actionable phase without ever fetching state', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const server = scripted(() => ({ body: waitPayload() }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: recorder().hooks });
     const wake = right(yield* wait(run(waitValue(ctx, waitArgs({})), server.fetch, seat.store)));
@@ -321,7 +327,7 @@ describe('waitValue', () => {
   });
 
   awaitTest('wait_s reaches the wire in CPython %g', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: recorder().hooks });
     for (const [given, encoded] of [
       [615, 'wait_s=615'],
@@ -337,7 +343,7 @@ describe('waitValue', () => {
 
   awaitTest('the ceiling covers a whole opponent phase and refuses one second more', function* (wait) {
     expect(V2_WAIT_S_MAX).toBe(615);
-    const seat = bench();
+    const seat = yield* bench();
     const server = scripted(() => ({ body: waitPayload() }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: recorder().hooks });
     expect(message(yield* wait(run(waitValue(ctx, waitArgs({ waitS: 616 })), server.fetch, seat.store)))).toBe(
@@ -350,7 +356,7 @@ describe('waitValue', () => {
   });
 
   awaitTest('poll-s is bounded too', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const server = scripted(() => ({ body: waitPayload() }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: recorder().hooks });
     expect(message(yield* wait(run(waitValue(ctx, waitArgs({ pollS: 0.04 })), server.fetch, seat.store)))).toBe(
@@ -362,7 +368,7 @@ describe('waitValue', () => {
   });
 
   awaitTest('--until takes exactly two values', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const server = scripted(() => ({ body: waitPayload() }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: recorder().hooks });
     expect(
@@ -371,7 +377,7 @@ describe('waitValue', () => {
   });
 
   awaitTest('--until revision without a validated state page is refused', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const server = scripted(() => ({ body: waitPayload() }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: recorder().hooks });
     expect(
@@ -380,7 +386,7 @@ describe('waitValue', () => {
   });
 
   awaitTest('a stateless wait is refused outside phase mode', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const server = scripted(() => ({ body: waitPayload() }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: recorder().hooks });
     expect(
@@ -395,7 +401,7 @@ describe('waitValue', () => {
   });
 
   awaitTest('a stateless wait never reads .v2-state', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const server = scripted(() => ({ body: waitPayload() }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: recorder().hooks });
     right(yield* wait(run(waitValue(ctx, waitArgs({}), { stateless: true }), server.fetch, seat.store)));
@@ -405,13 +411,11 @@ describe('waitValue', () => {
   });
 
   awaitTest('--until revision sends the cached baseline as after_state_token', function* (wait) {
-    const seat = bench();
-    Effect.runSync(
-      seat.store.writeState(seat.sessionPath, {
-        ...emptyV2ClientState(seat.session),
-        last_revision: { turn: 5, revision: 12, state_token: 'token_5_12' },
-      })
-    );
+    const seat = yield* bench();
+    yield* seat.store.writeState(seat.sessionPath, {
+      ...emptyV2ClientState(seat.session),
+      last_revision: { turn: 5, revision: 12, state_token: 'token_5_12' },
+    });
     const server = scripted(() => ({
       body: waitPayload({
         wake_reason: 'revision_changed',
@@ -428,7 +432,7 @@ describe('waitValue', () => {
   });
 
   awaitTest('a structured non-2xx refusal is raised, never downgraded to polling', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const server = scripted(() => ({
       status: 404,
       body: {
@@ -454,7 +458,7 @@ describe('the legacy fallback', () => {
   const missingRoute: Reply = { status: 404, body: { error: 'Not Found' } };
 
   awaitTest('a bare-string 404 downgrades to polling /health', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const server = scripted((url) =>
       url.includes('/me/wait?') ? missingRoute : { body: healthPayload() }
     );
@@ -466,7 +470,7 @@ describe('the legacy fallback', () => {
   });
 
   awaitTest('a terminal game answers game_terminal without waiting out the clock', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const server = scripted((url) =>
       url.includes('/me/wait?')
         ? missingRoute
@@ -479,7 +483,7 @@ describe('the legacy fallback', () => {
   });
 
   awaitTest('an inactive phase polls until the budget runs out, then times out', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const server = scripted((url) =>
       url.includes('/me/wait?') ? missingRoute : { body: pvpHealth({ mine: false }) }
     );
@@ -507,7 +511,7 @@ describe('the legacy fallback', () => {
   });
 
   awaitTest('revision mode fetches the overview page, remembers it and mirrors it', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const kit = recorder();
     const bumped = pagePayload([{ id: 'unit_0', name: 'Warriors' }], {
       state_revision: { turn: 5, revision: 13, state_token: 'token_5_13' },
@@ -542,9 +546,9 @@ describe('the legacy fallback', () => {
 // ---------------------------------------------------------------------------
 
 describe('localWaitResponse', () => {
-  test('carries this seat identity and nothing the server did not say', () => {
-    const seat = bench();
-    const health = Effect.runSync(decodeHealth(healthPayload(), seat.session));
+  effectTest('carries this seat identity and nothing the server did not say', () => Effect.gen(function* () {
+    const seat = yield* bench();
+    const health = yield* decodeHealth(healthPayload(), seat.session);
     expect(localWaitResponse(seat.session, 'timeout', health, null)).toEqual({
       schema_version: 2,
       control_protocol: 'full-control-v2',
@@ -554,7 +558,7 @@ describe('localWaitResponse', () => {
       health,
       state_revision: null,
     });
-  });
+  }));
 });
 
 // ---------------------------------------------------------------------------
@@ -562,31 +566,33 @@ describe('localWaitResponse', () => {
 // ---------------------------------------------------------------------------
 
 describe('holderRemainingS', () => {
-  const decodedHealth = (fixture: PvpHealthFixture): HealthEnvelope =>
-    Effect.runSync(decodeHealth(pvpHealth(fixture), bench().session));
+  const decodedHealth = (fixture: PvpHealthFixture): Effect.Effect<HealthEnvelope> =>
+    Effect.flatMap(bench(), (seat) => decodeHealth(pvpHealth(fixture), seat.session)).pipe(
+      Effect.orDie
+    );
 
-  test('names the deadline when exactly one other seat holds the phase', () => {
-    expect(holderRemainingS(decodedHealth({ mine: false, remainingS: 40 }), holderSeat)).toBe(40);
-  });
+  effectTest('names the deadline when exactly one other seat holds the phase', () => Effect.gen(function* () {
+    expect(holderRemainingS(yield* decodedHealth({ mine: false, remainingS: 40 }), holderSeat)).toBe(40);
+  }));
 
-  test('an active phase has no holder to name', () => {
-    expect(holderRemainingS(decodedHealth({ mine: true }), holderSeat)).toBeNull();
-  });
+  effectTest('an active phase has no holder to name', () => Effect.gen(function* () {
+    expect(holderRemainingS(yield* decodedHealth({ mine: true }), holderSeat)).toBeNull();
+  }));
 
-  test('a seat waiting on itself is not a holder', () => {
+  effectTest('a seat waiting on itself is not a holder', () => Effect.gen(function* () {
     expect(
-      holderRemainingS(decodedHealth({ mine: false, selfHeld: true }), holderSeat)
+      holderRemainingS(yield* decodedHealth({ mine: false, selfHeld: true }), holderSeat)
     ).toBeNull();
-  });
+  }));
 
-  test('a spent deadline is zero and an absent one is unknown', () => {
+  effectTest('a spent deadline is zero and an absent one is unknown', () => Effect.gen(function* () {
     // A negative `remaining_s` never survives `_validate_health`, so the
     // `max(0, …)` floor is defensive; zero is the value a pinned holder sends.
-    expect(holderRemainingS(decodedHealth({ mine: false, remainingS: 0 }), holderSeat)).toBe(0);
+    expect(holderRemainingS(yield* decodedHealth({ mine: false, remainingS: 0 }), holderSeat)).toBe(0);
     expect(
-      holderRemainingS(decodedHealth({ mine: false, remainingS: null }), holderSeat)
+      holderRemainingS(yield* decodedHealth({ mine: false, remainingS: null }), holderSeat)
     ).toBeNull();
-  });
+  }));
 });
 
 // ---------------------------------------------------------------------------
@@ -644,7 +650,7 @@ describe('waitUntilTurn', () => {
     // for the whole waitS budget, so no tick line ever printed before the
     // wake.  Interactive composites now poll at V2_WAIT_TICK_S from the
     // first request.
-    const seat = bench();
+    const seat = yield* bench();
     const kit = recorder();
     const fake = clocked((elapsed) =>
       pvpWake(elapsed >= 45 ? 'phase_active' : 'timeout', {
@@ -668,7 +674,7 @@ describe('waitUntilTurn', () => {
   });
 
   awaitTest('a silent await still spends its budget on one long first poll', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const kit = recorder();
     const fake = clocked(() => pvpWake('phase_active', { mine: true }));
     right(
@@ -684,7 +690,7 @@ describe('waitUntilTurn', () => {
   });
 
   awaitTest('is bounded by the holder deadline plus exactly one grace window', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const kit = recorder();
     const fake = clocked((elapsed) =>
       pvpWake('timeout', {
@@ -715,7 +721,7 @@ describe('waitUntilTurn', () => {
   });
 
   awaitTest('the marker is refreshed on every tick, before the transcript line', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const kit = recorder();
     const fake = clocked((elapsed) =>
       pvpWake(elapsed >= 45 ? 'phase_active' : 'timeout', {
@@ -752,7 +758,7 @@ describe('waitUntilTurn', () => {
   });
 
   awaitTest('returns the moment the phase is genuinely ours', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const kit = recorder();
     const fake = clocked((elapsed) =>
       pvpWake(elapsed >= 30 ? 'phase_active' : 'timeout', {
@@ -772,7 +778,7 @@ describe('waitUntilTurn', () => {
   });
 
   awaitTest('a cap is a hard ceiling over the holder deadline', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const kit = recorder();
     const fake = clocked((elapsed) =>
       pvpWake('timeout', { mine: false, remainingS: Math.max(0, 600 - elapsed) })
@@ -789,7 +795,7 @@ describe('waitUntilTurn', () => {
   });
 
   awaitTest('without --for-turn the first poll is the caller own --wait-s', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const kit = recorder();
     // A holder whose deadline has already run out: the loop continues only
     // while the server names a seat that still has time left.
@@ -808,7 +814,7 @@ describe('waitUntilTurn', () => {
   });
 
   awaitTest('without --for-turn and no holder named, one poll and out', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const kit = recorder();
     // No `waiting_on`: the server named nobody, so a single-seat game behaves
     // exactly as it always did.
@@ -825,7 +831,7 @@ describe('waitUntilTurn', () => {
   });
 
   awaitTest('the mirror override replaces the default marker write', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const kit = recorder();
     const own: HealthEnvelope[] = [];
     const fake = clocked(() => pvpWake('phase_active', { mine: true }));
@@ -853,7 +859,7 @@ describe('waitUntilTurn', () => {
 
 describe('waitCommandValue', () => {
   awaitTest('--max without --for-turn is refused rather than ignored', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const kit = recorder();
     const server = scripted(() => ({ body: waitPayload() }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: kit.hooks });
@@ -864,7 +870,7 @@ describe('waitCommandValue', () => {
   });
 
   awaitTest('--max is bounded by the same ceiling the wait is', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const kit = recorder();
     const server = scripted(() => ({ body: waitPayload() }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: kit.hooks });
@@ -880,7 +886,7 @@ describe('waitCommandValue', () => {
   });
 
   awaitTest('a plain wait makes exactly one request and never loops', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const kit = recorder();
     const server = scripted(() => ({ body: pvpWake('timeout', { mine: false }) }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: kit.hooks });
@@ -897,28 +903,32 @@ describe('waitCommandValue', () => {
 // _seat_rebound
 // ---------------------------------------------------------------------------
 
-const reboundOf = (seat: Bench): Promise<boolean> =>
-  Effect.runPromise(provideTestLayer(seatRebound(seat.sessionPath), Layer.succeed(SessionStore, seat.store)));
+const reboundOf = (seat: Bench): Effect.Effect<boolean> =>
+  provideTestLayer(
+    seatRebound(seat.sessionPath),
+    Layer.succeed(SessionStore, seat.store)
+  );
 
 describe('seatRebound', () => {
-  awaitTest('is false when no current session can be resolved at all', function* (wait) {
-    expect(yield* wait(reboundOf(bench()))).toBe(false);
+  awaitTest('is false when no current session can be resolved at all', function* () {
+    expect(yield* reboundOf(yield* bench())).toBe(false);
   });
 
-  awaitTest('is false while the workspace still points at this seat', function* (wait) {
-    const seat = bench();
-    Effect.runSync(seat.store.setCurrentSession(seat.sessionPath));
-    expect(yield* wait(reboundOf(seat))).toBe(false);
+  awaitTest('is false while the workspace still points at this seat', function* () {
+    const seat = yield* bench();
+    yield* seat.store.setCurrentSession(seat.sessionPath);
+    expect(yield* reboundOf(seat)).toBe(false);
   });
 
-  awaitTest('is true once `use` has pointed the workspace at another seat', function* (wait) {
-    const seat = bench();
+  awaitTest('is true once `use` has pointed the workspace at another seat', function* () {
+    const seat = yield* bench();
     const other = path.join(seat.scratch.workspace.stateRoot, 'session-other-harness.json');
-    Effect.runSync(
-      seat.scratch.files.writeJson(other, sessionFile({ controller_label: 'other-harness' }))
+    yield* seat.scratch.files.writeJson(
+      other,
+      sessionFile({ controller_label: 'other-harness' })
     );
-    Effect.runSync(seat.store.setCurrentSession(other));
-    expect(yield* wait(reboundOf(seat))).toBe(true);
+    yield* seat.store.setCurrentSession(other);
+    expect(yield* reboundOf(seat)).toBe(true);
   });
 });
 
@@ -930,8 +940,8 @@ const decodedWake = (payload: JsonObject, session: Session): WaitEnvelope =>
   Effect.runSync(decodeWait(payload, session, { until: 'phase', afterStateToken: null }));
 
 describe('the wait renderers', () => {
-  test('a timeout names the holder instead of calling itself a wake', () => {
-    const seat = bench();
+  effectTest('a timeout names the holder instead of calling itself a wake', () => Effect.gen(function* () {
+    const seat = yield* bench();
     const wake = decodedWake(pvpWake('timeout', { mine: false }), seat.session);
     const line = awaitLine(wake);
     expect(line).toContain('still seat 2 AgentPlace2 (pi-gpt-5.6-sol)');
@@ -941,53 +951,53 @@ describe('the wait renderers', () => {
     expect(line).not.toContain('next: just turn');
     expect(line).toContain('just wait --for-turn');
     expect(line).toContain('[exit 75]');
-  });
+  }));
 
-  test('an actionable wake keeps the plain briefing tail', () => {
-    const seat = bench();
+  effectTest('an actionable wake keeps the plain briefing tail', () => Effect.gen(function* () {
+    const seat = yield* bench();
     const wake = decodedWake(pvpWake('phase_active', { mine: true }), seat.session);
     const line = awaitLine(wake);
     expect(line.startsWith('T3 | ')).toBe(true);
     expect(line).toContain('next: just turn');
     expect(line).not.toContain('woke phase_active');
-  });
+  }));
 
-  test('a non-phase_active wake on our own phase says which wake it was', () => {
-    const seat = bench();
+  effectTest('a non-phase_active wake on our own phase says which wake it was', () => Effect.gen(function* () {
+    const seat = yield* bench();
     const wake = decodedWake(pvpWake('boundary_recovered', { mine: true }), seat.session);
     expect(awaitLine(wake)).toContain('woke boundary_recovered');
-  });
+  }));
 
-  test('an empty follow drops the tail entirely, on both branches', () => {
-    const seat = bench();
+  effectTest('an empty follow drops the tail entirely, on both branches', () => Effect.gen(function* () {
+    const seat = yield* bench();
     const mine = decodedWake(pvpWake('phase_active', { mine: true }), seat.session);
     const theirs = decodedWake(pvpWake('timeout', { mine: false }), seat.session);
     expect(awaitLine(mine, '')).not.toContain('next:');
     expect(awaitLine(theirs, '')).not.toContain('next:');
-  });
+  }));
 
-  test('the tick line names the seat, how long it has held and what is left', () => {
-    const seat = bench();
+  effectTest('the tick line names the seat, how long it has held and what is left', () => Effect.gen(function* () {
+    const seat = yield* bench();
     const wake = decodedWake(pvpWake('timeout', { mine: false }), seat.session);
     const line = waitingTickLine(wake.health);
     expect(line.startsWith('… waiting on ')).toBe(true);
     expect(line).toContain('seat 2 AgentPlace2 (pi-gpt-5.6-sol)');
     expect(line).toContain('held 13s');
     expect(line).toContain('9m47s left');
-  });
+  }));
 
-  test('with nobody named, the tick line says only that the phase is shut', () => {
-    const seat = bench();
+  effectTest('with nobody named, the tick line says only that the phase is shut', () => Effect.gen(function* () {
+    const seat = yield* bench();
     const wake = decodedWake(pvpWake('timeout', { mine: true }), seat.session);
     expect(waitingTickLine(wake.health)).toBe("… waiting for this seat's phase to open");
-  });
+  }));
 
-  test('renderWait is the await header over the health block', () => {
-    const seat = bench();
+  effectTest('renderWait is the await header over the health block', () => Effect.gen(function* () {
+    const seat = yield* bench();
     const wake = decodedWake(pvpWake('phase_active', { mine: true }), seat.session);
     expect(renderWait(wake)).toEqual([
       awaitLine(wake),
       ...renderHealth(wake.health),
     ]);
-  });
+  }));
 });

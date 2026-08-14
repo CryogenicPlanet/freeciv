@@ -110,7 +110,9 @@ const OPENAPI_PATH = path.resolve(
 const scratches: Scratch[] = [];
 
 afterEach(() =>
-  Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup()))
+  Effect.runPromise(
+    Effect.asVoid(Effect.all(scratches.splice(0).map((scratch) => scratch.cleanup)))
+  )
 );
 
 const stateSchema = {
@@ -127,15 +129,19 @@ interface Bench {
   readonly files: PrivateFsApi;
 }
 
-const bench = (): Bench => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const sessionPath = path.join(scratch.workspace.stateRoot, 'session-codex-gpt-5.6-sol.json');
-  Effect.runSync(scratch.files.writeJson(sessionPath, sessionFile()));
-  const store = sessionStoreFor(scratch.workspace, scratch.files, stateSchema, {});
-  const loaded = Effect.runSync(store.resolveV2(sessionPath));
-  return { scratch, sessionPath, session: loaded.session, store, files: scratch.files };
-};
+const bench = (): Effect.Effect<Bench> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const sessionPath = path.join(
+      scratch.workspace.stateRoot,
+      'session-codex-gpt-5.6-sol.json'
+    );
+    yield* scratch.files.writeJson(sessionPath, sessionFile());
+    const store = sessionStoreFor(scratch.workspace, scratch.files, stateSchema, {});
+    const loaded = yield* store.resolveV2(sessionPath);
+    return { scratch, sessionPath, session: loaded.session, store, files: scratch.files };
+  }).pipe(Effect.orDie);
 
 /** `_holder_seat`; U06 owns the real one, the engine takes it as a hook. */
 const holderSeat: HolderSeatFn = (phase) => {
@@ -308,7 +314,7 @@ describe('boundary_recovered', () => {
     // the phase end had applied, which is the one moment a client must not be
     // telling the agent it does not understand the server.
     expect(V2_WAKE_REASONS.has('boundary_recovered')).toBe(true);
-    const seat = bench();
+    const seat = yield* bench();
     const wake = yield* decodedWake(pvpWake('boundary_recovered', { mine: true }), seat.session);
     expect(wake.wake_reason).toBe('boundary_recovered');
     expect(waitExitCode(wake)).toBe(V2_WAIT_EXIT_ACTIVE);
@@ -337,7 +343,7 @@ describe('the exit status', () => {
 
   for (const [reason, fixture, code] of CASES) {
     awaitTest(`a real ${reason} wake exits ${code}`, function* (wait) {
-      const seat = bench();
+      const seat = yield* bench();
       const kit = recorder();
       const server = answering(pvpWake(reason, fixture));
       const ctx = waitCtx({
@@ -351,7 +357,7 @@ describe('the exit status', () => {
   }
 
   awaitTest('a lobby timeout is EX_TEMPFAIL, not success, and calls no state route', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const kit = recorder();
     const server = answering(
       waitPayload({
@@ -388,7 +394,7 @@ describe('the exit status', () => {
   });
 
   awaitTest('a terminal game stops the loop with EX_NOINPUT', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const kit = recorder();
     const server = answering(pvpWake('game_terminal', { mine: false, gameState: 'completed' }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: kit.hooks });
@@ -397,7 +403,7 @@ describe('the exit status', () => {
   });
 
   awaitTest('the JSON payload is unchanged by the exit status', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const kit = recorder();
     const payload = pvpWake('timeout', { mine: false });
     const server = answering(payload);
@@ -447,7 +453,7 @@ const clocked = (script: (elapsed: number) => JsonValue): Clocked => {
 describe('the wait ceiling', () => {
   awaitTest('covers a whole opponent phase', function* (wait) {
     expect(V2_WAIT_S_MAX).toBe(615);
-    const seat = bench();
+    const seat = yield* bench();
     const kit = recorder();
     const server = answering(pvpWake('phase_active', { mine: true }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: kit.hooks });
@@ -461,7 +467,7 @@ describe('the wait ceiling', () => {
 
 describe('--for-turn', () => {
   awaitTest('is bounded by the holder remaining deadline', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const kit = recorder();
     const fake = clocked((elapsed) =>
       pvpWake('timeout', {
@@ -496,7 +502,7 @@ describe('--for-turn', () => {
   });
 
   awaitTest('returns the moment the phase is ours', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const kit = recorder();
     const fake = clocked((elapsed) =>
       pvpWake(elapsed >= 30 ? 'phase_active' : 'timeout', {
@@ -518,7 +524,7 @@ describe('--for-turn', () => {
   });
 
   awaitTest('--max is a hard ceiling over the holder deadline', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const kit = recorder();
     const fake = clocked((elapsed) =>
       pvpWake('timeout', { mine: false, remainingS: Math.max(0, 600 - elapsed) })
@@ -543,7 +549,7 @@ describe('--for-turn', () => {
   });
 
   awaitTest('--max without --for-turn is refused rather than ignored', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const kit = recorder();
     const server = answering(pvpWake('phase_active', { mine: true }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: kit.hooks });
@@ -555,7 +561,7 @@ describe('--for-turn', () => {
   });
 
   awaitTest('a plain wait still makes exactly one request', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const kit = recorder();
     const server = answering(pvpWake('timeout', { mine: false }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: kit.hooks });
@@ -571,7 +577,7 @@ describe('--for-turn', () => {
 
 describe('the phase marker', () => {
   awaitTest('is written on every tick of a wait, not once at the end', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const kit = recorder();
     const fake = clocked((elapsed) =>
       pvpWake(elapsed >= 45 ? 'phase_active' : 'timeout', {
@@ -609,7 +615,7 @@ describe('the phase marker', () => {
 
 describe('the rendered wake', () => {
   awaitTest('a timeout wake names the holder instead of calling it a wake', function* () {
-    const seat = bench();
+    const seat = yield* bench();
     const wake = yield* decodedWake(pvpWake('timeout', { mine: false }), seat.session);
     const lines = renderWait(wake);
     expect(lines[0]).toContain('still seat 2 AgentPlace2 (pi-gpt-5.6-sol)');
@@ -623,7 +629,7 @@ describe('the rendered wake', () => {
   });
 
   awaitTest('text is the default and nothing raw leaks into it', function* () {
-    const seat = bench();
+    const seat = yield* bench();
     const wake = yield* decodedWake(pvpWake('phase_active', { mine: true }), seat.session);
     const text = renderWait(wake).join('\n');
     expect(text.startsWith('{')).toBe(false);
@@ -712,7 +718,7 @@ describe('play wait', () => {
 
   for (const [reason, fixture, code] of CASES) {
     awaitTest(`exits ${reason} → ${code} on a real wake`, function* (wait) {
-      const seat = bench();
+      const seat = yield* bench();
       const kit = recorder();
       const result = yield* wait(runWaitCommand(seat, kit, answering(pvpWake(reason, fixture)).fetch, []));
       expect(result.code).toBe(code);
@@ -720,7 +726,7 @@ describe('play wait', () => {
   }
 
   awaitTest('prints compact text and keeps JSON behind the flag', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const payload = pvpWake('phase_active', { mine: true });
 
     const text = yield* wait(runWaitCommand(seat, recorder(), answering(payload).fetch, []));
@@ -737,7 +743,7 @@ describe('play wait', () => {
   });
 
   awaitTest('the JSON payload is unchanged by the exit status', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const payload = pvpWake('timeout', { mine: false });
     const json = yield* wait(runWaitCommand(seat, recorder(), answering(payload).fetch, ['--json']));
     expect(json.code).toBe(V2_WAIT_EXIT_RETRY);
@@ -745,7 +751,7 @@ describe('play wait', () => {
   });
 
   awaitTest('a --for-turn tick is prose on stdout, and the wake follows it', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const result = yield* wait(runWaitCommand(seat, recorder(), oneTickThenOurs(), ['--for-turn']));
     expect(result.code).toBe(V2_WAIT_EXIT_ACTIVE);
     expect(result.out[0]).toContain('… waiting on seat 2 AgentPlace2 (pi-gpt-5.6-sol)');
@@ -753,7 +759,7 @@ describe('play wait', () => {
   });
 
   awaitTest('--json prints one object and no tick prose', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const result = yield* wait(runWaitCommand(seat, recorder(), oneTickThenOurs(), ['--json', '--for-turn']));
     expect(result.code).toBe(V2_WAIT_EXIT_ACTIVE);
     expect(result.out.join('\n')).not.toContain('… waiting');
@@ -761,7 +767,7 @@ describe('play wait', () => {
   });
 
   awaitTest('both spellings of --wait-s are accepted, and never together', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const payload = pvpWake('phase_active', { mine: true });
     for (const spelling of ['--wait-s', '--wait_s']) {
       const server = answering(payload);
@@ -779,7 +785,7 @@ describe('play wait', () => {
   });
 
   awaitTest('--max without --for-turn refuses instead of ignoring the flag', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const server = answering(pvpWake('phase_active', { mine: true }));
     const result = yield* wait(runWaitCommand(seat, recorder(), server.fetch, ['--max', '30']));
     expect(result.code).toBe(2);
@@ -862,7 +868,7 @@ const legacyRevisionServer = (overview: JsonObject): LegacyRevisionServer => {
  */
 describe('liveWaitHooks', () => {
   awaitTest('mirrorHealth writes the full protocol card into state/header.txt', function* () {
-    const seat = bench();
+    const seat = yield* bench();
     const health = yield* decodeHealth(pvpHealth({ mine: true }), seat.session);
     const hooks = yield* provideTestLayer(
       liveWaitHooks(seat.sessionPath, seat.session),
@@ -881,7 +887,7 @@ describe('liveWaitHooks', () => {
   });
 
   awaitTest('a --for-turn wait leaves a header a later `show header` can still read', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const result = yield* wait(runCommandWith(seat, liveWaitHooks, oneTickThenOurs(), ['--for-turn']));
     expect(result.code).toBe(V2_WAIT_EXIT_ACTIVE);
     // Two ticks wrote the header; the last write must still carry the card.
@@ -893,7 +899,7 @@ describe('liveWaitHooks', () => {
   });
 
   awaitTest('the marker file is refreshed on the way through, not only at the wake', function* (wait) {
-    const seat = bench();
+    const seat = yield* bench();
     const result = yield* wait(runCommandWith(seat, liveWaitHooks, oneTickThenOurs(), ['--for-turn']));
     expect(result.code).toBe(V2_WAIT_EXIT_ACTIVE);
     const dir = yield* mirrorDir(seat.sessionPath);
@@ -904,13 +910,11 @@ describe('liveWaitHooks', () => {
   });
 
   awaitTest('the legacy --until revision fallback projects the page it woke on', function* (wait) {
-    const seat = bench();
-    Effect.runSync(
-      seat.store.writeState(seat.sessionPath, {
-        ...emptyV2ClientState(seat.session),
-        last_revision: { turn: 5, revision: 12, state_token: 'token_5_12' },
-      })
-    );
+    const seat = yield* bench();
+    yield* seat.store.writeState(seat.sessionPath, {
+      ...emptyV2ClientState(seat.session),
+      last_revision: { turn: 5, revision: 12, state_token: 'token_5_12' },
+    });
     const server = legacyRevisionServer(OVERVIEW_PAGE);
     const result = yield* wait(runCommandWith(seat, liveWaitHooks, server.fetch, ['--until', 'revision']));
 
@@ -931,13 +935,11 @@ describe('liveWaitHooks', () => {
   });
 
   awaitTest('the projection uses the aliases this seat just learned from the page', function* (wait) {
-    const seat = bench();
-    Effect.runSync(
-      seat.store.writeState(seat.sessionPath, {
-        ...emptyV2ClientState(seat.session),
-        last_revision: { turn: 5, revision: 12, state_token: 'token_5_12' },
-      })
-    );
+    const seat = yield* bench();
+    yield* seat.store.writeState(seat.sessionPath, {
+      ...emptyV2ClientState(seat.session),
+      last_revision: { turn: 5, revision: 12, state_token: 'token_5_12' },
+    });
     const result = yield* wait(
       runCommandWith(
         seat,
@@ -950,7 +952,7 @@ describe('liveWaitHooks', () => {
     // `_remember_page` runs before `_mirror_page` and CPython passes
     // `_alias_map(cached)` — the state the ingestion just folded the page into.
     // Reading it back must therefore see the wake's own revision.
-    const state = Effect.runSync(seat.store.readState(seat.sessionPath, seat.session));
+    const state = yield* seat.store.readState(seat.sessionPath, seat.session);
     expect(state.last_revision?.state_token).toBe('token_5_13');
   });
 });

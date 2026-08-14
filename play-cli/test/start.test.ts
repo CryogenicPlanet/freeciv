@@ -17,7 +17,7 @@
  * is mandatory — is asserted for real rather than stubbed away.
  */
 import { afterEach, describe, expect } from 'bun:test';
-import { Effect, Either, Layer, Schema } from 'effect';
+import { Effect, Either, Layer, Ref, Schema } from 'effect';
 import { FULL_CONTROL_V2 } from 'src/constants';
 import { playerError, type PlayError } from 'src/errors';
 import type { ExitCodeSignal } from 'src/exit';
@@ -47,7 +47,9 @@ import { path, withTestFileSystem } from 'test/_test-platform';
 const scratches: Scratch[] = [];
 
 afterEach(() =>
-  Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup()))
+  Effect.runPromise(
+    Effect.asVoid(Effect.all(scratches.splice(0).map((scratch) => scratch.cleanup)))
+  )
 );
 
 // ---------------------------------------------------------------------------
@@ -345,72 +347,76 @@ const hooksFor = (
   client: V2ClientApi,
   session: Session,
   choose: (items: ReadonlyArray<PregameItem>) => PregameItem
-): StartHooks => {
-  const credentials: V2Credentials = credentialsOf(session);
-  let cached: ReadonlyArray<JsonObject> = [];
-  let issued = 0;
-  const persisted = new Map<string, JsonObject>();
-  const drain = Effect.gen(function* () {
-    const page = yield* client.get(credentials, '/legal-actions');
-    cached = objectsAt(page);
+): Effect.Effect<StartHooks> =>
+  Effect.gen(function* () {
+    const credentials: V2Credentials = credentialsOf(session);
+    const cached = yield* Ref.make<ReadonlyArray<JsonObject>>([]);
+    const issued = yield* Ref.make(0);
+    const persisted = yield* Ref.make<ReadonlyMap<string, JsonObject>>(new Map());
+    const drain = Effect.gen(function* () {
+      const page = yield* client.get(credentials, '/legal-actions');
+      yield* Ref.set(cached, objectsAt(page));
+    });
+    const cachedOf = (kind: string): Effect.Effect<JsonObject | null> =>
+      Effect.map(Ref.get(cached), (descriptors) => {
+        const matches = descriptors.filter((descriptor) => descriptor['kind'] === kind);
+        return matches.length === 1 ? (matches[0] ?? null) : null;
+      });
+    return {
+      mirrorPage: () => Effect.void,
+      choose,
+      receiptOk: orderReceiptOk,
+      drainLegal: () => drain,
+      resolveKindAction: (kind, remedy) =>
+        Effect.gen(function* () {
+          if ((yield* cachedOf(kind)) === null) yield* drain;
+          const found = yield* cachedOf(kind);
+          if (found === null) {
+            return yield* playerError(
+              `no ${kind} action is enumerable for this seat right now; ${remedy}`
+            );
+          }
+          return asAction(found);
+        }),
+      persistBatchForAction: (actionId, argumentValues) =>
+        Effect.gen(function* () {
+          const issuedCount = yield* Ref.updateAndGet(issued, (count) => count + 1);
+          const batchId = `batch_${String(issuedCount).padStart(24, '0')}`;
+          const descriptors = yield* Ref.get(cached);
+          const descriptor = descriptors.find((entry) => entry['action_id'] === actionId);
+          const body: JsonObject = {
+            schema_version: 2,
+            control_protocol: FULL_CONTROL_V2,
+            game_id: credentials.gameId,
+            agent_id: FIXTURE_AGENT_ID,
+            batch_id: batchId,
+            state_revision: (descriptor?.['state_revision'] ?? null),
+            commands: [{ action_id: actionId, arguments: argumentValues }],
+          };
+          yield* Ref.update(persisted, (batches) => new Map(batches).set(batchId, body));
+          return batchId;
+        }),
+      submitPersistedBatch: (batchId) =>
+        Effect.gen(function* () {
+          const body = (yield* Ref.get(persisted)).get(batchId);
+          if (body === undefined) {
+            return yield* Effect.die(new Error(`no persisted batch ${batchId}`));
+          }
+          const wire = yield* client.post(credentials, '/batches', body);
+          return {
+            disposition: yield* batchDisposition(session, batchId, 'receipt_terminal', {
+              receipt: wire,
+            }),
+            warning: null,
+            exitCode: 0,
+          };
+        }),
+      renderDisposition: (disposition, intent) =>
+        Effect.succeed([
+          `${intent} → ${disposition.receipt?.receipt_state ?? 'unknown'} rev5/t0`,
+        ]),
+    };
   });
-  const cachedOf = (kind: string): JsonObject | null => {
-    const matches = cached.filter((descriptor) => descriptor['kind'] === kind);
-    return matches.length === 1 ? (matches[0] ?? null) : null;
-  };
-  return {
-    mirrorPage: () => Effect.void,
-    choose,
-    receiptOk: orderReceiptOk,
-    drainLegal: () => drain,
-    resolveKindAction: (kind, remedy) =>
-      Effect.gen(function* () {
-        if (cachedOf(kind) === null) yield* drain;
-        const found = cachedOf(kind);
-        if (found === null) {
-          return yield* playerError(
-            `no ${kind} action is enumerable for this seat right now; ${remedy}`
-          );
-        }
-        return asAction(found);
-      }),
-    persistBatchForAction: (actionId, argumentValues) =>
-      Effect.sync(() => {
-        issued += 1;
-        const batchId = `batch_${String(issued).padStart(24, '0')}`;
-        const descriptor = cached.find((entry) => entry['action_id'] === actionId);
-        persisted.set(batchId, {
-          schema_version: 2,
-          control_protocol: FULL_CONTROL_V2,
-          game_id: credentials.gameId,
-          agent_id: FIXTURE_AGENT_ID,
-          batch_id: batchId,
-          state_revision: (descriptor?.['state_revision'] ?? null),
-          commands: [{ action_id: actionId, arguments: argumentValues }],
-        });
-        return batchId;
-      }),
-    submitPersistedBatch: (batchId) =>
-      Effect.gen(function* () {
-        const body = persisted.get(batchId);
-        if (body === undefined) {
-          return yield* Effect.die(new Error(`no persisted batch ${batchId}`));
-        }
-        const wire = yield* client.post(credentials, '/batches', body);
-        return {
-          disposition: yield* batchDisposition(session, batchId, 'receipt_terminal', {
-            receipt: wire,
-          }),
-          warning: null,
-          exitCode: 0,
-        };
-      }),
-    renderDisposition: (disposition, intent) =>
-      Effect.succeed([
-        `${intent} → ${disposition.receipt?.receipt_state ?? 'unknown'} rev5/t0`,
-      ]),
-  };
-};
 
 // ---------------------------------------------------------------------------
 // The fixture
@@ -428,35 +434,38 @@ const fixture = (
     readonly controller?: string;
     readonly choose?: (items: ReadonlyArray<PregameItem>) => PregameItem;
   } = {}
-): Fixture => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'codex-test.json');
-  Effect.runSync(
-    scratch.files.writeJson(
+): Effect.Effect<Fixture> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const sessionPath = path.join(
+      scratch.workspace.stateRoot,
+      FIXTURE_GAME_ID,
+      'codex-test.json'
+    );
+    yield* scratch.files.writeJson(
       sessionPath,
       sessionFile({ controller_label: options.controller ?? CONTROLLER })
-    )
-  );
-  const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
-  const client = v2ClientFor(httpFor(recorded.fetch), () => Effect.void);
-  const choose =
-    options.choose ??
-    ((items: ReadonlyArray<PregameItem>): PregameItem => {
-      const first = items[0];
-      if (first === undefined) throw new Error('the draw must not happen');
-      return first;
-    });
-  return {
-    sessionPath,
-    layer: Layer.mergeAll(
-      Layer.succeed(SessionStore, store),
-      Layer.succeed(V2Client, client),
-      Layer.succeed(PrivateFs, scratch.files)
-    ),
-    hooks: (_sessionPath, session) => Effect.succeed(hooksFor(client, session, choose)),
-  };
-};
+    );
+    const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
+    const client = v2ClientFor(httpFor(recorded.fetch), () => Effect.void);
+    const choose =
+      options.choose ??
+      ((items: ReadonlyArray<PregameItem>): PregameItem => {
+        const first = items[0];
+        if (first === undefined) throw new Error('the draw must not happen');
+        return first;
+      });
+    return {
+      sessionPath,
+      layer: Layer.mergeAll(
+        Layer.succeed(SessionStore, store),
+        Layer.succeed(V2Client, client),
+        Layer.succeed(PrivateFs, scratch.files)
+      ),
+      hooks: (_sessionPath: string, session: Session) => hooksFor(client, session, choose),
+    };
+  }).pipe(Effect.orDie);
 
 const startOptions = (sessionPath: string, overrides: Partial<StartOptions> = {}): StartOptions => ({
   session: sessionPath,
@@ -554,7 +563,7 @@ const startJsonSchema = Schema.parseJson(
 describe('play start', () => {
   awaitTest('names resolve, then configure, then RE-ENUMERATE, then ready', function* () {
     const recorded = startResponder();
-    const fix = fixture(recorded);
+    const fix = yield* fixture(recorded);
     const lines = yield* run(fix, { nation: 'eNgLiSh', leader: 'Ada', female: true });
 
     // Lobby check, catalog, enumerate, configure, re-enumerate, ready: the
@@ -594,7 +603,7 @@ describe('play start', () => {
     // pregame_style_unknown.  One fresh re-read wins; unrelated refusals
     // must not retry.
     const recorded = startResponder({ staleConfigures: 1 });
-    const fix = fixture(recorded);
+    const fix = yield* fixture(recorded);
     const lines = yield* run(fix, { nation: 'English', leader: 'Ada', female: true });
 
     // Two configure submissions, with a fresh nations+styles read between.
@@ -618,7 +627,7 @@ describe('play start', () => {
 
   awaitTest('three stale configures exhaust the retry budget and stop', function* () {
     const recorded = startResponder({ staleConfigures: 99 });
-    const fix = fixture(recorded);
+    const fix = yield* fixture(recorded);
     const lines = yield* run(fix, { nation: 'English', leader: 'Ada', female: true });
     expect(recorded.steps.filter((step) => step === 'batch')).toHaveLength(3);
     expect(lines.some((line) => line.includes('attempt 3 of 3'))).toBe(true);
@@ -627,7 +636,7 @@ describe('play start', () => {
   });
 
   awaitTest('a nation that is not on the catalog is refused by name', function* () {
-    const fix = fixture(startResponder());
+    const fix = yield* fixture(startResponder());
     const message = yield* refuse(fix, { nation: 'Atlantean', leader: 'Ada', male: true });
     expect(message).toContain("no nation named 'Atlantean'");
     expect(message).toContain('English');
@@ -636,7 +645,7 @@ describe('play start', () => {
   awaitTest('an opaque id is not a name: the catalog is matched on the display name only', function* () {
     // CPython's `_pregame_choice` compares `item["name"]` and nothing else, so
     // `--nation nation_aaa…` is an unknown *name*.  See NOTES.md §U18.
-    const fix = fixture(startResponder());
+    const fix = yield* fixture(startResponder());
     const message = yield* refuse(fix, { nation: NATION_ENGLISH, leader: 'Ada', male: true });
     expect(message).toBe(
       `no nation named '${NATION_ENGLISH}' is offered; try one of: English Zulu`
@@ -645,7 +654,7 @@ describe('play start', () => {
 
   awaitTest('sex is optional but exclusive, and the refusal precedes the first request', function* () {
     const recorded = startResponder();
-    const fix = fixture(recorded);
+    const fix = yield* fixture(recorded);
     const message = yield* refuse(fix, {
       nation: 'English',
       leader: 'Ada',
@@ -659,7 +668,7 @@ describe('play start', () => {
   awaitTest('with no arguments it resolves every choice itself', function* () {
     const recorded = startResponder();
     const drawn: ReadonlyArray<string>[] = [];
-    const fix = fixture(recorded, {
+    const fix = yield* fixture(recorded, {
       choose: (items) => {
         drawn.push(items.map((entry) => entry.name));
         const last = items[items.length - 1];
@@ -697,7 +706,7 @@ describe('play start', () => {
 
   awaitTest('each flag overrides exactly what it names and nothing else', function* () {
     const recorded = startResponder();
-    const fix = fixture(recorded, {
+    const fix = yield* fixture(recorded, {
       choose: () => {
         throw new Error('a named nation must never draw');
       },
@@ -716,7 +725,7 @@ describe('play start', () => {
 
   awaitTest('a named style is resolved against its own catalog and printed by name', function* () {
     const recorded = startResponder();
-    const fix = fixture(recorded);
+    const fix = yield* fixture(recorded);
     const lines = yield* run(fix, {
       nation: 'English',
       leader: 'Ada',
@@ -734,14 +743,14 @@ describe('play start', () => {
   });
 
   awaitTest('an unknown style is refused with its own catalog quoted back', function* () {
-    const fix = fixture(startResponder());
+    const fix = yield* fixture(startResponder());
     const message = yield* refuse(fix, { nation: 'English', style: 'Martian', male: true });
     expect(message).toBe("no style named 'Martian' is offered; try one of: European");
   });
 
   awaitTest('an unusable controller label falls back to the leader the lobby holds', function* () {
     const recorded = startResponder({ leader: 'Boudica', sex: 'male', controller: '***' });
-    const fix = fixture(recorded, { controller: '***' });
+    const fix = yield* fixture(recorded, { controller: '***' });
     yield* run(fix);
     expect(argumentsOf(recorded.bodies[0] ?? {})).toMatchObject({
       leader_name: 'Boudica',
@@ -755,7 +764,7 @@ describe('play start', () => {
       // The lobby volunteers no usable sex, so the fallback is a pure function
       // of the resolved leader name.
       const recorded = startResponder({ sex: 'unspecified' });
-      const fix = fixture(recorded);
+      const fix = yield* fixture(recorded);
       yield* run(fix);
       const values = argumentsOf(recorded.bodies[0] ?? {});
       chosen.push(isJsonObject(values) ? values['is_male'] : null);
@@ -767,7 +776,7 @@ describe('play start', () => {
 
   awaitTest('a lobby that offers no nation fails closed before any batch', function* () {
     const recorded = startResponder({ nations: [] });
-    const fix = fixture(recorded);
+    const fix = yield* fixture(recorded);
     const message = yield* refuse(fix);
     expect(message).toContain('just state --section pregame_nations');
     expect(recorded.steps).not.toContain('batch');
@@ -775,7 +784,7 @@ describe('play start', () => {
 
   awaitTest('a game that has already left the lobby is told so, and told what to run', function* () {
     const recorded = startResponder({ gameState: 'running' });
-    const fix = fixture(recorded);
+    const fix = yield* fixture(recorded);
     const message = yield* refuse(fix, { nation: 'English', leader: 'Ada', male: true });
     expect(message).toBe(
       'just start configures a lobby seat; this game is running -- run `just turn`'
@@ -785,7 +794,7 @@ describe('play start', () => {
 
   awaitTest('--leader is bounded by the byte budget, not the character count', function* () {
     const recorded = startResponder();
-    const fix = fixture(recorded);
+    const fix = yield* fixture(recorded);
     const message = yield* refuse(fix, { leader: 'é'.repeat(24) });
     expect(message).toBe('--leader must be at most 47 UTF-8 bytes');
     expect(recorded.steps).toEqual([]);
@@ -793,7 +802,7 @@ describe('play start', () => {
 
   awaitTest('--json prints the composite payload and no prose', function* () {
     const recorded = startResponder();
-    const fix = fixture(recorded);
+    const fix = yield* fixture(recorded);
     const out = yield* run(fix, { nation: 'English', leader: 'Ada', female: true, json: true });
     expect(out).toHaveLength(1);
     const payload = Schema.decodeUnknownSync(startJsonSchema)(out[0] ?? '');
@@ -819,7 +828,7 @@ describe('play start', () => {
    */
   awaitTest('the shipped hooks configure and ready the seat, re-enumerating between', function* () {
     const recorded = startResponder();
-    const fix = fixture(recorded);
+    const fix = yield* fixture(recorded);
     const captured = yield* captureEffect(
       Effect.either(
         provideTestLayer(
@@ -865,7 +874,7 @@ describe('play start', () => {
   awaitTest('each enumeration carries the remedy that unblocks exactly its own failure', function* () {
     const recorded = startResponder();
     const remedies: string[] = [];
-    const fix = withHooks(fixture(recorded), (hooks) => ({
+    const fix = withHooks(yield* fixture(recorded), (hooks) => ({
       ...hooks,
       resolveKindAction: (kind, remedy) => {
         remedies.push(remedy);
@@ -883,7 +892,7 @@ describe('play start', () => {
 
   awaitTest('an unproven configure is never readied, and its status leaves quietly', function* () {
     const recorded = startResponder();
-    const fix = withHooks(fixture(recorded), (hooks, session) => ({
+    const fix = withHooks(yield* fixture(recorded), (hooks, session) => ({
       ...hooks,
       submitPersistedBatch: (batchId) =>
         Effect.map(batchDisposition(session, batchId, 'receipt_first'), (disposition) => ({
@@ -921,10 +930,10 @@ describe('play start', () => {
    * (tests/test_client.py:7194-7254).
    */
   awaitTest("start's health probe writes the full protocol card into state/header.txt", function* () {
-    const fix = fixture(startResponder());
+    const fix = yield* fixture(startResponder());
     yield* run(fix, { nation: 'English', leader: 'Ada', male: true });
 
-    const dir = Effect.runSync(mirrorDir(fix.sessionPath));
+    const dir = yield* mirrorDir(fix.sessionPath);
     yield* withTestFileSystem((files) =>
       Effect.gen(function* () {
         const header = yield* files.readFileString(path.join(dir, 'state', 'header.txt'));

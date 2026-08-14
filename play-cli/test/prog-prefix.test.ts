@@ -9,42 +9,49 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect } from 'effect';
 import { PROG_ENV, resolveProg, rewriteProgMentions } from 'src/services/prog-prefix';
 import { writeMirror } from 'src/services/mirror/store';
-import { scratchWorkspace } from 'test/_fixtures';
-import { provideTestLayer } from 'test/_effect-test';
+import { scratchWorkspace, type Scratch } from 'test/_fixtures';
+import { effectTest, provideTestLayer } from 'test/_effect-test';
 import { path } from 'test/_test-platform';
 
-const scratches: Array<ReturnType<typeof scratchWorkspace>> = [];
+const scratches: Scratch[] = [];
 
-afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
+afterEach(() =>
+  Effect.runPromise(
+    Effect.asVoid(Effect.all(scratches.splice(0).map((scratch) => scratch.cleanup)))
+  )
+);
 
-const withProg = <A>(value: string | undefined, body: () => A): A => {
-  const previous = Bun.env[PROG_ENV];
-  if (value === undefined) {
-    delete Bun.env[PROG_ENV];
-  } else {
-    Bun.env[PROG_ENV] = value;
-  }
-  try {
-    return body();
-  } finally {
-    if (previous === undefined) {
+const setProg = (value: string | undefined): Effect.Effect<void> =>
+  Effect.sync(() => {
+    if (value === undefined) {
       delete Bun.env[PROG_ENV];
     } else {
-      Bun.env[PROG_ENV] = previous;
+      Bun.env[PROG_ENV] = value;
     }
-  }
-};
+  });
+
+const withProg = <A, E, R>(
+  value: string | undefined,
+  body: Effect.Effect<A, E, R>
+): Effect.Effect<A, E, R> =>
+  Effect.acquireUseRelease(
+    Effect.flatMap(Effect.sync(() => Bun.env[PROG_ENV]), (previous) =>
+      Effect.as(setProg(value), previous)
+    ),
+    () => body,
+    setProg
+  );
 
 describe('resolveProg', () => {
-  test('defaults to ./play when unset', () => {
-    withProg(undefined, () => expect(resolveProg()).toBe('./play'));
-  });
-  test('defaults to ./play when blank', () => {
-    withProg('  ', () => expect(resolveProg()).toBe('./play'));
-  });
-  test('honours an explicit spelling', () => {
-    withProg('just', () => expect(resolveProg()).toBe('just'));
-  });
+  effectTest('defaults to ./play when unset', () =>
+    withProg(undefined, Effect.sync(() => expect(resolveProg()).toBe('./play')))
+  );
+  effectTest('defaults to ./play when blank', () =>
+    withProg('  ', Effect.sync(() => expect(resolveProg()).toBe('./play')))
+  );
+  effectTest('honours an explicit spelling', () =>
+    withProg('just', Effect.sync(() => expect(resolveProg()).toBe('just')))
+  );
 });
 
 describe('rewriteProgMentions', () => {
@@ -86,39 +93,50 @@ describe('rewriteProgMentions', () => {
     expect(rewriteProgMentions('just --list', './play')).toBe('just --list');
   });
 
-  test('reads PLAY_PROG per call', () => {
-    withProg('./play', () => {
-      expect(rewriteProgMentions('next: just wait')).toBe('next: ./play wait');
-    });
-    withProg('just', () => {
-      expect(rewriteProgMentions('next: just wait')).toBe('next: just wait');
-    });
-  });
+  effectTest('reads PLAY_PROG per call', () =>
+    Effect.gen(function* () {
+      yield* withProg(
+        './play',
+        Effect.sync(() =>
+          expect(rewriteProgMentions('next: just wait')).toBe('next: ./play wait')
+        )
+      );
+      yield* withProg(
+        'just',
+        Effect.sync(() =>
+          expect(rewriteProgMentions('next: just wait')).toBe('next: just wait')
+        )
+      );
+    })
+  );
 });
 
 describe('writeMirror', () => {
-  const mirrorThrough = (prog: string): string => {
-    const scratch = scratchWorkspace();
-    scratches.push(scratch);
-    return withProg(prog, () => {
-      Effect.runSync(
-        provideTestLayer(
-          writeMirror(scratch.workspace.stateRoot, ['header.txt'], 'NOT YOUR TURN — next: just wait'),
-          scratch.layer
-        )
-      );
-      return Effect.runSync(
-        Effect.orDie(
-          scratch.files.readText(path.join(scratch.workspace.stateRoot, 'header.txt'), 'mirror')
-        )
+  const mirrorThrough = (prog: string): Effect.Effect<string> =>
+    Effect.gen(function* () {
+      const scratch = yield* scratchWorkspace();
+      scratches.push(scratch);
+      return yield* withProg(
+        prog,
+        Effect.gen(function* () {
+          yield* provideTestLayer(
+            writeMirror(scratch.workspace.stateRoot, ['header.txt'], 'NOT YOUR TURN — next: just wait'),
+            scratch.layer
+          );
+          return yield* scratch.files.readText(
+            path.join(scratch.workspace.stateRoot, 'header.txt'),
+            'mirror'
+          );
+        }).pipe(Effect.orDie)
       );
     });
-  };
 
-  test('spells guidance per PLAY_PROG', () => {
-    expect(mirrorThrough('./play')).toBe('NOT YOUR TURN — next: ./play wait\n');
-    expect(mirrorThrough('just')).toBe('NOT YOUR TURN — next: just wait\n');
-  });
+  effectTest('spells guidance per PLAY_PROG', () =>
+    Effect.gen(function* () {
+      expect(yield* mirrorThrough('./play')).toBe('NOT YOUR TURN — next: ./play wait\n');
+      expect(yield* mirrorThrough('just')).toBe('NOT YOUR TURN — next: just wait\n');
+    })
+  );
 });
 
 const spawnHelp = (env: Readonly<Record<string, string | undefined>>): string => {

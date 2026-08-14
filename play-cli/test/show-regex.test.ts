@@ -24,13 +24,14 @@
  */
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect, Either, Layer } from 'effect';
-import { runShow } from 'src/commands/show.cmd';
+import { runShow, type ShowOptions } from 'src/commands/show.cmd';
 import { PY_IGNORECASE, compilePythonRegex } from 'src/render/show-regex';
 import { casefold } from 'src/render/show-unicode';
 import { v2StateSchema } from 'src/services/aliases';
 import { type PrivateFs } from 'src/services/private-fs';
 import { SessionStore, sessionStoreFor } from 'src/services/session-store';
 import { FIXTURE_AGENT_ID, FIXTURE_GAME_ID, scratchWorkspace, sessionFile, type Scratch } from 'test/_fixtures';
+import { captureEffect } from 'test/_capture';
 import { awaitTest, provideTestLayer } from 'test/_effect-test';
 import { path } from 'test/_test-platform';
 
@@ -362,7 +363,11 @@ const GOLDEN = {
 // ---------------------------------------------------------------------------
 
 const scratches: Scratch[] = [];
-afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
+afterEach(() =>
+  Effect.runPromise(
+    Effect.asVoid(Effect.all(scratches.splice(0).map((scratch) => scratch.cleanup)))
+  )
+);
 
 const clientState = {
   schema_version: 5,
@@ -384,49 +389,55 @@ interface Seat {
   readonly layer: Layer.Layer<SessionStore | PrivateFs>;
 }
 
-const seat = (): Seat => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const home = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID);
-  const sessionPath = path.join(home, 'codex-test.json');
-  Effect.runSync(scratch.files.writeJson(sessionPath, sessionFile()));
-  Effect.runSync(scratch.files.writeJson(path.join(home, 'codex-test.v2-state'), clientState));
-  const mirror = path.join(home, 'codex-test');
-  for (const [relative, text] of MIRROR) {
-    Effect.runSync(scratch.files.writeText(path.join(mirror, relative), text));
-  }
-  const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
-  return {
-    sessionPath,
-    layer: Layer.merge(scratch.layer, Layer.succeed(SessionStore, store)),
-  };
-};
+const seat = (): Effect.Effect<Seat> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const home = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID);
+    const sessionPath = path.join(home, 'codex-test.json');
+    yield* scratch.files.writeJson(sessionPath, sessionFile());
+    yield* scratch.files.writeJson(path.join(home, 'codex-test.v2-state'), clientState);
+    const mirror = path.join(home, 'codex-test');
+    for (const [relative, text] of MIRROR) {
+      yield* scratch.files.writeText(path.join(mirror, relative), text);
+    }
+    const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
+    return {
+      sessionPath,
+      layer: Layer.merge(scratch.layer, Layer.succeed(SessionStore, store)),
+    };
+  }).pipe(Effect.orDie);
 
 /** `show` with the argv CPython was given, back as the three streams it wrote. */
-const show = (args: ReadonlyArray<string>): Effect.Effect<Omit<Golden, 'args'>> => {
-  const fixture = seat();
-  const options = { session: fixture.sessionPath, name: '', grep: '', regex: false, yields: false, json: false };
-  for (let index = 0; index < args.length; index += 1) {
-    const argument = args[index];
-    if (argument === '--grep') options.grep = args[index + 1] ?? '';
-    else if (argument === '--regex') options.regex = true;
-    else if (argument === '--json') options.json = true;
-    else if (argument !== options.grep) options.name = argument ?? '';
-  }
-  const written: string[] = [];
-  const original = console.log;
-  console.log = (...parts: ReadonlyArray<unknown>) => written.push(parts.map(String).join(' '));
-  return Effect.either(provideTestLayer(runShow(options), fixture.layer)).pipe(
-    Effect.map((result) => ({
+const show = (args: ReadonlyArray<string>): Effect.Effect<Omit<Golden, 'args'>> =>
+  Effect.gen(function* () {
+    const fixture = yield* seat();
+    const options = args.reduce<ShowOptions>(
+      (parsed, argument, index) => {
+        if (argument === '--grep') return { ...parsed, grep: args[index + 1] ?? '' };
+        if (argument === '--regex') return { ...parsed, regex: true };
+        if (argument === '--json') return { ...parsed, json: true };
+        if (argument !== parsed.grep) return { ...parsed, name: argument };
+        return parsed;
+      },
+      {
+        session: fixture.sessionPath,
+        name: '',
+        grep: '',
+        regex: false,
+        yields: false,
+        json: false,
+      }
+    );
+    const { value: result, captured } = yield* captureEffect(
+      Effect.either(provideTestLayer(runShow(options), fixture.layer))
+    );
+    return {
       code: Either.isLeft(result) ? 2 : 0,
-      stdout: written.length > 0 ? `${written.join('\n')}\n` : '',
+      stdout: captured.out.length > 0 ? `${captured.out.join('\n')}\n` : '',
       stderr: Either.isLeft(result) ? `error: ${result.left.message}\n` : '',
-    })),
-    Effect.ensuring(Effect.sync(() => {
-      console.log = original;
-    }))
-  );
-};
+    };
+  });
 
 describe('show --grep against CPython', () => {
   for (const [name, golden] of Object.entries(GOLDEN)) {

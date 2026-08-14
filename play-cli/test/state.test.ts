@@ -42,7 +42,9 @@ import { path, withTestFileSystem } from 'test/_test-platform';
 
 const scratches: Scratch[] = [];
 afterEach(() =>
-  Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup()))
+  Effect.runPromise(
+    Effect.asVoid(Effect.all(scratches.splice(0).map((scratch) => scratch.cleanup)))
+  )
 );
 
 // ---------------------------------------------------------------------------
@@ -251,25 +253,26 @@ interface Fixture {
 
 type Plan = ReadonlyMap<string, FakeRoute> | ReadonlyArray<FakeRoute>;
 
-const fixture = (routes: Plan): Fixture => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const target = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'seat.json');
-  Effect.runSync(scratch.files.writeJson(target, sessionFile()));
-  const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
-  const recorder = recordingFetch(routes);
-  const requests = recorder.requests;
-  const client = v2ClientFor(httpFor(recorder.fetch), () => Effect.void);
-  return {
-    layer: Layer.mergeAll(
-      Layer.succeed(SessionStore, store),
-      Layer.succeed(V2Client, client),
-      Layer.succeed(PrivateFs, scratch.files)
-    ),
-    requests,
-    mirrorDir: path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'seat'),
-  };
-};
+const fixture = (routes: Plan): Effect.Effect<Fixture> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const target = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'seat.json');
+    yield* scratch.files.writeJson(target, sessionFile());
+    const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
+    const recorder = recordingFetch(routes);
+    const requests = recorder.requests;
+    const client = v2ClientFor(httpFor(recorder.fetch), () => Effect.void);
+    return {
+      layer: Layer.mergeAll(
+        Layer.succeed(SessionStore, store),
+        Layer.succeed(V2Client, client),
+        Layer.succeed(PrivateFs, scratch.files)
+      ),
+      requests,
+      mirrorDir: path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'seat'),
+    };
+  }).pipe(Effect.orDie);
 
 const capture = <E>(
   effect: Effect.Effect<void, E, SessionStore | V2Client | PrivateFs>,
@@ -339,7 +342,7 @@ const BUILD_CHOICES: ReadonlyArray<JsonObject> = [
 
 describe('play state', () => {
   awaitTest('the section and limit ride the query string, and the page renders', function* () {
-    const active = fixture(
+    const active = yield* fixture(
       new Map([
         [
           '/state',
@@ -379,7 +382,7 @@ describe('play state', () => {
 
   awaitTest('a relation alias is learned here and named on the clause command', function* () {
     const relation = `relation_${'d'.repeat(32)}`;
-    const active = fixture(
+    const active = yield* fixture(
       new Map([
         [
           '/state',
@@ -419,7 +422,7 @@ describe('play state', () => {
   });
 
   awaitTest('--json prints the validated envelope, not the rendered text', function* () {
-    const active = fixture(
+    const active = yield* fixture(
       new Map([['/state', { body: sectionPage('chat', [{ id: 'chat_1', sender: 'Ada' }]) }]])
     );
     const lines = yield* capture(
@@ -433,7 +436,7 @@ describe('play state', () => {
   });
 
   awaitTest('a --cursor request carries only the cursor', function* () {
-    const active = fixture(
+    const active = yield* fixture(
       new Map([['/state', { body: sectionPage('units', []) }]])
     );
     yield* capture(runState(stateOptions({ cursor: CURSOR })), active);
@@ -442,7 +445,7 @@ describe('play state', () => {
   });
 
   awaitTest('a refused query never opens a socket', function* () {
-    const active = fixture(new Map([['/state', { body: sectionPage('units', []) }]]));
+    const active = yield* fixture(new Map([['/state', { body: sectionPage('units', []) }]]));
     const outcome = yield* Effect.either(
       provideTestLayer(runState(stateOptions({ section: 'city_detail' })), active.layer)
     );
@@ -451,7 +454,7 @@ describe('play state', () => {
   });
 
   awaitTest('an expired cursor is re-raised, and the staged catalog it named is dropped', function* () {
-    const active = fixture(
+    const active = yield* fixture(
       new Map([
         [
           '/state',
@@ -479,7 +482,7 @@ describe('play state', () => {
   });
 
   awaitTest('a non-cursor refusal is raised untouched', function* () {
-    const active = fixture(
+    const active = yield* fixture(
       new Map([['/state', { status: 400, body: errorPayload() }]])
     );
     const outcome = yield* Effect.either(
@@ -492,7 +495,7 @@ describe('play state', () => {
   });
 
   awaitTest('an entity alias is expanded before the query is built', function* () {
-    const active = fixture([
+    const active = yield* fixture([
       { body: sectionPage('cities', [{ id: CITY, name: 'London', x: 1, y: 1, size: 1 }]) },
       { body: sectionPage('city_detail', []) },
     ]);
@@ -512,7 +515,7 @@ describe('play state', () => {
   });
 
   awaitTest('an alias that names nothing is refused before the request', function* () {
-    const active = fixture(new Map([['/state', { body: sectionPage('units', []) }]]));
+    const active = yield* fixture(new Map([['/state', { body: sectionPage('units', []) }]]));
     const outcome = yield* Effect.either(
       provideTestLayer(
         runState(
@@ -529,7 +532,7 @@ describe('play state', () => {
   });
 
   awaitTest('the fetched page is projected into the mirror, not only rendered', function* () {
-    const active = fixture(
+    const active = yield* fixture(
       new Map([['/state', { body: sectionPage('cities', [LONDON]) }]])
     );
     yield* capture(runState(stateOptions({ section: 'cities' })), active);
@@ -544,7 +547,7 @@ describe('play state', () => {
   });
 
   awaitTest('the forfeit `state` alone can derive: cities first, then build choices', function* () {
-    const active = fixture([
+    const active = yield* fixture([
       { body: sectionPage('cities', [LONDON]) },
       { body: sectionPage('city_build_choices', BUILD_CHOICES) },
     ]);
@@ -571,7 +574,7 @@ describe('play state', () => {
 
   awaitTest('a city_citizens page prices the tiles the yields overlay reads back', function* () {
     const tile = `tile_${'7'.repeat(32)}`;
-    const active = fixture(
+    const active = yield* fixture(
       new Map([
         [
           '/state',
@@ -612,7 +615,7 @@ describe('play state', () => {
   });
 
   awaitTest('--json still projects the page it printed', function* () {
-    const active = fixture(
+    const active = yield* fixture(
       new Map([['/state', { body: sectionPage('cities', [LONDON]) }]])
     );
     yield* capture(runState(stateOptions({ section: 'cities', json: true })), active);
@@ -626,7 +629,7 @@ describe('play state', () => {
   });
 
   awaitTest('both spellings of one flag at once is a refusal, not a coin toss', function* () {
-    const active = fixture(new Map([['/state', { body: sectionPage('units', []) }]]));
+    const active = yield* fixture(new Map([['/state', { body: sectionPage('units', []) }]]));
     const outcome = yield* Effect.either(
       provideTestLayer(
         runState(

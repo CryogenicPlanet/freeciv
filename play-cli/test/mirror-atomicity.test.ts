@@ -28,24 +28,33 @@ const SECRET = 'v2-agent-secret-bearer-token';
 
 const scratches: Scratch[] = [];
 
-afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
+afterEach(() =>
+  Effect.runPromise(
+    Effect.asVoid(Effect.all(scratches.splice(0).map((scratch) => scratch.cleanup)))
+  )
+);
 
 interface Mirror {
   readonly dir: string;
-  readonly run: <A, E>(effect: Effect.Effect<A, E, PrivateFs>) => Either.Either<A, E>;
+  readonly run: <A, E>(
+    effect: Effect.Effect<A, E, PrivateFs>
+  ) => Effect.Effect<Either.Either<A, E>>;
 }
 
-const freshMirror = (): Mirror => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const sessionPath = path.join(scratch.workspace.stateRoot, GAME_ID, 'codex-test.json');
-  const dir = Effect.runSync(mirrorDir(sessionPath));
-  return {
-    dir,
-    run: (effect) => Effect.runSync(Effect.either(provideTestLayer(effect, scratch.layer))),
-  };
-};
-
+const freshMirror = (): Effect.Effect<Mirror> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const sessionPath = path.join(scratch.workspace.stateRoot, GAME_ID, 'codex-test.json');
+    const dir = yield* mirrorDir(sessionPath);
+    return {
+      dir,
+      run: <A, E>(
+        effect: Effect.Effect<A, E, PrivateFs>
+      ): Effect.Effect<Either.Either<A, E>> =>
+        Effect.either(provideTestLayer(effect, scratch.layer)),
+    };
+  }).pipe(Effect.orDie);
 
 const REVISION = { turn: 3, revision: 9 } as const;
 
@@ -58,16 +67,22 @@ describe('atomicity', () => {
   effectTest('a failed write leaves the previous file and no partial', () =>
     withTestFileSystem((files) =>
       Effect.gen(function* () {
-        const { dir, run } = freshMirror();
+        const { dir, run } = yield* freshMirror();
         const target = path.join(dir, 'state', 'units.tsv');
-        expect(Either.isRight(run(writeMirror(dir, ['state', 'units.tsv'], unitsTable('3/3'))))).toBe(true);
+        expect(
+          Either.isRight(
+            yield* run(writeMirror(dir, ['state', 'units.tsv'], unitsTable('3/3')))
+          )
+        ).toBe(true);
         const before = yield* files.readFileString(target);
         yield* files.chmod(path.dirname(target), 0o500);
-        const failed = run(writeMirror(dir, ['state', 'units.tsv'], unitsTable('1/3')));
+        const failed = yield* run(writeMirror(dir, ['state', 'units.tsv'], unitsTable('1/3')));
         yield* files.chmod(path.dirname(target), 0o700);
         expect(Either.isLeft(failed)).toBe(true);
         expect(yield* files.readFileString(target)).toBe(before);
-        expect((yield* files.readDirectory(path.dirname(target))).filter((name) => name.startsWith('.'))).toEqual([]);
+        expect(
+          (yield* files.readDirectory(path.dirname(target))).filter((name) => name.startsWith('.'))
+        ).toEqual([]);
       }).pipe(Effect.orDie)
     )
   );
@@ -75,11 +90,11 @@ describe('atomicity', () => {
   effectTest('a failed first write creates no file at all', () =>
     withTestFileSystem((files) =>
       Effect.gen(function* () {
-        const { dir, run } = freshMirror();
+        const { dir, run } = yield* freshMirror();
         const state = path.join(dir, 'state');
         yield* files.makeDirectory(state, { recursive: true, mode: 0o700 });
         yield* files.chmod(state, 0o500);
-        const failed = run(writeMirror(dir, ['state', 'cities.tsv'], unitsTable('3/3')));
+        const failed = yield* run(writeMirror(dir, ['state', 'cities.tsv'], unitsTable('3/3')));
         yield* files.chmod(state, 0o700);
         expect(Either.isLeft(failed)).toBe(true);
         expect(yield* files.exists(path.join(state, 'cities.tsv'))).toBe(false);
@@ -91,11 +106,11 @@ describe('atomicity', () => {
   effectTest('the failure is a state-mirror PlayerError, never a thrown exception', () =>
     withTestFileSystem((files) =>
       Effect.gen(function* () {
-        const { dir, run } = freshMirror();
+        const { dir, run } = yield* freshMirror();
         const state = path.join(dir, 'state');
         yield* files.makeDirectory(state, { recursive: true, mode: 0o700 });
         yield* files.chmod(state, 0o500);
-        const failed = run(writeMirror(dir, ['state', 'units.tsv'], unitsTable('3/3')));
+        const failed = yield* run(writeMirror(dir, ['state', 'units.tsv'], unitsTable('3/3')));
         yield* files.chmod(state, 0o700);
         expect(Either.isLeft(failed) ? failed.left._tag : '').toBe('PlayerError');
       }).pipe(Effect.orDie)
@@ -105,13 +120,15 @@ describe('atomicity', () => {
   effectTest('a rename that fails over an occupied name leaks no temp file', () =>
     withTestFileSystem((files) =>
       Effect.gen(function* () {
-        const { dir, run } = freshMirror();
+        const { dir, run } = yield* freshMirror();
         const occupied = path.join(dir, 'state', 'units.tsv');
         yield* files.makeDirectory(occupied, { recursive: true });
         yield* files.writeFileString(path.join(occupied, 'occupied'), 'x');
-        const failed = run(writeMirror(dir, ['state', 'units.tsv'], unitsTable('3/3')));
+        const failed = yield* run(writeMirror(dir, ['state', 'units.tsv'], unitsTable('3/3')));
         expect(Either.isLeft(failed)).toBe(true);
-        expect((yield* files.readDirectory(path.dirname(occupied))).filter((name) => name.startsWith('.'))).toEqual([]);
+        expect(
+          (yield* files.readDirectory(path.dirname(occupied))).filter((name) => name.startsWith('.'))
+        ).toEqual([]);
       }).pipe(Effect.orDie)
     )
   );
@@ -153,7 +170,7 @@ describe('leaks', () => {
   effectTest('no token or private state reaches the mirror', () =>
     withTestFileSystem((files) =>
       Effect.gen(function* () {
-        const { dir, run } = freshMirror();
+        const { dir, run } = yield* freshMirror();
         const poisoned = {
           ...HEALTH,
           agent: { ...HEALTH.agent, agent_token: SECRET },
@@ -161,7 +178,7 @@ describe('leaks', () => {
           authorization: `Bearer ${SECRET}`,
           invite: `invite_${'7'.repeat(32)}`,
         };
-        const written = run(
+        const written = yield* run(
           updateFromHealth(dir, 'turn', poisoned, {
             revision: { turn: 3, revision: 9, state_token: STATE_TOKEN },
           })
@@ -183,10 +200,18 @@ describe('leaks', () => {
   effectTest('mirror files are private to the seat', () =>
     withTestFileSystem((files) =>
       Effect.gen(function* () {
-        const { dir, run } = freshMirror();
-        expect(Either.isRight(run(writeMirror(dir, ['state', 'units.tsv'], unitsTable('3/3'))))).toBe(true);
-        expect(Either.isRight(run(updateFromHealth(dir, 'turn', HEALTH, { revision: REVISION })))).toBe(true);
-        expect(Either.isRight(run(writeMirror(dir, DELTA_FILE, '# rev 9 turn 3\n')))).toBe(true);
+        const { dir, run } = yield* freshMirror();
+        expect(
+          Either.isRight(
+            yield* run(writeMirror(dir, ['state', 'units.tsv'], unitsTable('3/3')))
+          )
+        ).toBe(true);
+        expect(
+          Either.isRight(yield* run(updateFromHealth(dir, 'turn', HEALTH, { revision: REVISION })))
+        ).toBe(true);
+        expect(Either.isRight(yield* run(writeMirror(dir, DELTA_FILE, '# rev 9 turn 3\n')))).toBe(
+          true
+        );
         for (const relative of [['state', 'units.tsv'], HEADER_FILE, PHASE_FILE, DELTA_FILE]) {
           const mode = (yield* files.stat(path.join(dir, ...relative))).mode & 0o777;
           expect([relative.join('/'), mode.toString(8)]).toEqual([relative.join('/'), '600']);
@@ -198,9 +223,13 @@ describe('leaks', () => {
   effectTest('a hostile value can never forge a header line', () =>
     withTestFileSystem((files) =>
       Effect.gen(function* () {
-        const { dir, run } = freshMirror();
+        const { dir, run } = yield* freshMirror();
         const hostile = { ...HEALTH, game_state: 'run\nning\t# rev 999 turn 999' };
-        expect(Either.isRight(run(updateFromHealth(dir, 'turn', hostile, { revision: REVISION })))).toBe(true);
+        expect(
+          Either.isRight(
+            yield* run(updateFromHealth(dir, 'turn', hostile, { revision: REVISION }))
+          )
+        ).toBe(true);
         const text = yield* files.readFileString(path.join(dir, ...HEADER_FILE));
         expect(text.split('\n').filter((line) => line.startsWith('#'))).toEqual([
           '# rev 9 turn 3',

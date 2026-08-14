@@ -61,7 +61,11 @@ import { path, withTestFileSystem } from 'test/_test-platform';
 
 const scratches: Scratch[] = [];
 
-afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
+afterEach(() =>
+  Effect.runPromise(
+    Effect.asVoid(Effect.all(scratches.splice(0).map((scratch) => scratch.cleanup)))
+  )
+);
 
 const decode = (payload: JsonObject): HealthEnvelope =>
   Effect.runSync(decodeHealth(payload, identity()));
@@ -364,35 +368,36 @@ interface Fixture {
   readonly mirror: (...parts: ReadonlyArray<string>) => string;
 }
 
-const commandFixture = (payload: JsonObject, status = 200): Fixture => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const target = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'seat.json');
-  Effect.runSync(scratch.files.writeJson(target, sessionFile()));
-  const store = sessionStoreFor(
-    scratch.workspace,
-    scratch.files,
-    {
-      empty: emptyV2ClientState,
-      validate: () => Effect.void,
-      cursorExpired: () => false,
-    },
-    {}
-  );
-  const client = v2ClientFor(
-    httpFor(fakeFetch(new Map([['/health', { status, body: payload }]]))),
-    () => Effect.void
-  );
-  return {
-    layer: Layer.mergeAll(
-      Layer.succeed(SessionStore, store),
-      Layer.succeed(V2Client, client),
-      Layer.succeed(PrivateFs, scratch.files)
-    ),
-    mirror: (...parts) =>
-      path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'seat', 'state', ...parts),
-  };
-};
+const commandFixture = (payload: JsonObject, status = 200): Effect.Effect<Fixture> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const target = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'seat.json');
+    yield* scratch.files.writeJson(target, sessionFile());
+    const store = sessionStoreFor(
+      scratch.workspace,
+      scratch.files,
+      {
+        empty: emptyV2ClientState,
+        validate: () => Effect.void,
+        cursorExpired: () => false,
+      },
+      {}
+    );
+    const client = v2ClientFor(
+      httpFor(fakeFetch(new Map([['/health', { status, body: payload }]]))),
+      () => Effect.void
+    );
+    return {
+      layer: Layer.mergeAll(
+        Layer.succeed(SessionStore, store),
+        Layer.succeed(V2Client, client),
+        Layer.succeed(PrivateFs, scratch.files)
+      ),
+      mirror: (...parts: ReadonlyArray<string>) =>
+        path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'seat', 'state', ...parts),
+    };
+  }).pipe(Effect.orDie);
 
 const capture = <E>(
   effect: Effect.Effect<void, E, PrivateFs | SessionStore | V2Client>,
@@ -412,7 +417,7 @@ const capture = <E>(
 describe('play health', () => {
   awaitTest('it prints the rendered block and nothing else', function* (wait) {
     const payload = phaseHealthPayload({ mine: true, remainingS: 592, elapsedS: 8 });
-    const fixture = commandFixture(payload);
+    const fixture = yield* commandFixture(payload);
     const out = yield* wait(capture(runHealth({ session: '', json: false }), fixture));
     expect(out).toEqual([
       `health running | ${PHASE_HEADLINE.yourTurn} | ${SIDECAR}`,
@@ -422,7 +427,7 @@ describe('play health', () => {
 
   awaitTest('a blocked seat gets the block plus the remedy, in that order', function* (wait) {
     const payload = phaseHealthPayload({ mine: false, remainingS: 13, elapsedS: 587 });
-    const fixture = commandFixture(payload);
+    const fixture = yield* commandFixture(payload);
     const out = yield* wait(capture(runHealth({ session: '', json: false }), fixture));
     expect(out[0]).toBe(`health running | ${PHASE_HEADLINE.holder} | ${SIDECAR}`);
     expect(out.at(-1)).toBe(BLOCKED_NEXT_LINE);
@@ -430,7 +435,7 @@ describe('play health', () => {
 
   awaitTest('--json prints the validated envelope, not the raw body', function* (wait) {
     const payload = phaseHealthPayload({ mine: true });
-    const fixture = commandFixture(payload);
+    const fixture = yield* commandFixture(payload);
     const out = yield* wait(capture(runHealth({ session: '', json: true }), fixture));
     expect(out).toHaveLength(1);
     const jsonValue = Schema.parseJson(Schema.Unknown);
@@ -443,13 +448,13 @@ describe('play health', () => {
   });
 
   awaitTest('--json is byte-identical to json.dumps(sort_keys, separators)', function* (wait) {
-    const fixture = commandFixture(phaseHealthPayload({ mine: true }));
+    const fixture = yield* commandFixture(phaseHealthPayload({ mine: true }));
     const out = yield* wait(capture(runHealth({ session: '', json: true }), fixture));
     expect(out[0]).toBe(JSON_GOLDEN.simple);
   });
 
   awaitTest('--json keeps every wire float a float, on all twelve timing fields', function* (wait) {
-    const fixture = commandFixture({
+    const fixture = yield* commandFixture({
       ...phaseHealthPayload({
         mine: true,
         autoEnd: { enabled: true, armed: true, grace_s: 20.0, remaining_s: 12.0 },
@@ -463,7 +468,7 @@ describe('play health', () => {
 
   awaitTest('it refreshes the state mirror between validating and rendering', function* (wait) {
     const payload = phaseHealthPayload({ mine: false, remainingS: 13, elapsedS: 587 });
-    const fixture = commandFixture(payload);
+    const fixture = yield* commandFixture(payload);
     yield* wait(capture(runHealth({ session: '', json: false }), fixture));
     yield* wait(withTestFileSystem((files) =>
       Effect.gen(function* () {
@@ -478,7 +483,7 @@ describe('play health', () => {
   });
 
   awaitTest('--json refreshes the mirror too — the write is not part of the render', function* (wait) {
-    const fixture = commandFixture(phaseHealthPayload({ mine: true }));
+    const fixture = yield* commandFixture(phaseHealthPayload({ mine: true }));
     yield* wait(capture(runHealth({ session: '', json: true }), fixture));
     yield* wait(withTestFileSystem((files) =>
       Effect.gen(function* () {
@@ -493,11 +498,9 @@ describe('play health', () => {
       ...phaseHealthPayload({ mine: true }),
       agent: { agent_id: identity().agentId, controller_label: 'claude-other-model' },
     };
-    const fixture = commandFixture(payload);
+    const fixture = yield* commandFixture(payload);
     const outcome = yield* wait(
-      Effect.runPromise(
-        Effect.either(provideTestLayer(runHealth({ session: '', json: false }), fixture.layer))
-      )
+      Effect.either(provideTestLayer(runHealth({ session: '', json: false }), fixture.layer))
     );
     expect(Either.isLeft(outcome)).toBe(true);
     if (Either.isLeft(outcome)) {
@@ -506,11 +509,9 @@ describe('play health', () => {
   });
 
   awaitTest('a non-2xx body is raised as a validated refusal', function* (wait) {
-    const fixture = commandFixture(errorPayload(), 404);
+    const fixture = yield* commandFixture(errorPayload(), 404);
     const outcome = yield* wait(
-      Effect.runPromise(
-        Effect.either(provideTestLayer(runHealth({ session: '', json: false }), fixture.layer))
-      )
+      Effect.either(provideTestLayer(runHealth({ session: '', json: false }), fixture.layer))
     );
     expect(Either.isLeft(outcome)).toBe(true);
     if (Either.isLeft(outcome)) {

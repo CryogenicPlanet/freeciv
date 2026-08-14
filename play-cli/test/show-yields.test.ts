@@ -55,7 +55,11 @@ const GOLDEN = {
 // ---------------------------------------------------------------------------
 
 const scratches: Scratch[] = [];
-afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
+afterEach(() =>
+  Effect.runPromise(
+    Effect.asVoid(Effect.all(scratches.splice(0).map((scratch) => scratch.cleanup)))
+  )
+);
 
 const clientState = (revision: number): V2ClientState => ({
   schema_version: 5,
@@ -81,24 +85,28 @@ interface Seat {
 const seat = (
   files: ReadonlyArray<readonly [string, string]> = YIELD_MIRROR,
   revision = 7
-): Seat => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const home = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID);
-  const sessionPath = path.join(home, 'codex-test.json');
-  const mirror = path.join(home, 'codex-test');
-  Effect.runSync(scratch.files.writeJson(sessionPath, sessionFile()));
-  Effect.runSync(scratch.files.writeJson(path.join(home, 'codex-test.v2-state'), clientState(revision)));
-  for (const [relative, text] of files) {
-    Effect.runSync(scratch.files.writeText(path.join(mirror, relative), text));
-  }
-  const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
-  return {
-    sessionPath,
-    mirror,
-    layer: Layer.merge(scratch.layer, Layer.succeed(SessionStore, store)),
-  };
-};
+): Effect.Effect<Seat> =>
+  Effect.gen(function* () {
+    const scratch = yield* scratchWorkspace();
+    scratches.push(scratch);
+    const home = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID);
+    const sessionPath = path.join(home, 'codex-test.json');
+    const mirror = path.join(home, 'codex-test');
+    yield* scratch.files.writeJson(sessionPath, sessionFile());
+    yield* scratch.files.writeJson(
+      path.join(home, 'codex-test.v2-state'),
+      clientState(revision)
+    );
+    for (const [relative, text] of files) {
+      yield* scratch.files.writeText(path.join(mirror, relative), text);
+    }
+    const store = sessionStoreFor(scratch.workspace, scratch.files, v2StateSchema, {});
+    return {
+      sessionPath,
+      mirror,
+      layer: Layer.merge(scratch.layer, Layer.succeed(SessionStore, store)),
+    };
+  }).pipe(Effect.orDie);
 
 const show = (
   fixture: Seat,
@@ -129,17 +137,21 @@ const show = (
 
 const golden = (
   key: keyof typeof GOLDEN,
-  fixture: Seat,
+  fixture: Effect.Effect<Seat>,
   overrides: Partial<ShowOptions> = {}
 ): Effect.Effect<void> =>
-  Effect.map(show(fixture, overrides), (actual) => {
-    const expected = GOLDEN[key];
-    expect(actual.stdout).toBe(expected.stdout);
-    expect(actual.stderr).toBe(expected.stderr);
-  });
+  Effect.flatMap(fixture, (ready) =>
+    Effect.map(show(ready, overrides), (actual) => {
+      const expected = GOLDEN[key];
+      expect(actual.stdout).toBe(expected.stdout);
+      expect(actual.stderr).toBe(expected.stderr);
+    })
+  );
 
-const overlay = (fixture: Seat): Effect.Effect<ReadonlyArray<string>> =>
-  provideTestLayer(renderMapYields(fixture.mirror), fixture.layer);
+const overlay = (fixture: Effect.Effect<Seat>): Effect.Effect<ReadonlyArray<string>> =>
+  Effect.flatMap(fixture, (ready) =>
+    provideTestLayer(renderMapYields(ready.mirror), ready.layer)
+  );
 
 const mirrorWithSpan = (span: number): ReadonlyArray<readonly [string, string]> => {
   const row = 'G'.repeat(span);
@@ -180,10 +192,10 @@ describe('the grid overlay', () => {
   effectTest('the overlay never rewrites either file it read', () =>
     withTestFileSystem((platformFiles) =>
       Effect.gen(function* () {
-        const fixture = seat();
+        const fixture = yield* seat();
         const fixtureMapPath = path.join(fixture.mirror, 'state', 'map.txt');
         const before = yield* platformFiles.readFileString(fixtureMapPath);
-        yield* golden('current/yields_map', fixture);
+        yield* golden('current/yields_map', Effect.succeed(fixture));
         expect(yield* platformFiles.readFileString(fixtureMapPath)).toBe(before);
       })
     ).pipe(Effect.orDie)
