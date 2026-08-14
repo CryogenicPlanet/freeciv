@@ -211,14 +211,15 @@ const runSentinel = <A, E, R>(
         }),
         () => false
       );
-    let acquired = yield* claim();
-    if (!acquired) {
-      const pid = yield* sentinelPid(sentinel);
-      if (pid !== null && !isLive(pid)) {
-        yield* Effect.ignore(fileSystem.remove(sentinel));
-        acquired = yield* claim();
-      }
-    }
+    const acquired = yield* Effect.flatMap(claim(), (claimed) =>
+      claimed
+        ? Effect.succeed(true)
+        : Effect.flatMap(sentinelPid(sentinel), (pid) =>
+            pid !== null && !isLive(pid)
+              ? Effect.zipRight(Effect.ignore(fileSystem.remove(sentinel)), claim())
+              : Effect.succeed(false)
+          )
+    );
     if (!acquired) return yield* body(yield* readMonitorHolder(opened));
     return yield* Effect.ensuring(
       Effect.zipRight(writeHolder(opened, holder), body(null)),

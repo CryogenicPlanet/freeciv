@@ -232,16 +232,28 @@ const randomSuffix = (): string =>
 const leafOf = (relative: StatePath['relative']): string => relative.at(-1) ?? relative[0];
 const bytes = (text: string): Uint8Array => new TextEncoder().encode(text);
 
+interface ReadState {
+  readonly chunks: ReadonlyArray<Uint8Array>;
+  readonly complete: boolean;
+}
+
+const initialReadState: ReadState = { chunks: [], complete: false };
+
 const readAll = (opened: FileSystem.File) =>
-  Effect.gen(function* () {
-    const chunks: Uint8Array[] = [];
-    for (;;) {
-      const chunk = yield* opened.readAlloc(64 * 1024);
-      if (chunk._tag === 'None') break;
-      chunks.push(chunk.value);
-    }
-    return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
-  });
+  Effect.map(
+    Effect.iterate(initialReadState, {
+      while: ({ complete }) => !complete,
+      body: (state) =>
+        Effect.map(
+          opened.readAlloc(64 * 1024),
+          (chunk): ReadState =>
+            chunk._tag === 'None'
+              ? { ...state, complete: true }
+              : { chunks: [...state.chunks, chunk.value], complete: false }
+        ),
+    }),
+    ({ chunks }) => Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)))
+  );
 
 const makeApi = (workspace: WorkspacePaths): PrivateFsApi => {
   const resolve = (target: string): Effect.Effect<StatePath, PlayerError> =>

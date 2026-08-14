@@ -614,18 +614,25 @@ const isLineBoundary = (code: number): boolean =>
   code === 0x2028 ||
   code === 0x2029;
 
+interface SplitLinesState {
+  readonly parts: ReadonlyArray<string>;
+  readonly start: number;
+}
+
 export const splitLines = (text: string): ReadonlyArray<string> => {
-  const parts: string[] = [];
-  let start = 0;
-  for (let index = 0; index < text.length; index += 1) {
-    const code = text.charCodeAt(index);
-    if (!isLineBoundary(code)) continue;
-    parts.push(text.slice(start, index));
-    if (code === 0x0d && text.charCodeAt(index + 1) === 0x0a) index += 1;
-    start = index + 1;
-  }
-  if (start < text.length) parts.push(text.slice(start));
-  return parts;
+  const initial: SplitLinesState = { parts: [], start: 0 };
+  const { parts, start } = Array.from({ length: text.length }, (_, index) => index).reduce(
+    (state: SplitLinesState, index): SplitLinesState => {
+      if (index < state.start || !isLineBoundary(text.charCodeAt(index))) return state;
+      const next =
+        text.charCodeAt(index) === 0x0d && text.charCodeAt(index + 1) === 0x0a
+          ? index + 2
+          : index + 1;
+      return { parts: [...state.parts, text.slice(state.start, index)], start: next };
+    },
+    initial
+  );
+  return start < text.length ? [...parts, text.slice(start)] : parts;
 };
 
 export { rstrip, strip };
