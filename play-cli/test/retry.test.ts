@@ -47,7 +47,7 @@ import {
 import { awaitTest, provideTestLayer } from 'test/_effect-test';
 import { fixtureString } from 'test/_expect';
 
-afterEach(cleanupScratches);
+afterEach(() => Effect.runPromise(cleanupScratches()));
 
 const RECEIPT_ROUTE = '/receipts/';
 
@@ -116,7 +116,7 @@ const submitting = (
 const captureRetry = <A, E>(
   effect: Effect.Effect<A, E, SessionStore | V2Client | PrivateFs>,
   fixture: Fixture
-) => Effect.promise(() => capture(effect, fixture));
+) => capture(effect, fixture);
 
 // ---------------------------------------------------------------------------
 // Nothing persisted
@@ -124,8 +124,8 @@ const captureRetry = <A, E>(
 
 describe('play retry: nothing to re-derive', () => {
   awaitTest('an unknown batch is refused by name, and nothing is sent', function* () {
-    const fixture = buildFixture(new Map<string, FakeRoute>());
-    fixture.seed({});
+    const fixture = yield* buildFixture(new Map<string, FakeRoute>());
+    yield* fixture.seed({});
     const hooks = recordingHooks();
     const { result } = yield* captureRetry(
       runRetry({ session: fixture.sessionPath, batchId: BATCH_ID, json: false }, hooks.make),
@@ -140,8 +140,8 @@ describe('play retry: nothing to re-derive', () => {
   });
 
   awaitTest('a malformed batch ID is refused before the state is even consulted', function* () {
-    const fixture = buildFixture(new Map<string, FakeRoute>());
-    fixture.seed({});
+    const fixture = yield* buildFixture(new Map<string, FakeRoute>());
+    yield* fixture.seed({});
     const { result } = yield* captureRetry(
       runRetry({ session: fixture.sessionPath, batchId: '  ', json: false }),
       fixture
@@ -159,8 +159,8 @@ describe('play retry: nothing to re-derive', () => {
 describe('play retry: a cached terminal receipt is the answer', () => {
   for (const state of ['applied', 'rejected'] as const) {
     awaitTest(`a cached ${state} receipt is printed with no request at all`, function* () {
-      const fixture = buildFixture(new Map<string, FakeRoute>());
-      fixture.seed({
+      const fixture = yield* buildFixture(new Map<string, FakeRoute>());
+      yield* fixture.seed({
         actions: { action_opaque: DESCRIPTOR },
         batches: { [BATCH_ID]: batchBody(BATCH_ID) },
         receipts: { [BATCH_ID]: receiptWire(BATCH_ID, state) },
@@ -183,8 +183,8 @@ describe('play retry: a cached terminal receipt is the answer', () => {
   }
 
   awaitTest('a cached accepted receipt is NOT terminal, so it is polled', function* () {
-    const fixture = buildFixture(queue([ok(receiptWire(BATCH_ID, 'applied'))]));
-    fixture.seed({
+    const fixture = yield* buildFixture(queue([ok(receiptWire(BATCH_ID, 'applied'))]));
+    yield* fixture.seed({
       batches: { [BATCH_ID]: batchBody(BATCH_ID) },
       receipts: { [BATCH_ID]: receiptWire(BATCH_ID, 'accepted') },
     });
@@ -205,14 +205,14 @@ describe('play retry: a cached terminal receipt is the answer', () => {
 
 describe('play retry: polling', () => {
   awaitTest('accepted is polled until it resolves, at the documented interval', function* () {
-    const fixture = buildFixture(
+    const fixture = yield* buildFixture(
       queue([
         ok(receiptWire(BATCH_ID, 'accepted')),
         ok(receiptWire(BATCH_ID, 'accepted')),
         ok(receiptWire(BATCH_ID, 'applied')),
       ])
     );
-    fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
+    yield* fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
     const clock = testClock();
     const { out, result } = yield* captureRetry(
       retryLocked(
@@ -234,10 +234,10 @@ describe('play retry: polling', () => {
   });
 
   awaitTest('the poll gives up at the deadline and prints the accepted line once', function* () {
-    const fixture = buildFixture(
+    const fixture = yield* buildFixture(
       new Map([[RECEIPT_ROUTE, ok(receiptWire(BATCH_ID, 'accepted'))]])
     );
-    fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
+    yield* fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
     // Each sleep burns a quarter of the budget, so the loop cannot outrun the
     // deadline and the test cannot hang.
     const clock = testClock({ advanceOnSleep: RETRY_POLL_DEADLINE_S / 4 });
@@ -261,8 +261,8 @@ describe('play retry: polling', () => {
   });
 
   awaitTest('a receipt already past the deadline is printed without a single sleep', function* () {
-    const fixture = buildFixture(queue([ok(receiptWire(BATCH_ID, 'accepted'))]));
-    fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
+    const fixture = yield* buildFixture(queue([ok(receiptWire(BATCH_ID, 'accepted'))]));
+    yield* fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
     const clock = testClock();
     const hooks = recordingHooks();
     // The clock jumps past the deadline between the two `monotonic()` reads,
@@ -295,10 +295,10 @@ describe('play retry: polling', () => {
   });
 
   awaitTest('every polled receipt is remembered and mirrored under the "retry" tag', function* () {
-    const fixture = buildFixture(
+    const fixture = yield* buildFixture(
       queue([ok(receiptWire(BATCH_ID, 'accepted')), ok(receiptWire(BATCH_ID, 'applied'))])
     );
-    fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
+    yield* fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
     const hooks = recordingHooks();
     yield* captureRetry(
       retryLocked(
@@ -327,9 +327,9 @@ describe('play retry: polling', () => {
 
 describe('play retry: the persisted body goes back only when it never arrived', () => {
   awaitTest('404 invalid_request with no receipt ever seen re-sends the exact bytes', function* () {
-    const fixture = buildFixture(new Map([[RECEIPT_ROUTE, missing()]]));
+    const fixture = yield* buildFixture(new Map([[RECEIPT_ROUTE, missing()]]));
     const body = batchBody(BATCH_ID);
-    fixture.seed({ actions: { action_opaque: DESCRIPTOR }, batches: { [BATCH_ID]: body } });
+    yield* fixture.seed({ actions: { action_opaque: DESCRIPTOR }, batches: { [BATCH_ID]: body } });
     const submit = submitting(fixture);
     const { out, err, result } = yield* captureRetry(
       runRetry(
@@ -347,8 +347,8 @@ describe('play retry: the persisted body goes back only when it never arrived', 
   });
 
   awaitTest('and once it has applied, a second retry sends nothing at all', function* () {
-    const fixture = buildFixture(new Map([[RECEIPT_ROUTE, missing()]]));
-    fixture.seed({
+    const fixture = yield* buildFixture(new Map([[RECEIPT_ROUTE, missing()]]));
+    yield* fixture.seed({
       actions: { action_opaque: DESCRIPTOR },
       batches: { [BATCH_ID]: batchBody(BATCH_ID) },
     });
@@ -370,8 +370,8 @@ describe('play retry: the persisted body goes back only when it never arrived', 
   });
 
   awaitTest('a warning from the submit path goes to stderr, the disposition to stdout', function* () {
-    const fixture = buildFixture(new Map([[RECEIPT_ROUTE, missing()]]));
-    fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
+    const fixture = yield* buildFixture(new Map([[RECEIPT_ROUTE, missing()]]));
+    yield* fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
     const submit = submitting(fixture, { warning: 'transport outcome is unknown', exitCode: 2 });
     const { out, err, result } = yield* captureRetry(
       runRetry(
@@ -394,14 +394,14 @@ describe('play retry: the persisted body goes back only when it never arrived', 
     // No hook stand-in here: this is `retry` wired to the real submit path,
     // against a fake supervisor. It is the end-to-end proof that a re-send
     // reuses the idempotency key rather than re-serializing one.
-    const fixture = buildFixture(
+    const fixture = yield* buildFixture(
       new Map([
         [RECEIPT_ROUTE, missing()],
         ['/batches', ok(receiptWire(BATCH_ID, 'applied'))],
       ])
     );
     const body = batchBody(BATCH_ID);
-    fixture.seed({ actions: { action_opaque: DESCRIPTOR }, batches: { [BATCH_ID]: body } });
+    yield* fixture.seed({ actions: { action_opaque: DESCRIPTOR }, batches: { [BATCH_ID]: body } });
     const { out, result } = yield* captureRetry(
       runRetry({ session: fixture.sessionPath, batchId: BATCH_ID, json: false }),
       fixture
@@ -429,10 +429,10 @@ describe('play retry: the persisted body goes back only when it never arrived', 
 
 describe('play retry: a refusal it cannot interpret is raised, never guessed', () => {
   awaitTest('a 404 with another code is raised, and nothing is sent', function* () {
-    const fixture = buildFixture(
+    const fixture = yield* buildFixture(
       new Map([[RECEIPT_ROUTE, { status: 404, body: errorEnvelope('conflict', null) }]])
     );
-    fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
+    yield* fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
     const submit = submitting(fixture);
     const { result } = yield* captureRetry(
       runRetry(
@@ -450,10 +450,10 @@ describe('play retry: a refusal it cannot interpret is raised, never guessed', (
   });
 
   awaitTest('a 500 invalid_request is raised too — only 404 means "never arrived"', function* () {
-    const fixture = buildFixture(
+    const fixture = yield* buildFixture(
       new Map([[RECEIPT_ROUTE, { status: 500, body: errorEnvelope('invalid_request', null) }]])
     );
-    fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
+    yield* fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
     const submit = submitting(fixture);
     const { result } = yield* captureRetry(
       runRetry(
@@ -474,8 +474,8 @@ describe('play retry: a refusal it cannot interpret is raised, never guessed', (
 
 describe('play retry: --json', () => {
   awaitTest('a receipt prints as the validated receipt envelope', function* () {
-    const fixture = buildFixture(queue([ok(receiptWire(BATCH_ID, 'applied'))]));
-    fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
+    const fixture = yield* buildFixture(queue([ok(receiptWire(BATCH_ID, 'applied'))]));
+    yield* fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
     const { out } = yield* captureRetry(
       runRetry({ session: fixture.sessionPath, batchId: BATCH_ID, json: true }),
       fixture
@@ -488,8 +488,8 @@ describe('play retry: --json', () => {
   });
 
   awaitTest('a submit prints the disposition envelope, not the receipt', function* () {
-    const fixture = buildFixture(new Map([[RECEIPT_ROUTE, missing()]]));
-    fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
+    const fixture = yield* buildFixture(new Map([[RECEIPT_ROUTE, missing()]]));
+    yield* fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
     const submit = submitting(fixture);
     const { out } = yield* captureRetry(
       runRetry({ session: fixture.sessionPath, batchId: BATCH_ID, json: true }, submit.hooks.make),
@@ -503,8 +503,8 @@ describe('play retry: --json', () => {
   });
 
   awaitTest('a cached terminal receipt prints as JSON too, with no request', function* () {
-    const fixture = buildFixture(new Map<string, FakeRoute>());
-    fixture.seed({
+    const fixture = yield* buildFixture(new Map<string, FakeRoute>());
+    yield* fixture.seed({
       batches: { [BATCH_ID]: batchBody(BATCH_ID) },
       receipts: { [BATCH_ID]: receiptWire(BATCH_ID, 'rejected') },
     });

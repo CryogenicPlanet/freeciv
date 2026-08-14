@@ -19,6 +19,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect, Either, Layer, Schema } from 'effect';
 import { V2_RECEIPT_STATES, V2_TERMINAL_RECEIPTS } from 'src/constants';
+import type { PlayError } from 'src/errors';
 import { runReceipt } from 'src/commands/receipt.cmd';
 import { retryLocked, runRetry } from 'src/commands/retry.cmd';
 import {
@@ -64,7 +65,7 @@ import {
 import { awaitTest, provideTestLayer } from 'test/_effect-test';
 import { fixtureString } from 'test/_expect';
 
-afterEach(cleanupScratches);
+afterEach(() => Effect.runPromise(cleanupScratches()));
 
 const RECEIPT_ROUTE = '/receipts/';
 const ok = (body: JsonObject): FakeRoute => ({ status: 200, body });
@@ -92,12 +93,11 @@ const buildDisposition = (kind: string, state: ReceiptState | null): BatchDispos
   );
 
 /** Everything `batch` writes before it sends: the body, and nothing else. */
-const halfWritten = (fixture: Fixture): void => {
+const halfWritten = (fixture: Fixture): Effect.Effect<void, PlayError> =>
   fixture.seed({
     actions: { action_opaque: DESCRIPTOR },
     batches: { [BATCH_ID]: batchBody(BATCH_ID) },
   });
-};
 
 // ---------------------------------------------------------------------------
 // The truth table
@@ -184,13 +184,13 @@ describe('the four receipt states', () => {
 // ---------------------------------------------------------------------------
 
 describe('missingAcceptedReceipt', () => {
-  test('it is ambiguous, non-retryable, and carries the accepted revision', () => {
+  awaitTest('it is ambiguous, non-retryable, and carries the accepted revision', function* () {
     const accepted = Effect.runSync(
       decodeReceipt(receiptWire(BATCH_ID, 'accepted', { idempotent: true }), identity(), {
         batchId: BATCH_ID,
       })
     );
-    const fixture = buildFixture(new Map<string, FakeRoute>());
+    const fixture = yield* buildFixture(new Map<string, FakeRoute>());
     const terminal = Effect.runSync(
       missingAcceptedReceipt(fixture.session, accepted, BATCH_ID)
     );
@@ -224,8 +224,8 @@ describe('missingAcceptedReceipt', () => {
 
 describe('retry refuses to resubmit an ambiguous batch', () => {
   awaitTest('a cached ambiguous receipt: no GET, no POST, and the warning on stderr', (wait) => Effect.gen(function* () {
-    const fixture = buildFixture(new Map<string, FakeRoute>());
-    fixture.seed({
+    const fixture = yield* buildFixture(new Map<string, FakeRoute>());
+    yield* fixture.seed({
       actions: { action_opaque: DESCRIPTOR },
       batches: { [BATCH_ID]: batchBody(BATCH_ID) },
       receipts: { [BATCH_ID]: receiptWire(BATCH_ID, 'ambiguous') },
@@ -246,8 +246,8 @@ describe('retry refuses to resubmit an ambiguous batch', () => {
   }));
 
   awaitTest('the warning is on stderr even under --json, and stdout stays parseable', (wait) => Effect.gen(function* () {
-    const fixture = buildFixture(new Map<string, FakeRoute>());
-    fixture.seed({
+    const fixture = yield* buildFixture(new Map<string, FakeRoute>());
+    yield* fixture.seed({
       batches: { [BATCH_ID]: batchBody(BATCH_ID) },
       receipts: { [BATCH_ID]: receiptWire(BATCH_ID, 'ambiguous') },
     });
@@ -261,8 +261,8 @@ describe('retry refuses to resubmit an ambiguous batch', () => {
   }));
 
   awaitTest('a server-sent ambiguous receipt stops the command dead', (wait) => Effect.gen(function* () {
-    const fixture = buildFixture(new Map([[RECEIPT_ROUTE, ok(receiptWire(BATCH_ID, 'ambiguous'))]]));
-    fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
+    const fixture = yield* buildFixture(new Map([[RECEIPT_ROUTE, ok(receiptWire(BATCH_ID, 'ambiguous'))]]));
+    yield* fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
     const hooks = recordingHooks();
     const { err, result } = yield* wait(capture(
       runRetry({ session: fixture.sessionPath, batchId: BATCH_ID, json: false }, hooks.make),
@@ -275,8 +275,8 @@ describe('retry refuses to resubmit an ambiguous batch', () => {
   }));
 
   awaitTest('and a second retry after that answers from the cache, silently offline', (wait) => Effect.gen(function* () {
-    const fixture = buildFixture(new Map([[RECEIPT_ROUTE, ok(receiptWire(BATCH_ID, 'ambiguous'))]]));
-    fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
+    const fixture = yield* buildFixture(new Map([[RECEIPT_ROUTE, ok(receiptWire(BATCH_ID, 'ambiguous'))]]));
+    yield* fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
     yield* wait(capture(
       runRetry({ session: fixture.sessionPath, batchId: BATCH_ID, json: false }),
       fixture
@@ -292,8 +292,8 @@ describe('retry refuses to resubmit an ambiguous batch', () => {
   }));
 
   awaitTest('`receipt` warns too, and still exits successfully', (wait) => Effect.gen(function* () {
-    const fixture = buildFixture(new Map([[RECEIPT_ROUTE, ok(receiptWire(BATCH_ID, 'ambiguous'))]]));
-    fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
+    const fixture = yield* buildFixture(new Map([[RECEIPT_ROUTE, ok(receiptWire(BATCH_ID, 'ambiguous'))]]));
+    yield* fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
     const { out, err, result } = yield* wait(capture(
       runReceipt({ session: fixture.sessionPath, batchId: BATCH_ID, json: false }),
       fixture
@@ -310,8 +310,8 @@ describe('retry refuses to resubmit an ambiguous batch', () => {
 
 describe('an accepted receipt that disappears', () => {
   awaitTest('it becomes ambiguous without a resend, and is persisted that way', (wait) => Effect.gen(function* () {
-    const fixture = buildFixture(new Map([[RECEIPT_ROUTE, missing()]]));
-    fixture.seed({
+    const fixture = yield* buildFixture(new Map([[RECEIPT_ROUTE, missing()]]));
+    yield* fixture.seed({
       batches: { [BATCH_ID]: batchBody(BATCH_ID) },
       receipts: { [BATCH_ID]: receiptWire(BATCH_ID, 'accepted') },
     });
@@ -326,7 +326,7 @@ describe('an accepted receipt that disappears', () => {
     expect(receiptStateJson(out[0] ?? '').receipt_state).toBe('ambiguous');
     expect(err).toEqual([ACCEPTED_RECEIPT_VANISHED]);
     // The ambiguity is now the persisted truth, so no later command can undo it.
-    const persisted = fixture.readState().receipts[BATCH_ID];
+    const persisted = (yield* fixture.readState()).receipts[BATCH_ID];
     expect(isJsonObject(persisted) ? persisted['receipt_state'] : null).toBe('ambiguous');
   }));
 
@@ -334,8 +334,8 @@ describe('an accepted receipt that disappears', () => {
     // Nothing was cached: the FIRST poll returns `accepted`, the second 404s.
     // CPython terminalizes on the strength of that in-flight observation, and
     // so does this. A client that only trusted the cache would re-send here.
-    const fixture = buildFixture([ok(receiptWire(BATCH_ID, 'accepted')), missing()]);
-    fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
+    const fixture = yield* buildFixture([ok(receiptWire(BATCH_ID, 'accepted')), missing()]);
+    yield* fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
     const hooks = recordingHooks();
     const { err, result } = yield* wait(capture(
       retryLocked(
@@ -363,8 +363,8 @@ describe('an accepted receipt that disappears', () => {
 
 describe('killed between the persist and the POST', () => {
   awaitTest('retry re-sends exactly the persisted bytes, exactly once', (wait) => Effect.gen(function* () {
-    const fixture = buildFixture(new Map([[RECEIPT_ROUTE, missing()]]));
-    halfWritten(fixture);
+    const fixture = yield* buildFixture(new Map([[RECEIPT_ROUTE, missing()]]));
+    yield* halfWritten(fixture);
     const posted: string[] = [];
     const provided = Layer.merge(
       Layer.succeed(SessionStore, fixture.store),
@@ -422,8 +422,8 @@ describe('killed between the persist and the POST', () => {
   awaitTest('a kill AFTER the POST but before the receipt read never re-sends', (wait) => Effect.gen(function* () {
     // The server has the batch and answers with its receipt; nothing about the
     // local state says the POST happened, and it still must not go again.
-    const fixture = buildFixture(new Map([[RECEIPT_ROUTE, ok(receiptWire(BATCH_ID, 'applied'))]]));
-    halfWritten(fixture);
+    const fixture = yield* buildFixture(new Map([[RECEIPT_ROUTE, ok(receiptWire(BATCH_ID, 'applied'))]]));
+    yield* halfWritten(fixture);
     const hooks = recordingHooks();
     const { out, result } = yield* wait(capture(
       runRetry({ session: fixture.sessionPath, batchId: BATCH_ID, json: false }, hooks.make),
@@ -435,8 +435,8 @@ describe('killed between the persist and the POST', () => {
   }));
 
   awaitTest('a kill leaving an accepted receipt behind never re-sends either', (wait) => Effect.gen(function* () {
-    const fixture = buildFixture(new Map([[RECEIPT_ROUTE, missing()]]));
-    fixture.seed({
+    const fixture = yield* buildFixture(new Map([[RECEIPT_ROUTE, missing()]]));
+    yield* fixture.seed({
       batches: { [BATCH_ID]: batchBody(BATCH_ID) },
       receipts: { [BATCH_ID]: receiptWire(BATCH_ID, 'accepted') },
     });
@@ -455,7 +455,7 @@ describe('killed between the persist and the POST', () => {
 
 describe('a receipt that flips accepted → ambiguous between polls', () => {
   awaitTest('the poll stops at the flip, warns, and never sends', (wait) => Effect.gen(function* () {
-    const fixture = buildFixture([
+    const fixture = yield* buildFixture([
       ok(receiptWire(BATCH_ID, 'accepted')),
       ok(receiptWire(BATCH_ID, 'accepted')),
       ok(receiptWire(BATCH_ID, 'ambiguous')),
@@ -463,7 +463,7 @@ describe('a receipt that flips accepted → ambiguous between polls', () => {
       // state; it is deliberately an `applied` so the test fails loudly.
       ok(receiptWire(BATCH_ID, 'applied')),
     ]);
-    fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
+    yield* fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
     const hooks = recordingHooks();
     const clock = testClock();
     const { out, err, result } = yield* wait(capture(
@@ -494,8 +494,8 @@ describe('a receipt that flips accepted → ambiguous between polls', () => {
     // Even if a later response claimed `applied` for the same batch, U03's
     // receipt ledger refuses the transition. Terminal means terminal on disk,
     // not just in this process.
-    const fixture = buildFixture(new Map<string, FakeRoute>());
-    fixture.seed({
+    const fixture = yield* buildFixture(new Map<string, FakeRoute>());
+    yield* fixture.seed({
       batches: { [BATCH_ID]: batchBody(BATCH_ID) },
       receipts: { [BATCH_ID]: receiptWire(BATCH_ID, 'ambiguous') },
     });

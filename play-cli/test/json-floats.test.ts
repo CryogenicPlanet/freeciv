@@ -26,6 +26,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect, Schema } from 'effect';
 import { awaitTest } from 'test/_effect-test';
 import { emitTurn } from 'src/commands/turn.cmd';
+import type { PlayError } from 'src/errors';
 import { turnEndJson } from 'src/services/turn-end';
 import type { RenderTurnDeps, TurnResult } from 'src/render/turn';
 import { pyDumps } from 'src/services/canonical-body';
@@ -242,32 +243,35 @@ describe('wait --json', () => {
 describe('do --end --await --brief --json', () => {
   const benches: Bench[] = [];
   afterEach(() =>
-    Promise.all(benches.splice(0).map((kit) => kit.scratch.cleanup()))
+    Effect.runPromise(
+      Effect.forEach(benches.splice(0), (kit) => kit.scratch.cleanup, { discard: true })
+    )
   );
 
   const FOUND_ONE = `action_${'2'.repeat(26)}`;
   const END_BATCH = 'batch_phase_end_1';
 
   /** One seat with a one-action catalog, staged at rev 7. */
-  const seated = (): Bench => {
-    const kit = bench();
-    benches.push(kit);
-    const revision = rev(7);
-    kit.world.revision = revision;
-    kit.seed(UNIT_ONE, [foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
-    kit.world.receipt = () => ({ state: 'applied', revision });
-    kit.world.phaseEnd = () =>
-      Effect.succeed({
-        disposition: dispositionOf(END_BATCH, 'applied', revision),
-        warning: '',
-        exitCode: 0,
-        lines: [`phase end → applied rev${revision.revision}/t${revision.turn}  ${END_BATCH}`],
-      });
-    return kit;
-  };
+  const seated = (): Effect.Effect<Bench, PlayError> =>
+    Effect.gen(function* () {
+      const kit = yield* bench();
+      yield* Effect.sync(() => benches.push(kit));
+      const revision = rev(7);
+      kit.world.revision = revision;
+      yield* kit.seed(UNIT_ONE, [foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
+      kit.world.receipt = () => ({ state: 'applied', revision });
+      kit.world.phaseEnd = () =>
+        Effect.succeed({
+          disposition: dispositionOf(END_BATCH, 'applied', revision),
+          warning: '',
+          exitCode: 0,
+          lines: [`phase end → applied rev${revision.revision}/t${revision.turn}  ${END_BATCH}`],
+        });
+      return kit;
+    });
 
   awaitTest('the composite carries the wake and the briefing with CPython floats', function* (wait) {
-    const kit = seated();
+    const kit = yield* seated();
     kit.world.awaitBrief = () =>
       Effect.succeed({
         wait: decodedFloatWake(),
@@ -292,7 +296,7 @@ describe('do --end --await --brief --json', () => {
   });
 
   awaitTest('without --end the payload carries neither key, so the projection is inert', function* (wait) {
-    const kit = seated();
+    const kit = yield* seated();
     const run = yield* wait(runDoCaptured(kit, doArgs('u1 found_city London', { json: true })));
     expect(run.out).toHaveLength(1);
     const payload = Schema.decodeUnknownSync(jsonObjectSchema)(run.out[0] ?? '');
