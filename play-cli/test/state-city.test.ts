@@ -12,8 +12,6 @@
  * the whole point of the section is that the surviving columns explain where
  * the shields went.  So the tables are asserted as whole lines.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect } from 'effect';
 import { renderStatePage, type StatePageValue } from 'src/render/state/page';
@@ -25,13 +23,12 @@ import type { JsonObject } from 'src/schema/primitives';
 import type { Revision } from 'src/schema/revision';
 import { PrivateFs, privateFsFor } from 'src/services/private-fs';
 import { scratchWorkspace, type Scratch } from 'test/_fixtures';
+import { path } from 'test/_test-platform';
 
 const NO_FILES = privateFsFor({ root: '/nonexistent', stateRoot: '/nonexistent/.sessions' });
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
 
 const revision = (number: number, turn: number): Revision => ({
   turn,
@@ -53,6 +50,12 @@ const statePage = (
     cursor_expires_at: null,
   },
 });
+
+const granaryText = (storage: JsonValue, food: number): string =>
+  Effect.runSync(cityGranaryText({ food_storage: storage }, { food }));
+
+const outputRows = (outputs: JsonValue): ReadonlyArray<string> =>
+  table(Effect.runSync(cityOutputRows(outputs)));
 
 const rendered = (
   value: StatePageValue,
@@ -255,12 +258,10 @@ describe('city_detail', () => {
   });
 
   test('a granary with no growth at all says so, and a full one says why', () => {
-    const text = (storage: JsonValue, food: number): string =>
-      Effect.runSync(cityGranaryText({ food_storage: storage }, { food }));
-    expect(text({ stock: 5, granary_size: 20, growth_turns: null }, 0)).toBe(
+    expect(granaryText({ stock: 5, granary_size: 20, growth_turns: null }, 0)).toBe(
       'granary 5/20 food +0/turn no growth'
     );
-    expect(text({ stock: 20, granary_size: 20, growth_turns: 0 }, 3)).toBe(
+    expect(granaryText({ stock: 20, granary_size: 20, growth_turns: 0 }, 3)).toBe(
       'granary 20/20 food +3/turn !full, growth blocked'
     );
   });
@@ -280,11 +281,8 @@ describe('city_detail', () => {
 // ---------------------------------------------------------------------------
 
 describe('cityOutputRows', () => {
-  const rows = (outputs: JsonValue): ReadonlyArray<string> =>
-    table(Effect.runSync(cityOutputRows(outputs)));
-
   test('a chain step that merely repeats the step before it is dropped', () => {
-    expect(rows(cityOutputs({ food: [3, 3, 2, 1, 0, 0] }))).toEqual([
+    expect(outputRows(cityOutputs({ food: [3, 3, 2, 1, 0, 0] }))).toEqual([
       'output  base  used  surplus',
       'food    3     1     +2',
     ]);
@@ -297,7 +295,7 @@ describe('cityOutputRows', () => {
   });
 
   test('an output the chain does not name sorts after the ones it does', () => {
-    const lines = rows(
+    const lines = outputRows(
       cityOutputs({ pollution: [1, 1, 1, 0, 0, 0], food: [2, 2, 2, 0, 0, 0] })
     );
     expect(lines[1]).toContain('food');
@@ -430,16 +428,15 @@ const CHOICES: ReadonlyArray<JsonObject> = [
 /** Write the `cities` mirror table this seat would have written at `at`. */
 const stageCitiesMirror = (scratch: Scratch, sessionPath: string, at: Revision | null): void => {
   const directory = path.join(path.dirname(sessionPath), path.basename(sessionPath, '.json'));
-  fs.mkdirSync(path.join(directory, 'state'), { recursive: true, mode: 0o700 });
   const stamp = at === null ? '# rev - turn -' : `# rev ${at.revision} turn ${at.turn}`;
-  fs.writeFileSync(
-    path.join(directory, ...CITIES_MIRROR_FILE),
-    `${stamp}\n# cities 1/1 complete\n` +
-      'alias\tcity\tpos\tsize\tbuilding\tshields\tsurplus\tbuy\n' +
-      'c1   \tLondon\t31,72\t3\tMusketeers\t25/30\tf1 s2 t3\t12\n',
-    { mode: 0o600 }
+  Effect.runSync(
+    scratch.files.writeText(
+      path.join(directory, ...CITIES_MIRROR_FILE),
+      `${stamp}\n# cities 1/1 complete\n` +
+        'alias\tcity\tpos\tsize\tbuilding\tshields\tsurplus\tbuy\n' +
+        'c1   \tLondon\t31,72\t3\tMusketeers\t25/30\tf1 s2 t3\t12\n'
+    )
   );
-  void scratch;
 };
 
 describe('city_build_choices', () => {

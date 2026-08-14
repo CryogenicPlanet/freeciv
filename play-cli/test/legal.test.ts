@@ -13,10 +13,8 @@
  * `test/legal-drain.test.ts`; what is under test here is what one page *reads*
  * like and which flag combinations never reach the wire at all.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
-import { Effect, Either, Layer, Option } from 'effect';
+import { Effect, Either, Layer, Option, Schema } from 'effect';
 import { ACTION_KIND_RE, FULL_CONTROL_V2 } from 'src/constants';
 import type { DualSpelling } from 'src/options';
 import { runLegal, type LegalOptions } from 'src/commands/legal.cmd';
@@ -25,7 +23,13 @@ import { descriptorKindKey, kindSelectorMatches } from 'src/render/legal/kinds';
 import { renderLegalCompact, renderLegalPage } from 'src/render/legal/page';
 import type { LegalCompactResult } from 'src/services/legal-compact';
 import { decodeLegalPage, type LegalActionPageEnvelope } from 'src/schema/page';
-import type { JsonObject, JsonValue } from 'src/schema/primitives';
+import {
+  field,
+  isJsonArray,
+  isJsonObject,
+  type JsonObject,
+  type JsonValue,
+} from 'src/schema/primitives';
 import { httpFor } from 'src/services/http';
 import { v2StateSchema } from 'src/services/aliases';
 import { mirrorDir } from 'src/services/mirror';
@@ -43,11 +47,13 @@ import {
   type RecordedRequest,
   type Scratch,
 } from 'test/_fixtures';
+import { captureEffect } from 'test/_capture';
+import { effectTest, provideTestLayer } from 'test/_effect-test';
+import { fixtureObject, fixtureString, observedAt } from 'test/_expect';
+import { fileSystem, path, withTestFileSystem } from 'test/_test-platform';
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
 
 // ---------------------------------------------------------------------------
 // Wire fixtures, ported from PlayerClientTests
@@ -89,7 +95,7 @@ const scopedLegalPage = (
 ): JsonObject => {
   const cursor = options.cursor ?? null;
   const base = legalPage(items, rev, cursor);
-  const page = base['page'] as JsonObject;
+  const page = fixtureObject(field(base, 'page'));
   return {
     ...base,
     page: {
@@ -218,7 +224,7 @@ describe('renderLegalPage', () => {
 
   const scopedPage = ((): LegalActionPageEnvelope => {
     const raw = legalPage([certain, gamble], rev, `cursor_${'9'.repeat(32)}`);
-    const page = raw['page'] as JsonObject;
+    const page = fixtureObject(field(raw, 'page'));
     return decode({
       ...raw,
       page: {
@@ -235,7 +241,9 @@ describe('renderLegalPage', () => {
   test('the envelope is printed once and never repeats inside the body', () => {
     const out = lines(renderLegalPage(scopedPage));
     expect(out).toHaveLength(3);
-    const [header, first, second] = out as [string, string, string];
+    const header = observedAt(out, 0);
+    const first = observedAt(out, 1);
+    const second = observedAt(out, 2);
     expect(header).toContain('rev11/t3');
     expect(header).toContain(`scope=unit ${UNIT}`);
     expect(header).toContain('2/3');
@@ -256,7 +264,9 @@ describe('renderLegalPage', () => {
   });
 
   test('omit-when-default hides four fields; a non-default is always marked', () => {
-    const [, first, second] = lines(renderLegalPage(scopedPage)) as [string, string, string];
+    const out = lines(renderLegalPage(scopedPage));
+    const first = observedAt(out, 1);
+    const second = observedAt(out, 2);
     expect(first.startsWith('a1 ')).toBe(true);
     expect(first.endsWith(`action_${'1'.repeat(32)}`)).toBe(true);
     expect(second.endsWith(`action_${'2'.repeat(32)}`)).toBe(true);
@@ -569,7 +579,7 @@ const commandFixture = (plan: ReadonlyArray<FakeRoute>): Fixture => {
       Layer.succeed(V2Client, client)
     ),
     requests: recorder.requests,
-    mirror: Effect.runSync(mirrorDir(target)),
+    mirror: Effect.runSync(Effect.orDie(mirrorDir(target))),
   };
 };
 
@@ -597,160 +607,180 @@ const legalOptions = (overrides: Partial<LegalOptions> = {}): LegalOptions => ({
   ...overrides,
 });
 
-const capture = async (
+const capture = (
   options: LegalOptions,
   fixture: Fixture
-): Promise<{ readonly out: ReadonlyArray<string>; readonly error: string | null }> => {
-  const out: string[] = [];
-  const original = console.log;
-  console.log = (...parts: ReadonlyArray<unknown>) => out.push(parts.join(' '));
-  try {
-    const either = await Effect.runPromise(
-      Effect.either(Effect.provide(runLegal(options), fixture.layer))
-    );
-    return {
-      out,
-      error: Either.isLeft(either) ? (either.left as { message: string }).message : null,
-    };
-  } finally {
-    console.log = original;
-  }
-};
+): Effect.Effect<{ readonly out: ReadonlyArray<string>; readonly error: string | null }> =>
+  Effect.map(
+    captureEffect(Effect.either(provideTestLayer(runLegal(options), fixture.layer))),
+    ({ value: either, captured }) => ({
+      out: captured.out,
+      error: Either.isLeft(either) ? either.left.message : null,
+    })
+  );
 
 describe('play legal', () => {
   const rev = revision(7);
+  const jsonValue = Schema.parseJson(Schema.Unknown);
 
-  test('one page renders as text and --json prints the validated envelope', async () => {
-    const payload = legalPage(
-      [
-        {
-          action_id: 'action_opaque',
-          kind: 'phase.end',
-          label: 'End phase',
-          subject: { operation: 'end' },
-          arguments_schema: { type: 'object' },
-          state_revision: rev,
-        },
-      ],
-      rev
-    );
-    const text = await capture(legalOptions(), commandFixture([{ body: payload }]));
-    expect(text.error).toBeNull();
-    expect(text.out[0]).toBe('rev7/t3 legal scope=all 1/1 complete');
-    expect(text.out[0]?.startsWith('{')).toBe(false);
+  effectTest('one page renders as text and --json prints the validated envelope', () => {
+      const payload = legalPage(
+        [
+          {
+            action_id: 'action_opaque',
+            kind: 'phase.end',
+            label: 'End phase',
+            subject: { operation: 'end' },
+            arguments_schema: { type: 'object' },
+            state_revision: rev,
+          },
+        ],
+        rev
+      );
+      const expectedJson = Schema.decodeUnknownSync(jsonValue)(JSON.stringify(decode(payload)));
+      return Effect.gen(function* () {
+        const text = yield* capture(legalOptions(), commandFixture([{ body: payload }]));
+        expect(text.error).toBeNull();
+        expect(text.out[0]).toBe('rev7/t3 legal scope=all 1/1 complete');
+        expect(text.out[0]?.startsWith('{')).toBe(false);
 
-    const json = await capture(
-      legalOptions({ json: true }),
-      commandFixture([{ body: payload }])
-    );
-    expect(json.error).toBeNull();
-    expect(json.out).toHaveLength(1);
-    expect(JSON.parse(json.out[0] ?? '') as unknown).toEqual(
-      JSON.parse(JSON.stringify(decode(payload))) as unknown
-    );
-  });
-
-  test('the flag matrix refuses before any authenticated request is sent', async () => {
-    for (const [options, expected] of [
-      [legalOptions({ all: true }), 'legal --all needs a scope'],
-      [legalOptions({ kind: 'phase.end' }), 'use --kind ACTION_KIND and --all together'],
-      [legalOptions({ offset: '4' }), 'legal --offset requires --all'],
-    ] as ReadonlyArray<readonly [LegalOptions, string]>) {
-      const fixture = commandFixture([]);
-      const { error } = await capture(options, fixture);
-      expect(error).toContain(expected);
-      expect(fixture.requests).toHaveLength(0);
+        const json = yield* capture(
+          legalOptions({ json: true }),
+          commandFixture([{ body: payload }])
+        );
+        expect(json.error).toBeNull();
+        expect(json.out).toHaveLength(1);
+        expect(yield* Schema.decodeUnknown(jsonValue)(json.out[0] ?? '')).toEqual(expectedJson);
+      });
     }
-  });
+  );
 
-  test('the unscoped --all refusal names both scoped forms', async () => {
-    const { error } = await capture(legalOptions({ all: true }), commandFixture([]));
-    expect(error).toContain('--kind ACTION_KIND --all');
-    expect(error).toContain('--actor_id ACTOR_ID');
-  });
+  effectTest('the flag matrix refuses before any authenticated request is sent', () => {
+      const refusalCases: ReadonlyArray<readonly [LegalOptions, string]> = [
+        [legalOptions({ all: true }), 'legal --all needs a scope'],
+        [legalOptions({ kind: 'phase.end' }), 'use --kind ACTION_KIND and --all together'],
+        [legalOptions({ offset: '4' }), 'legal --offset requires --all'],
+      ];
+      return Effect.gen(function* () {
+        for (const [options, expected] of refusalCases) {
+          const fixture = commandFixture([]);
+          const { error } = yield* capture(options, fixture);
+          expect(error).toContain(expected);
+          expect(fixture.requests).toHaveLength(0);
+        }
+      });
+    }
+  );
 
-  test('a malformed kind lists the kinds this seat has read, without a request', async () => {
-    const fixture = commandFixture([]);
-    const { error } = await capture(
-      legalOptions({ kind: 'bogus', all: true }),
-      fixture
-    );
-    expect(error).toContain('is not an action kind');
-    expect(error).toContain('this seat has read no catalog yet');
-    expect(fixture.requests).toHaveLength(0);
-  });
+  effectTest('the unscoped --all refusal names both scoped forms', () =>
+    Effect.gen(function* () {
+      const { error } = yield* capture(legalOptions({ all: true }), commandFixture([]));
+      expect(error).toContain('--kind ACTION_KIND --all');
+      expect(error).toContain('--actor_id ACTOR_ID');
+    })
+  );
 
-  test('--cursor is passed through and is the only page option', async () => {
-    const cursor = `cursor_${'a'.repeat(32)}`;
-    const fixture = commandFixture([{ body: legalPage([], rev) }]);
-    const { error } = await capture(legalOptions({ cursor }), fixture);
-    expect(error).toBeNull();
-    expect(fixture.requests[0]?.url).toContain(`cursor=${cursor}`);
+  effectTest('a malformed kind lists the kinds this seat has read, without a request', () =>
+    Effect.gen(function* () {
+      const fixture = commandFixture([]);
+      const { error } = yield* capture(
+        legalOptions({ kind: 'bogus', all: true }),
+        fixture
+      );
+      expect(error).toContain('is not an action kind');
+      expect(error).toContain('this seat has read no catalog yet');
+      expect(fixture.requests).toHaveLength(0);
+    })
+  );
 
-    const clash = commandFixture([]);
-    const refused = await capture(
-      legalOptions({ cursor, actorId: some(UNIT) }),
-      clash
-    );
-    expect(refused.error).toBe('legal cursor must be the only page option');
-    expect(clash.requests).toHaveLength(0);
-  });
+  effectTest('--cursor is passed through and is the only page option', () =>
+    Effect.gen(function* () {
+      const cursor = `cursor_${'a'.repeat(32)}`;
+      const fixture = commandFixture([{ body: legalPage([], rev) }]);
+      const { error } = yield* capture(legalOptions({ cursor }), fixture);
+      expect(error).toBeNull();
+      expect(fixture.requests[0]?.url).toContain(`cursor=${cursor}`);
 
-  /**
-   * `_read_legal_page` (client.py:7895) calls `_mirror_page` unconditionally,
-   * and that is the *only* path that reaches `_update_options`.  A port that
-   * skipped it left `state/options/<alias>.txt` and the actions projection
-   * frozen at whatever the workspace shipped with, however many `legal --all`
-   * and `do` calls followed — a `show options/u1` divergence that grows with
-   * every command, in a file `V2_PROTOCOL_CARD` tells the agent to read.
-   */
-  test('every page read projects itself into state/options, as _read_legal_page does', async () => {
-    const action = actorAction(rev, `action_${'7'.repeat(32)}`, UNIT, {
-      operation: 'sentry',
-      label: 'Sentry',
-    });
-    const fixture = commandFixture([
-      { body: scopedLegalPage([action], rev, UNIT) },
-      { body: scopedLegalPage([action], rev, UNIT) },
-    ]);
-    const { error } = await capture(
-      legalOptions({ actorId: some(UNIT), all: true }),
-      fixture
-    );
-    expect(error).toBeNull();
-    const projected = path.join(fixture.mirror, 'state', 'options', 'u1.txt');
-    expect(fs.existsSync(projected)).toBe(true);
-    const text = fs.readFileSync(projected, 'utf8');
-    expect(text).toContain('# rev 7 turn 3');
-    expect(text).toContain('# actor unit u1');
-    expect(text).toContain('Sentry');
-  });
+      const clash = commandFixture([]);
+      const refused = yield* capture(
+        legalOptions({ cursor, actorId: some(UNIT) }),
+        clash
+      );
+      expect(refused.error).toBe('legal cursor must be the only page option');
+      expect(clash.requests).toHaveLength(0);
+    })
+  );
+
+  effectTest('every page read projects itself into state/options, as _read_legal_page does', () =>
+    withTestFileSystem((files) =>
+      Effect.gen(function* () {
+        const action = actorAction(rev, `action_${'7'.repeat(32)}`, UNIT, {
+          operation: 'sentry',
+          label: 'Sentry',
+        });
+        const fixture = commandFixture([
+          { body: scopedLegalPage([action], rev, UNIT) },
+          { body: scopedLegalPage([action], rev, UNIT) },
+        ]);
+        const { error } = yield* capture(
+          legalOptions({ actorId: some(UNIT), all: true }),
+          fixture
+        );
+        expect(error).toBeNull();
+        const projected = path.join(fixture.mirror, 'state', 'options', 'u1.txt');
+        expect(yield* files.exists(projected)).toBe(true);
+        const text = yield* files.readFileString(projected);
+        expect(text).toContain('# rev 7 turn 3');
+        expect(text).toContain('# actor unit u1');
+        expect(text).toContain('Sentry');
+      })
+    ).pipe(Effect.orDie)
+  );
 });
 
-// ---------------------------------------------------------------------------
-// The served contract
-// ---------------------------------------------------------------------------
+
+const OPENAPI_PATH = path.resolve(
+  import.meta.dir,
+  '..',
+  '..',
+  'play',
+  'docs',
+  'full-control-v2.openapi.json'
+);
+
+const loadOpenApiContract = (): Effect.Effect<JsonObject> =>
+  Effect.gen(function* () {
+    const contractText = yield* fileSystem.readFileString(OPENAPI_PATH);
+    const parsed = yield* Schema.decodeUnknown(Schema.parseJson(Schema.Unknown))(contractText);
+    if (!isJsonObject(parsed)) throw new Error('expected OpenAPI contract object');
+    return parsed;
+  }).pipe(Effect.orDie);
+
+const openApiRef = (root: JsonObject, ...parts: ReadonlyArray<string>): string => {
+  let current: JsonObject = root;
+  for (let index = 0; index < parts.length - 1; index += 1) {
+    current = fixtureObject(field(current, parts[index] ?? ''));
+  }
+  return fixtureString(field(current, parts.at(-1) ?? ''));
+};
+
+const openApiRequired = (root: JsonObject, ...parts: ReadonlyArray<string>): ReadonlySet<string> => {
+  let current: JsonObject = root;
+  for (const part of parts) {
+    current = fixtureObject(field(current, part));
+  }
+  const required = field(current, 'required');
+  if (!isJsonArray(required)) throw new Error('expected required array');
+  return new Set(required.map((item) => fixtureString(item)));
+};
 
 describe('the legal-actions OpenAPI contract', () => {
-  const contract = JSON.parse(
-    fs.readFileSync(
-      path.join(import.meta.dir, '..', '..', 'play', 'docs', 'full-control-v2.openapi.json'),
-      'utf8'
-    )
-  ) as Record<string, never>;
-
-  const at = (...parts: ReadonlyArray<string>): unknown =>
-    parts.reduce<unknown>(
-      (value, part) =>
-        typeof value === 'object' && value !== null
-          ? (value as Record<string, unknown>)[part]
-          : undefined,
-      contract
-    );
-
-  test('the legal-actions route returns the page envelope, items closed', () => {
+  effectTest('the legal-actions route returns the page envelope, items closed', () =>
+    Effect.gen(function* () {
+    const contract = yield* loadOpenApiContract();
     expect(
-      at(
+      openApiRef(
+        contract,
         'paths',
         '/v2/games/{game_id}/me/legal-actions',
         'get',
@@ -763,23 +793,45 @@ describe('the legal-actions OpenAPI contract', () => {
       )
     ).toBe('#/components/schemas/LegalActionPageEnvelope');
     expect(
-      at('components', 'schemas', 'LegalActionPage', 'properties', 'items', 'items', '$ref')
+      openApiRef(
+        contract,
+        'components',
+        'schemas',
+        'LegalActionPage',
+        'properties',
+        'items',
+        'items',
+        '$ref'
+      )
     ).toBe('#/components/schemas/LegalActionDescriptor');
-  });
+  })
+  );
 
-  test('a descriptor requires exactly the six fields this unit reads', () => {
-    const required = at('components', 'schemas', 'LegalActionDescriptor', 'required');
-    expect(new Set(required as ReadonlyArray<string>)).toEqual(
+  effectTest('a descriptor requires exactly the six fields this unit reads', () =>
+    Effect.gen(function* () {
+    const contract = yield* loadOpenApiContract();
+    expect(
+      openApiRequired(contract, 'components', 'schemas', 'LegalActionDescriptor')
+    ).toEqual(
       new Set(['action_id', 'kind', 'label', 'subject', 'arguments_schema', 'state_revision'])
     );
     expect(
-      at('components', 'schemas', 'LegalActionDescriptor', 'properties', 'kind', '$ref')
+      openApiRef(
+        contract,
+        'components',
+        'schemas',
+        'LegalActionDescriptor',
+        'properties',
+        'kind',
+        '$ref'
+      )
     ).toBe('#/components/schemas/ActionKind');
-    // The client's own kind regex is the served pattern, so `--kind` cannot
-    // drift away from what the supervisor will actually emit.
-    expect(at('components', 'schemas', 'ActionKind', 'pattern')).toBe(ACTION_KIND_RE.source);
-    expect(at('components', 'schemas', 'LegalActionSubject', 'required')).toContain(
-      'operation'
+    expect(openApiRef(contract, 'components', 'schemas', 'ActionKind', 'pattern')).toBe(
+      ACTION_KIND_RE.source
     );
-  });
+    expect(
+      openApiRequired(contract, 'components', 'schemas', 'LegalActionSubject').has('operation')
+    ).toBe(true);
+  })
+  );
 });

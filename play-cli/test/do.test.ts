@@ -15,7 +15,7 @@
  * (`…_fetches_every_unread_actor_before_it_sends_anything`) and the two
  * spellings of the same orders (`do "…"` positionally versus `--orders`).
  */
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect } from 'bun:test';
 import { Command, ValidationError } from '@effect/cli';
 import { BunContext } from '@effect/platform-bun';
 import { Cause, Effect, Exit, Layer, Option } from 'effect';
@@ -40,6 +40,9 @@ import {
   UNIT_TWO,
   type Bench,
 } from 'test/_do-harness';
+import { awaitTest, provideTestLayer } from 'test/_effect-test';
+import { captureEffect } from 'test/_capture';
+import { parseFixtureObject } from 'test/_expect';
 
 const benches: Bench[] = [];
 
@@ -49,9 +52,45 @@ const fresh = (): Bench => {
   return made;
 };
 
-afterEach(() => {
-  while (benches.length > 0) benches.pop()?.scratch.cleanup();
-});
+afterEach(() =>
+  Promise.all(benches.splice(0).map((kit) => kit.scratch.cleanup()))
+);
+
+const runCaptured = (kit: Bench, args: ReturnType<typeof doArgs>) =>
+  Effect.promise(() => runDoCaptured(kit, args));
+
+const explodingHooks: DoHooksFor = () =>
+  Effect.die(new Error('no hook may be built for a refused invocation'));
+
+type Reached = 'validation-error' | 'handler' | 'other';
+
+const parseArgv = (kit: Bench, argv: ReadonlyArray<string>): Effect.Effect<Reached> =>
+  captureEffect(
+    Effect.exit(
+      provideTestLayer(
+        Command.run(doCommandWith(explodingHooks), { name: 'play', version: '0.1.0' })([
+          'bun',
+          'play',
+          '--session',
+          kit.sessionPath,
+          ...argv,
+        ]),
+        Layer.mergeAll(kit.layer, BunContext.layer)
+      )
+    )
+  ).pipe(
+    Effect.map(({ value: exit }) => {
+      if (Exit.isSuccess(exit)) return 'other' as const;
+      const failure = Option.getOrNull(Cause.failureOption(exit.cause));
+      if (failure !== null && ValidationError.isValidationError(failure)) {
+        return 'validation-error' as const;
+      }
+      const died = Option.getOrNull(Cause.dieOption(exit.cause));
+      return died instanceof Error && died.message.includes('no hook may be built')
+        ? ('handler' as const)
+        : ('other' as const);
+    })
+  );
 
 const MOVE_ONE = `action_${'1'.repeat(26)}`;
 const FOUND_ONE = `action_${'2'.repeat(26)}`;
@@ -59,7 +98,7 @@ const MOVE_FRESH = `action_${'3'.repeat(26)}`;
 const FOUND_FRESH = `action_${'4'.repeat(26)}`;
 
 describe('do — the batch', () => {
-  test('sends one batch per order and rebinds after a revision bump', async () => {
+  awaitTest('sends one batch per order and rebinds after a revision bump', function* () {
     const kit = fresh();
     const first = rev(7);
     const later = rev(9);
@@ -72,7 +111,7 @@ describe('do — the batch', () => {
     ]);
     kit.world.receipt = () => ({ state: 'applied', revision: later });
 
-    const run = await runDoCaptured(kit, doArgs('u1 move 32,72; u1 found_city London'));
+    const run = yield* runCaptured(kit, doArgs('u1 move 32,72; u1 found_city London'));
 
     expect(run.code).toBe(0);
     // POST, GET (one drain of exactly u1), POST.
@@ -91,16 +130,16 @@ describe('do — the batch', () => {
     // The second order went out against the *re-bound* handle, never the one
     // the first receipt expired.
     const state = kit.readState();
-    expect(Object.keys(state.actions).sort()).toEqual([FOUND_FRESH, MOVE_FRESH].sort());
+    expect(Object.keys(state.actions).toSorted()).toEqual([FOUND_FRESH, MOVE_FRESH].toSorted());
   });
 
-  test('the summary never contradicts the receipt above it', async () => {
+  awaitTest('the summary never contradicts the receipt above it', function* () {
     const kit = fresh();
     kit.world.revision = rev(7);
     kit.seed(UNIT_ONE, [foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
     kit.world.receipt = () => ({ state: 'applied', revision: rev(9) });
 
-    const run = await runDoCaptured(kit, doArgs('u1 found_city London'));
+    const run = yield* runCaptured(kit, doArgs('u1 found_city London'));
 
     expect(run.code).toBe(0);
     expect(run.out).toHaveLength(2);
@@ -110,17 +149,17 @@ describe('do — the batch', () => {
     expect(run.out[1]).toBe('1/1 applied rev9/t3');
   });
 
-  test('--json carries the receipt revision, not the pre-batch one', async () => {
+  awaitTest('--json carries the receipt revision, not the pre-batch one', function* () {
     const kit = fresh();
     kit.world.revision = rev(7);
     kit.seed(UNIT_ONE, [foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
     kit.world.receipt = () => ({ state: 'applied', revision: rev(9) });
 
-    const run = await runDoCaptured(kit, doArgs('u1 found_city London', { json: true }));
+    const run = yield* runCaptured(kit, doArgs('u1 found_city London', { json: true }));
 
     expect(run.code).toBe(0);
     expect(run.out).toHaveLength(1);
-    const payload: unknown = JSON.parse(run.out[0] ?? '');
+    const payload = parseFixtureObject(run.out[0] ?? '');
     expect(payload).toMatchObject({
       schema_version: 1,
       command: 'do',
@@ -129,11 +168,10 @@ describe('do — the batch', () => {
       state_revision: { turn: 3, revision: 9 },
       stopped: null,
     });
-    // The composite `--end` keys only appear when `--end` asked for them.
-    expect(Object.keys(payload as Record<string, unknown>)).not.toContain('end');
+    expect(Object.keys(payload)).not.toContain('end');
   });
 
-  test('an outcome it already printed is never discarded', async () => {
+  awaitTest('an outcome it already printed is never discarded', function* () {
     const kit = fresh();
     kit.world.revision = rev(7);
     kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72), foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
@@ -142,7 +180,7 @@ describe('do — the batch', () => {
     kit.world.drainFailure = () =>
       playerError('the v2 request could not be sent: connection reset');
 
-    const run = await runDoCaptured(kit, doArgs('u1 move 32,72; u1 found_city London'));
+    const run = yield* runCaptured(kit, doArgs('u1 move 32,72; u1 found_city London'));
 
     expect(run.code).toBe(2);
     // The applied order, its server-issued batch_id and the remedy that
@@ -154,13 +192,13 @@ describe('do — the batch', () => {
     expect(run.out.some((line) => line.includes('stopped after order 1'))).toBe(true);
   });
 
-  test('a submit that fails names the batch the agent must resolve by hand', async () => {
+  awaitTest('a submit that fails names the batch the agent must resolve by hand', function* () {
     const kit = fresh();
     kit.world.revision = rev(7);
     kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
     kit.world.submitFailure = () => playerError('the v2 request could not be sent: timeout');
 
-    const run = await runDoCaptured(kit, doArgs('u1 move 32,72'));
+    const run = yield* runCaptured(kit, doArgs('u1 move 32,72'));
 
     expect(run.code).toBe(2);
     expect(run.out[0]).toBe('u1 move 32,72 → not sent: the v2 request could not be sent: timeout');
@@ -170,13 +208,13 @@ describe('do — the batch', () => {
     );
   });
 
-  test('a persist that fails names no batch, because none exists', async () => {
+  awaitTest('a persist that fails names no batch, because none exists', function* () {
     const kit = fresh();
     kit.world.revision = rev(7);
     kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
     kit.world.persistFailure = () => playerError('unknown or expired action ID');
 
-    const run = await runDoCaptured(kit, doArgs('u1 move 32,72'));
+    const run = yield* runCaptured(kit, doArgs('u1 move 32,72'));
 
     expect(run.code).toBe(2);
     expect(run.out[0]).toBe('u1 move 32,72 → not sent: unknown or expired action ID');
@@ -185,7 +223,7 @@ describe('do — the batch', () => {
 });
 
 describe('do — refusal', () => {
-  test('stops on the first rejection and prints that actor’s options', async () => {
+  awaitTest('stops on the first rejection and prints that actor’s options', function* () {
     const kit = fresh();
     kit.world.revision = rev(7);
     kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72), foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
@@ -194,7 +232,7 @@ describe('do — refusal', () => {
       revision: rev(7),
     });
 
-    const run = await runDoCaptured(kit, doArgs('u1 move 32,72; u1 found_city London'));
+    const run = yield* runCaptured(kit, doArgs('u1 move 32,72; u1 found_city London'));
 
     expect(run.code).toBe(2);
     // The refused actor's own options print under the refusal, and the still
@@ -210,7 +248,7 @@ describe('do — refusal', () => {
     expect(run.out[4]).toStartWith('a1  unit.order/move');
   });
 
-  test('--continue-on-error keeps issuing the later orders', async () => {
+  awaitTest('--continue-on-error keeps issuing the later orders', function* () {
     const kit = fresh();
     kit.world.revision = rev(7);
     kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72), foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
@@ -220,7 +258,7 @@ describe('do — refusal', () => {
     });
     kit.world.focus = () => 'next: just turn';
 
-    const run = await runDoCaptured(
+    const run = yield* runCaptured(
       kit,
       doArgs('u1 move 32,72; u1 found_city London', { continueOnError: true })
     );
@@ -235,14 +273,14 @@ describe('do — refusal', () => {
     expect(run.out[run.out.length - 1]).toStartWith('next: ');
   });
 
-  test('one options section per refused actor, capped at three', async () => {
+  awaitTest('one options section per refused actor, capped at three', function* () {
     const kit = fresh();
     kit.world.revision = rev(7);
     kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
     kit.seed(UNIT_TWO, [move(`action_${'5'.repeat(26)}`, UNIT_TWO, 32, 72)]);
     kit.world.receipt = () => ({ state: 'rejected', revision: rev(7) });
 
-    const run = await runDoCaptured(
+    const run = yield* runCaptured(
       kit,
       doArgs('u1 move 32,72; u2 move 32,72', { continueOnError: true })
     );
@@ -255,7 +293,7 @@ describe('do — refusal', () => {
     expect(run.out[5]).toBe('u2 can (rev7/t3): 1 options');
   });
 
-  test('a refusal that moved the game re-reads the menu it hands back, bounded', async () => {
+  awaitTest('a refusal that moved the game re-reads the menu it hands back, bounded', function* () {
     const kit = fresh();
     const moved = rev(9);
     kit.world.revision = rev(7);
@@ -270,7 +308,7 @@ describe('do — refusal', () => {
     );
     kit.world.receipt = () => ({ state: 'rejected', revision: moved });
 
-    const run = await runDoCaptured(kit, doArgs('u1 move 32,72'));
+    const run = yield* runCaptured(kit, doArgs('u1 move 32,72'));
 
     expect(run.code).toBe(2);
     // One drain of exactly the refused actor's catalog, and nothing else.
@@ -290,14 +328,14 @@ describe('do — refusal', () => {
     expect(rows[11]).toStartWith('a12 ');
   });
 
-  test('an options lookup that fails leaves the refusal exactly as it was', async () => {
+  awaitTest('an options lookup that fails leaves the refusal exactly as it was', function* () {
     const kit = fresh();
     kit.world.revision = rev(7);
     kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
     kit.world.receipt = () => ({ state: 'rejected', revision: rev(9) });
     kit.world.drainFailure = () => playerError('the catalog could not be read');
 
-    const run = await runDoCaptured(kit, doArgs('u1 move 32,72'));
+    const run = yield* runCaptured(kit, doArgs('u1 move 32,72'));
 
     expect(run.code).toBe(2);
     expect(run.out).toHaveLength(3);
@@ -305,7 +343,7 @@ describe('do — refusal', () => {
     expect(run.out[2]).toContain('stopped after order 1');
   });
 
-  test('an options drain that *throws* leaves the refusal exactly as it was', async () => {
+  awaitTest('an options drain that *throws* leaves the refusal exactly as it was', function* () {
     // `_refused_actor_options` catches `OSError` as well as the two client
     // errors, and the port's `OSError` is the defect channel:
     // `PrivateFsApi.readText`/`appendText` run their `fstat`/`read` inside a
@@ -332,7 +370,7 @@ describe('do — refusal', () => {
           }),
       }));
 
-    const run = await runDoCaptured(
+    const run = yield* runCaptured(
       { ...kit, hooks: throwing },
       doArgs('u1 move 32,72; u1 found_city London', { continueOnError: true })
     );
@@ -349,7 +387,7 @@ describe('do — refusal', () => {
     expect(run.err.join('\n')).not.toContain('EIO');
   });
 
-  test('a state re-read that *throws* leaves the refusal exactly as it was', async () => {
+  awaitTest('a state re-read that *throws* leaves the refusal exactly as it was', function* () {
     // The other half of the same `except OSError`: `_actor_options_section`
     // re-loads `.v2-state` before it renders, and that read defects too.
     const kit = fresh();
@@ -382,7 +420,7 @@ describe('do — refusal', () => {
     };
     const layer = Layer.merge(kit.layer, Layer.succeed(SessionStore, store));
 
-    const run = await runDoCaptured(
+    const run = yield* runCaptured(
       { ...kit, layer },
       doArgs('u1 move 32,72; u1 found_city London', { continueOnError: true })
     );
@@ -396,14 +434,14 @@ describe('do — refusal', () => {
     expect(run.out[run.out.length - 1]).toBe('next: just turn');
   });
 
-  test('--json prints no inline options and no focus line', async () => {
+  awaitTest('--json prints no inline options and no focus line', function* () {
     const kit = fresh();
     kit.world.revision = rev(7);
     kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
     kit.world.receipt = () => ({ state: 'rejected', revision: rev(7) });
     kit.world.focus = () => 'next: never printed';
 
-    const run = await runDoCaptured(kit, doArgs('u1 move 32,72', { json: true }));
+    const run = yield* runCaptured(kit, doArgs('u1 move 32,72', { json: true }));
 
     expect(run.code).toBe(2);
     expect(run.out).toHaveLength(1);
@@ -415,12 +453,12 @@ describe('do — refusal', () => {
 });
 
 describe('do — resolution', () => {
-  test('refuses every order when one cannot be resolved, before any request', async () => {
+  awaitTest('refuses every order when one cannot be resolved, before any request', function* () {
     const kit = fresh();
     kit.world.revision = rev(7);
     kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
 
-    const run = await runDoCaptured(kit, doArgs('u1 move 32,72; u1 teleport 99,99'));
+    const run = yield* runCaptured(kit, doArgs('u1 move 32,72; u1 teleport 99,99'));
 
     expect(run.code).toBe(2);
     expect(kit.world.trace).toEqual([]);
@@ -437,26 +475,26 @@ describe('do — resolution', () => {
     expect(run.error).toContain('enumerate with: just legal --actor_id u1 --all');
   });
 
-  test('the order-count bounds are refused with no request either', async () => {
+  awaitTest('the order-count bounds are refused with no request either', function* () {
     const kit = fresh();
     kit.world.revision = rev(7);
     kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
 
-    const many = await runDoCaptured(
+    const many = yield* runCaptured(
       kit,
       doArgs(Array.from({ length: 9 }, () => 'u1 move 32,72').join('; '))
     );
     expect(many.code).toBe(2);
     expect(many.error).toContain('1 through 8 orders');
 
-    const none = await runDoCaptured(kit, doArgs('  ;  '));
+    const none = yield* runCaptured(kit, doArgs('  ;  '));
     expect(none.code).toBe(2);
     expect(none.error).toContain('at least one order');
 
     expect(kit.world.trace).toEqual([]);
   });
 
-  test('every unread actor is fetched before anything is sent', async () => {
+  awaitTest('every unread actor is fetched before anything is sent', function* () {
     const kit = fresh();
     kit.world.revision = rev(7);
     // Learn the entity aliases without learning any capability: seed both
@@ -470,7 +508,7 @@ describe('do — resolution', () => {
     // `u1 teleport` is a bad verb, not a cold cache.  u1 is still fetched
     // first — the whole batch is re-checked before anything is sent — and then
     // the batch refuses whole.
-    const run = await runDoCaptured(kit, doArgs('u1 teleport 9,9; u2 move 32,72'));
+    const run = yield* runCaptured(kit, doArgs('u1 teleport 9,9; u2 move 32,72'));
 
     expect(run.code).toBe(2);
     expect(kit.world.trace.filter((entry) => entry.startsWith('submit:'))).toEqual([]);
@@ -480,19 +518,19 @@ describe('do — resolution', () => {
     expect(run.error).toContain('enumerate with: just legal --actor_id u1 --all');
   });
 
-  test('an actor already read is never re-fetched for a bad verb', async () => {
+  awaitTest('an actor already read is never re-fetched for a bad verb', function* () {
     const kit = fresh();
     kit.world.revision = rev(7);
     kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
 
-    const run = await runDoCaptured(kit, doArgs('u1 teleport 9,9'));
+    const run = yield* runCaptured(kit, doArgs('u1 teleport 9,9'));
 
     expect(run.code).toBe(2);
     expect(kit.world.trace).toEqual([]);
     expect(run.error).toContain('did not resolve');
   });
 
-  test('--no-refresh keeps the plain refusal and fetches nothing', async () => {
+  awaitTest('--no-refresh keeps the plain refusal and fetches nothing', function* () {
     const kit = fresh();
     kit.world.revision = rev(7);
     kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
@@ -500,21 +538,21 @@ describe('do — resolution', () => {
     kit.world.revision = rev(8);
     kit.world.catalogs.set(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
 
-    const run = await runDoCaptured(kit, doArgs('u1 move 32,72', { noRefresh: true }));
+    const run = yield* runCaptured(kit, doArgs('u1 move 32,72', { noRefresh: true }));
 
     expect(run.code).toBe(2);
     expect(kit.world.trace).toEqual([]);
     expect(run.error).toContain('did not resolve');
   });
 
-  test('a stale-alias rebind note prints above the receipt', async () => {
+  awaitTest('a stale-alias rebind note prints above the receipt', function* () {
     const kit = fresh();
     kit.world.revision = rev(9);
     kit.seed(UNIT_ONE, [foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
     kit.world.aliasNotes = ['a1 rebound at rev9'];
     kit.world.receipt = () => ({ state: 'applied', revision: rev(9) });
 
-    const run = await runDoCaptured(kit, doArgs('u1 found_city London'));
+    const run = yield* runCaptured(kit, doArgs('u1 found_city London'));
 
     expect(run.code).toBe(0);
     expect(run.out[0]).toBe('a1 rebound at rev9');
@@ -526,7 +564,7 @@ describe('do — the actorless order', () => {
   const END_ONE = `action_${'7'.repeat(26)}`;
   const END_FRESH = `action_${'8'.repeat(26)}`;
 
-  test('a bump re-enumerates the global catalog for an order with no actor', async () => {
+  awaitTest('a bump re-enumerates the global catalog for an order with no actor', function* () {
     const kit = fresh();
     const later = rev(9);
     kit.world.revision = rev(7);
@@ -540,7 +578,7 @@ describe('do — the actorless order', () => {
     kit.world.catalogs.set('', [phaseEndAction(END_FRESH)]);
     kit.world.receipt = () => ({ state: 'applied', revision: later });
 
-    const run = await runDoCaptured(kit, doArgs('u1 move 32,72; end'));
+    const run = yield* runCaptured(kit, doArgs('u1 move 32,72; end'));
 
     // `_refresh_orders` dedupes pending actors with a plain set and drains
     // whatever is in it, `""` included.  Skipping the empty id leaves
@@ -560,7 +598,7 @@ describe('do — the actorless order', () => {
     expect(Object.keys(kit.readState().actions)).toEqual([END_FRESH]);
   });
 
-  test('the global catalog is drained once, however many actorless orders name it', async () => {
+  awaitTest('the global catalog is drained once, however many actorless orders name it', function* () {
     const kit = fresh();
     kit.world.revision = rev(7);
     kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
@@ -568,7 +606,7 @@ describe('do — the actorless order', () => {
     kit.world.catalogs.set('', [phaseEndAction(END_FRESH)]);
     kit.world.receipt = (index) => ({ state: 'applied', revision: index === 0 ? rev(9) : rev(9) });
 
-    const run = await runDoCaptured(kit, doArgs('u1 move 32,72; end; end'));
+    const run = yield* runCaptured(kit, doArgs('u1 move 32,72; end; end'));
 
     expect(run.code).toBe(0);
     expect(kit.world.trace.filter((entry) => entry === 'drain:')).toHaveLength(1);
@@ -577,72 +615,22 @@ describe('do — the actorless order', () => {
 });
 
 describe('do — the argparse surface', () => {
-  const explodingHooks: DoHooksFor = () =>
-    Effect.die(new Error('no hook may be built for a refused invocation'));
-
-  /**
-   * How far one argv got: refused by the parser, or handed to the handler.
-   *
-   * The distinction is the whole test.  `Options.text` would have *also* ended
-   * in a non-zero status here — as a die out of `explodingHooks` — so a test
-   * that only checked the exit code would pass against the bug.
-   */
-  type Reached = 'validation-error' | 'handler' | 'other';
-
-  const parse = async (kit: Bench, argv: ReadonlyArray<string>): Promise<Reached> => {
-    const log = console.log;
-    const error = console.error;
-    console.log = () => undefined;
-    console.error = () => undefined;
-    try {
-      const exit = await Effect.runPromiseExit(
-        Effect.provide(
-          Command.run(doCommandWith(explodingHooks), { name: 'play', version: '0.1.0' })([
-            'bun',
-            'play',
-            '--session',
-            kit.sessionPath,
-            ...argv,
-          ]),
-          Layer.mergeAll(kit.layer, BunContext.layer)
-        )
-      );
-      if (Exit.isSuccess(exit)) return 'other';
-      const failure = Option.getOrNull(Cause.failureOption(exit.cause));
-      if (failure !== null && ValidationError.isValidationError(failure)) return 'validation-error';
-      const died = Option.getOrNull(Cause.dieOption(exit.cause));
-      return died instanceof Error && died.message.includes('no hook may be built')
-        ? 'handler'
-        : 'other';
-    } finally {
-      console.log = log;
-      console.error = error;
-    }
-  };
-
-  test('--until is a choice, so a bad value is refused before any order is sent', async () => {
+  awaitTest('--until is a choice, so a bad value is refused before any order is sent', function* () {
     const kit = fresh();
     kit.world.revision = rev(7);
     kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
 
-    // argparse declared `choices=("phase", "revision")`, so CPython refused at
-    // parse time with a usage dump and status 2, having sent nothing.  A plain
-    // text option would have let the whole batch reach the wire and only
-    // surfaced the bad value from the wait engine — and only if `--end
-    // --await` was passed at all.
-    expect(await parse(kit, ['u1 move 32,72', '--until', 'bogus'])).toBe('validation-error');
+    expect(yield* parseArgv(kit, ['u1 move 32,72', '--until', 'bogus'])).toBe('validation-error');
     expect(kit.world.trace).toEqual([]);
-    // …and the control: a good value is not refused by the parser, it reaches
-    // the handler.
-    expect(await parse(kit, ['u1 move 32,72', '--until', 'revision'])).toBe('handler');
-    expect(await parse(kit, ['u1 move 32,72'])).toBe('handler');
+    expect(yield* parseArgv(kit, ['u1 move 32,72', '--until', 'revision'])).toBe('handler');
+    expect(yield* parseArgv(kit, ['u1 move 32,72'])).toBe('handler');
 
     // Both accepted spellings still parse, and reach the handler.
     for (const value of ['phase', 'revision']) {
       const kept = fresh();
       kept.world.revision = rev(7);
       kept.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
-      const run = await runDoCaptured(
+      const run = yield* runCaptured(
         kept,
         doArgs('u1 move 32,72', { wait: { waitS: 120, pollS: 1, until: value } })
       );
@@ -652,35 +640,24 @@ describe('do — the argparse surface', () => {
 });
 
 describe('do — the drain refusal payload', () => {
-  test('a supervisor refusal during the pre-send drain keeps its wire payload', async () => {
+  awaitTest('a supervisor refusal during the pre-send drain keeps its wire payload', function* () {
     const kit = fresh();
     const payload = errorPayload();
     // One route, one refusal: the very first legal page the pre-send drain
     // asks for comes back 409.
     const client = v2ClientFor(httpFor(fakeFetch([{ status: 409, body: payload }])));
-    const hooks = await Effect.runPromise(
-      Effect.provide(
-        liveDoHooks(kit.sessionPath, kit.session, { waitS: 120, pollS: 1, until: 'phase' }),
-        Layer.mergeAll(
-          kit.layer,
-          Layer.succeed(V2Client, client),
-          Layer.succeed(SessionStore, kit.store),
-          Layer.succeed(PrivateFs, kit.scratch.files)
-        )
-      )
+    const drainLayer = Layer.mergeAll(
+      kit.layer,
+      Layer.succeed(V2Client, client),
+      Layer.succeed(SessionStore, kit.store),
+      Layer.succeed(PrivateFs, kit.scratch.files)
     );
-    const failure = await Effect.runPromise(
-      Effect.either(
-        Effect.provide(
-          hooks.drainLegalUnlocked(UNIT_ONE, openGate),
-          Layer.mergeAll(
-            kit.layer,
-            Layer.succeed(V2Client, client),
-            Layer.succeed(SessionStore, kit.store),
-            Layer.succeed(PrivateFs, kit.scratch.files)
-          )
-        )
-      )
+    const hooks = yield* provideTestLayer(
+      liveDoHooks(kit.sessionPath, kit.session, { waitS: 120, pollS: 1, until: 'phase' }),
+      drainLayer
+    );
+    const failure = yield* Effect.either(
+      provideTestLayer(hooks.drainLegalUnlocked(UNIT_ONE, openGate), drainLayer)
     );
 
     // CPython called `_drain_legal_unlocked` from `_resolve_orders_fetching`
@@ -697,7 +674,7 @@ describe('do — the drain refusal payload', () => {
 });
 
 describe('do — the two spellings', () => {
-  test('positional orders equal --orders', async () => {
+  awaitTest('positional orders equal --orders', function* () {
     const positional = fresh();
     positional.world.revision = rev(7);
     positional.seed(UNIT_ONE, [foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
@@ -708,22 +685,22 @@ describe('do — the two spellings', () => {
     written.seed(UNIT_ONE, [foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
     written.world.receipt = () => ({ state: 'applied', revision: rev(7) });
 
-    const one = await runDoCaptured(
+    const one = yield* runCaptured(
       positional,
       doArgs('', { positionalOrders: ['u1 found_city London'] })
     );
-    const two = await runDoCaptured(written, doArgs('u1 found_city London'));
+    const two = yield* runCaptured(written, doArgs('u1 found_city London'));
 
     expect(one.code).toBe(two.code);
     expect(one.out).toEqual(two.out);
   });
 
-  test('orders given twice are refused by name', async () => {
+  awaitTest('orders given twice are refused by name', function* () {
     const kit = fresh();
     kit.world.revision = rev(7);
     kit.seed(UNIT_ONE, [foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
 
-    const run = await runDoCaptured(
+    const run = yield* runCaptured(
       kit,
       doArgs('u1 found_city London', { positionalOrders: ['u1 found_city York'] })
     );
@@ -735,21 +712,19 @@ describe('do — the two spellings', () => {
 });
 
 describe('do — the streamed receipt ledger', () => {
-  test('every applied receipt is on disk before the command renders', async () => {
+  awaitTest('every applied receipt is on disk before the command renders', function* () {
     const kit = fresh();
     kit.world.revision = rev(7);
     kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72), foundCity(FOUND_ONE, UNIT_ONE, 31, 72)]);
     kit.world.receipt = () => ({ state: 'applied', revision: rev(7) });
 
-    const run = await runDoCaptured(
+    const run = yield* runCaptured(
       kit,
       doArgs('u1 move 32,72; u1 found_city London', { continueOnError: true })
     );
     expect(run.code).toBe(0);
 
-    const ledger = await Effect.runPromise(
-      Effect.provide(readSessionLedger(kit.sessionPath), kit.layer)
-    );
+    const ledger = yield* provideTestLayer(readSessionLedger(kit.sessionPath), kit.layer);
     expect(ledger).toHaveLength(2);
     expect(ledger[0]).toMatchObject({
       schema_version: 1,
@@ -767,17 +742,15 @@ describe('do — the streamed receipt ledger', () => {
     });
   });
 
-  test('a rejected receipt is recorded too, marked not ok', async () => {
+  awaitTest('a rejected receipt is recorded too, marked not ok', function* () {
     const kit = fresh();
     kit.world.revision = rev(7);
     kit.seed(UNIT_ONE, [move(MOVE_ONE, UNIT_ONE, 32, 72)]);
     kit.world.receipt = () => ({ state: 'rejected', revision: rev(7) });
 
-    await runDoCaptured(kit, doArgs('u1 move 32,72'));
+    yield* runCaptured(kit, doArgs('u1 move 32,72'));
 
-    const ledger = await Effect.runPromise(
-      Effect.provide(readSessionLedger(kit.sessionPath), kit.layer)
-    );
+    const ledger = yield* provideTestLayer(readSessionLedger(kit.sessionPath), kit.layer);
     expect(ledger).toHaveLength(1);
     expect(ledger[0]).toMatchObject({ receipt_state: 'rejected', ok: false });
   });

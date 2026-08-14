@@ -10,7 +10,6 @@
  * The two lifetimes are the whole point and are asserted against each other
  * everywhere: an action alias dies with its revision, an entity alias does not.
  */
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect, Either, Layer } from 'effect';
 import {
@@ -26,7 +25,7 @@ import {
 import { decodeLegalPage, decodePage } from 'src/schema/page';
 import { decodeReceipt } from 'src/schema/receipt';
 import type { JsonObject, JsonValue } from 'src/schema/primitives';
-import { isJsonObject } from 'src/schema/primitives';
+import { isJsonObject, isNonEmptyString } from 'src/schema/primitives';
 import { PrivateFs } from 'src/services/private-fs';
 import {
   SessionStore,
@@ -48,7 +47,6 @@ import {
   rememberReceipt,
   tileReference,
   v2StateSchema,
-  type ActionAliasEntry,
 } from 'src/services/aliases';
 import { closestAliases, expandAlias } from 'src/services/alias-expand';
 import {
@@ -64,15 +62,16 @@ import {
   sessionFile,
   type Scratch,
 } from 'test/_fixtures';
+import { fixtureString } from 'test/_expect';
+import { provideTestLayer } from 'test/_effect-test';
+import { path } from 'test/_test-platform';
 
 // ---------------------------------------------------------------------------
 // Fixture
 // ---------------------------------------------------------------------------
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
 
 interface Fixture {
   readonly scratch: Scratch;
@@ -102,7 +101,7 @@ const fixture = (): Fixture => {
     store,
     sessionPath,
     session: loaded.session,
-    run: (effect) => Effect.runSync(Effect.either(Effect.provide(effect, layer))),
+    run: (effect) => Effect.runSync(Effect.either(provideTestLayer(effect, layer))),
   };
 };
 
@@ -289,13 +288,13 @@ const ingestLegal = (
     )
   );
 
-const aliasEntries = (state: V2ClientState): Record<string, string> => {
+const aliasEntries = (state: V2ClientState): ReadonlyMap<string, string> => {
   const table = state.action_aliases['by_alias'];
-  const mapped: Record<string, string> = {};
+  const mapped = new Map<string, string>();
   if (!isJsonObject(table)) return mapped;
   for (const [alias, entry] of Object.entries(table)) {
-    if (isJsonObject(entry) && typeof entry['action_id'] === 'string') {
-      mapped[alias] = entry['action_id'];
+    if (isJsonObject(entry) && isNonEmptyString(entry['action_id'])) {
+      mapped.set(alias, entry['action_id']);
     }
   }
   return mapped;
@@ -420,12 +419,12 @@ describe('action aliases die with their revision', () => {
     const newOne = descriptor(second, `action_${'9'.repeat(32)}`);
 
     const staged = ok(ingestLegal(fx, scopedLegalPage(first, [oldOne, oldTwo], ACTOR))).state;
-    expect(aliasEntries(staged)).toEqual({
-      a1: oldOne['action_id'] as string,
-      a2: oldTwo['action_id'] as string,
-    });
+    expect([...aliasEntries(staged)]).toEqual([
+      ['a1', fixtureString(oldOne['action_id'])],
+      ['a2', fixtureString(oldTwo['action_id'])],
+    ]);
     expect(ok(fx.run(expandAlias(staged, 'a2', fx.sessionPath)))).toBe(
-      oldTwo['action_id'] as string
+      fixtureString(oldTwo['action_id'])
     );
 
     // The agent's own action bumps the revision.  The bucket still names the
@@ -448,7 +447,7 @@ describe('action aliases die with their revision', () => {
       )
     ).state;
     expect(ok(fx.run(expandAlias(reenumerated, 'a1', fx.sessionPath)))).toBe(
-      newOne['action_id'] as string
+      fixtureString(newOne['action_id'])
     );
     expect(failure(fx.run(expandAlias(reenumerated, 'a2', fx.sessionPath)))).toContain(
       'unknown action alias a2'
@@ -1089,7 +1088,7 @@ describe('a scoped catalog only earns its numbers when it is promoted', () => {
       )
     );
     expect(staged.promoted).toBeNull();
-    expect(aliasEntries(staged.state)).toEqual({});
+    expect(aliasEntries(staged.state).size).toBe(0);
     expect(Object.keys(staged.state.pending_catalogs)).toEqual([catalog]);
 
     const promoted = ok(
@@ -1099,7 +1098,7 @@ describe('a scoped catalog only earns its numbers when it is promoted', () => {
       )
     );
     expect(promoted.promoted).toHaveLength(4);
-    expect(Object.keys(aliasEntries(promoted.state))).toEqual(['a1', 'a2', 'a3', 'a4']);
+    expect([...aliasEntries(promoted.state).keys()]).toEqual(['a1', 'a2', 'a3', 'a4']);
     expect(promoted.state.pending_catalogs).toEqual({});
     // Only a complete, actor-wide catalog is remembered as drained.
     expect(promoted.state.drained_actors).toEqual([ACTOR]);
@@ -1221,7 +1220,7 @@ describe('a scoped catalog only earns its numbers when it is promoted', () => {
     );
     const after = ok(ingestLegal(fx, page)).state;
     expect(after.drained_actors).toEqual([]);
-    expect(Object.keys(aliasEntries(after))).toEqual(['a1']);
+    expect([...aliasEntries(after).keys()]).toEqual(['a1']);
   });
 });
 
@@ -1315,7 +1314,7 @@ describe('receipts retire capabilities the way a newer page does', () => {
     const fx = fixture();
     const first = revision(7);
     const staged = ok(ingestLegal(fx, scopedLegalPage(first, [descriptor(first)], ACTOR))).state;
-    expect(Object.keys(aliasEntries(staged))).toEqual(['a1']);
+    expect([...aliasEntries(staged).keys()]).toEqual(['a1']);
 
     const applied = ok(
       fx.run(
@@ -1331,7 +1330,7 @@ describe('receipts retire capabilities the way a newer page does', () => {
     expect(applied.actions).toEqual({});
     expect(applied.drained_actors).toEqual([]);
     // The bucket survives so the refusal can name the revision it came from.
-    expect(Object.keys(aliasEntries(applied))).toEqual(['a1']);
+    expect([...aliasEntries(applied).keys()]).toEqual(['a1']);
     expect(failure(fx.run(expandAlias(applied, 'a1', fx.sessionPath)))).toContain(
       'die with their revision'
     );
@@ -1400,26 +1399,25 @@ describe('renumbering across revisions', () => {
       // Action aliases restart at a1 for every fresh revision and each number
       // is live exactly once.
       const live = aliasEntries(state);
-      expect(Object.keys(live)).toEqual(['a1', 'a2', 'a3']);
-      expect(new Set(Object.values(live)).size).toBe(3);
+      expect([...live.keys()]).toEqual(['a1', 'a2', 'a3']);
+      expect(new Set(live.values()).size).toBe(3);
       expect(state.action_aliases['state_revision']).toEqual(stateRevision);
       expect(Object.keys(ok(fx.run(freshActionAliases(state))))).toEqual(['a1', 'a2', 'a3']);
 
       // Entity aliases survive every bump and never re-point.
-      for (const [alias, identifier] of Object.entries(state.entity_aliases)) {
-        expect(typeof identifier).toBe('string');
-        if (typeof identifier !== 'string') continue;
+      for (const [alias, rawIdentifier] of Object.entries(state.entity_aliases)) {
+        const identifier = fixtureString(rawIdentifier);
         const previous = seenEntities.get(alias);
         if (previous !== undefined) expect(identifier).toBe(previous);
         seenEntities.set(alias, identifier);
       }
       expect(Object.keys(state.entity_aliases)).toHaveLength(round + 1);
-      for (const alias of Object.keys(live)) expect(ACTION_ALIAS_RE.test(alias)).toBe(true);
+      for (const alias of live.keys()) expect(ACTION_ALIAS_RE.test(alias)).toBe(true);
     }
   });
 
   test('rebinding gives an unchanged action its previous number back', () => {
-    const previous: Record<string, ActionAliasEntry> = {
+    const previous = {
       a1: { action_id: 'action_old_found', actor_id: ACTOR, semantics: 'found' },
       a2: { action_id: 'action_old_move', actor_id: ACTOR, semantics: 'move' },
     };
@@ -1439,7 +1437,7 @@ describe('renumbering across revisions', () => {
   });
 
   test('an identity that now names two actions keeps the fresh numbering', () => {
-    const previous: Record<string, ActionAliasEntry> = {
+    const previous = {
       a1: { action_id: 'action_old', actor_id: ACTOR, semantics: 'found' },
     };
     const fresh = {
@@ -1456,7 +1454,7 @@ describe('renumbering across revisions', () => {
   });
 
   test('a new action fills the first free number around the re-bound ones', () => {
-    const previous: Record<string, ActionAliasEntry> = {
+    const previous = {
       a2: { action_id: 'action_old_move', actor_id: ACTOR, semantics: 'move' },
     };
     const fresh = {
@@ -1474,7 +1472,7 @@ describe('renumbering across revisions', () => {
   });
 
   test('an entry with no semantics is never carried across', () => {
-    const previous: Record<string, ActionAliasEntry> = {
+    const previous = {
       a1: { action_id: 'action_old', actor_id: ACTOR, semantics: '' },
     };
     const fresh = {

@@ -15,7 +15,6 @@
  * line-for-line port of client.py:7899-7947 so this unit is tested against the
  * projection it will actually receive.  See NOTES.md §15.1.
  */
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect, Either, Layer } from 'effect';
 import { FULL_CONTROL_V2, V2_WITHHELD } from 'src/constants';
@@ -47,7 +46,9 @@ import {
   type OrdersFetchDeps,
   type ResolvedOrder,
 } from 'src/services/orders';
+import { provideTestLayer } from 'test/_effect-test';
 import { FIXTURE_GAME_ID, scratchWorkspace, sessionFile, type Scratch } from 'test/_fixtures';
+import { path } from 'test/_test-platform';
 
 // ---------------------------------------------------------------------------
 // `_compact_legal_action` (client.py:7899-7947) — U11's, ported for the seam
@@ -65,6 +66,10 @@ const CERTAIN: JsonObject = { kind: 'exact', minimum_percent: 100, maximum_perce
 
 const sameJson = (left: JsonValue, right: JsonValue): boolean =>
   JSON.stringify(left) === JSON.stringify(right);
+
+interface CompactLegalResult {
+  [key: string]: JsonValue;
+}
 
 const compactLegalAction = (descriptor: JsonObject): Effect.Effect<JsonObject, PlayerError> =>
   Effect.sync(() => {
@@ -84,7 +89,7 @@ const compactLegalAction = (descriptor: JsonObject): Effect.Effect<JsonObject, P
     }
     const schema = (descriptor['arguments_schema'] ?? null);
     const target = (subject['target'] ?? null);
-    const result: Record<string, JsonValue> = {
+    const result: CompactLegalResult = {
       action_id: (descriptor['action_id'] ?? null),
       kind: (descriptor['kind'] ?? null),
       label: (descriptor['label'] ?? null),
@@ -104,7 +109,8 @@ const compactLegalAction = (descriptor: JsonObject): Effect.Effect<JsonObject, P
     if (isJsonObject(gold)) {
       const range: Record<string, JsonValue> = {};
       for (const key of ['minimum', 'maximum'] as const) {
-        if (Object.hasOwn(gold, key)) range[key] = gold[key] as JsonValue;
+        const bound = gold[key];
+        if (bound !== undefined) range[key] = bound;
       }
       result['gold_range'] = range;
     }
@@ -118,9 +124,9 @@ const deps: OrdersDeps = { compactLegalAction };
 // ---------------------------------------------------------------------------
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() =>
+  Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup()))
+);
 
 interface TestRevision {
   readonly turn: number;
@@ -155,7 +161,7 @@ const fixture = (): Fixture => {
     store,
     sessionPath,
     session: loaded.session,
-    run: (effect) => Effect.runSync(Effect.either(Effect.provide(effect, layer))),
+    run: (effect) => Effect.runSync(Effect.either(provideTestLayer(effect, layer))),
   };
 };
 
@@ -323,19 +329,20 @@ const ingestState = (fx: Fixture, page: JsonObject): V2ClientState =>
 
 /** A `LegalPageFetcher` that ingests one page per actor and counts its calls. */
 const fetcherFor = (
-  fx: Fixture,
+  _fixture: Fixture,
   pages: Readonly<Record<string, JsonObject>>
-): { readonly fetch: LegalPageFetcher; readonly calls: string[] } => {
+) => {
   const calls: string[] = [];
   const fetch: LegalPageFetcher = (sessionPath, session, actorId) =>
     Effect.gen(function* () {
       calls.push(actorId);
       const page = pages[actorId];
-      if (page === undefined) return yield* Effect.fail(playerError(`no catalog for ${actorId}`));
+      if (page === undefined) return yield* playerError(`no catalog for ${actorId}`);
       const decoded = yield* Effect.mapError(decodeLegalPage(page, session), (error) =>
         playerError(error.message)
       );
       yield* rememberPage(sessionPath, session, { legal: true, page: decoded });
+      return undefined;
     });
   return { fetch, calls };
 };
@@ -355,7 +362,7 @@ const resolve = (
 
 const GOAL_ID = `action_${'g'.repeat(26)}`;
 
-const withGoal = (): { readonly fx: Fixture; readonly state: V2ClientState } => {
+const withGoal = () => {
   const fx = fixture();
   const at = revision(7);
   const goal = pregameAction(
@@ -636,7 +643,7 @@ describe('the pool is narrowed only by what the order named', () => {
 // ---------------------------------------------------------------------------
 
 describe('the batch resolves whole or refuses whole', () => {
-  const withMove = (): { readonly fx: Fixture; readonly state: V2ClientState } => {
+  const withMove = () => {
     const fx = fixture();
     const at = revision(7);
     return {
@@ -720,7 +727,7 @@ describe('the batch resolves whole or refuses whole', () => {
 // ---------------------------------------------------------------------------
 
 describe('every unread actor is fetched before anything is sent', () => {
-  const withUnitAliases = (): { readonly fx: Fixture; readonly state: V2ClientState } => {
+  const withUnitAliases = () => {
     const fx = fixture();
     const at = revision(7);
     // Learn the entity aliases without learning any capability.
@@ -731,7 +738,7 @@ describe('every unread actor is fetched before anything is sent', () => {
     return { fx, state };
   };
 
-  const catalogs = (at: TestRevision): Readonly<Record<string, JsonObject>> => ({
+  const catalogs = (at: TestRevision) => ({
     [UNIT_ONE]: scopedLegalPage(
       at,
       [
@@ -798,7 +805,9 @@ describe('every unread actor is fetched before anything is sent', () => {
   test('an actor already read is never re-fetched for a bad verb', () => {
     const { fx } = withUnitAliases();
     const at = revision(7);
-    const state = ingestLegal(fx, catalogs(at)[UNIT_ONE] as JsonObject);
+    const unitOneCatalog = catalogs(at)[UNIT_ONE];
+    if (unitOneCatalog === undefined) throw new Error('expected the unit-one catalog');
+    const state = ingestLegal(fx, unitOneCatalog);
     const fetching: OrdersFetchDeps = { compactLegalAction, drainLegal: never };
     const message = failure(
       fx.run(resolveOrdersFetching(fetching, fx.sessionPath, fx.session, state, ['u1 teleport 9,9']))
@@ -840,7 +849,7 @@ describe('every unread actor is fetched before anything is sent', () => {
 // ---------------------------------------------------------------------------
 
 describe('a stale alias is re-bound before the order resolves', () => {
-  const stage = (): { readonly fx: Fixture; readonly state: V2ClientState } => {
+  const stage = () => {
     const fx = fixture();
     const old = revision(7);
     ingestLegal(
@@ -994,51 +1003,49 @@ describe('_rebind_order re-points a resolved order at the newest handle', () => 
 // _drain_legal_unlocked / _refresh_orders
 // ---------------------------------------------------------------------------
 
-describe('_drain_legal_unlocked walks the cursor chain and nothing else', () => {
-  /** A `LegalPageReader` over a scripted cursor chain, recording every query. */
-  const readerFor = (
-    fx: Fixture,
-    pages: ReadonlyArray<JsonObject>
-  ): { readonly read: LegalPageReader; readonly queries: string[] } => {
-    const queries: string[] = [];
-    let index = 0;
-    const read: LegalPageReader = (_sessionPath, session, query) =>
-      Effect.gen(function* () {
-        queries.push(query);
-        const page = pages[Math.min(index, pages.length - 1)];
-        index += 1;
-        if (page === undefined) return yield* Effect.fail(playerError('no page'));
-        return yield* Effect.mapError(decodeLegalPage(page, session), (error) =>
-          playerError(error.message)
-        );
-      });
-    return { read, queries };
-  };
+/** A `LegalPageReader` over a scripted cursor chain, recording every query. */
+const readerFor = (pages: ReadonlyArray<JsonObject>) => {
+  const queries: string[] = [];
+  let index = 0;
+  const read: LegalPageReader = (_sessionPath, session, query) =>
+    Effect.gen(function* () {
+      queries.push(query);
+      const page = pages[Math.min(index, pages.length - 1)];
+      index += 1;
+      if (page === undefined) return yield* playerError('no page');
+      return yield* Effect.mapError(decodeLegalPage(page, session), (error) =>
+        playerError(error.message)
+      );
+    });
+  return { read, queries };
+};
 
-  const paged = (
-    stateRevision: TestRevision,
-    items: ReadonlyArray<JsonValue>,
-    cursor: string | null
-  ): JsonObject => ({
-    schema_version: 2,
-    control_protocol: FULL_CONTROL_V2,
-    game_id: FIXTURE_GAME_ID,
-    agent_id: 'agent_0123456789abcdef',
-    state_revision: stateRevision,
-    page: {
-      section: 'legal_actions',
-      items,
-      total_items: items.length + (cursor === null ? 0 : 1),
-      next_cursor: cursor,
-      cursor_expires_at: cursor === null ? null : '2030-01-01T00:00:00Z',
-    },
-  });
+const paged = (
+  stateRevision: TestRevision,
+  items: ReadonlyArray<JsonValue>,
+  cursor: string | null
+): JsonObject => ({
+  schema_version: 2,
+  control_protocol: FULL_CONTROL_V2,
+  game_id: FIXTURE_GAME_ID,
+  agent_id: 'agent_0123456789abcdef',
+  state_revision: stateRevision,
+  page: {
+    section: 'legal_actions',
+    items,
+    total_items: items.length + (cursor === null ? 0 : 1),
+    next_cursor: cursor,
+    cursor_expires_at: cursor === null ? null : '2030-01-01T00:00:00Z',
+  },
+});
+
+describe('_drain_legal_unlocked walks the cursor chain and nothing else', () => {
 
   test('a scoped drain asks by actor, then by cursor, and stops at the last page', () => {
     const fx = fixture();
     const at = revision(7);
     const first = `cursor_${'1'.repeat(32)}`;
-    const { read, queries } = readerFor(fx, [
+    const { read, queries } = readerFor([
       paged(at, [actorAction(at, `action_${'1'.repeat(26)}`, UNIT_ONE)], first),
       paged(at, [actorAction(at, `action_${'2'.repeat(26)}`, UNIT_ONE, { x: 30, y: 70 })], null),
     ]);
@@ -1050,7 +1057,7 @@ describe('_drain_legal_unlocked walks the cursor chain and nothing else', () => 
   test('a global drain sends no query at all', () => {
     const fx = fixture();
     const at = revision(7);
-    const { read, queries } = readerFor(fx, [paged(at, [], null)]);
+    const { read, queries } = readerFor([paged(at, [], null)]);
     ok(fx.run(drainLegalUnlocked(read, fx.sessionPath, fx.session)));
     expect(queries).toEqual(['']);
   });
@@ -1059,7 +1066,7 @@ describe('_drain_legal_unlocked walks the cursor chain and nothing else', () => 
     const fx = fixture();
     const at = revision(7);
     const stuck = `cursor_${'9'.repeat(32)}`;
-    const { read } = readerFor(fx, [paged(at, [], stuck), paged(at, [], stuck)]);
+    const { read } = readerFor([paged(at, [], stuck), paged(at, [], stuck)]);
     expect(failure(fx.run(drainLegalUnlocked(read, fx.sessionPath, fx.session)))).toBe(
       'the legal catalog repeated a cursor'
     );
@@ -1201,7 +1208,7 @@ describe('a cached target name folds the way CPython folds it', () => {
 
   const withJoinCity = (
     ...cities: ReadonlyArray<readonly [string, string, string]>
-  ): { readonly fx: Fixture; readonly state: V2ClientState } => {
+  ) => {
     const fx = fixture();
     const at = revision(7);
     return {

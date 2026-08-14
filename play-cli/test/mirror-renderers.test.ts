@@ -11,7 +11,6 @@
  * has to read back cell-for-cell, because the merge contract is exactly that
  * round trip.
  */
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect, Either } from 'effect';
 import type { JsonObject, JsonValue } from 'src/schema/primitives';
@@ -25,6 +24,8 @@ import { renderNations } from 'src/render/mirror/nations';
 import { renderStyles } from 'src/render/mirror/styles';
 import { renderUnits } from 'src/render/mirror/units';
 import { scratchWorkspace, type Scratch } from 'test/_fixtures';
+import { provideTestLayer } from 'test/_effect-test';
+import { path } from 'test/_test-platform';
 
 const GAME_ID = 'game_12345678901234567890';
 const AGENT_ID = 'agent_test-controller';
@@ -59,14 +60,23 @@ const page = (
   game_id: GAME_ID,
   agent_id: AGENT_ID,
   state_revision: rev,
-  page: {
-    section,
-    items,
-    total_items: options.total ?? items.length,
-    next_cursor: options.cursor ?? null,
-    cursor_expires_at: null,
-    ...(options.scope === undefined ? {} : { scope: options.scope }),
-  },
+  page:
+    options.scope === undefined
+      ? {
+          section,
+          items,
+          total_items: options.total ?? items.length,
+          next_cursor: options.cursor ?? null,
+          cursor_expires_at: null,
+        }
+      : {
+          section,
+          items,
+          total_items: options.total ?? items.length,
+          next_cursor: options.cursor ?? null,
+          cursor_expires_at: null,
+          scope: options.scope,
+        },
 });
 
 interface UnitOptions {
@@ -143,9 +153,7 @@ const receipt = (state = 'applied', rev: JsonObject = revision(8)): JsonObject =
 // ---------------------------------------------------------------------------
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
 
 interface Mirror {
   readonly dir: string;
@@ -165,7 +173,7 @@ const freshMirror = (): Mirror => {
     mirrorDir(path.join(scratch.workspace.stateRoot, GAME_ID, 'codex-test.json'))
   );
   const run = <A, E>(effect: Effect.Effect<A, E, PrivateFs>): Either.Either<A, E> =>
-    Effect.runSync(Effect.either(Effect.provide(effect, scratch.layer)));
+    Effect.runSync(Effect.either(provideTestLayer(effect, scratch.layer)));
   return {
     dir,
     run,
@@ -175,33 +183,20 @@ const freshMirror = (): Mirror => {
           updateFromPage(dir, command, payload, aliases === undefined ? {} : { aliases })
         )
       ),
-    read: (...relative) => {
-      const text = right(run(readMirror(dir, relative)));
-      expect(typeof text).toBe('string');
-      return text ?? '';
-    },
+    read: (...relative) => right(run(readMirror(dir, relative))) ?? '',
   };
 };
 
-const right = <A, E>(either: Either.Either<A, E>): A => {
+const right = <A, E extends { readonly message?: string }>(either: Either.Either<A, E>): A => {
   if (Either.isLeft(either)) {
-    const failure: unknown = either.left;
-    const message =
-      typeof failure === 'object' && failure !== null && 'message' in failure
-        ? String((failure).message)
-        : String(failure);
-    throw new Error(`expected success, got: ${message}`);
+    throw new Error(`expected success, got: ${either.left.message ?? 'unknown failure'}`);
   }
   return either.right;
 };
 
-const leftMessage = <A, E>(either: Either.Either<A, E>): string => {
+const leftMessage = <A, E extends { readonly message?: string }>(either: Either.Either<A, E>): string => {
   expect(Either.isLeft(either)).toBe(true);
-  if (!Either.isLeft(either)) return '';
-  const failure: unknown = either.left;
-  return typeof failure === 'object' && failure !== null && 'message' in failure
-    ? String((failure).message)
-    : String(failure);
+  return Either.isLeft(either) ? (either.left.message ?? '') : '';
 };
 
 const bodyLines = (text: string): ReadonlyArray<string> =>
@@ -269,8 +264,7 @@ describe('the units table', () => {
 
   test('renders a fact the payload omits as a visible dash', () => {
     const mirror = freshMirror();
-    const item = unit();
-    delete (item as Record<string, unknown>)['moves'];
+    const { moves: _moves, ...item } = unit();
     mirror.write('state', page('units', revision(9), [item]));
     const row = mirror
       .read('state', 'units.tsv')
@@ -575,8 +569,10 @@ describe('update_from_page', () => {
 
   test('a page without a revision is refused', () => {
     const mirror = freshMirror();
-    const broken = page('units', revision(9), [unit()]);
-    (broken as Record<string, unknown>)['state_revision'] = { state_token: 'x' };
+    const broken = {
+      ...page('units', revision(9), [unit()]),
+      state_revision: { state_token: 'x' },
+    };
     const message = leftMessage(mirror.run(updateFromPage(mirror.dir, 'state', broken)));
     expect(message).toContain('state revision counters');
   });

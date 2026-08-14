@@ -15,13 +15,11 @@
  * result has been proved**, and the bearer token never reaches stdout, stderr
  * or the seat-binding file.
  */
-import * as fs from 'node:fs';
-import * as os from 'node:os';
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
-import { Command } from '@effect/cli';
+import { Command, HelpDoc, ValidationError } from '@effect/cli';
 import { BunContext } from '@effect/platform-bun';
-import { Effect, Either, Layer, Option } from 'effect';
+import { Effect, Either, Layer, Option, Schema } from 'effect';
+import type { MappedError } from 'src/cli-main';
 import { FULL_CONTROL_V2, SEAT_BINDING_NAME } from 'src/constants';
 import { compactJson } from 'src/services/json-output';
 import {
@@ -38,11 +36,11 @@ import {
   joinCommand,
   type JoinArgs,
 } from 'src/commands/join.cmd';
-import { Http, httpLayer } from 'src/services/http';
+import { type Http, httpLayer } from 'src/services/http';
 import {
-  PrivateFs,
-  Workspace,
-  privateFsFor,
+  type PrivateFs,
+  type PrivateFsApi,
+  type Workspace,
   type WorkspacePaths,
 } from 'src/services/private-fs';
 import {
@@ -53,7 +51,23 @@ import {
 } from 'src/services/session-store';
 import type { JsonObject } from 'src/schema/primitives';
 import type { SeatBinding } from 'src/services/session-store';
-import { recordingFetch, type FakeRoute, type RecordedRequest } from 'test/_fixtures';
+import {
+  recordingFetch,
+  scratchWorkspace,
+  type FakeRoute,
+  type RecordedRequest,
+  type Scratch,
+} from 'test/_fixtures';
+import { captureEffect } from 'test/_capture';
+import { awaitTest, effectTest, provideTestLayer } from 'test/_effect-test';
+import { leftValue, observedFirst, parseFixtureObject } from 'test/_expect';
+import { fileSystem, path } from 'test/_test-platform';
+
+type FetchArguments = Parameters<typeof fetch>;
+
+const completeFetch = (
+  handler: (...args: FetchArguments) => ReturnType<typeof fetch>
+): typeof fetch => Object.assign(handler, { preconnect: fetch.preconnect });
 
 const GAME_ID = 'game_Hsit9YEuBjKdJPPouFoGVYlk';
 const SECOND_ID = 'game_9SecondBoundGame00000000';
@@ -61,14 +75,11 @@ const CONTROLLER = 'codex-bind-model';
 const BASE = 'http://127.0.0.1:8765';
 const TOKEN = 'agent-v2-secret';
 
-const roots: string[] = [];
+const scratches: Scratch[] = [];
 
-afterEach(() => {
-  while (roots.length > 0) {
-    const root = roots.pop();
-    if (root !== undefined) fs.rmSync(root, { recursive: true, force: true });
-  }
-});
+afterEach(() =>
+  Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup()))
+);
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -77,59 +88,56 @@ afterEach(() => {
 const schema = {
   empty: emptyV2ClientState,
   validate: () => Effect.void,
-  cursorExpired: (expiresAt: string | null): boolean =>
-    expiresAt === null ? false : Date.parse(expiresAt) <= Date.now(),
+  cursorExpired: (): boolean => false,
 };
 
 interface Bench {
+  readonly scratch: Scratch;
   readonly root: string;
   readonly workspace: WorkspacePaths;
-  readonly stage: (gameId: string) => void;
+  readonly files: PrivateFsApi;
   readonly layer: (
     fetchImpl: typeof fetch
   ) => Layer.Layer<Workspace | PrivateFs | SessionStore | Http>;
 }
 
 const bench = (): Bench => {
-  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'play-cli-u02-')));
-  roots.push(root);
-  const workspace: WorkspacePaths = { root, stateRoot: path.join(root, '.sessions') };
-  const files = privateFsFor(workspace);
+  const scratch = scratchWorkspace();
+  scratches.push(scratch);
+  const { workspace, files } = scratch;
   const store = sessionStoreFor(workspace, files, schema, {});
   return {
-    root,
+    scratch,
+    root: workspace.root,
     workspace,
-    stage: (gameId) => {
-      const invites = path.join(root, '.invites');
-      fs.mkdirSync(invites, { mode: 0o700, recursive: true });
-      const target = path.join(invites, `${gameId}.json`);
-      fs.writeFileSync(
-        target,
-        JSON.stringify({
-          schema_version: 1,
-          game_id: gameId,
-          service_url: BASE,
-          join_token: 'join-secret',
-        }),
-        'utf8'
-      );
-      fs.chmodSync(target, 0o600);
-    },
+    files,
     layer: (fetchImpl) =>
-      Layer.mergeAll(
-        Layer.succeed(Workspace, workspace),
-        Layer.succeed(PrivateFs, files),
-        Layer.succeed(SessionStore, store),
-        httpLayer(fetchImpl)
-      ),
+      Layer.mergeAll(scratch.layer, Layer.succeed(SessionStore, store), httpLayer(fetchImpl)),
   };
 };
+
+const stageInvite = (fixture: Bench, gameId: string): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    const invites = path.join(fixture.workspace.root, '.invites');
+    yield* fileSystem.makeDirectory(invites, { mode: 0o700, recursive: true });
+    const target = path.join(invites, `${gameId}.json`);
+    yield* fileSystem.writeFileString(target, inviteJson(gameId));
+    yield* fileSystem.chmod(target, 0o600);
+  }).pipe(Effect.orDie);
 
 interface Captured {
   readonly out: string;
   readonly err: string;
   readonly requests: ReadonlyArray<RecordedRequest>;
 }
+
+const inviteJson = (gameId: string): string =>
+  compactJson({
+    schema_version: 1,
+    game_id: gameId,
+    service_url: BASE,
+    join_token: 'join-secret',
+  });
 
 const v2Result = (
   gameId: string,
@@ -177,15 +185,23 @@ const args = (overrides: Partial<JoinArgs> = {}): JoinArgs => ({
   ...overrides,
 });
 
+const v2Plan = (overrides: JsonObject = {}) => ({
+  status: { body: { control_protocol: FULL_CONTROL_V2 } },
+  join: { body: v2Result(GAME_ID, CONTROLLER, overrides) },
+});
+
 /** Run one join with the supervisor answering `health`, `status` and `join`. */
-const join = async (
+const join = (
   fixture: Bench,
   plan: {
     readonly status?: FakeRoute;
     readonly join: FakeRoute;
   },
   overrides: Partial<JoinArgs> = {}
-): Promise<{ readonly result: Either.Either<void, { readonly message: string }>; readonly captured: Captured }> => {
+): Effect.Effect<{
+  readonly result: Either.Either<void, { readonly message: string }>;
+  readonly captured: Captured;
+}> => {
   const recorder = recordingFetch(
     new Map<string, FakeRoute>([
       ['/join', plan.join],
@@ -193,31 +209,25 @@ const join = async (
       ['/health', { body: {} }],
     ])
   );
-  const out: string[] = [];
-  const err: string[] = [];
-  const originalLog = console.log;
-  const originalError = console.error;
-  console.log = (...parts: ReadonlyArray<unknown>) => out.push(parts.join(' '));
-  console.error = (...parts: ReadonlyArray<unknown>) => err.push(parts.join(' '));
-  try {
-    const result = await Effect.runPromise(
-      Effect.either(
-        Effect.provide(commandJoin(args(overrides), {}), fixture.layer(recorder.fetch))
-      )
-    );
-    return {
-      result,
-      captured: { out: out.join('\n'), err: err.join('\n'), requests: recorder.requests },
-    };
-  } finally {
-    console.log = originalLog;
-    console.error = originalError;
-  }
+  return captureEffect(
+    Effect.either(
+      provideTestLayer(commandJoin(args(overrides), {}), fixture.layer(recorder.fetch))
+    )
+  ).pipe(
+    Effect.map(({ value, captured }) => ({
+      result: value,
+      captured: {
+        out: captured.out.join('\n'),
+        err: captured.err.join('\n'),
+        requests: recorder.requests,
+      },
+    }))
+  );
 };
 
 const failure = <A>(either: Either.Either<A, { readonly message: string }>): string => {
   expect(Either.isLeft(either)).toBe(true);
-  return Either.isLeft(either) ? either.left.message : '';
+  return leftValue(either).message;
 };
 
 const ok = <A, E>(either: Either.Either<A, E>): void => {
@@ -226,23 +236,142 @@ const ok = <A, E>(either: Either.Either<A, E>): void => {
   }
 };
 
-const sessionFilesOf = (fixture: Bench, gameId: string): ReadonlyArray<string> => {
-  const directory = path.join(fixture.workspace.stateRoot, gameId);
-  try {
-    return fs
-      .readdirSync(directory)
+const stateRootEntries = (fixture: Bench): Effect.Effect<ReadonlyArray<string>> =>
+  fileSystem.readDirectory(fixture.workspace.stateRoot).pipe(Effect.orDie);
+
+const fileMode = (target: string): Effect.Effect<number> =>
+  Effect.map(fileSystem.stat(target).pipe(Effect.orDie), (stat) => stat.mode & 0o777);
+
+const sessionFilesOf = (
+  fixture: Bench,
+  gameId: string
+): Effect.Effect<ReadonlyArray<string>> =>
+  Effect.gen(function* () {
+    const directory = path.join(fixture.workspace.stateRoot, gameId);
+    const exists = yield* fileSystem.exists(directory);
+    if (!exists) return [];
+    const names = yield* fileSystem.readDirectory(directory);
+    return names
       .filter((name) => name.endsWith('.json'))
       .map((name) => path.join(directory, name));
-  } catch {
-    return [];
-  }
-};
+  }).pipe(Effect.orDie);
 
-const readJson = (target: string): JsonObject =>
-  JSON.parse(fs.readFileSync(target, 'utf8')) as JsonObject;
+const parseJsonText = (text: string): JsonObject => parseFixtureObject(text);
+
+const readJsonAt = (target: string): Effect.Effect<JsonObject> =>
+  Effect.map(fileSystem.readFileString(target).pipe(Effect.orDie), parseJsonText);
+
+const protocolLeadLine = (): string => observedFirst(V2_PROTOCOL_CARD);
 
 const binding = (gameId: string): Option.Option<SeatBinding> =>
   Option.some({ gameId, session: '/x', relative: 'x', boundAt: '' });
+
+const playConfigIdentity = { gameId: '', name: '', place: '' };
+
+const playConfigText = (value: JsonObject | string): string => {
+  const asString = Schema.decodeUnknownEither(Schema.String)(value);
+  return Either.isRight(asString) ? asString.right : compactJson(value);
+};
+
+const writePlayConfig = (fixture: Bench, value: JsonObject | string): Effect.Effect<void> =>
+  fileSystem
+    .writeFileString(path.join(fixture.root, '.playconfig.json'), playConfigText(value))
+    .pipe(Effect.orDie, Effect.asVoid);
+
+const writeInvalidUtf8PlayConfig = (fixture: Bench): Effect.Effect<void> =>
+  fileSystem
+    .writeFile(path.join(fixture.root, '.playconfig.json'), invalidUtf8PlayConfig())
+    .pipe(Effect.orDie, Effect.asVoid);
+
+const runPlayDefaults = (fixture: Bench, given = playConfigIdentity) =>
+  Effect.runSync(Effect.either(applyPlayDefaults(fixture.workspace, given)));
+
+const stagedJoin = (
+  body: JsonObject,
+  status: FakeRoute = { body: {} }
+): Effect.Effect<{ readonly fixture: Bench; readonly message: string }> =>
+  Effect.gen(function* () {
+    const fixture = bench();
+    yield* stageInvite(fixture, GAME_ID);
+    const { result } = yield* join(fixture, { status, join: { body } });
+    return { fixture, message: failure(result) };
+  });
+
+const cliFailureText = (error: MappedError | ValidationError.ValidationError): string => {
+  if (ValidationError.isValidationError(error)) return HelpDoc.toAnsiText(error.error);
+  if (error._tag === 'ExitCodeSignal') return String(error.code);
+  return error.message;
+};
+
+const joinCli = (
+  fixture: Bench,
+  argv: ReadonlyArray<string>,
+  plan: FakeRoute = { body: v2Result(GAME_ID, CONTROLLER) }
+): Effect.Effect<{ readonly failure: string | null; readonly out: string }> => {
+  const recorder = recordingFetch(
+    new Map<string, FakeRoute>([
+      ['/join', plan],
+      ['/status', { body: { control_protocol: FULL_CONTROL_V2 } }],
+      ['/health', { body: {} }],
+    ])
+  );
+  const root = Command.make('play', {}, () => Effect.void).pipe(
+    Command.withSubcommands([joinCommand])
+  );
+  return captureEffect(
+    Effect.either(
+      provideTestLayer(
+        Command.run(root, { name: 'play', version: '0.1.0' })(['bun', 'play', ...argv]),
+        Layer.merge(fixture.layer(recorder.fetch), BunContext.layer)
+      )
+    )
+  ).pipe(
+    Effect.map(({ value, captured }) => ({
+      failure: value._tag === 'Left' ? cliFailureText(value.left) : null,
+      out: captured.out.join('\n'),
+    }))
+  );
+};
+
+const unplayableJoinCases: ReadonlyArray<readonly [string, JsonObject, string]> = [
+  [
+    'transport',
+    { v2_transport_available: false, state: 'starting' },
+    'the full-control-v2 transport did not become playable; stop and tell the game owner',
+  ],
+  [
+    'terminal',
+    { v2_transport_available: true, state: 'failed' },
+    'the full-control-v2 transport did not become playable; stop and tell the game owner',
+  ],
+  [
+    'error',
+    { v2_transport_available: true, state: 'running', error: 'sidecar startup failed' },
+    'the full-control-v2 transport did not become playable; stop and tell the game owner',
+  ],
+  [
+    'availability',
+    { v2_transport_available: 'yes' },
+    'the v2 join result omitted transport availability',
+  ],
+  [
+    'protocol',
+    { supported_control_protocols: [] },
+    'the v2 join result omitted the negotiated protocol',
+  ],
+];
+
+const invalidUtf8PlayConfig = (): Uint8Array => {
+  const prefix = new TextEncoder().encode(
+    `{"schema_version":1,"game_id":"${GAME_ID}","name":"co`
+  );
+  const suffix = new TextEncoder().encode('dex","place":null}');
+  const bytes = new Uint8Array(prefix.length + 1 + suffix.length);
+  bytes.set(prefix, 0);
+  bytes[prefix.length] = 0xff;
+  bytes.set(suffix, prefix.length + 1);
+  return bytes;
+};
 
 // ---------------------------------------------------------------------------
 // The protocol card
@@ -250,7 +379,7 @@ const binding = (gameId: string): Option.Option<SeatBinding> =>
 
 describe('the one protocol card', () => {
   test('it opens on the alias dialect and the wire contract', () => {
-    expect(V2_PROTOCOL_CARD[0]?.startsWith('ALIASES')).toBe(true);
+    expect(observedFirst(V2_PROTOCOL_CARD).startsWith('ALIASES')).toBe(true);
     expect(V2_PROTOCOL_CARD[0]).toContain('dies with its revision');
     expect(V2_PROTOCOL_CARD[0]).toContain("the wire carries the server's opaque ID");
     expect(V2_PROTOCOL_CARD[1]?.startsWith('ERRORS carry their own remedy')).toBe(true);
@@ -330,7 +459,7 @@ describe('the join card', () => {
 
   test('a strategic-v1 seat never sees the v2 card', () => {
     const lines = card({ control_protocol: 'strategic-v1' }, { state: 'lobby' });
-    expect(lines).not.toContain(V2_PROTOCOL_CARD[0] as string);
+    expect(lines).not.toContain(protocolLeadLine());
     expect(lines).toContain('PROTOCOL strategic-v1 — poll a turn, submit one action.');
     expect(lines).toContain('  just next --after_turn LAST_TURN');
     expect(lines).toContain('  just act --turn TURN --observation_id ID --action JSON');
@@ -379,92 +508,118 @@ describe('the deadline sentence', () => {
 // ---------------------------------------------------------------------------
 
 describe('_apply_play_defaults', () => {
-  const identity = { gameId: '', name: '', place: '' };
+  effectTest('a pre-configured workspace fills game, name and place', () =>
+    Effect.gen(function* () {
+      const fixture = bench();
+      yield* writePlayConfig(fixture, {
+        schema_version: 1,
+        game_id: GAME_ID,
+        name: CONTROLLER,
+        place: 2,
+      });
+      expect(runPlayDefaults(fixture)).toEqual(
+        Either.right({ gameId: GAME_ID, name: CONTROLLER, place: '2' })
+      );
+    })
+  );
 
-  const write = (fixture: Bench, value: unknown): void => {
-    fs.writeFileSync(
-      path.join(fixture.root, '.playconfig.json'),
-      typeof value === 'string' ? value : JSON.stringify(value),
-      'utf8'
-    );
-  };
-
-  const run = (fixture: Bench, given = identity) =>
-    Effect.runSync(Effect.either(applyPlayDefaults(fixture.workspace, given)));
-
-  test('a pre-configured workspace fills game, name and place', () => {
-    const fixture = bench();
-    write(fixture, { schema_version: 1, game_id: GAME_ID, name: CONTROLLER, place: 2 });
-    expect(run(fixture)).toEqual(
-      Either.right({ gameId: GAME_ID, name: CONTROLLER, place: '2' })
-    );
-  });
-
-  test('explicit arguments always win', () => {
-    const fixture = bench();
-    write(fixture, { schema_version: 1, game_id: GAME_ID, name: CONTROLLER, place: 2 });
-    expect(
-      run(fixture, { gameId: SECOND_ID, name: 'pi-gpt-5.5', place: '' })
-    ).toEqual(Either.right({ gameId: SECOND_ID, name: 'pi-gpt-5.5', place: '2' }));
-  });
+  effectTest('explicit arguments always win', () =>
+    Effect.gen(function* () {
+      const fixture = bench();
+      yield* writePlayConfig(fixture, {
+        schema_version: 1,
+        game_id: GAME_ID,
+        name: CONTROLLER,
+        place: 2,
+      });
+      expect(
+        runPlayDefaults(fixture, { gameId: SECOND_ID, name: 'pi-gpt-5.5', place: '' })
+      ).toEqual(Either.right({ gameId: SECOND_ID, name: 'pi-gpt-5.5', place: '2' }));
+    })
+  );
 
   test('a missing config leaves every argument untouched', () => {
-    expect(run(bench())).toEqual(Either.right(identity));
+    expect(runPlayDefaults(bench())).toEqual(Either.right(playConfigIdentity));
   });
 
-  test('a malformed config fails closed rather than guessing', () => {
-    const fixture = bench();
-    write(fixture, { schema_version: 1, game_id: 'nope', name: 'x', place: null });
-    expect(failure(run(fixture))).toContain('.playconfig.json');
-  });
-
-  test('unparseable JSON names the file too', () => {
-    const fixture = bench();
-    write(fixture, '{');
-    expect(failure(run(fixture))).toContain('invalid .playconfig.json:');
-  });
-
-  test('a name that is only CPython whitespace is a malformed config', () => {
-    // `not raw["name"].strip()`.  `.trim()` calls `"\x1f"` non-blank and would
-    // accept it as a controller name.
-    for (const name of ['', '', '', ' \t\n']) {
+  effectTest('a malformed config fails closed rather than guessing', () =>
+    Effect.gen(function* () {
       const fixture = bench();
-      write(fixture, { schema_version: 1, game_id: GAME_ID, name, place: null });
-      expect(failure(run(fixture))).toContain('.playconfig.json');
-    }
-  });
+      yield* writePlayConfig(fixture, {
+        schema_version: 1,
+        game_id: 'nope',
+        name: 'x',
+        place: null,
+      });
+      expect(failure(runPlayDefaults(fixture))).toContain('.playconfig.json');
+    })
+  );
 
-  test('an argument that is only CPython whitespace is still omitted', () => {
-    const fixture = bench();
-    write(fixture, { schema_version: 1, game_id: GAME_ID, name: CONTROLLER, place: 2 });
-    expect(run(fixture, { gameId: '', name: '', place: '' })).toEqual(
-      Either.right({ gameId: GAME_ID, name: CONTROLLER, place: '2' })
-    );
-  });
-
-  test('invalid UTF-8 is invalid .playconfig.json, not U+FFFD', () => {
-    // `read_text(encoding="utf-8")` raises `UnicodeDecodeError`, which
-    // `except ValueError` turns into the refusal.  Node's `'utf8'` reader
-    // would substitute and accept a config CPython refuses.
-    const fixture = bench();
-    fs.writeFileSync(
-      path.join(fixture.root, '.playconfig.json'),
-      Buffer.concat([
-        Buffer.from(`{"schema_version":1,"game_id":"${GAME_ID}","name":"co`, 'utf8'),
-        Buffer.from([0xff]),
-        Buffer.from('dex","place":null}', 'utf8'),
-      ])
-    );
-    expect(failure(run(fixture))).toContain('invalid .playconfig.json:');
-  });
-
-  test('place 0 and a boolean place are both refused', () => {
-    for (const place of [0, true, 'two']) {
+  effectTest('unparseable JSON names the file too', () =>
+    Effect.gen(function* () {
       const fixture = bench();
-      write(fixture, { schema_version: 1, game_id: GAME_ID, name: CONTROLLER, place });
-      expect(failure(run(fixture))).toContain('.playconfig.json');
-    }
-  });
+      yield* writePlayConfig(fixture, '{');
+      expect(failure(runPlayDefaults(fixture))).toContain('invalid .playconfig.json:');
+    })
+  );
+
+  effectTest('a name that is only CPython whitespace is a malformed config', () =>
+    Effect.gen(function* () {
+      // `not raw["name"].strip()`.  `.trim()` calls `"\x1f"` non-blank and would
+      // accept it as a controller name.
+      for (const name of ['', '', '', ' \t\n']) {
+        const fixture = bench();
+        yield* writePlayConfig(fixture, {
+          schema_version: 1,
+          game_id: GAME_ID,
+          name,
+          place: null,
+        });
+        expect(failure(runPlayDefaults(fixture))).toContain('.playconfig.json');
+      }
+    })
+  );
+
+  effectTest('an argument that is only CPython whitespace is still omitted', () =>
+    Effect.gen(function* () {
+      const fixture = bench();
+      yield* writePlayConfig(fixture, {
+        schema_version: 1,
+        game_id: GAME_ID,
+        name: CONTROLLER,
+        place: 2,
+      });
+      expect(runPlayDefaults(fixture, { gameId: '', name: '', place: '' })).toEqual(
+        Either.right({ gameId: GAME_ID, name: CONTROLLER, place: '2' })
+      );
+    })
+  );
+
+  effectTest('invalid UTF-8 is invalid .playconfig.json, not U+FFFD', () =>
+    Effect.gen(function* () {
+      // `read_text(encoding="utf-8")` raises `UnicodeDecodeError`, which
+      // `except ValueError` turns into the refusal.  Node's `'utf8'` reader
+      // would substitute and accept a config CPython refuses.
+      const fixture = bench();
+      yield* writeInvalidUtf8PlayConfig(fixture);
+      expect(failure(runPlayDefaults(fixture))).toContain('invalid .playconfig.json:');
+    })
+  );
+
+  effectTest('place 0 and a boolean place are both refused', () =>
+    Effect.gen(function* () {
+      for (const place of [0, true, 'two']) {
+        const fixture = bench();
+        yield* writePlayConfig(fixture, {
+          schema_version: 1,
+          game_id: GAME_ID,
+          name: CONTROLLER,
+          place,
+        });
+        expect(failure(runPlayDefaults(fixture))).toContain('.playconfig.json');
+      }
+    })
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -472,9 +627,9 @@ describe('_apply_play_defaults', () => {
 // ---------------------------------------------------------------------------
 
 describe('a strategic-v1 join', () => {
-  test('it reports and saves the exact timing contract', async () => {
+  awaitTest('it reports and saves the exact timing contract', function* (wait) {
     const fixture = bench();
-    fixture.stage(GAME_ID);
+    yield* stageInvite(fixture, GAME_ID);
     const joined: JsonObject = {
       schema_version: 1,
       game_id: GAME_ID,
@@ -489,16 +644,16 @@ describe('a strategic-v1 join', () => {
       timing_mode: 'infinite',
       action_timeout_s: null,
     };
-    const { result, captured } = await join(fixture, { join: { body: joined } });
+    const { result, captured } = yield* wait(join(fixture, { join: { body: joined } }));
     ok(result);
     expect(captured.out).not.toContain('agent-private-secret');
     expect(captured.err).not.toContain('agent-private-secret');
     expect(captured.err).toContain('Joined in infinite timing mode: no agent deadline');
     expect(captured.err).toContain('choose its action directly');
 
-    const files = sessionFilesOf(fixture, GAME_ID);
+    const files = yield* sessionFilesOf(fixture, GAME_ID);
     expect(files).toHaveLength(1);
-    const session = readJson(files[0] as string);
+    const session = yield* readJsonAt(observedFirst(files));
     expect(session['timing_mode']).toBe('infinite');
     expect(session['action_timeout_s']).toBeNull();
     expect(session['control_protocol']).toBe('strategic-v1');
@@ -508,91 +663,91 @@ describe('a strategic-v1 join', () => {
     expect(post?.body).not.toContain('supported_control_protocols');
   });
 
-  test('the session file is named for the controller and written 0600', async () => {
+  awaitTest('the session file is named for the controller and written 0600', function* (wait) {
     const fixture = bench();
-    fixture.stage(GAME_ID);
-    const { result } = await join(fixture, {
-      join: {
-        body: {
-          game_id: GAME_ID,
-          agent_id: 'agent-test',
-          agent_token: 'agent-private-secret',
-          controller_label: CONTROLLER,
+    yield* stageInvite(fixture, GAME_ID);
+    const { result } = yield* wait(
+      join(fixture, {
+        join: {
+          body: {
+            game_id: GAME_ID,
+            agent_id: 'agent-test',
+            agent_token: 'agent-private-secret',
+            controller_label: CONTROLLER,
+          },
         },
-      },
-    });
+      })
+    );
     ok(result);
     const expected = path.join(
       fixture.workspace.stateRoot,
       GAME_ID,
       `${sessionKey(CONTROLLER)}.json`
     );
-    expect(fs.statSync(expected).mode & 0o777).toBe(0o600);
+    expect(yield* fileMode(expected)).toBe(0o600);
   });
 });
 
 describe('a join the supervisor answered wrongly', () => {
-  const stagedJoin = async (
-    body: JsonObject,
-    status: FakeRoute = { body: {} }
-  ): Promise<{ readonly fixture: Bench; readonly message: string }> => {
-    const fixture = bench();
-    fixture.stage(GAME_ID);
-    const { result } = await join(fixture, { status, join: { body } });
-    return { fixture, message: failure(result) };
-  };
-
-  test('a different controller label is refused, and nothing is written', async () => {
-    const { fixture, message } = await stagedJoin({
-      game_id: GAME_ID,
-      agent_id: 'agent-test',
-      agent_token: 'agent-private-secret',
-      controller_label: 'claude-returned-model',
-    });
+  awaitTest('a different controller label is refused, and nothing is written', function* (wait) {
+    const { fixture, message } = yield* wait(
+      stagedJoin({
+        game_id: GAME_ID,
+        agent_id: 'agent-test',
+        agent_token: 'agent-private-secret',
+        controller_label: 'claude-returned-model',
+      })
+    );
     expect(message).toBe(
       'the join response controller label does not match the requested ' +
         'harness-model identity'
     );
-    expect(fs.existsSync(fixture.workspace.stateRoot)).toBe(false);
+    expect(yield* stateRootEntries(fixture)).toEqual([]);
   });
 
-  test('an incomplete response is refused before anything is written', async () => {
-    const { fixture, message } = await stagedJoin({ game_id: GAME_ID });
+  awaitTest('an incomplete response is refused before anything is written', function* (wait) {
+    const { fixture, message } = yield* wait(stagedJoin({ game_id: GAME_ID }));
     expect(message).toBe('the supervisor returned an incomplete join response');
-    expect(fs.existsSync(fixture.workspace.stateRoot)).toBe(false);
+    expect(yield* stateRootEntries(fixture)).toEqual([]);
   });
 
-  test('a response for another game is refused', async () => {
-    const { message } = await stagedJoin({
-      game_id: SECOND_ID,
-      agent_id: 'a',
-      agent_token: 'b',
-      controller_label: CONTROLLER,
-    });
-    expect(message).toBe('the join response belongs to a different game');
-  });
-
-  test('a protocol switch between preflight and join is refused', async () => {
-    const { message } = await stagedJoin(
-      {
-        game_id: GAME_ID,
+  awaitTest('a response for another game is refused', function* (wait) {
+    const { message } = yield* wait(
+      stagedJoin({
+        game_id: SECOND_ID,
         agent_id: 'a',
         agent_token: 'b',
         controller_label: CONTROLLER,
-        control_protocol: 'strategic-v1',
-      },
-      { body: { control_protocol: FULL_CONTROL_V2 } }
+      })
+    );
+    expect(message).toBe('the join response belongs to a different game');
+  });
+
+  awaitTest('a protocol switch between preflight and join is refused', function* (wait) {
+    const { message } = yield* wait(
+      stagedJoin(
+        {
+          game_id: GAME_ID,
+          agent_id: 'a',
+          agent_token: 'b',
+          controller_label: CONTROLLER,
+          control_protocol: 'strategic-v1',
+        },
+        { body: { control_protocol: FULL_CONTROL_V2 } }
+      )
     );
     expect(message).toBe('the join result changed the preflight control protocol');
   });
 
-  test('an unsupported preflight protocol names the value it saw', async () => {
+  awaitTest('an unsupported preflight protocol names the value it saw', function* (wait) {
     const fixture = bench();
-    fixture.stage(GAME_ID);
-    const { result } = await join(fixture, {
-      status: { body: { control_protocol: 'full-control-v3' } },
-      join: { body: {} },
-    });
+    yield* stageInvite(fixture, GAME_ID);
+    const { result } = yield* wait(
+      join(fixture, {
+        status: { body: { control_protocol: 'full-control-v3' } },
+        join: { body: {} },
+      })
+    );
     expect(failure(result)).toBe(
       "game requires unsupported control protocol 'full-control-v3'"
     );
@@ -600,56 +755,46 @@ describe('a join the supervisor answered wrongly', () => {
 });
 
 describe('a full-control-v2 join', () => {
-  const v2Plan = (overrides: JsonObject = {}) => ({
-    status: { body: { control_protocol: FULL_CONTROL_V2 } },
-    join: { body: v2Result(GAME_ID, CONTROLLER, overrides) },
-  });
-
-  test('a second join re-binds the held seat instead of claiming again', async () => {
-    // The game_vkNE incident: a re-join whose first response was lost claimed
-    // a SECOND seat under the same controller and silently overwrote the
-    // local session.  Join is idempotent per workspace now (NOTES §12.13).
+  awaitTest('a second join re-binds the held seat instead of claiming again', function* (wait) {
     const fixture = bench();
-    fixture.stage(GAME_ID);
-    const first = await join(fixture, v2Plan());
+    yield* stageInvite(fixture, GAME_ID);
+    const first = yield* wait(join(fixture, v2Plan()));
     ok(first.result);
     expect(first.captured.requests.filter((r) => r.method === 'POST')).toHaveLength(1);
 
-    const second = await join(fixture, v2Plan());
+    const second = yield* wait(join(fixture, v2Plan()));
     ok(second.result);
-    // No network at all: not the claim POST, not even the preflight.
     expect(second.captured.requests).toHaveLength(0);
     expect(second.captured.out).toContain(`already joined ${GAME_ID} as ${CONTROLLER}`);
     expect(second.captured.out).toContain('seat 1 AgentPlace1');
     expect(second.captured.err).toContain('joining again would claim a second seat');
     expect(second.captured.err).toContain(`delete .sessions/${GAME_ID}/`);
-    // The one session file is untouched, still holding the first claim.
-    expect(sessionFilesOf(fixture, GAME_ID)).toHaveLength(1);
+    expect(yield* sessionFilesOf(fixture, GAME_ID)).toHaveLength(1);
   });
 
-  test('a held-but-corrupt session refuses rather than silently re-claiming', async () => {
+  awaitTest('a held-but-corrupt session refuses rather than silently re-claiming', function* (wait) {
     const fixture = bench();
-    fixture.stage(GAME_ID);
-    const first = await join(fixture, v2Plan());
+    yield* stageInvite(fixture, GAME_ID);
+    const first = yield* wait(join(fixture, v2Plan()));
     ok(first.result);
-    const file = sessionFilesOf(fixture, GAME_ID)[0] as string;
-    fs.writeFileSync(file, 'not json');
-    const second = await join(fixture, v2Plan());
+    const file = observedFirst(yield* sessionFilesOf(fixture, GAME_ID));
+    yield* fileSystem.writeFileString(file, 'not json').pipe(Effect.orDie);
+    const second = yield* wait(join(fixture, v2Plan()));
     expect(Either.isLeft(second.result)).toBe(true);
-    const message = Either.isLeft(second.result) ? second.result.left.message : '';
+    const message = leftValue(second.result).message;
     expect(message).toContain(`already holds a session for ${GAME_ID}`);
     expect(message).toContain(`delete .sessions/${GAME_ID}/`);
     expect(second.captured.requests).toHaveLength(0);
   });
 
-  test('it advertises the capability and never prints the v1 loop', async () => {
+  awaitTest('it advertises the capability and never prints the v1 loop', function* (wait) {
     const fixture = bench();
-    fixture.stage(GAME_ID);
-    const { result, captured } = await join(fixture, v2Plan());
+    yield* stageInvite(fixture, GAME_ID);
+    const { result, captured } = yield* wait(join(fixture, v2Plan()));
     ok(result);
 
     const post = captured.requests.find((request) => request.method === 'POST');
-    expect(JSON.parse(post?.body ?? '{}')['supported_control_protocols']).toEqual([
+    expect(parseJsonText(post?.body ?? '{}')['supported_control_protocols']).toEqual([
       FULL_CONTROL_V2,
     ]);
     expect(captured.err).toContain('Do not use strategic');
@@ -664,113 +809,89 @@ describe('a full-control-v2 join', () => {
     expect(captured.err).toContain('remaining turns unavailable until native play starts.');
     expect(captured.err).not.toContain(TOKEN);
 
-    const saved = readJson(sessionFilesOf(fixture, GAME_ID)[0] as string);
+    const saved = yield* readJsonAt(observedFirst(yield* sessionFilesOf(fixture, GAME_ID)));
     expect(saved['control_protocol']).toBe(FULL_CONTROL_V2);
     expect(saved['objective']).toBe('Win by the configured evaluation objective.');
     expect(saved['max_turns']).toBe(321);
     expect(saved['turns_remaining']).toBeNull();
   });
 
-  test('the conduct block leads with the capitalized binding sentence', async () => {
+  awaitTest('the conduct block leads with the capitalized binding sentence', function* (wait) {
     const fixture = bench();
-    fixture.stage(GAME_ID);
-    const { captured } = await join(fixture, v2Plan());
+    yield* stageInvite(fixture, GAME_ID);
+    const { captured } = yield* wait(join(fixture, v2Plan()));
     expect(captured.err).toContain(
       `This workspace is now playing ${GAME_ID} — commands need no --session.`
     );
     expect(captured.err).toContain('Timing mode: default; 600 seconds per agent turn.');
   });
 
-  for (const [name, override, expected] of [
-    [
-      'transport',
-      { v2_transport_available: false, state: 'starting' },
-      'the full-control-v2 transport did not become playable; stop and tell the game owner',
-    ],
-    [
-      'terminal',
-      { v2_transport_available: true, state: 'failed' },
-      'the full-control-v2 transport did not become playable; stop and tell the game owner',
-    ],
-    [
-      'error',
-      { v2_transport_available: true, state: 'running', error: 'sidecar startup failed' },
-      'the full-control-v2 transport did not become playable; stop and tell the game owner',
-    ],
-    [
-      'availability',
-      { v2_transport_available: 'yes' },
-      'the v2 join result omitted transport availability',
-    ],
-    [
-      'protocol',
-      { supported_control_protocols: [] },
-      'the v2 join result omitted the negotiated protocol',
-    ],
-  ] as ReadonlyArray<readonly [string, JsonObject, string]>) {
-    test(`an unplayable result (${name}) is refused and writes nothing`, async () => {
+  for (const [name, override, expected] of unplayableJoinCases) {
+    awaitTest(`an unplayable result (${name}) is refused and writes nothing`, function* (wait) {
       const fixture = bench();
-      fixture.stage(GAME_ID);
-      const { result } = await join(fixture, v2Plan(override));
+      yield* stageInvite(fixture, GAME_ID);
+      const { result } = yield* wait(join(fixture, v2Plan(override)));
       expect(failure(result)).toBe(expected);
-      expect(fs.existsSync(fixture.workspace.stateRoot)).toBe(false);
+      expect(yield* stateRootEntries(fixture)).toEqual([]);
     });
   }
 
-  test('a cross-origin endpoint is refused by name', async () => {
+  awaitTest('a cross-origin endpoint is refused by name', function* (wait) {
     const fixture = bench();
-    fixture.stage(GAME_ID);
-    const { result } = await join(
-      fixture,
-      v2Plan({ state_url: 'http://evil.test/v2/state' })
+    yield* stageInvite(fixture, GAME_ID);
+    const { result } = yield* wait(
+      join(fixture, v2Plan({ state_url: 'http://evil.test/v2/state' }))
     );
     expect(failure(result)).toBe('the v2 join result has an invalid same-origin state_url');
   });
 
-  test('a malformed evaluation frame is refused before the transport checks', async () => {
+  awaitTest('a malformed evaluation frame is refused before the transport checks', function* (wait) {
     const fixture = bench();
-    fixture.stage(GAME_ID);
-    const { result } = await join(fixture, v2Plan({ max_turns: 0 }));
+    yield* stageInvite(fixture, GAME_ID);
+    const { result } = yield* wait(join(fixture, v2Plan({ max_turns: 0 })));
     expect(failure(result)).toBe('invalid v2 join result: evaluation context is malformed');
   });
 });
 
 describe('the workspace binding', () => {
-  test('a join binds this workspace and a second join rebinds it', async () => {
+  awaitTest('a join binds this workspace and a second join rebinds it', function* (wait) {
     const fixture = bench();
-    fixture.stage(GAME_ID);
-    fixture.stage(SECOND_ID);
+    yield* stageInvite(fixture, GAME_ID);
+    yield* stageInvite(fixture, SECOND_ID);
 
-    const first = await join(fixture, {
-      status: { body: { control_protocol: FULL_CONTROL_V2 } },
-      join: { body: v2Result(GAME_ID, CONTROLLER) },
-    });
+    const first = yield* wait(
+      join(fixture, {
+        status: { body: { control_protocol: FULL_CONTROL_V2 } },
+        join: { body: v2Result(GAME_ID, CONTROLLER) },
+      })
+    );
     ok(first.result);
     expect(first.captured.out).toContain(
       `this workspace is now playing ${GAME_ID} — commands need no --session`
     );
-    // The path an agent would otherwise re-type is not printed.
     expect(first.captured.out).not.toContain('.sessions');
     expect(first.captured.out).not.toContain(fixture.root);
     expect(first.captured.err).not.toContain('Session file:');
 
     const bindingPath = path.join(fixture.workspace.stateRoot, SEAT_BINDING_NAME);
-    expect(fs.statSync(bindingPath).mode & 0o777).toBe(0o600);
-    const text = fs.readFileSync(bindingPath, 'utf8');
+    expect(yield* fileMode(bindingPath)).toBe(0o600);
+    const text = yield* fileSystem.readFileString(bindingPath).pipe(Effect.orDie);
     expect(text).not.toContain(TOKEN);
-    const saved = JSON.parse(text) as JsonObject;
-    const sessionName = path.basename(sessionFilesOf(fixture, GAME_ID)[0] as string);
+    const saved = parseJsonText(text);
+    const sessionName = path.basename(observedFirst(yield* sessionFilesOf(fixture, GAME_ID)));
     expect(saved['game_id']).toBe(GAME_ID);
     expect(saved['session']).toBe(`${GAME_ID}/${sessionName}`);
     expect(saved['bound_at']).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/);
 
-    const second = await join(
-      fixture,
-      {
-        status: { body: { control_protocol: FULL_CONTROL_V2 } },
-        join: { body: v2Result(SECOND_ID, CONTROLLER) },
-      },
-      { gameId: SECOND_ID }
+    const second = yield* wait(
+      join(
+        fixture,
+        {
+          status: { body: { control_protocol: FULL_CONTROL_V2 } },
+          join: { body: v2Result(SECOND_ID, CONTROLLER) },
+        },
+        { gameId: SECOND_ID }
+      )
     );
     ok(second.result);
     expect(second.captured.out).toContain(
@@ -781,34 +902,37 @@ describe('the workspace binding', () => {
 });
 
 describe('a stale invitation', () => {
-  test('a 401 from the join POST names the owner recovery command', async () => {
+  awaitTest('a 401 from the join POST names the owner recovery command', function* (wait) {
     const fixture = bench();
-    fixture.stage(GAME_ID);
-    const { result } = await join(fixture, {
-      join: { status: 401, body: { error: { code: 'unauthorized', message: 'unauthorized' } } },
-    });
+    yield* stageInvite(fixture, GAME_ID);
+    const { result } = yield* wait(
+      join(fixture, {
+        join: { status: 401, body: { error: { code: 'unauthorized', message: 'unauthorized' } } },
+      })
+    );
     const message = failure(result);
     expect(message).toContain('HTTP 401: unauthorized');
     expect(message).toContain(`just invite ${GAME_ID}`);
     expect(message).toContain('The game invitation may be stale.');
   });
 
-  test('a 500 is passed through without the stale-invite advice', async () => {
+  awaitTest('a 500 is passed through without the stale-invite advice', function* (wait) {
     const fixture = bench();
-    fixture.stage(GAME_ID);
-    const { result } = await join(fixture, {
-      join: { status: 500, body: { error: { code: 'internal_error', message: 'boom' } } },
-    });
+    yield* stageInvite(fixture, GAME_ID);
+    const { result } = yield* wait(
+      join(fixture, {
+        join: { status: 500, body: { error: { code: 'internal_error', message: 'boom' } } },
+      })
+    );
     expect(failure(result)).toBe('HTTP 500: boom');
   });
 
-  test('an unreachable supervisor tells the user to stop', async () => {
+  awaitTest('an unreachable supervisor tells the user to stop', function* (wait) {
     const fixture = bench();
-    fixture.stage(GAME_ID);
-    const failing = (() =>
-      Promise.reject(new Error('connection refused'))) as unknown as typeof fetch;
-    const captured = await Effect.runPromise(
-      Effect.either(Effect.provide(commandJoin(args(), {}), fixture.layer(failing)))
+    yield* stageInvite(fixture, GAME_ID);
+    const failing = completeFetch(() => Promise.reject(new Error('connection refused')));
+    const captured = yield* wait(
+      Effect.either(provideTestLayer(commandJoin(args(), {}), fixture.layer(failing)))
     );
     expect(failure(captured)).toContain(
       'The assigned game cannot be joined. Stop and tell the user.'
@@ -817,34 +941,34 @@ describe('a stale invitation', () => {
 });
 
 describe('--json', () => {
-  test('it prints the raw payload, minus the bearer, plus where it was saved', async () => {
+  awaitTest('it prints the raw payload, minus the bearer, plus where it was saved', function* (wait) {
     const fixture = bench();
-    fixture.stage(GAME_ID);
-    const { result, captured } = await join(
-      fixture,
-      {
-        status: { body: { control_protocol: FULL_CONTROL_V2 } },
-        join: { body: v2Result(GAME_ID, CONTROLLER) },
-      },
-      { json: true }
+    yield* stageInvite(fixture, GAME_ID);
+    const { result, captured } = yield* wait(
+      join(
+        fixture,
+        {
+          status: { body: { control_protocol: FULL_CONTROL_V2 } },
+          join: { body: v2Result(GAME_ID, CONTROLLER) },
+        },
+        { json: true }
+      )
     );
     ok(result);
-    const payload = JSON.parse(captured.out) as JsonObject;
+    const payload = parseJsonText(captured.out);
     expect(payload['agent_token']).toBeUndefined();
     expect(payload['session_saved']).toBe(true);
     expect(payload['session_file']).toBe(
       path.join(fixture.workspace.stateRoot, GAME_ID, `${sessionKey(CONTROLLER)}.json`)
     );
     expect(payload['game_id']).toBe(GAME_ID);
-    // The JSON rendering is the wire payload, so the card never appears in it.
     expect(captured.out).not.toContain('ALIASES');
-    // The conduct block is stderr and stays byte-identical under --json.
     expect(captured.err).toContain('Joined a full-control-v2 session.');
   });
 
-  test('PLAY_JSON=1 is exactly --json', async () => {
+  awaitTest('PLAY_JSON=1 is exactly --json', function* (wait) {
     const fixture = bench();
-    fixture.stage(GAME_ID);
+    yield* stageInvite(fixture, GAME_ID);
     const recorder = recordingFetch(
       new Map<string, FakeRoute>([
         ['/join', { body: v2Result(GAME_ID, CONTROLLER) }],
@@ -852,113 +976,65 @@ describe('--json', () => {
         ['/health', { body: {} }],
       ])
     );
-    const out: string[] = [];
-    const originalLog = console.log;
-    const originalError = console.error;
-    console.log = (...parts: ReadonlyArray<unknown>) => out.push(parts.join(' '));
-    console.error = () => undefined;
-    try {
-      const result = await Effect.runPromise(
+    const { value, captured } = yield* wait(
+      captureEffect(
         Effect.either(
-          Effect.provide(
+          provideTestLayer(
             commandJoin(args(), { PLAY_JSON: '1' }),
             fixture.layer(recorder.fetch)
           )
         )
-      );
-      ok(result);
-    } finally {
-      console.log = originalLog;
-      console.error = originalError;
-    }
-    expect(out.join('\n')).not.toContain('ALIASES');
-    expect(JSON.parse(out.join('\n'))['session_saved']).toBe(true);
+      )
+    );
+    ok(value);
+    const out = captured.out.join('\n');
+    expect(out).not.toContain('ALIASES');
+    expect(parseJsonText(out)['session_saved']).toBe(true);
   });
 });
 
-// ---------------------------------------------------------------------------
-// The flag surface `just join` folds in
-// ---------------------------------------------------------------------------
-
 describe('the flag surface', () => {
-  const cli = async (
-    fixture: Bench,
-    argv: ReadonlyArray<string>,
-    plan: FakeRoute = { body: v2Result(GAME_ID, CONTROLLER) }
-  ): Promise<{ readonly failure: string | null; readonly out: string }> => {
-    const recorder = recordingFetch(
-      new Map<string, FakeRoute>([
-        ['/join', plan],
-        ['/status', { body: { control_protocol: FULL_CONTROL_V2 } }],
-        ['/health', { body: {} }],
-      ])
-    );
-    const root = Command.make('play', {}, () => Effect.void).pipe(
-      Command.withSubcommands([joinCommand])
-    );
-    const out: string[] = [];
-    const originalLog = console.log;
-    const originalError = console.error;
-    console.log = (...parts: ReadonlyArray<unknown>) => out.push(parts.join(' '));
-    console.error = () => undefined;
-    try {
-      const outcome = await Effect.runPromise(
-        Command.run(root, { name: 'play', version: '0.1.0' })(['bun', 'play', ...argv]).pipe(
-          Effect.provide(Layer.merge(fixture.layer(recorder.fetch), BunContext.layer)),
-          Effect.either
-        )
-      );
-      return {
-        failure:
-          outcome._tag === 'Left'
-            ? ((outcome.left as { readonly message?: string }).message ?? compactJson(outcome.left))
-            : null,
-        out: out.join('\n'),
-      };
-    } finally {
-      console.log = originalLog;
-      console.error = originalError;
-    }
-  };
-
-  test('the underscored spellings the protocol card prints are accepted', async () => {
+  awaitTest('the underscored spellings the protocol card prints are accepted', function* (wait) {
     const fixture = bench();
-    fixture.stage(GAME_ID);
-    const run = await cli(fixture, ['join', '--game_id', GAME_ID, '--name', CONTROLLER]);
+    yield* stageInvite(fixture, GAME_ID);
+    const run = yield* wait(joinCli(fixture, ['join', '--game_id', GAME_ID, '--name', CONTROLLER]));
     expect(run.failure).toBeNull();
     expect(run.out).toContain(`this workspace is now playing ${GAME_ID}`);
   });
 
-  test('both spellings at once is a refusal, not a silent pick', async () => {
+  awaitTest('both spellings at once is a refusal, not a silent pick', function* (wait) {
     const fixture = bench();
-    fixture.stage(GAME_ID);
-    const run = await cli(fixture, [
-      'join',
-      '--game_id',
-      GAME_ID,
-      '--game-id',
-      GAME_ID,
-      '--name',
-      CONTROLLER,
-    ]);
+    yield* stageInvite(fixture, GAME_ID);
+    const run = yield* wait(
+      joinCli(fixture, [
+        'join',
+        '--game_id',
+        GAME_ID,
+        '--game-id',
+        GAME_ID,
+        '--name',
+        CONTROLLER,
+      ])
+    );
     expect(run.failure).toBe('pass only one of --game-id or --game_id');
   });
 
-  test('a pre-configured workspace joins with no arguments at all', async () => {
+  awaitTest('a pre-configured workspace joins with no arguments at all', function* (wait) {
     const fixture = bench();
-    fixture.stage(GAME_ID);
-    fs.writeFileSync(
-      path.join(fixture.root, '.playconfig.json'),
-      JSON.stringify({ schema_version: 1, game_id: GAME_ID, name: CONTROLLER, place: null }),
-      'utf8'
-    );
-    const run = await cli(fixture, ['join']);
+    yield* stageInvite(fixture, GAME_ID);
+    yield* writePlayConfig(fixture, {
+      schema_version: 1,
+      game_id: GAME_ID,
+      name: CONTROLLER,
+      place: null,
+    });
+    const run = yield* wait(joinCli(fixture, ['join']));
     expect(run.failure).toBeNull();
     expect(run.out).toContain(`this workspace is now playing ${GAME_ID}`);
   });
 
-  test('a bare workspace with no arguments refuses on the game ID', async () => {
-    const run = await cli(bench(), ['join']);
+  awaitTest('a bare workspace with no arguments refuses on the game ID', function* (wait) {
+    const run = yield* wait(joinCli(bench(), ['join']));
     expect(run.failure).toBe('a valid assigned game ID is required');
   });
 });

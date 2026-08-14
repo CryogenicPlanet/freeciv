@@ -14,10 +14,8 @@
  * wrap-around board whose grid spans the full width read back from
  * `state/overview.tsv`.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
-import { Effect, Either } from 'effect';
+import { Cause, Effect, Either } from 'effect';
 import { renderMap, terrainLegendLine } from 'src/render/mirror/map';
 import type { PrivateFs } from 'src/services/private-fs';
 import {
@@ -31,7 +29,10 @@ import {
 } from 'src/services/mirror';
 import { updateMap } from 'src/services/mirror/update-map';
 import { updateYields, yieldRows } from 'src/services/mirror/update-yields';
+import type { JsonObject } from 'src/schema/primitives';
 import { scratchWorkspace, type Scratch } from 'test/_fixtures';
+import { provideTestLayer } from 'test/_effect-test';
+import { path } from 'test/_test-platform';
 
 const GAME_ID = 'game_12345678901234567890';
 const CITY_A = `city_${'c'.repeat(32)}`;
@@ -46,9 +47,7 @@ const byKey = (a: readonly [string, string], b: readonly [string, string]): numb
   a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0;
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
 
 interface Mirror {
   readonly dir: string;
@@ -67,28 +66,20 @@ const freshMirror = (): Mirror => {
   const sessionPath = path.join(scratch.workspace.stateRoot, GAME_ID, 'codex-test.json');
   const dir = Effect.runSync(mirrorDir(sessionPath));
   const attempt = <A, E>(effect: Effect.Effect<A, E, PrivateFs>): Either.Either<A, E> =>
-    Effect.runSync(Effect.either(Effect.provide(effect, scratch.layer)));
+    Effect.runSync(Effect.either(provideTestLayer(effect, scratch.layer)));
   return {
     dir,
     attempt,
     run: <A, E>(effect: Effect.Effect<A, E, PrivateFs>): A => {
       const either = attempt(effect);
       if (Either.isLeft(either)) {
-        const failure: unknown = either.left;
-        throw new Error(
-          `unexpected failure: ${
-            failure !== null && typeof failure === 'object' && 'message' in failure
-              ? String(failure.message)
-              : String(failure)
-          }`
-        );
+        throw new Error(`unexpected failure: ${Cause.pretty(Cause.fail(either.left))}`);
       }
       return either.right;
     },
-    read: (relative) => fs.readFileSync(path.join(dir, ...relative), 'utf8'),
-    exists: (relative) => fs.existsSync(path.join(dir, ...relative)),
-    relative: (absolute) =>
-      absolute.map((item) => path.relative(fs.realpathSync(dir), fs.realpathSync(item))),
+    read: (relative) => Effect.runSync(scratch.files.readText(path.join(dir, ...relative), 'mirror')),
+    exists: (relative) => Effect.runSync(scratch.files.exists(path.join(dir, ...relative))),
+    relative: (absolute) => absolute.map((item) => path.relative(dir, item)),
   };
 };
 
@@ -96,13 +87,13 @@ const freshMirror = (): Mirror => {
 // Fixtures — the CPython test's own payloads
 // ---------------------------------------------------------------------------
 
-const tiles = (): ReadonlyArray<Record<string, unknown>> => [
+const tiles = (): ReadonlyArray<JsonObject> => [
   { id: 'tile_1', x: 30, y: 71, visibility: 'visible', terrain: 'Ocean' },
   { id: 'tile_2', x: 31, y: 71, visibility: 'remembered', terrain: 'Desert' },
   { id: 'tile_3', x: 32, y: 71, visibility: 'unknown' },
 ];
 
-const citizens = (city: string = CITY_A): ReadonlyArray<Record<string, unknown>> => [
+const citizens = (city: string = CITY_A): ReadonlyArray<JsonObject> => [
   {
     city_id: city,
     kind: 'tile',
@@ -384,11 +375,11 @@ describe('state/map.txt', () => {
     ]));
     const parsed = parseMap(mirror.read(MAP_FILE));
     expect(parsed.revision).toEqual({ turn: 7, revision: 12 });
-    expect([...parsed.grid.entries()].sort(byKey)).toEqual([
+    expect([...parsed.grid.entries()].toSorted(byKey)).toEqual([
       ['-2,-1', 'T'],
       ['0,0', 'L'],
     ]);
-    expect([...parsed.legend.entries()].sort(byKey)).toEqual([
+    expect([...parsed.legend.entries()].toSorted(byKey)).toEqual([
       ['Lake', 'L'],
       ['Tundra', 'T'],
     ]);

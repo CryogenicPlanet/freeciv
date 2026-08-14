@@ -7,10 +7,8 @@
  * (client.py:10755-10799).  Every golden string was produced by running the
  * CPython original against the same input.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
-import { Effect, Either } from 'effect';
+import { DateTime, Effect, Either, Schema } from 'effect';
 import type { PrivateFs } from 'src/services/private-fs';
 import {
   HEADER_FILE,
@@ -45,15 +43,17 @@ import {
 } from 'src/services/mirror';
 import { playerError } from 'src/errors';
 import { scratchWorkspace, type Scratch } from 'test/_fixtures';
+import { awaitTest, provideTestLayer } from 'test/_effect-test';
+import { path, withTestFileSystem } from 'test/_test-platform';
 
 const GAME_ID = 'game_12345678901234567890';
 const UNIT_A = `unit_${'a'.repeat(32)}`;
 const UNIT_B = `unit_${'b'.repeat(32)}`;
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() =>
+  Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup()))
+);
 
 interface Mirror {
   readonly dir: string;
@@ -68,7 +68,7 @@ const freshMirror = (): Mirror => {
   return {
     dir: Effect.runSync(mirrorDir(sessionPath)),
     sessionPath,
-    run: (effect) => Effect.runSync(Effect.either(Effect.provide(effect, scratch.layer))),
+    run: (effect) => Effect.runSync(Effect.either(provideTestLayer(effect, scratch.layer))),
   };
 };
 
@@ -133,8 +133,45 @@ const DEFAULT_CARD = [
   'just wait                              block until the next phase',
 ];
 
-const readFile = (dir: string, relative: ReadonlyArray<string>): string =>
-  fs.readFileSync(path.join(dir, ...relative), 'utf8');
+const readFile = (dir: string, relative: ReadonlyArray<string>): Effect.Effect<string> =>
+  Effect.orDie(withTestFileSystem((files) => files.readFileString(path.join(dir, ...relative))));
+
+const pathExists = (target: string): Effect.Effect<boolean> =>
+  Effect.orDie(withTestFileSystem((files) => files.exists(target)));
+
+const directoryEntries = (target: string): Effect.Effect<ReadonlyArray<string>> =>
+  Effect.orDie(withTestFileSystem((files) => files.readDirectory(target)));
+
+const markerClock = (): number => 1786091354.086;
+
+const markerSchema = Schema.parseJson(
+  Schema.Struct({
+    holder: Schema.NullOr(
+      Schema.Struct({
+        controller_label: Schema.String,
+        place: Schema.Number,
+        player_name: Schema.String,
+        seat_id: Schema.String,
+      })
+    ),
+    announced: Schema.NullOr(Schema.Tuple(Schema.Number, Schema.Number, Schema.Number)),
+    active: Schema.Boolean,
+  })
+);
+
+const decodeMarker = (text: string) => Schema.decodeUnknownSync(markerSchema)(text);
+
+const localTestDate = (
+  year: number,
+  zeroBasedMonth: number,
+  day: number,
+  hours: number,
+  minutes: number,
+  seconds: number
+): Date =>
+  DateTime.toDate(
+    DateTime.unsafeMake({ year, month: zeroBasedMonth + 1, day, hours, minutes, seconds })
+  );
 
 // ---------------------------------------------------------------------------
 
@@ -428,7 +465,7 @@ describe('revisions', () => {
 // ---------------------------------------------------------------------------
 
 describe('update_from_health', () => {
-  test('the header is byte-identical to CPython and stamps the page revision', () => {
+  awaitTest('the header is byte-identical to CPython and stamps the page revision', function* () {
     const { dir, run } = freshMirror();
     const written = right(
       run(updateFromHealth(dir, 'turn', HEALTH, { revision: { turn: 3, revision: 9 } }))
@@ -437,18 +474,18 @@ describe('update_from_health', () => {
       path.join('state', 'header.txt'),
       path.join('state', 'phase.json'),
     ]);
-    expect(readFile(dir, HEADER_FILE)).toBe(
+    expect(yield* readFile(dir, HEADER_FILE)).toBe(
       `${['# rev 9 turn 3', ...HEADER_BODY, ...DEFAULT_CARD].join('\n')}\n`
     );
   });
 
-  test('a header without a known revision is marked unknown', () => {
+  awaitTest('a header without a known revision is marked unknown', function* () {
     const { dir, run } = freshMirror();
     right(run(updateFromHealth(dir, 'health', HEALTH)));
-    expect(readFile(dir, HEADER_FILE).startsWith('# rev ? turn ?')).toBe(true);
+    expect((yield* readFile(dir, HEADER_FILE)).startsWith('# rev ? turn ?')).toBe(true);
   });
 
-  test('the header reuses the newest revision the mirror holds', () => {
+  awaitTest('the header reuses the newest revision the mirror holds', function* () {
     const { dir, run } = freshMirror();
     right(
       run(
@@ -462,10 +499,10 @@ describe('update_from_health', () => {
       )
     );
     right(run(updateFromHealth(dir, 'health', HEALTH)));
-    expect(readFile(dir, HEADER_FILE).startsWith('# rev 11 turn 3')).toBe(true);
+    expect((yield* readFile(dir, HEADER_FILE)).startsWith('# rev 11 turn 3')).toBe(true);
   });
 
-  test('the command card is caller supplied', () => {
+  awaitTest('the command card is caller supplied', function* () {
     const { dir, run } = freshMirror();
     right(
       run(
@@ -475,13 +512,13 @@ describe('update_from_health', () => {
         })
       )
     );
-    const text = readFile(dir, HEADER_FILE);
+    const text = yield* readFile(dir, HEADER_FILE);
     expect(text).toContain('just turn --end --await');
     expect(text).toContain('just options u1');
     expect(text).not.toContain('just batch');
   });
 
-  test('a drifted revision refuses the whole projection', () => {
+  awaitTest('a drifted revision refuses the whole projection', function* () {
     const { dir, run } = freshMirror();
     const either = run(
       updateFromHealth(dir, 'turn', HEALTH, { revision: { state_token: 'x' } })
@@ -489,15 +526,13 @@ describe('update_from_health', () => {
     expect(Either.isLeft(either) ? either.left.message : '').toBe(
       'state mirror: payload carries no state revision counters'
     );
-    expect(fs.existsSync(path.join(dir, ...HEADER_FILE))).toBe(false);
+    expect(yield* pathExists(path.join(dir, ...HEADER_FILE))).toBe(false);
   });
 });
 
 describe('phase.json', () => {
-  const clock = (): number => 1786091354.086;
-
   test('the marker is the closed, key-sorted object a watcher parses', () => {
-    expect(phaseMarker(HEALTH, null, clock)).toBe(
+    expect(phaseMarker(HEALTH, null, markerClock)).toBe(
       [
         '{',
         '  "active": true,',
@@ -536,10 +571,7 @@ describe('phase.json', () => {
         },
       },
     };
-    const marker = JSON.parse(phaseMarker(waiting, [1, 5, 0], clock)) as Record<
-      string,
-      unknown
-    >;
+    const marker = decodeMarker(phaseMarker(waiting, [1, 5, 0], markerClock));
     expect(marker['holder']).toEqual({
       controller_label: 'pi-gpt',
       place: 2,
@@ -559,14 +591,14 @@ describe('phase.json', () => {
       },
     };
     expect(
-      (JSON.parse(phaseMarker(waiting, null, clock)) as Record<string, unknown>)['holder']
+      decodeMarker(phaseMarker(waiting, null, markerClock)).holder
     ).toBe(null);
   });
 
   test('a malformed announcement is dropped rather than trusted', () => {
     for (const bad of [[1, 5], [1, 5, 0, 2], [1, 5, -1], [true, 5, 0], ['1', 5, 0], null]) {
       expect(
-        (JSON.parse(phaseMarker(HEALTH, bad, clock)) as Record<string, unknown>)['announced']
+        decodeMarker(phaseMarker(HEALTH, bad, markerClock)).announced
       ).toBe(null);
     }
   });
@@ -594,20 +626,20 @@ describe('phase.json', () => {
     expect(right(run(readPhaseMarker(dir)))?.['announced']).toEqual([1, 5, 0]);
   });
 
-  test('the monitor write touches no other projection', () => {
+  awaitTest('the monitor write touches no other projection', function* () {
     const { dir, run } = freshMirror();
     right(run(updatePhaseMarker(dir, HEALTH)));
-    expect(fs.readdirSync(path.join(dir, 'state'))).toEqual(['phase.json']);
+    expect(yield* directoryEntries(path.join(dir, 'state'))).toEqual(['phase.json']);
   });
 });
 
 describe('monitor.log', () => {
-  test('a line is stamped, sanitized, capped and appended', () => {
+  awaitTest('a line is stamped, sanitized, capped and appended', function* () {
     const { dir, run } = freshMirror();
-    const at = new Date(2026, 7, 7, 9, 5, 3);
+    const at = localTestDate(2026, 7, 7, 9, 5, 3);
     right(run(appendMonitorLog(dir, 'turn 5 opened', at)));
     right(run(appendMonitorLog(dir, `exec\nrm -rf /\t${'x'.repeat(600)}`, at)));
-    const lines = readFile(dir, ['state', 'monitor.log']).split('\n').slice(0, -1);
+    const lines = (yield* readFile(dir, ['state', 'monitor.log'])).split('\n').slice(0, -1);
     expect(lines[0]).toBe('2026-08-07T09:05:03 turn 5 opened');
     expect(lines[1]?.startsWith('2026-08-07T09:05:03 exec rm -rf / xxx')).toBe(true);
     expect(lines[1]?.length).toBe(19 + 1 + 512);
@@ -616,11 +648,11 @@ describe('monitor.log', () => {
 
   // Regression: `[:_MAX_LOG_LINE]` counts code points.  A UTF-16 slice split a
   // surrogate pair in half in every logged `--exec` string that carried one.
-  test('the 512 cap counts code points and never splits a surrogate pair', () => {
+  awaitTest('the 512 cap counts code points and never splits a surrogate pair', function* () {
     const { dir, run } = freshMirror();
-    const at = new Date(2026, 7, 7, 9, 5, 3);
+    const at = localTestDate(2026, 7, 7, 9, 5, 3);
     right(run(appendMonitorLog(dir, `${'z'.repeat(500)}${'\u{1F600}'.repeat(20)}`, at)));
-    const line = readFile(dir, ['state', 'monitor.log']).split('\n')[0] ?? '';
+    const line = (yield* readFile(dir, ['state', 'monitor.log'])).split('\n')[0] ?? '';
     const body = line.slice('2026-08-07T09:05:03 '.length);
     expect(body).toBe(`${'z'.repeat(500)}${'\u{1F600}'.repeat(12)}`);
     expect([...body].length).toBe(512);
@@ -628,7 +660,7 @@ describe('monitor.log', () => {
   });
 
   test('the timestamp is local time in the CPython format', () => {
-    expect(localTimestamp(new Date(2026, 0, 2, 3, 4, 5))).toBe('2026-01-02T03:04:05');
+    expect(localTimestamp(localTestDate(2026, 0, 2, 3, 4, 5))).toBe('2026-01-02T03:04:05');
   });
 });
 

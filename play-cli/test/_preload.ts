@@ -7,4 +7,4 @@
  * tests that exercise the `./play` cutover set the variable explicitly around
  * their calls and restore it.
  */
-process.env['PLAY_PROG'] ??= 'just';
+Bun.env['PLAY_PROG'] ??= 'just';

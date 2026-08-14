@@ -16,16 +16,25 @@
  * Named with a leading underscore so `bun test`'s `*.test.ts` glob does not
  * pick it up (PORT_MAP §7.1 records the file).
  */
-import * as path from 'node:path';
-import { Effect, Layer } from 'effect';
+import { Data, Effect, Layer, Option, Schema } from 'effect';
 import { FULL_CONTROL_V2, V2_PAGE_MAX_ITEMS } from 'src/constants';
 import { playerError, type PlayError } from 'src/errors';
+import { ExitCodeSignal } from 'src/exit';
 import type { BatchDisposition } from 'src/schema/batch';
 import { decodeLegalPage } from 'src/schema/legal-page';
 import type { PageScope } from 'src/schema/page';
-import { field, isJsonObject, type JsonObject, type JsonValue } from 'src/schema/primitives';
+import {
+  field,
+  isJsonObject,
+  type JsonObject,
+  type JsonValue,
+  type MutableJsonObject,
+} from 'src/schema/primitives';
 import type { ReceiptState } from 'src/schema/receipt';
 import type { Revision } from 'src/schema/revision';
+import { captureEffect } from 'test/_capture';
+import { provideTestLayer } from 'test/_effect-test';
+import { path } from 'test/_test-platform';
 import { revisionLabel, scalar, table } from 'src/render/primitives';
 import {
   runDo,
@@ -269,7 +278,7 @@ export const dispositionOf = (
   error: null,
 });
 
-export class SimulatedKill extends Error {}
+export class SimulatedKill extends Data.TaggedError('SimulatedKill')<{}> {}
 
 export const world = (): World => ({
   catalogs: new Map(),
@@ -374,23 +383,24 @@ export const bench = (options: BenchOptions = {}): Bench => {
         const last = index + 1 === pages;
         const cursor = last ? null : `cursor_${String(index + 1).padStart(32, 'c')}`;
         const scope = scopeOf(actorId);
+        const pagePayload: MutableJsonObject = {
+          section: 'legal_actions',
+          items,
+          total_items: all.length,
+          next_cursor: cursor,
+          cursor_expires_at: cursor === null ? null : '2099-01-01T00:00:00Z',
+        };
+        // A global drain's page carries none of the scoped-catalog keys: the
+        // envelope's field set is validated, and the three scoped keys only
+        // exist together (`decodePageShape`).
+        if (scope !== undefined) {
+          pagePayload['scope'] = scope;
+          pagePayload['catalog_id'] = identifier;
+          pagePayload['catalog_complete'] = last;
+        }
         const payload = legalPagePayload(items, {
           state_revision: { ...at },
-          page: {
-            section: 'legal_actions',
-            items,
-            total_items: all.length,
-            next_cursor: cursor,
-            cursor_expires_at: cursor === null ? null : '2099-01-01T00:00:00Z',
-            // A global drain's page carries none of the scoped-catalog keys:
-            // the envelope's *field set* is validated, and `scope`,
-            // `catalog_id` and `catalog_complete` only exist together
-            // (`decodePageShape`).  So the actorless catalog is learned
-            // descriptor by descriptor, exactly as the wire serves it.
-            ...(scope === undefined
-              ? {}
-              : { scope, catalog_id: identifier, catalog_complete: last }),
-          },
+          page: pagePayload,
         });
         const page = yield* Effect.mapError(decodeLegalPage(payload, session), (drift) =>
           playerError(drift.message)
@@ -404,7 +414,7 @@ export const bench = (options: BenchOptions = {}): Bench => {
     });
 
   const seed = (actorId: string, actions: ReadonlyArray<FakeAction>, at?: Revision): void => {
-    Effect.runSync(Effect.provide(ingest(actorId, actions, at ?? state.revision), layer));
+    Effect.runSync(provideTestLayer(ingest(actorId, actions, at ?? state.revision), layer));
   };
 
   const readState = (): V2ClientState => Effect.runSync(store.readState(sessionPath, session));
@@ -447,7 +457,8 @@ const sameRevision = (left: JsonValue, right: Revision): boolean =>
   field(left, 'revision') === right.revision &&
   field(left, 'state_token') === right.state_token;
 
-const textOf = (value: JsonValue): string => (typeof value === 'string' ? value : '');
+const textOf = (value: JsonValue | undefined): string =>
+  Option.getOrElse(Schema.decodeUnknownOption(Schema.String)(value), () => '');
 
 /** `_order_actor` — `""` whenever the subject names no actor at all. */
 const descriptorActor = (descriptor: JsonObject): string => {
@@ -493,7 +504,7 @@ const requiredArgument = (descriptor: JsonObject): string => {
   const required = field(schema, 'required');
   if (!Array.isArray(required)) return '';
   const first = required[0];
-  return typeof first === 'string' ? first : '';
+  return textOf(first);
 };
 
 const resolutionOf = (descriptor: JsonObject, order: string, args: JsonObject): ResolvedOrder => ({
@@ -509,8 +520,7 @@ const resolutionOf = (descriptor: JsonObject, order: string, args: JsonObject): 
 
 /** `_expand_alias` over the real entity-alias table `rememberPage` wrote. */
 const expandActor = (state: V2ClientState, token: string): string => {
-  const identifier = state.entity_aliases[token];
-  return typeof identifier === 'string' ? identifier : '';
+  return textOf(state.entity_aliases[token]);
 };
 
 const makeHooks =
@@ -659,7 +669,6 @@ const makeHooks =
           Effect.succeed({ state: current, notes: state.aliasNotes }),
 
         rebindOrder: (current, resolved) => {
-          // eslint-disable-next-line no-unused-expressions
           const matches = cachedFor(current, resolved.actor_id).filter(
             (descriptor) =>
               textOf(field(descriptor, 'kind')) === resolved.kind &&
@@ -679,10 +688,10 @@ const makeHooks =
             // as U11's `readLegalPage` places `LegalCtx.gate`.
             yield* delay('drain', actorId);
             const failure = state.drainFailure(actorId);
-            if (failure !== null) return yield* Effect.fail(failure);
+            if (failure !== null) return yield* failure;
             const actions = state.catalogs.get(actorId) ?? [];
             return yield* gate(
-              Effect.provide(ingest(actorId, actions, state.revision), provided)
+              provideTestLayer(ingest(actorId, actions, state.revision), provided)
             );
           }),
 
@@ -693,10 +702,10 @@ const makeHooks =
             // receipt and the next order's batch, which is exactly the window
             // the streamed ledger exists for.
             if (state.killAfterReceipt !== 0 && batches > state.killAfterReceipt) {
-              return yield* Effect.die(new SimulatedKill('SIGKILL'));
+              return yield* Effect.die(new SimulatedKill());
             }
             const failure = state.persistFailure(batches - 1, actionId);
-            if (failure !== null) return yield* Effect.fail(failure);
+            if (failure !== null) return yield* failure;
             return `batch_${String(batches).padStart(8, '0')}`;
           }),
 
@@ -706,7 +715,7 @@ const makeHooks =
             submitted += 1;
             yield* delay('submit', batchId);
             const failure = state.submitFailure(index, batchId);
-            if (failure !== null) return yield* Effect.fail(failure);
+            if (failure !== null) return yield* failure;
             const script = state.receipt(index, batchId);
             const disposition: BatchDisposition = {
               schema_version: 2,
@@ -735,7 +744,7 @@ const makeHooks =
             // "is this actor still drained" question is answered honestly.
             const receipt = disposition.receipt;
             if (receipt !== null) {
-              yield* Effect.provide(rememberReceipt(sessionPath, session, receipt), provided);
+              yield* provideTestLayer(rememberReceipt(sessionPath, session, receipt), provided);
             }
             if (script.revision.revision !== state.revision.revision) {
               state.revision = script.revision;
@@ -810,49 +819,35 @@ export interface Captured {
   readonly killed: boolean;
 }
 
-const property = (value: unknown, key: string): unknown =>
-  typeof value === 'object' && value !== null ? Reflect.get(value, key) : undefined;
-
 /**
  * Run one `do` with stdout and stderr collected and the exit status mapped the
  * way `cli-main.handleError` maps it: `ExitCodeSignal` is the status, anything
  * else is `error: …` on stderr and status 2.
  */
-export const runDoCaptured = async (
-  target: Bench,
-  args: DoArguments
-): Promise<Captured> => {
-  const out: Array<string> = [];
-  const err: Array<string> = [];
-  const originalLog = console.log;
-  const originalError = console.error;
-  console.log = (...parts: ReadonlyArray<unknown>) => out.push(parts.join(' '));
-  console.error = (...parts: ReadonlyArray<unknown>) => err.push(parts.join(' '));
-  try {
-    const result = await Effect.runPromise(
-      Effect.either(
-        Effect.provide(runDo({ ...args, session: target.sessionPath }, target.hooks), target.layer)
-      )
-    ).catch((cause: unknown) => {
-      if (String(cause).includes('SIGKILL')) return 'killed' as const;
-      throw cause;
-    });
-    if (result === 'killed') return { out, err, code: 137, error: '', killed: true };
-    if (result._tag === 'Right') return { out, err, code: 0, error: '', killed: false };
-    const failure: unknown = result.left;
-    if (property(failure, '_tag') === 'ExitCodeSignal') {
-      const code = property(failure, 'code');
-      return { out, err, code: typeof code === 'number' ? code : 2, error: '', killed: false };
-    }
-    return {
-      out,
-      err,
-      code: 2,
-      error: String(property(failure, 'message') ?? failure),
-      killed: false,
-    };
-  } finally {
-    console.log = originalLog;
-    console.error = originalError;
-  }
+export const runDoCaptured = (target: Bench, args: DoArguments): Promise<Captured> => {
+  const execution = Effect.either(
+    provideTestLayer(runDo({ ...args, session: target.sessionPath }, target.hooks), target.layer)
+  ).pipe(
+    Effect.map((result) => result),
+    Effect.catchAllDefect((defect) =>
+      defect instanceof SimulatedKill ? Effect.succeed(null) : Effect.die(defect)
+    )
+  );
+  return Effect.runPromise(
+    captureEffect(execution).pipe(
+      Effect.map(({ value: result, captured }) => {
+        if (result === null) {
+          return { ...captured, code: 137, error: '', killed: true };
+        }
+        if (result._tag === 'Right') {
+          return { ...captured, code: 0, error: '', killed: false };
+        }
+        const failure = result.left;
+        if (failure instanceof ExitCodeSignal) {
+          return { ...captured, code: failure.code, error: '', killed: false };
+        }
+        return { ...captured, code: 2, error: failure.message, killed: false };
+      })
+    )
+  );
 };

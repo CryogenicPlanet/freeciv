@@ -9,9 +9,10 @@
  *
  * It is not a `*.test.ts` file, so `bun test` never collects it as a suite.
  */
-import * as path from 'node:path';
-import { Effect, Either, Layer } from 'effect';
+import { Effect, type Either, Layer } from 'effect';
 import { FULL_CONTROL_V2 } from 'src/constants';
+import type { PlayError } from 'src/errors';
+import type { ExitCodeSignal } from 'src/exit';
 import type { JsonObject, JsonValue } from 'src/schema/primitives';
 import type { CommandReceipt } from 'src/schema/receipt';
 import { v2StateSchema } from 'src/services/aliases';
@@ -43,6 +44,9 @@ import {
   type RecordedRequest,
   type Scratch,
 } from 'test/_fixtures';
+import { captureEffect } from 'test/_capture';
+import { provideTestLayer } from 'test/_effect-test';
+import { path } from 'test/_test-platform';
 
 // ---------------------------------------------------------------------------
 // Wire shapes
@@ -122,9 +126,8 @@ export const batchBody = (batchId: string, args: JsonObject = { ready: true }): 
 const scratches: Scratch[] = [];
 
 /** Call from an `afterEach`. */
-export const cleanupScratches = (): void => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-};
+export const cleanupScratches = (): Promise<ReadonlyArray<void>> =>
+  Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup()));
 
 export interface Fixture {
   readonly scratch: Scratch;
@@ -228,36 +231,30 @@ export interface Recorded<A, E> {
 }
 
 /** Run one effect with stdout and stderr captured separately. */
-export const capture = async <A, E>(
+export const capture = <A, E>(
   effect: Effect.Effect<A, E, SessionStore | V2Client | PrivateFs>,
   fixture: Fixture
-): Promise<Recorded<A, E>> => {
-  const out: string[] = [];
-  const err: string[] = [];
-  const log = console.log;
-  const error = console.error;
-  console.log = (...parts: ReadonlyArray<unknown>) => out.push(parts.join(' '));
-  console.error = (...parts: ReadonlyArray<unknown>) => err.push(parts.join(' '));
-  try {
-    const result = await Effect.runPromise(
-      Effect.either(Effect.provide(effect, fixture.layer))
-    );
-    return { out, err, result };
-  } finally {
-    console.log = log;
-    console.error = error;
+): Promise<Recorded<A, E>> =>
+  Effect.runPromise(
+    captureEffect(Effect.either(provideTestLayer(effect, fixture.layer))).pipe(
+      Effect.map(({ value, captured }) => ({
+        out: captured.out,
+        err: captured.err,
+        result: value,
+      }))
+    )
+  );
+
+type CommandFailure = PlayError | ExitCodeSignal;
+
+export const messageOf = (failure: CommandFailure): string => {
+  if (failure._tag === 'ExitCodeSignal') {
+    throw new Error(`expected a player-facing error, received exit ${failure.code}`);
   }
+  return failure.message;
 };
 
-export const messageOf = (value: unknown): string =>
-  typeof value === 'object' && value !== null && 'message' in value
-    ? String((value as { readonly message: unknown }).message)
-    : String(value);
-
-export const tagOf = (value: unknown): string =>
-  typeof value === 'object' && value !== null && '_tag' in value
-    ? String((value as { readonly _tag: unknown })._tag)
-    : '';
+export const tagOf = (failure: CommandFailure): CommandFailure['_tag'] => failure._tag;
 
 // ---------------------------------------------------------------------------
 // Hooks

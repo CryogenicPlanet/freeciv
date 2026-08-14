@@ -7,7 +7,6 @@
  * `parseDelta`, `deltaText`, `updateDelta` and `rowChanges`.  Every golden
  * string came from running the CPython original on the same input.
  */
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect, Either } from 'effect';
 import type { PrivateFs } from 'src/services/private-fs';
@@ -23,6 +22,8 @@ import {
   type MirrorTable,
 } from 'src/services/mirror';
 import { scratchWorkspace, type Scratch } from 'test/_fixtures';
+import { provideTestLayer } from 'test/_effect-test';
+import { path } from 'test/_test-platform';
 
 const GAME_ID = 'game_12345678901234567890';
 const REV9 = { turn: 3, revision: 9 } as const;
@@ -30,9 +31,7 @@ const REV10 = { turn: 3, revision: 10 } as const;
 const REV7 = { turn: 3, revision: 7 } as const;
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
 
 interface Mirror {
   readonly dir: string;
@@ -47,7 +46,7 @@ const freshMirror = (): Mirror => {
     mirrorDir(path.join(scratch.workspace.stateRoot, GAME_ID, 'codex-test.json'))
   );
   const run = <A, E>(effect: Effect.Effect<A, E, PrivateFs>): Either.Either<A, E> =>
-    Effect.runSync(Effect.either(Effect.provide(effect, scratch.layer)));
+    Effect.runSync(Effect.either(provideTestLayer(effect, scratch.layer)));
   return {
     dir,
     run,

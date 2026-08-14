@@ -6,12 +6,12 @@
  * are the Python originals — a partial file must never be observable and a
  * world-readable one must never be accepted.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect, Either } from 'effect';
 import { workspacePaths } from 'src/services/private-fs';
 import { scratchWorkspace, type Scratch } from 'test/_fixtures';
+import { effectTest } from 'test/_effect-test';
+import { path, withTestFileSystem } from 'test/_test-platform';
 
 const scratches: Scratch[] = [];
 
@@ -21,9 +21,7 @@ const fresh = (): Scratch => {
   return scratch;
 };
 
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
 
 const run = <A, E>(effect: Effect.Effect<A, E>): Either.Either<A, E> =>
   Effect.runSync(Effect.either(effect));
@@ -64,14 +62,17 @@ describe('containment', () => {
 });
 
 describe('writes', () => {
-  test('a written file is mode 0600 and leaves no temp file behind', () => {
-    const { files, workspace } = fresh();
-    const target = path.join(workspace.stateRoot, 'game_abc', 'seat.json');
-    expect(Either.isRight(run(files.writeJson(target, { a: 1 })))).toBe(true);
-    expect(fs.statSync(target).mode & 0o777).toBe(0o600);
-    const siblings = fs.readdirSync(path.dirname(target));
-    expect(siblings).toEqual(['seat.json']);
-  });
+  effectTest('a written file is mode 0600 and leaves no temp file behind', () =>
+    withTestFileSystem((platformFiles) =>
+      Effect.gen(function* () {
+        const { files, workspace } = fresh();
+        const target = path.join(workspace.stateRoot, 'game_abc', 'seat.json');
+        yield* files.writeJson(target, { a: 1 });
+        expect((yield* platformFiles.stat(target)).mode & 0o777).toBe(0o600);
+        expect(yield* platformFiles.readDirectory(path.dirname(target))).toEqual(['seat.json']);
+      }).pipe(Effect.orDie)
+    )
+  );
 
   test('writeJson round-trips through loadObject', () => {
     const { files, workspace } = fresh();
@@ -80,43 +81,59 @@ describe('writes', () => {
     expect(run(files.loadObject(target, 'session'))).toEqual(Either.right({ b: 2, a: [1] }));
   });
 
-  test('writeJson emits the indent=2 sorted shape with a trailing newline', () => {
-    const { files, workspace } = fresh();
-    const target = path.join(workspace.stateRoot, 'seat.json');
-    Effect.runSync(files.writeJson(target, { b: 2, a: 1 }));
-    expect(fs.readFileSync(target, 'utf8')).toBe('{\n  "a": 1,\n  "b": 2\n}\n');
-  });
+  effectTest('writeJson emits the indent=2 sorted shape with a trailing newline', () =>
+    withTestFileSystem((platformFiles) =>
+      Effect.gen(function* () {
+        const { files, workspace } = fresh();
+        const target = path.join(workspace.stateRoot, 'seat.json');
+        yield* files.writeJson(target, { b: 2, a: 1 });
+        expect(yield* platformFiles.readFileString(target)).toBe('{\n  "a": 1,\n  "b": 2\n}\n');
+      }).pipe(Effect.orDie)
+    )
+  );
 
-  test('a replaced file is never observed half-written', () => {
-    const { files, workspace } = fresh();
-    const target = path.join(workspace.stateRoot, 'seat.json');
-    Effect.runSync(files.writeText(target, 'first'));
-    const before = fs.readFileSync(target, 'utf8');
-    Effect.runSync(files.writeText(target, 'second-and-longer'));
-    expect(before).toBe('first');
-    expect(fs.readFileSync(target, 'utf8')).toBe('second-and-longer');
-  });
+  effectTest('a replaced file is never observed half-written', () =>
+    withTestFileSystem((platformFiles) =>
+      Effect.gen(function* () {
+        const { files, workspace } = fresh();
+        const target = path.join(workspace.stateRoot, 'seat.json');
+        yield* files.writeText(target, 'first');
+        const before = yield* platformFiles.readFileString(target);
+        yield* files.writeText(target, 'second-and-longer');
+        expect(before).toBe('first');
+        expect(yield* platformFiles.readFileString(target)).toBe('second-and-longer');
+      }).pipe(Effect.orDie)
+    )
+  );
 
-  test('appendText adds without rewriting, as a log must', () => {
-    const { files, workspace } = fresh();
-    const target = path.join(workspace.stateRoot, 'receipts.log');
-    Effect.runSync(files.appendText(target, 'one\n'));
-    Effect.runSync(files.appendText(target, 'two\n'));
-    expect(fs.readFileSync(target, 'utf8')).toBe('one\ntwo\n');
-    expect(fs.statSync(target).mode & 0o777).toBe(0o600);
-  });
+  effectTest('appendText adds without rewriting, as a log must', () =>
+    withTestFileSystem((platformFiles) =>
+      Effect.gen(function* () {
+        const { files, workspace } = fresh();
+        const target = path.join(workspace.stateRoot, 'receipts.log');
+        yield* files.appendText(target, 'one\n');
+        yield* files.appendText(target, 'two\n');
+        expect(yield* platformFiles.readFileString(target)).toBe('one\ntwo\n');
+        expect((yield* platformFiles.stat(target)).mode & 0o777).toBe(0o600);
+      }).pipe(Effect.orDie)
+    )
+  );
 });
 
 describe('reads', () => {
-  test('a world-readable state file is refused', () => {
-    const { files, workspace } = fresh();
-    const target = path.join(workspace.stateRoot, 'seat.json');
-    Effect.runSync(files.writeText(target, '{}'));
-    fs.chmodSync(target, 0o644);
-    expect(message(run(files.readText(target, 'session')))).toBe(
-      'private session must be a mode-0600 file'
-    );
-  });
+  effectTest('a world-readable state file is refused', () =>
+    withTestFileSystem((platformFiles) =>
+      Effect.gen(function* () {
+        const { files, workspace } = fresh();
+        const target = path.join(workspace.stateRoot, 'seat.json');
+        yield* files.writeText(target, '{}');
+        yield* platformFiles.chmod(target, 0o644);
+        expect(message(yield* Effect.either(files.readText(target, 'session')))).toBe(
+          'private session must be a mode-0600 file'
+        );
+      }).pipe(Effect.orDie)
+    )
+  );
 
   test('invalid JSON names the label, not the parser', () => {
     const { files, workspace } = fresh();
@@ -138,22 +155,35 @@ describe('reads', () => {
 });
 
 describe('symlinks', () => {
-  test('a symlinked directory component is refused', () => {
-    const { files, workspace } = fresh();
-    const outside = fs.mkdtempSync(path.join(workspace.root, 'outside-'));
-    fs.symlinkSync(outside, path.join(workspace.stateRoot, 'game_link'));
-    const target = path.join(workspace.stateRoot, 'game_link', 'seat.json');
-    expect(message(run(files.writeText(target, '{}')))).toBe(
-      'private state directories must be real directories inside PLAY_STATE_DIR'
-    );
-  });
+  effectTest('a symlinked directory component is refused', () =>
+    withTestFileSystem((platformFiles) =>
+      Effect.gen(function* () {
+        const { files, workspace } = fresh();
+        const outside = yield* platformFiles.makeTempDirectory({
+          directory: workspace.root,
+          prefix: 'outside-',
+        });
+        yield* platformFiles.symlink(outside, path.join(workspace.stateRoot, 'game_link'));
+        const target = path.join(workspace.stateRoot, 'game_link', 'seat.json');
+        expect(message(yield* Effect.either(files.writeText(target, '{}')))).toBe(
+          'private state directories must be real directories inside PLAY_STATE_DIR'
+        );
+      }).pipe(Effect.orDie)
+    )
+  );
 
-  test('an existing directory is walked without complaint', () => {
-    const { files, workspace } = fresh();
-    fs.mkdirSync(path.join(workspace.stateRoot, 'game_abc'), { mode: 0o700 });
-    const target = path.join(workspace.stateRoot, 'game_abc', 'seat.json');
-    expect(Either.isRight(run(files.writeText(target, '{}')))).toBe(true);
-  });
+  effectTest('an existing directory is walked without complaint', () =>
+    withTestFileSystem((platformFiles) =>
+      Effect.gen(function* () {
+        const { files, workspace } = fresh();
+        yield* platformFiles.makeDirectory(path.join(workspace.stateRoot, 'game_abc'), {
+          mode: 0o700,
+        });
+        const target = path.join(workspace.stateRoot, 'game_abc', 'seat.json');
+        yield* files.writeText(target, '{}');
+      }).pipe(Effect.orDie)
+    )
+  );
 
   test('reading a directory that does not exist says so', () => {
     const { files, workspace } = fresh();

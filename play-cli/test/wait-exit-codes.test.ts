@@ -37,36 +37,36 @@ const timing = {
   remaining_s: 587,
 } as const;
 
-interface PhaseShape {
+interface PhaseOptions {
   readonly state?: string;
   readonly active?: boolean;
 }
 
-const phaseBlock = (shape: PhaseShape = {}): PhaseBlock => ({
-  state: shape.state ?? 'awaiting_agent',
+const phaseBlock = (options: PhaseOptions = {}): PhaseBlock => ({
+  state: options.state ?? 'awaiting_agent',
   turn: 3,
   phase: 1,
-  active: shape.active ?? true,
+  active: options.active ?? true,
   timing,
 });
 
-interface HealthShape {
+interface HealthOptions {
   readonly phase?: PhaseBlock | null;
   readonly observation?: boolean;
   readonly gameState?: string;
 }
 
-const health = (shape: HealthShape = {}): HealthEnvelope => ({
+const health = (options: HealthOptions = {}): HealthEnvelope => ({
   schema_version: 2,
   control_protocol: FULL_CONTROL_V2,
   game_id: FIXTURE_GAME_ID,
   agent: { agent_id: FIXTURE_AGENT_ID, controller_label: FIXTURE_CONTROLLER },
-  game_state: shape.gameState ?? 'running',
+  game_state: options.gameState ?? 'running',
   seat: { place: 1, seat_id: 'seat_one', player_name: 'Alice' },
   sidecar: { state: 'ready', generation: 3 },
-  observation_available: shape.observation ?? true,
+  observation_available: options.observation ?? true,
   legal_actions_available: true,
-  phase: shape.phase === undefined ? phaseBlock() : shape.phase,
+  phase: options.phase === undefined ? phaseBlock() : options.phase,
   last_phase_end: null,
 });
 
@@ -147,7 +147,7 @@ describe('waitExitCode', () => {
 
   test('the table is total over every wake reason the server can send', () => {
     const covered: ReadonlyArray<string> = TABLE.map((row) => row.reason);
-    expect([...new Set(covered)].sort()).toEqual([...V2_WAKE_REASONS].sort());
+    expect([...new Set(covered)].toSorted()).toEqual([...V2_WAKE_REASONS].toSorted());
   });
 
   test('every satisfied wake reason exits 0 even on a phase that is not ours', () => {
@@ -157,7 +157,7 @@ describe('waitExitCode', () => {
     }
     // …and the reasons the table calls satisfied are exactly the constant's.
     const named: ReadonlyArray<string> = satisfied.map((row) => row.reason);
-    expect([...new Set(named)].sort()).toEqual([...V2_SATISFIED_WAKE_REASONS].sort());
+    expect([...new Set(named)].toSorted()).toEqual([...V2_SATISFIED_WAKE_REASONS].toSorted());
   });
 
   test('the three statuses are the sysexits spellings, not invented numbers', () => {

@@ -207,7 +207,7 @@ describe('priorEndLine', () => {
     ['auto_idle', 0, 600.0, PRIOR_END.autoIdle],
     ['agent', 7, 32.0, PRIOR_END.agentSevenOrders],
     ['agent', 1, 32.0, PRIOR_END.agentOneOrder],
-  ] as ReadonlyArray<readonly [string, number | null, number, string]>)(
+  ] satisfies ReadonlyArray<readonly [string, number | null, number, string]>)(
     'source=%s orders=%p',
     (source, orders, elapsedS, expected) => {
       const health = decode(
@@ -259,7 +259,7 @@ describe('the turn health epoch', () => {
 describe('the turn health context', () => {
   test('it carries exactly the eleven keys `--json` embeds', () => {
     const health = decode(phaseHealthPayload({ mine: true }));
-    expect(Object.keys(turnHealthContext(health)).sort()).toEqual([
+    expect(Object.keys(turnHealthContext(health)).toSorted()).toEqual([
       'agent',
       'game_state',
       'last_phase_end',

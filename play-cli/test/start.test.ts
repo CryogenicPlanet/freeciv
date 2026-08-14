@@ -16,10 +16,8 @@
  * actually guards, because the re-enumeration between configure and set_ready
  * is mandatory — is asserted for real rather than stubbed away.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import { afterEach, describe, expect, test } from 'bun:test';
-import { Effect, Either, Layer } from 'effect';
+import { afterEach, describe, expect } from 'bun:test';
+import { Effect, Either, Layer, Schema } from 'effect';
 import { FULL_CONTROL_V2 } from 'src/constants';
 import { playerError, type PlayError } from 'src/errors';
 import type { ExitCodeSignal } from 'src/exit';
@@ -42,12 +40,15 @@ import {
 import { V2Client, v2ClientFor, type V2ClientApi, type V2Credentials } from 'src/services/v2-client';
 import { v2StateSchema } from 'src/services/aliases';
 import { FIXTURE_AGENT_ID, FIXTURE_GAME_ID, scratchWorkspace, sessionFile, type Scratch } from 'test/_fixtures';
+import { captureEffect } from 'test/_capture';
+import { awaitTest, provideTestLayer } from 'test/_effect-test';
+import { path, withTestFileSystem } from 'test/_test-platform';
 
 const scratches: Scratch[] = [];
 
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() =>
+  Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup()))
+);
 
 // ---------------------------------------------------------------------------
 // Wire payloads (the Python test class's helpers, ported)
@@ -179,10 +180,19 @@ const OFFERED: ReadonlyArray<JsonObject> = [
 // The fake supervisor
 // ---------------------------------------------------------------------------
 
-type FetchInput = Parameters<typeof fetch>[0];
+type FetchArguments = Parameters<typeof fetch>;
 
-const urlOf = (input: FetchInput): string =>
-  typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+const completeFetch = (
+  handler: (...args: FetchArguments) => ReturnType<typeof fetch>
+): typeof fetch => Object.assign(handler, { preconnect: fetch.preconnect });
+
+const urlOf = (input: Parameters<typeof fetch>[0]): string =>
+  input instanceof Request ? input.url : new URL(input).href;
+
+const initBodyText = (init: RequestInit | undefined): Promise<string> => {
+  if (init?.body === undefined || init?.body === null) return Promise.resolve('{}');
+  return new Response(init.body).text();
+};
 
 const json = (body: JsonValue, status = 200): Response =>
   new Response(JSON.stringify(body), {
@@ -212,101 +222,101 @@ const startResponder = (options: ResponderOptions = {}): Recorded => {
   const bodies: JsonObject[] = [];
   const nations = options.nations ?? OFFERED;
   const catalogs = [legalPage(LOBBY, [CONFIGURE]), legalPage(CONFIGURED, [SET_READY])];
-  const impl = async (input: FetchInput, init?: RequestInit): Promise<Response> => {
-    const url = urlOf(input);
-    if (url.includes('/health')) {
-      steps.push('health');
-      return json(lobbyHealth(options.gameState ?? 'lobby', options.controller ?? CONTROLLER));
-    }
-    if (url.includes('section=pregame_nations')) {
-      steps.push('nations');
-      return json(sectionPage('pregame_nations', LOBBY, nations));
-    }
-    if (url.includes('section=pregame_styles')) {
-      steps.push('styles');
-      return json(
-        sectionPage('pregame_styles', LOBBY, [{ id: STYLE_EUROPEAN, name: 'European' }])
-      );
-    }
-    if (url.includes('section=overview')) {
-      steps.push('overview');
-      return json(
-        sectionPage('overview', LOBBY, [
-          {
-            client_state: 'preparing',
-            turn: 0,
-            phase: null,
-            player: {
-              id: PLAYER,
-              leader_name: options.leader ?? 'Boudica',
-              nation: null,
-              sex: options.sex ?? 'female',
-              style: null,
-              ready: false,
+  const handler = (input: Parameters<typeof fetch>[0], init?: RequestInit): ReturnType<typeof fetch> =>
+    Effect.runPromise(
+      Effect.gen(function* () {
+        const url = urlOf(input);
+        if (url.includes('/health')) {
+          steps.push('health');
+          return json(lobbyHealth(options.gameState ?? 'lobby', options.controller ?? CONTROLLER));
+        }
+        if (url.includes('section=pregame_nations')) {
+          steps.push('nations');
+          return json(sectionPage('pregame_nations', LOBBY, nations));
+        }
+        if (url.includes('section=pregame_styles')) {
+          steps.push('styles');
+          return json(
+            sectionPage('pregame_styles', LOBBY, [{ id: STYLE_EUROPEAN, name: 'European' }])
+          );
+        }
+        if (url.includes('section=overview')) {
+          steps.push('overview');
+          return json(
+            sectionPage('overview', LOBBY, [
+              {
+                client_state: 'preparing',
+                turn: 0,
+                phase: null,
+                player: {
+                  id: PLAYER,
+                  leader_name: options.leader ?? 'Boudica',
+                  nation: null,
+                  sex: options.sex ?? 'female',
+                  style: null,
+                  ready: false,
+                },
+              },
+            ])
+          );
+        }
+        if (url.includes('legal-actions')) {
+          steps.push('legal');
+          const seen = steps.filter((step) => step === 'legal').length;
+          return json(catalogs[Math.min(seen, catalogs.length) - 1] ?? null);
+        }
+        steps.push('batch');
+        const bodyText = yield* Effect.promise(() => initBodyText(init));
+        const raw = yield* Schema.decodeUnknown(Schema.parseJson(Schema.Unknown))(bodyText);
+        if (!isJsonObject(raw)) {
+          return yield* Effect.die(new Error('the batch body was not an object'));
+        }
+        bodies.push(raw);
+        const staleBudget = options.staleConfigures ?? 0;
+        const batchesSeen = steps.filter((step) => step === 'batch').length;
+        if (batchesSeen <= staleBudget) {
+          return json({
+            schema_version: 2,
+            control_protocol: FULL_CONTROL_V2,
+            game_id: FIXTURE_GAME_ID,
+            agent_id: FIXTURE_AGENT_ID,
+            batch_id: scalar(raw['batch_id'] ?? null),
+            receipt_state: 'rejected',
+            idempotent: false,
+            state_revision: LOBBY,
+            error: {
+              schema_version: 2,
+              control_protocol: FULL_CONTROL_V2,
+              error: {
+                code: 'illegal_action',
+                message:
+                  'The style_id field is not one of the IDs the pregame_styles ' +
+                  'section advertises at this revision; only that field is wrong.',
+                retryable: false,
+                details: { rejection_reason: 'pregame_style_unknown' },
+              },
+              state_revision: LOBBY,
             },
-          },
-        ])
-      );
-    }
-    if (url.includes('legal-actions')) {
-      steps.push('legal');
-      const seen = steps.filter((step) => step === 'legal').length;
-      return json(catalogs[Math.min(seen, catalogs.length) - 1] ?? null);
-    }
-    steps.push('batch');
-    const raw: unknown = JSON.parse(typeof init?.body === 'string' ? init.body : '{}');
-    if (!isJsonObject(raw)) throw new Error('the batch body was not an object');
-    bodies.push(raw);
-    const staleBudget = options.staleConfigures ?? 0;
-    const batchesSeen = steps.filter((step) => step === 'batch').length;
-    if (batchesSeen <= staleBudget) {
-      // The live shape from game_Dn9l…: the section was not read at the
-      // validating revision, so the id refuses as pregame_style_unknown.
-      return json({
-        schema_version: 2,
-        control_protocol: FULL_CONTROL_V2,
-        game_id: FIXTURE_GAME_ID,
-        agent_id: FIXTURE_AGENT_ID,
-        batch_id: scalar(raw['batch_id'] ?? null),
-        receipt_state: 'rejected',
-        idempotent: false,
-        state_revision: LOBBY,
-        error: {
+            observation: null,
+          });
+        }
+        const sent = raw['state_revision'];
+        const sameRevision = isJsonObject(sent) && sent['revision'] === LOBBY['revision'];
+        return json({
           schema_version: 2,
           control_protocol: FULL_CONTROL_V2,
-          error: {
-            code: 'illegal_action',
-            message:
-              'The style_id field is not one of the IDs the pregame_styles ' +
-              'section advertises at this revision; only that field is wrong.',
-            retryable: false,
-            details: { rejection_reason: 'pregame_style_unknown' },
-          },
-          state_revision: LOBBY,
-        },
-        observation: null,
-      });
-    }
-    // Compared field by field, not by `JSON.stringify`: `_persist_batch_for_action`
-    // writes the *canonical* body, whose keys are sorted, so a whole-object
-    // string compare against this file's literal would answer "different" for
-    // the same revision and hand the configure batch the readied revision.
-    const sent = raw['state_revision'];
-    const sameRevision = isJsonObject(sent) && sent['revision'] === LOBBY['revision'];
-    return json({
-      schema_version: 2,
-      control_protocol: FULL_CONTROL_V2,
-      game_id: FIXTURE_GAME_ID,
-      agent_id: FIXTURE_AGENT_ID,
-      batch_id: scalar(raw['batch_id'] ?? null),
-      receipt_state: 'applied',
-      idempotent: true,
-      state_revision: sameRevision ? CONFIGURED : READIED,
-      error: null,
-      observation: null,
-    });
-  };
-  return { steps, bodies, fetch: impl as typeof fetch };
+          game_id: FIXTURE_GAME_ID,
+          agent_id: FIXTURE_AGENT_ID,
+          batch_id: scalar(raw['batch_id'] ?? null),
+          receipt_state: 'applied',
+          idempotent: true,
+          state_revision: sameRevision ? CONFIGURED : READIED,
+          error: null,
+          observation: null,
+        });
+      })
+    );
+  return { steps, bodies, fetch: completeFetch(handler) };
 };
 
 // ---------------------------------------------------------------------------
@@ -358,8 +368,8 @@ const hooksFor = (
         if (cachedOf(kind) === null) yield* drain;
         const found = cachedOf(kind);
         if (found === null) {
-          return yield* Effect.fail(
-            playerError(`no ${kind} action is enumerable for this seat right now; ${remedy}`)
+          return yield* playerError(
+            `no ${kind} action is enumerable for this seat right now; ${remedy}`
           );
         }
         return asAction(found);
@@ -459,22 +469,13 @@ const startOptions = (sessionPath: string, overrides: Partial<StartOptions> = {}
   ...overrides,
 });
 
-const run = async (
+const run = (
   fix: Fixture,
   overrides: Partial<StartOptions> = {}
-): Promise<ReadonlyArray<string>> => {
-  const out: string[] = [];
-  const original = console.log;
-  console.log = (...parts: ReadonlyArray<unknown>) => out.push(parts.join(' '));
-  try {
-    await Effect.runPromise(
-      Effect.provide(runStart(startOptions(fix.sessionPath, overrides), fix.hooks), fix.layer)
-    );
-    return out;
-  } finally {
-    console.log = original;
-  }
-};
+): Effect.Effect<ReadonlyArray<string>, PlayError | ExitCodeSignal> =>
+  captureEffect(
+    provideTestLayer(runStart(startOptions(fix.sessionPath, overrides), fix.hooks), fix.layer)
+  ).pipe(Effect.map(({ captured }) => captured.out));
 
 /** Rebuild a fixture's hooks with one or two seams replaced. */
 const withHooks = (
@@ -493,42 +494,34 @@ interface Captured {
 }
 
 /** Both streams and the outcome, for the paths that use all three. */
-const runRaw = async (
+const runRaw = (
   fix: Fixture,
   overrides: Partial<StartOptions> = {}
-): Promise<Captured> => {
-  const out: string[] = [];
-  const err: string[] = [];
-  const originalLog = console.log;
-  const originalError = console.error;
-  console.log = (...parts: ReadonlyArray<unknown>) => out.push(parts.join(' '));
-  console.error = (...parts: ReadonlyArray<unknown>) => err.push(parts.join(' '));
-  try {
-    const outcome = await Effect.runPromise(
-      Effect.either(
-        Effect.provide(runStart(startOptions(fix.sessionPath, overrides), fix.hooks), fix.layer)
-      )
-    );
-    return { out, err, outcome };
-  } finally {
-    console.log = originalLog;
-    console.error = originalError;
-  }
-};
-
-const refuse = async (
-  fix: Fixture,
-  overrides: Partial<StartOptions> = {}
-): Promise<string> => {
-  const outcome = await Effect.runPromise(
+): Effect.Effect<Captured> =>
+  captureEffect(
     Effect.either(
-      Effect.provide(runStart(startOptions(fix.sessionPath, overrides), fix.hooks), fix.layer)
+      provideTestLayer(runStart(startOptions(fix.sessionPath, overrides), fix.hooks), fix.layer)
     )
+  ).pipe(
+    Effect.map(({ value: outcome, captured }) => ({
+      out: captured.out,
+      err: captured.err,
+      outcome,
+    }))
   );
-  if (Either.isRight(outcome)) throw new Error('expected a refusal');
-  const failure = outcome.left as PlayError;
-  return failure.message;
-};
+
+const refuse = (fix: Fixture, overrides: Partial<StartOptions> = {}): Effect.Effect<string> =>
+  Effect.gen(function* () {
+    const captured = yield* runRaw(fix, overrides);
+    if (Either.isRight(captured.outcome)) {
+      return yield* Effect.die(new Error('expected a refusal'));
+    }
+    const failure = captured.outcome.left;
+    if (failure._tag !== 'PlayerError') {
+      return yield* Effect.die(new Error(`expected PlayerError, got ${failure._tag}`));
+    }
+    return failure.message;
+  });
 
 const argumentsOf = (body: JsonObject): JsonValue => {
   const commands = body['commands'];
@@ -539,18 +532,30 @@ const argumentsOf = (body: JsonObject): JsonValue => {
 const commandOf = (body: JsonObject): JsonValue => {
   const commands = body['commands'];
   const first = Array.isArray(commands) ? commands[0] : undefined;
-  return (first ?? null) as JsonValue;
+  return isJsonObject(first) ? first : null;
 };
+
+const startJsonSchema = Schema.parseJson(
+  Schema.Struct({
+    schema_version: Schema.Literal(1),
+    command: Schema.Literal('start'),
+    nation: Schema.String,
+    leader: Schema.String,
+    is_male: Schema.Boolean,
+    style_id: Schema.String,
+    dispositions: Schema.Array(Schema.Unknown),
+  })
+);
 
 // ---------------------------------------------------------------------------
 // The tests
 // ---------------------------------------------------------------------------
 
 describe('play start', () => {
-  test('names resolve, then configure, then RE-ENUMERATE, then ready', async () => {
+  awaitTest('names resolve, then configure, then RE-ENUMERATE, then ready', function* () {
     const recorded = startResponder();
     const fix = fixture(recorded);
-    const lines = await run(fix, { nation: 'eNgLiSh', leader: 'Ada', female: true });
+    const lines = yield* run(fix, { nation: 'eNgLiSh', leader: 'Ada', female: true });
 
     // Lobby check, catalog, enumerate, configure, re-enumerate, ready: the
     // refresh between the two steps is mandatory.
@@ -583,14 +588,14 @@ describe('play start', () => {
     expect(lines[2]?.startsWith('set ready → applied')).toBe(true);
   });
 
-  test('a catalog-freshness refusal re-reads and retries, bounded', async () => {
+  awaitTest('a catalog-freshness refusal re-reads and retries, bounded', function* () {
     // game_Dn9l…: the lobby revision advances in the background, so a
     // configure whose sections were read a revision ago refuses as
     // pregame_style_unknown.  One fresh re-read wins; unrelated refusals
     // must not retry.
     const recorded = startResponder({ staleConfigures: 1 });
     const fix = fixture(recorded);
-    const lines = await run(fix, { nation: 'English', leader: 'Ada', female: true });
+    const lines = yield* run(fix, { nation: 'English', leader: 'Ada', female: true });
 
     // Two configure submissions, with a fresh nations+styles read between.
     expect(recorded.steps).toEqual([
@@ -611,37 +616,37 @@ describe('play start', () => {
     expect(lines.some((line) => line.startsWith('set ready → applied'))).toBe(true);
   });
 
-  test('three stale configures exhaust the retry budget and stop', async () => {
+  awaitTest('three stale configures exhaust the retry budget and stop', function* () {
     const recorded = startResponder({ staleConfigures: 99 });
     const fix = fixture(recorded);
-    const lines = await run(fix, { nation: 'English', leader: 'Ada', female: true });
+    const lines = yield* run(fix, { nation: 'English', leader: 'Ada', female: true });
     expect(recorded.steps.filter((step) => step === 'batch')).toHaveLength(3);
     expect(lines.some((line) => line.includes('attempt 3 of 3'))).toBe(true);
     // The seat was never readied; the final line is the not-readied refusal.
     expect(lines.some((line) => line.startsWith('set ready'))).toBe(false);
   });
 
-  test('a nation that is not on the catalog is refused by name', async () => {
+  awaitTest('a nation that is not on the catalog is refused by name', function* () {
     const fix = fixture(startResponder());
-    const message = await refuse(fix, { nation: 'Atlantean', leader: 'Ada', male: true });
+    const message = yield* refuse(fix, { nation: 'Atlantean', leader: 'Ada', male: true });
     expect(message).toContain("no nation named 'Atlantean'");
     expect(message).toContain('English');
   });
 
-  test('an opaque id is not a name: the catalog is matched on the display name only', async () => {
+  awaitTest('an opaque id is not a name: the catalog is matched on the display name only', function* () {
     // CPython's `_pregame_choice` compares `item["name"]` and nothing else, so
     // `--nation nation_aaa…` is an unknown *name*.  See NOTES.md §U18.
     const fix = fixture(startResponder());
-    const message = await refuse(fix, { nation: NATION_ENGLISH, leader: 'Ada', male: true });
+    const message = yield* refuse(fix, { nation: NATION_ENGLISH, leader: 'Ada', male: true });
     expect(message).toBe(
       `no nation named '${NATION_ENGLISH}' is offered; try one of: English Zulu`
     );
   });
 
-  test('sex is optional but exclusive, and the refusal precedes the first request', async () => {
+  awaitTest('sex is optional but exclusive, and the refusal precedes the first request', function* () {
     const recorded = startResponder();
     const fix = fixture(recorded);
-    const message = await refuse(fix, {
+    const message = yield* refuse(fix, {
       nation: 'English',
       leader: 'Ada',
       male: true,
@@ -651,7 +656,7 @@ describe('play start', () => {
     expect(recorded.steps).toEqual([]);
   });
 
-  test('with no arguments it resolves every choice itself', async () => {
+  awaitTest('with no arguments it resolves every choice itself', function* () {
     const recorded = startResponder();
     const drawn: ReadonlyArray<string>[] = [];
     const fix = fixture(recorded, {
@@ -662,7 +667,7 @@ describe('play start', () => {
         return last;
       },
     });
-    const lines = await run(fix);
+    const lines = yield* run(fix);
 
     // The nation is drawn from what the lobby actually offers, sorted, so
     // seeding the RNG reproduces the pick.
@@ -690,14 +695,14 @@ describe('play start', () => {
     );
   });
 
-  test('each flag overrides exactly what it names and nothing else', async () => {
+  awaitTest('each flag overrides exactly what it names and nothing else', function* () {
     const recorded = startResponder();
     const fix = fixture(recorded, {
       choose: () => {
         throw new Error('a named nation must never draw');
       },
     });
-    await run(fix, { nation: 'english', male: true });
+    yield* run(fix, { nation: 'english', male: true });
     // A named nation never draws, and a named sex never reads the lobby
     // overview: only what is missing is fetched.
     expect(recorded.steps).not.toContain('overview');
@@ -709,10 +714,10 @@ describe('play start', () => {
     });
   });
 
-  test('a named style is resolved against its own catalog and printed by name', async () => {
+  awaitTest('a named style is resolved against its own catalog and printed by name', function* () {
     const recorded = startResponder();
     const fix = fixture(recorded);
-    const lines = await run(fix, {
+    const lines = yield* run(fix, {
       nation: 'English',
       leader: 'Ada',
       style: 'european',
@@ -728,70 +733,70 @@ describe('play start', () => {
     });
   });
 
-  test('an unknown style is refused with its own catalog quoted back', async () => {
+  awaitTest('an unknown style is refused with its own catalog quoted back', function* () {
     const fix = fixture(startResponder());
-    const message = await refuse(fix, { nation: 'English', style: 'Martian', male: true });
+    const message = yield* refuse(fix, { nation: 'English', style: 'Martian', male: true });
     expect(message).toBe("no style named 'Martian' is offered; try one of: European");
   });
 
-  test('an unusable controller label falls back to the leader the lobby holds', async () => {
+  awaitTest('an unusable controller label falls back to the leader the lobby holds', function* () {
     const recorded = startResponder({ leader: 'Boudica', sex: 'male', controller: '***' });
     const fix = fixture(recorded, { controller: '***' });
-    await run(fix);
+    yield* run(fix);
     expect(argumentsOf(recorded.bodies[0] ?? {})).toMatchObject({
       leader_name: 'Boudica',
       is_male: true,
     });
   });
 
-  test('the same zero-argument command picks the same sex twice', async () => {
+  awaitTest('the same zero-argument command picks the same sex twice', function* () {
     const chosen: unknown[] = [];
     for (const _run of [0, 1]) {
       // The lobby volunteers no usable sex, so the fallback is a pure function
       // of the resolved leader name.
       const recorded = startResponder({ sex: 'unspecified' });
       const fix = fixture(recorded);
-      await run(fix);
+      yield* run(fix);
       const values = argumentsOf(recorded.bodies[0] ?? {});
       chosen.push(isJsonObject(values) ? values['is_male'] : null);
     }
-    expect(chosen[0]).toBe(chosen[1] as boolean);
+    expect(chosen[0]).toBe(chosen[1]);
     const digest = new Bun.CryptoHasher('sha256').update('codex-test-model').digest();
     expect(chosen[0]).toBe((digest[0] ?? 0) % 2 !== 0);
   });
 
-  test('a lobby that offers no nation fails closed before any batch', async () => {
+  awaitTest('a lobby that offers no nation fails closed before any batch', function* () {
     const recorded = startResponder({ nations: [] });
     const fix = fixture(recorded);
-    const message = await refuse(fix);
+    const message = yield* refuse(fix);
     expect(message).toContain('just state --section pregame_nations');
     expect(recorded.steps).not.toContain('batch');
   });
 
-  test('a game that has already left the lobby is told so, and told what to run', async () => {
+  awaitTest('a game that has already left the lobby is told so, and told what to run', function* () {
     const recorded = startResponder({ gameState: 'running' });
     const fix = fixture(recorded);
-    const message = await refuse(fix, { nation: 'English', leader: 'Ada', male: true });
+    const message = yield* refuse(fix, { nation: 'English', leader: 'Ada', male: true });
     expect(message).toBe(
       'just start configures a lobby seat; this game is running -- run `just turn`'
     );
     expect(recorded.steps).toEqual(['health']);
   });
 
-  test('--leader is bounded by the byte budget, not the character count', async () => {
+  awaitTest('--leader is bounded by the byte budget, not the character count', function* () {
     const recorded = startResponder();
     const fix = fixture(recorded);
-    const message = await refuse(fix, { leader: 'é'.repeat(24) });
+    const message = yield* refuse(fix, { leader: 'é'.repeat(24) });
     expect(message).toBe('--leader must be at most 47 UTF-8 bytes');
     expect(recorded.steps).toEqual([]);
   });
 
-  test('--json prints the composite payload and no prose', async () => {
+  awaitTest('--json prints the composite payload and no prose', function* () {
     const recorded = startResponder();
     const fix = fixture(recorded);
-    const out = await run(fix, { nation: 'English', leader: 'Ada', female: true, json: true });
+    const out = yield* run(fix, { nation: 'English', leader: 'Ada', female: true, json: true });
     expect(out).toHaveLength(1);
-    const payload: unknown = JSON.parse(out[0] ?? '');
+    const payload = Schema.decodeUnknownSync(startJsonSchema)(out[0] ?? '');
     expect(payload).toMatchObject({
       schema_version: 1,
       command: 'start',
@@ -800,7 +805,7 @@ describe('play start', () => {
       is_male: false,
       style_id: STYLE_EUROPEAN,
     });
-    expect(isJsonObject(payload) && Array.isArray(payload['dispositions'])).toBe(true);
+    expect(payload.dispositions.length).toBeGreaterThan(0);
   });
 
   /**
@@ -812,28 +817,22 @@ describe('play start', () => {
    * it names is exercised for real: enumerate, persist, POST, RE-ENUMERATE,
    * enumerate, persist, POST.
    */
-  test('the shipped hooks configure and ready the seat, re-enumerating between', async () => {
+  awaitTest('the shipped hooks configure and ready the seat, re-enumerating between', function* () {
     const recorded = startResponder();
     const fix = fixture(recorded);
-    const out: string[] = [];
-    const original = console.log;
-    console.log = (...parts: ReadonlyArray<unknown>) => out.push(parts.join(' '));
-    let outcome: Either.Either<void, PlayError | ExitCodeSignal>;
-    try {
-      outcome = await Effect.runPromise(
-        Effect.either(
-          Effect.provide(
-            runStart(
-              startOptions(fix.sessionPath, { nation: 'English', leader: 'Ada', male: true }),
-              liveStartHooks
-            ),
-            fix.layer
-          )
+    const captured = yield* captureEffect(
+      Effect.either(
+        provideTestLayer(
+          runStart(
+            startOptions(fix.sessionPath, { nation: 'English', leader: 'Ada', male: true }),
+            liveStartHooks
+          ),
+          fix.layer
         )
-      );
-    } finally {
-      console.log = original;
-    }
+      )
+    );
+    const outcome = captured.value;
+    const out = captured.captured.out;
     expect(Either.isRight(outcome)).toBe(true);
     expect(recorded.steps).toEqual([
       'health',
@@ -863,7 +862,7 @@ describe('play start', () => {
     expect(out[2]?.startsWith('set ready → applied')).toBe(true);
   });
 
-  test('each enumeration carries the remedy that unblocks exactly its own failure', async () => {
+  awaitTest('each enumeration carries the remedy that unblocks exactly its own failure', function* () {
     const recorded = startResponder();
     const remedies: string[] = [];
     const fix = withHooks(fixture(recorded), (hooks) => ({
@@ -873,7 +872,7 @@ describe('play start', () => {
         return hooks.resolveKindAction(kind, remedy);
       },
     }));
-    await run(fix, { nation: 'English', leader: 'Ada', male: true });
+    yield* run(fix, { nation: 'English', leader: 'Ada', male: true });
     expect(remedies).toEqual([
       'this seat may already be ready -- run `just legal --kind pregame.set_ready ' +
         '--all` and withdraw readiness before configuring again',
@@ -882,7 +881,7 @@ describe('play start', () => {
     ]);
   });
 
-  test('an unproven configure is never readied, and its status leaves quietly', async () => {
+  awaitTest('an unproven configure is never readied, and its status leaves quietly', function* () {
     const recorded = startResponder();
     const fix = withHooks(fixture(recorded), (hooks, session) => ({
       ...hooks,
@@ -893,7 +892,7 @@ describe('play start', () => {
           exitCode: 2,
         })),
     }));
-    const captured = await runRaw(fix, { nation: 'English', leader: 'Ada', male: true });
+    const captured = yield* runRaw(fix, { nation: 'English', leader: 'Ada', male: true });
 
     // The seat was configured-or-not; readying on top of that would be a
     // second unproven mutation.
@@ -921,15 +920,17 @@ describe('play start', () => {
    * Python half is `test_v2_join_card_and_state_header_carry_the_same_contract`
    * (tests/test_client.py:7194-7254).
    */
-  test("start's health probe writes the full protocol card into state/header.txt", async () => {
+  awaitTest("start's health probe writes the full protocol card into state/header.txt", function* () {
     const fix = fixture(startResponder());
-    await run(fix, { nation: 'English', leader: 'Ada', male: true });
+    yield* run(fix, { nation: 'English', leader: 'Ada', male: true });
 
     const dir = Effect.runSync(mirrorDir(fix.sessionPath));
-    const header = fs.readFileSync(path.join(dir, 'state', 'header.txt'), 'utf-8');
-    for (const line of V2_PROTOCOL_CARD) expect(header).toContain(line);
-    // The default card is only ever the fallback for a dropped argument; none
-    // of its lines belongs in a header this client wrote.
-    for (const line of DEFAULT_COMMAND_CARD) expect(header).not.toContain(line);
+    yield* withTestFileSystem((files) =>
+      Effect.gen(function* () {
+        const header = yield* files.readFileString(path.join(dir, 'state', 'header.txt'));
+        for (const line of V2_PROTOCOL_CARD) expect(header).toContain(line);
+        for (const line of DEFAULT_COMMAND_CARD) expect(header).not.toContain(line);
+      }).pipe(Effect.orDie)
+    );
   });
 });

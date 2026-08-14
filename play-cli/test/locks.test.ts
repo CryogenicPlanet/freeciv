@@ -6,8 +6,6 @@
  * silently degraded to the sentinel fallback on this platform.
  */
 import { afterEach, describe, expect, test } from 'bun:test';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { Effect, Either, Layer } from 'effect';
 import { PrivateFs } from 'src/services/private-fs';
 import {
@@ -20,6 +18,8 @@ import {
   withSuffix,
 } from 'src/services/locks';
 import { scratchWorkspace, type Scratch } from 'test/_fixtures';
+import { effectTest, provideTestLayer } from 'test/_effect-test';
+import { path, withTestFileSystem } from 'test/_test-platform';
 
 const scratches: Scratch[] = [];
 
@@ -29,9 +29,7 @@ const fresh = (): Scratch => {
   return scratch;
 };
 
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
 
 describe('path derivation', () => {
   test('withSuffix mirrors pathlib.Path.with_suffix', () => {
@@ -55,49 +53,54 @@ describe('holding', () => {
     expect(hasNativeFlock()).toBe(true);
   });
 
-  test('the body runs and the lock file is left mode 0600', async () => {
-    const scratch = fresh();
-    const target = path.join(scratch.workspace.stateRoot, 'seat.v2-state.lock');
-    const result = await Effect.runPromise(
-      withAdvisoryLock(target, 1, Effect.succeed('done')).pipe(
-        Effect.provide(Layer.succeed(PrivateFs, scratch.files))
-      )
-    );
-    expect(result).toBe('done');
-    expect(fs.statSync(target).mode & 0o777).toBe(0o600);
-  });
+  effectTest('the body runs and the lock file is left mode 0600', () =>
+    withTestFileSystem((files) =>
+      Effect.gen(function* () {
+        const scratch = fresh();
+        const target = path.join(scratch.workspace.stateRoot, 'seat.v2-state.lock');
+        const result = yield* provideTestLayer(
+          withAdvisoryLock(target, 1, Effect.succeed('done')),
+          Layer.succeed(PrivateFs, scratch.files)
+        );
+        expect(result).toBe('done');
+        expect((yield* files.stat(target)).mode & 0o777).toBe(0o600);
+      }).pipe(Effect.orDie)
+    )
+  );
 
-  test('the lock is released even when the body fails', async () => {
-    const scratch = fresh();
-    const target = path.join(scratch.workspace.stateRoot, 'seat.v2-state.lock');
-    const provided = Layer.succeed(PrivateFs, scratch.files);
-    const first = await Effect.runPromise(
-      Effect.either(
-        withAdvisoryLock(target, 1, Effect.fail('boom' as const)).pipe(Effect.provide(provided))
-      )
-    );
-    expect(Either.isLeft(first)).toBe(true);
-    // If the release had leaked, this second acquisition would time out.
-    const second = await Effect.runPromise(
-      withAdvisoryLock(target, 1, Effect.succeed(2)).pipe(Effect.provide(provided))
-    );
-    expect(second).toBe(2);
-  });
+  effectTest('the lock is released even when the body fails', () =>
+    Effect.gen(function* () {
+      const scratch = fresh();
+      const target = path.join(scratch.workspace.stateRoot, 'seat.v2-state.lock');
+      const provided = Layer.succeed(PrivateFs, scratch.files);
+      const first = yield* Effect.either(
+        provideTestLayer(withAdvisoryLock(target, 1, Effect.fail('boom' as const)), provided)
+      );
+      expect(Either.isLeft(first)).toBe(true);
+      // If the release had leaked, this second acquisition would time out.
+      const second = yield* provideTestLayer(
+        withAdvisoryLock(target, 1, Effect.succeed(2)),
+        provided
+      );
+      expect(second).toBe(2);
+    }).pipe(Effect.orDie)
+  );
 
-  test('a lock outside PLAY_STATE_DIR is refused before any file is opened', async () => {
-    const scratch = fresh();
-    const either = await Effect.runPromise(
-      Effect.either(
-        withAdvisoryLock('/etc/play.lock', 1, Effect.succeed(0)).pipe(
-          Effect.provide(Layer.succeed(PrivateFs, scratch.files))
+  effectTest('a lock outside PLAY_STATE_DIR is refused before any file is opened', () =>
+    Effect.gen(function* () {
+      const scratch = fresh();
+      const either = yield* Effect.either(
+        provideTestLayer(
+          withAdvisoryLock('/etc/play.lock', 1, Effect.succeed(0)),
+          Layer.succeed(PrivateFs, scratch.files)
         )
-      )
-    );
+      );
     expect(Either.isLeft(either)).toBe(true);
     if (Either.isLeft(either)) {
       expect(either.left).toMatchObject({
         message: 'private state files must stay inside PLAY_STATE_DIR',
       });
     }
-  });
+    })
+  );
 });

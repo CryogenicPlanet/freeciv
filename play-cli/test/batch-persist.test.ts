@@ -13,7 +13,6 @@
  * number formatting could differ between two serializations of one order, a
  * `retry` would look like a second, different order and could apply twice.
  */
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect, Either, Layer } from 'effect';
 import { FULL_CONTROL_V2 } from 'src/constants';
@@ -38,15 +37,18 @@ import {
   sessionFile,
   type Scratch,
 } from 'test/_fixtures';
+import { provideTestLayer } from 'test/_effect-test';
+import { fixtureObject, fixtureString, observedAt } from 'test/_expect';
+import { path } from 'test/_test-platform';
 
 // ---------------------------------------------------------------------------
 // Fixture
 // ---------------------------------------------------------------------------
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() =>
+  Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup()))
+);
 
 interface TestRevision {
   readonly turn: number;
@@ -127,7 +129,7 @@ const fixture = (): Fixture => {
     store,
     sessionPath,
     session: loaded.session,
-    run: (effect) => Effect.runSync(Effect.either(Effect.provide(effect, layer))),
+    run: (effect) => Effect.runSync(Effect.either(provideTestLayer(effect, layer))),
   };
 };
 
@@ -165,9 +167,15 @@ const reCanonical = (text: string): string => {
 
 const persistedBody = (fx: Fixture, batchId: string): string => {
   const state = ok(fx.run(fx.store.readState(fx.sessionPath, fx.session)));
-  const stored = state.batches[batchId];
-  expect(typeof stored).toBe('string');
-  return stored as string;
+  return fixtureString(state.batches[batchId]);
+};
+
+const canonicalBytes = (value: JsonValue): Uint8Array => Effect.runSync(canonicalBody(value));
+
+const canonicalOf = (text: string): string => {
+  const parsed = parsePython(text);
+  expect(parsed.failure).toBe(null);
+  return Effect.runSync(canonicalText(parsed.value));
 };
 
 // ---------------------------------------------------------------------------
@@ -175,7 +183,6 @@ const persistedBody = (fx: Fixture, batchId: string): string => {
 // ---------------------------------------------------------------------------
 
 describe('the canonical body', () => {
-  const bytes = (value: JsonValue): Uint8Array => Effect.runSync(canonicalBody(value));
 
   test('the same order built from two differently-ordered objects is the same bytes', () => {
     const first: JsonValue = {
@@ -196,7 +203,7 @@ describe('the canonical body', () => {
       control_protocol: FULL_CONTROL_V2,
       schema_version: 2,
     };
-    expect(bytes(first)).toEqual(bytes(second));
+    expect(canonicalBytes(first)).toEqual(canonicalBytes(second));
     // Not merely equal — canonical: sorted keys, no spaces, at every depth.
     expect(Effect.runSync(canonicalText(first))).toBe(
       `{"agent_id":"${FIXTURE_AGENT_ID}","batch_id":"batch_one",` +
@@ -311,12 +318,6 @@ describe('the canonical body', () => {
  * the >2**53 case, a *different order* than the agent typed.
  */
 describe('the canonical body carries CPython numbers', () => {
-  const canonicalOf = (text: string): string => {
-    const parsed = parsePython(text);
-    expect(parsed.failure).toBe(null);
-    return Effect.runSync(canonicalText(parsed.value));
-  };
-
   test('an integral float keeps its float spelling, and an int keeps its own', () => {
     expect(canonicalOf('{"tax":40.0}')).toBe('{"tax":40.0}');
     expect(canonicalOf('{"tax":40}')).toBe('{"tax":40}');
@@ -385,7 +386,7 @@ describe('persistBatchForAction', () => {
     // string must reproduce it byte for byte.
     expect(reCanonical(stored)).toBe(stored);
     expect(stored).not.toContain('secret-token');
-    expect(JSON.parse(stored) as JsonObject).toEqual({
+    expect(fixtureObject(JSON.parse(stored))).toEqual({
       schema_version: 2,
       control_protocol: FULL_CONTROL_V2,
       game_id: FIXTURE_GAME_ID,
@@ -479,7 +480,7 @@ describe('persistBatchForAction', () => {
     ingest(fx, legalPage(rev, [descriptor(rev, ACTION_ONE)]));
     const tokens = ['A'.repeat(24), 'A'.repeat(24), 'C'.repeat(24)];
     let index = 0;
-    const token = (): string => tokens[Math.min(index++, tokens.length - 1)] as string;
+    const token = (): string => observedAt(tokens, Math.min(index++, tokens.length - 1));
     const first = ok(
       fx.run(persistBatchForAction(fx.sessionPath, fx.session, ACTION_ONE, {}, { token }))
     );
@@ -489,7 +490,7 @@ describe('persistBatchForAction', () => {
     expect(first).toBe(`batch_${'A'.repeat(24)}`);
     expect(second).toBe(`batch_${'C'.repeat(24)}`);
     const state = ok(fx.run(fx.store.readState(fx.sessionPath, fx.session)));
-    expect(Object.keys(state.batches).sort()).toEqual([first, second].sort());
+    expect(Object.keys(state.batches).toSorted()).toEqual([first, second].toSorted());
   });
 
   test('an unknown action ID names the enumeration that would make it real', () => {

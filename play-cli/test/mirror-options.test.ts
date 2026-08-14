@@ -8,16 +8,17 @@
  * typable and would resolve to a different capability), and two actions this
  * table renders alike stay two addressable rows.
  */
-import * as path from 'node:path';
-import * as fs from 'node:fs';
 import { afterEach, describe, expect, test } from 'bun:test';
-import { Effect, Either } from 'effect';
-import type { JsonObject, JsonValue } from 'src/schema/primitives';
+import { Cause, Effect, Either } from 'effect';
+import { isJsonObject, type JsonObject, type JsonValue } from 'src/schema/primitives';
 import type { PrivateFs } from 'src/services/private-fs';
 import { mirrorDir, readMirror } from 'src/services/mirror';
+import { OPTIONS_DIR } from 'src/services/mirror/store';
 import { updateFromPage } from 'src/services/mirror/update-page';
 import { actionFlags, argumentNames, targetText } from 'src/render/mirror/actions';
 import { scratchWorkspace, type Scratch } from 'test/_fixtures';
+import { provideTestLayer } from 'test/_effect-test';
+import { path } from 'test/_test-platform';
 
 const GAME_ID = 'game_12345678901234567890';
 const AGENT_ID = 'agent_test-controller';
@@ -48,20 +49,25 @@ const legalPage = (
   game_id: GAME_ID,
   agent_id: AGENT_ID,
   state_revision: rev,
-  page: {
-    section: 'legal_actions',
-    items,
-    total_items: options.total ?? items.length,
-    next_cursor: options.cursor ?? null,
-    cursor_expires_at: null,
-    ...(options.scope === undefined
-      ? {}
+  page:
+    options.scope === undefined
+      ? {
+          section: 'legal_actions',
+          items,
+          total_items: options.total ?? items.length,
+          next_cursor: options.cursor ?? null,
+          cursor_expires_at: null,
+        }
       : {
+          section: 'legal_actions',
+          items,
+          total_items: options.total ?? items.length,
+          next_cursor: options.cursor ?? null,
+          cursor_expires_at: null,
           scope: options.scope,
           catalog_id: `catalog_${'d'.repeat(32)}`,
           catalog_complete: options.complete ?? (options.cursor ?? null) === null,
-        }),
-  },
+        },
 });
 
 const descriptor = (
@@ -86,9 +92,7 @@ const descriptor = (
 });
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
 
 interface Mirror {
   readonly dir: string;
@@ -107,7 +111,7 @@ const freshMirror = (): Mirror => {
     mirrorDir(path.join(scratch.workspace.stateRoot, GAME_ID, 'codex-test.json'))
   );
   const run = <A, E>(effect: Effect.Effect<A, E, PrivateFs>): Either.Either<A, E> =>
-    Effect.runSync(Effect.either(Effect.provide(effect, scratch.layer)));
+    Effect.runSync(Effect.either(provideTestLayer(effect, scratch.layer)));
   return {
     dir,
     write: (payload, aliases) =>
@@ -122,20 +126,18 @@ const freshMirror = (): Mirror => {
         )
       ),
     options: (name) => right(run(readMirror(dir, ['state', 'options', name]))) ?? '',
-    optionFiles: () => fs.readdirSync(path.join(dir, 'state', 'options')).sort(),
+    optionFiles: () => [
+      ...new Bun.Glob('*.txt').scanSync({
+        cwd: path.join(dir, 'state', OPTIONS_DIR),
+        onlyFiles: true,
+      }),
+    ].toSorted(),
   };
 };
 
 const right = <A, E>(either: Either.Either<A, E>): A => {
   if (Either.isLeft(either)) {
-    const failure: unknown = either.left;
-    throw new Error(
-      `expected success, got: ${
-        typeof failure === 'object' && failure !== null && 'message' in failure
-          ? String((failure).message)
-          : String(failure)
-      }`
-    );
+    throw new Error(`expected success, got: ${Cause.pretty(Cause.fail(either.left))}`);
   }
   return either.right;
 };
@@ -196,8 +198,10 @@ describe('the flags column', () => {
   test('an actor outside the page scope is always named', () => {
     const mirror = freshMirror();
     const rev = revision(9);
-    const item = descriptor(rev, 'action_1');
-    (item['subject'] as Record<string, unknown>)['actor'] = { type: 'unit', id: UNIT_B };
+    const original = descriptor(rev, 'action_1');
+    const subject = original['subject'];
+    if (!isJsonObject(subject)) throw new Error('expected descriptor subject fixture');
+    const item = { ...original, subject: { ...subject, actor: { type: 'unit', id: UNIT_B } } };
     mirror.write(legalPage(rev, [item], { scope: { actor_id: UNIT_A, actor_type: 'unit' } }), {
       [UNIT_A]: 'u1',
     });

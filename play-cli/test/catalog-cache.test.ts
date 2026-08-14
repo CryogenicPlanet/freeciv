@@ -10,12 +10,11 @@
  * test here is the *comparison*: which catalogs are eligible, what "the same
  * options in the same order" means, and which rows are reported as differing.
  */
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect, Either, Layer } from 'effect';
 import { FULL_CONTROL_V2 } from 'src/constants';
 import { decodeLegalPage, type LegalActionPageEnvelope, type PageScope } from 'src/schema/page';
-import { field, isJsonObject, type JsonObject, type JsonValue } from 'src/schema/primitives';
+import { field, isJsonObject, isNonEmptyString, type JsonObject, type JsonValue } from 'src/schema/primitives';
 import { scalar } from 'src/render/primitives';
 import { PrivateFs } from 'src/services/private-fs';
 import {
@@ -25,7 +24,7 @@ import {
   type SessionStoreApi,
   type V2ClientState,
 } from 'src/services/session-store';
-import { aliasMap, rememberPage, v2StateSchema, type AliasMap } from 'src/services/aliases';
+import { aliasMap, rememberPage, v2StateSchema } from 'src/services/aliases';
 import {
   V2_KIND_LIST_MAX,
   cachedActorCatalog,
@@ -39,15 +38,15 @@ import {
   type CompactLegalResult,
 } from 'src/services/catalog-cache';
 import { FIXTURE_GAME_ID, scratchWorkspace, sessionFile, type Scratch } from 'test/_fixtures';
+import { provideTestLayer } from 'test/_effect-test';
+import { path } from 'test/_test-platform';
 
 // ---------------------------------------------------------------------------
 // Fixture
 // ---------------------------------------------------------------------------
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
 
 interface TestRevision {
   readonly turn: number;
@@ -82,7 +81,7 @@ const fixture = (): Fixture => {
     store,
     sessionPath,
     session: loaded.session,
-    run: (effect) => Effect.runSync(Effect.either(Effect.provide(effect, layer))),
+    run: (effect) => Effect.runSync(Effect.either(provideTestLayer(effect, layer))),
   };
 };
 
@@ -185,8 +184,8 @@ const compactLegalAction = (descriptor: JsonObject): JsonObject => {
 };
 
 const kindKeyOf = (kind: JsonValue, operation: JsonValue): string => {
-  if (typeof kind !== 'string') return '';
-  if (typeof operation !== 'string' || operation === '' || kind.endsWith(`.${operation}`)) {
+  if (!isNonEmptyString(kind)) return '';
+  if (!isNonEmptyString(operation) || kind.endsWith(`.${operation}`)) {
     return kind;
   }
   return `${kind}/${operation}`;
@@ -211,14 +210,14 @@ const deps: CatalogRenderDeps = {
     }
     const actor = isJsonObject(subject) ? field(subject, 'actor') : null;
     const actorId = isJsonObject(actor) ? field(actor, 'id') : null;
-    if (typeof actorId === 'string' && actorId !== (scope === null ? null : scope.actor_id)) {
+    if (isNonEmptyString(actorId) && actorId !== (scope === null ? null : scope.actor_id)) {
       detail.push(`actor=${aliases?.[actorId] ?? actorId}`);
     }
     const label = field(compact, 'label');
     return Effect.succeed([
       alias,
       kindKeyOf(field(compact, 'kind'), isJsonObject(subject) ? field(subject, 'operation') : null),
-      typeof label === 'string' ? label : '',
+      isNonEmptyString(label) ? label : '',
       detail.join(' '),
     ]);
   },
@@ -255,7 +254,7 @@ const resultOf = (
 const scopeOf = (actorId: string): PageScope => ({ actor_id: actorId, actor_type: 'unit' });
 
 /** Two units offered exactly the same menu at one revision. */
-const twoIdenticalActors = (fx: Fixture): { state: V2ClientState; aliases: AliasMap } => {
+const twoIdenticalActors = (fx: Fixture) => {
   const at = revision(7);
   const menu = (actor: string, prefix: string): ReadonlyArray<JsonObject> => [
     actorAction(at, `action_${prefix}1`.padEnd(24, 'z'), actor, { x: 31, y: 72 }),

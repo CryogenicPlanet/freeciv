@@ -12,13 +12,12 @@
  * that reads a paraphrase learns to retry.  Every case below asserts the whole
  * sentence, never a substring, for exactly that reason.
  */
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
-import { Effect, Either, Layer } from 'effect';
+import { Effect, Either, Equal, Layer } from 'effect';
 import { FULL_CONTROL_V2, V2_WITHHELD } from 'src/constants';
 import { playerError, type PlayerError } from 'src/errors';
 import { decodeLegalPage, decodePage } from 'src/schema/page';
-import { isJsonObject, type JsonObject, type JsonValue } from 'src/schema/primitives';
+import { isJsonObject, type JsonObject, type JsonValue, type MutableJsonObject } from 'src/schema/primitives';
 import { rememberPage, v2StateSchema } from 'src/services/aliases';
 import { HEADER_FILE, mirrorDir, writeMirror } from 'src/services/mirror/store';
 import { PrivateFs } from 'src/services/private-fs';
@@ -36,6 +35,8 @@ import {
   type OrdersDeps,
 } from 'src/services/orders';
 import { FIXTURE_GAME_ID, scratchWorkspace, sessionFile, type Scratch } from 'test/_fixtures';
+import { provideTestLayer } from 'test/_effect-test';
+import { path } from 'test/_test-platform';
 
 // ---------------------------------------------------------------------------
 // `_compact_legal_action` (client.py:7899-7947) — U11's, ported for the seam
@@ -49,13 +50,13 @@ const RESERVED_SUBJECT_TERMS: ReadonlySet<string> = new Set([
   'wire',
 ]);
 
-const CERTAIN = JSON.stringify({ kind: 'exact', minimum_percent: 100, maximum_percent: 100 });
+const CERTAIN: JsonObject = { kind: 'exact', minimum_percent: 100, maximum_percent: 100 };
 
 const compactLegalAction = (descriptor: JsonObject): Effect.Effect<JsonObject, PlayerError> =>
   Effect.sync(() => {
     const raw = descriptor['subject'];
     const subject = isJsonObject(raw) ? raw : {};
-    const compactSubject: Record<string, JsonValue> = {};
+    const compactSubject: MutableJsonObject = {};
     for (const [key, value] of Object.entries(subject)) {
       if (key === 'target' || key === 'probability' || key === 'gold_cost') continue;
       const withheld =
@@ -67,7 +68,7 @@ const compactLegalAction = (descriptor: JsonObject): Effect.Effect<JsonObject, P
           .some((part) => RESERVED_SUBJECT_TERMS.has(part));
       compactSubject[key] = withheld ? V2_WITHHELD : (value);
     }
-    const result: Record<string, JsonValue> = {
+    const result: MutableJsonObject = {
       action_id: (descriptor['action_id'] ?? null),
       kind: (descriptor['kind'] ?? null),
       label: (descriptor['label'] ?? null),
@@ -76,7 +77,7 @@ const compactLegalAction = (descriptor: JsonObject): Effect.Effect<JsonObject, P
       argument_schema: (descriptor['arguments_schema'] ?? null),
     };
     const probability = subject['probability'];
-    if (probability !== undefined && JSON.stringify(probability) !== CERTAIN) {
+    if (probability !== undefined && !Equal.equals(probability, CERTAIN)) {
       result['probability'] = probability;
     }
     return result;
@@ -89,9 +90,7 @@ const deps: OrdersDeps = { compactLegalAction };
 // ---------------------------------------------------------------------------
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
 
 interface TestRevision {
   readonly turn: number;
@@ -124,7 +123,7 @@ const fixture = (): Fixture => {
   return {
     sessionPath,
     session: loaded.session,
-    run: (effect) => Effect.runSync(Effect.either(Effect.provide(effect, layer))),
+    run: (effect) => Effect.runSync(Effect.either(provideTestLayer(effect, layer))),
   };
 };
 
@@ -246,7 +245,7 @@ const ingestState = (fx: Fixture, page: JsonObject): V2ClientState =>
  * onto T(31,71); `c1` holds one worklist action; `u2` and `r1` are known
  * entities this seat never enumerated.
  */
-const world = (): { readonly fx: Fixture; readonly state: V2ClientState } => {
+const world = () => {
   const fx = fixture();
   const at = revision(7);
   ingestLegal(

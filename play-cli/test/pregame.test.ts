@@ -10,8 +10,9 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect, Either } from 'effect';
 import { createHash } from 'node:crypto';
-import * as path from 'node:path';
-import { PlayerError, V2ResponseError, playerError } from 'src/errors';
+import type { BatchDisposition } from 'src/schema/batch';
+import type { ReceiptState } from 'src/schema/receipt';
+import { type PlayerError, V2ResponseError, playerError } from 'src/errors';
 import {
   NOT_READIED_LINE,
   PREGAME_SHOWN_MAX,
@@ -40,22 +41,28 @@ import {
   type PregameItem,
 } from 'src/services/pregame';
 import { FIXTURE_GAME_ID, scratchWorkspace, type Scratch } from 'test/_fixtures';
+import { dispositionOf, rev } from 'test/_do-harness';
+import { awaitTest } from 'test/_effect-test';
+import { observedFirst, observedLast } from 'test/_expect';
+import { path } from 'test/_test-platform';
 
 const scratches: Scratch[] = [];
 
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() =>
+  Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup()))
+);
 
 const NATION = `nation_${'a'.repeat(32)}`;
 const ZULU = `nation_${'c'.repeat(32)}`;
 const STYLE = `style_${'b'.repeat(32)}`;
 
-const item = (id: string, name: string, style?: string): PregameItem => ({
-  id,
-  name,
-  ...(style === undefined ? {} : { default_style_id: style }),
-});
+const item = (id: string, name: string, style?: string): PregameItem => {
+  if (style === undefined) return { id, name };
+  return { id, name, default_style_id: style };
+};
+
+const receiptDisposition = (state: ReceiptState): BatchDisposition =>
+  dispositionOf('batch_receipt_truth_table', state, rev(4));
 
 // ---------------------------------------------------------------------------
 // _sanitized_leader
@@ -178,7 +185,7 @@ describe('pregameDefaultNation', () => {
     const picked = Effect.runSync(
       pregameDefaultNation(offered, (choices) => {
         seen.push(choices.map((choice) => choice.name));
-        return choices[choices.length - 1] as PregameItem;
+        return observedLast(choices);
       })
     );
     expect(seen[0]).toEqual(['English', 'Zulu']);
@@ -190,7 +197,7 @@ describe('pregameDefaultNation', () => {
     const drawn = Effect.runSync(
       pregameDefaultNation(offered, (choices) => {
         expect(choices.map((choice) => choice.name)).toEqual(['English']);
-        return choices[0] as PregameItem;
+        return observedFirst(choices);
       })
     );
     expect(drawn.id).toBe(NATION);
@@ -214,25 +221,18 @@ describe('pregameDefaultNation', () => {
 // _mirror_pregame_catalog
 // ---------------------------------------------------------------------------
 
-const withMirror = async <E>(
+const withMirror = <A, E>(
   write: (dir: string) => Effect.Effect<unknown, E, PrivateFs>,
-  read: (sessionPath: string) => Effect.Effect<unknown, never, PrivateFs>
-): Promise<unknown> => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'codex-test.json');
-  const dir = Effect.runSync(mirrorDir(sessionPath));
-  await Effect.runPromise(
-    Effect.provideService(
-      Effect.orDie(write(dir)),
-      PrivateFs,
-      scratch.files
-    )
-  );
-  return Effect.runPromise(
-    Effect.provideService(read(sessionPath), PrivateFs, scratch.files)
-  );
-};
+  read: (sessionPath: string) => Effect.Effect<A, never, PrivateFs>
+): Effect.Effect<A> =>
+  Effect.gen(function* () {
+    const scratch = scratchWorkspace();
+    scratches.push(scratch);
+    const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'codex-test.json');
+    const dir = yield* Effect.orDie(mirrorDir(sessionPath));
+    yield* Effect.provideService(Effect.orDie(write(dir)), PrivateFs, scratch.files);
+    return yield* Effect.provideService(read(sessionPath), PrivateFs, scratch.files);
+  });
 
 const nationsTable = (
   rows: ReadonlyArray<ReadonlyArray<string>>,
@@ -246,8 +246,8 @@ const nationsTable = (
   );
 
 describe('mirrorPregameCatalog', () => {
-  test('a complete projection is re-read rather than re-fetched', async () => {
-    const items = await withMirror(
+  awaitTest('a complete projection is re-read rather than re-fetched', function* () {
+    const items = yield* withMirror(
       (dir) =>
         writeMirror(
           dir,
@@ -265,8 +265,8 @@ describe('mirrorPregameCatalog', () => {
     ]);
   });
 
-  test('a partial projection is refused whole; a half catalog is not a catalog', async () => {
-    const items = await withMirror(
+  awaitTest('a partial projection is refused whole; a half catalog is not a catalog', function* () {
+    const items = yield* withMirror(
       (dir) =>
         writeMirror(dir, [CACHE_DIR, 'nations.tsv'], nationsTable([[NATION, 'English', STYLE]], false)),
       (sessionPath) => mirrorPregameCatalog(sessionPath, 'pregame_nations')
@@ -274,8 +274,8 @@ describe('mirrorPregameCatalog', () => {
     expect(items).toEqual([]);
   });
 
-  test('a truncated opaque id poisons the whole projection', async () => {
-    const items = await withMirror(
+  awaitTest('a truncated opaque id poisons the whole projection', function* () {
+    const items = yield* withMirror(
       (dir) =>
         writeMirror(
           dir,
@@ -290,8 +290,8 @@ describe('mirrorPregameCatalog', () => {
     expect(items).toEqual([]);
   });
 
-  test('a projection whose columns moved is not guessed at', async () => {
-    const items = await withMirror(
+  awaitTest('a projection whose columns moved is not guessed at', function* () {
+    const items = yield* withMirror(
       (dir) =>
         writeMirror(
           dir,
@@ -308,16 +308,16 @@ describe('mirrorPregameCatalog', () => {
     expect(items).toEqual([]);
   });
 
-  test('an absent projection is empty, not an error', async () => {
-    const items = await withMirror(
+  awaitTest('an absent projection is empty, not an error', function* () {
+    const items = yield* withMirror(
       () => Effect.void,
       (sessionPath) => mirrorPregameCatalog(sessionPath, 'pregame_nations')
     );
     expect(items).toEqual([]);
   });
 
-  test('a style is named from the mirror alone', async () => {
-    const named = await withMirror(
+  awaitTest('a style is named from the mirror alone', function* () {
+    const named = yield* withMirror(
       (dir) =>
         writeMirror(
           dir,
@@ -332,7 +332,7 @@ describe('mirrorPregameCatalog', () => {
       (sessionPath) => cachedStyleName(sessionPath, STYLE)
     );
     expect(named).toBe('European');
-    const missing = await withMirror(
+    const missing = yield* withMirror(
       () => Effect.void,
       (sessionPath) => cachedStyleName(sessionPath, STYLE)
     );
@@ -347,37 +347,34 @@ describe('mirrorPregameCatalog', () => {
 const HEADER = (state: string, active: string): string =>
   `phase ${state} · turn 3 phase 1 · active ${active}\n`;
 
-const underRefusal = async (
+const underRefusal = (
   header: string | null,
   failure: PlayerError | V2ResponseError
-): Promise<string> => {
-  const scratch = scratchWorkspace();
-  scratches.push(scratch);
-  const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'codex-test.json');
-  if (header !== null) {
-    const dir = Effect.runSync(mirrorDir(sessionPath));
-    await Effect.runPromise(
-      Effect.provideService(
+): Effect.Effect<string> =>
+  Effect.gen(function* () {
+    const scratch = scratchWorkspace();
+    scratches.push(scratch);
+    const sessionPath = path.join(scratch.workspace.stateRoot, FIXTURE_GAME_ID, 'codex-test.json');
+    if (header !== null) {
+      const dir = yield* Effect.orDie(mirrorDir(sessionPath));
+      yield* Effect.provideService(
         Effect.orDie(writeMirror(dir, HEADER_FILE, header)),
         PrivateFs,
         scratch.files
-      )
-    );
-  }
-  const outcome = await Effect.runPromise(
-    Effect.provideService(
+      );
+    }
+    const outcome = yield* Effect.provideService(
       Effect.either(phaseAwareRefusal(sessionPath, Effect.fail(failure))),
       PrivateFs,
       scratch.files
-    )
-  );
-  if (Either.isRight(outcome)) throw new Error('expected a refusal');
-  return outcome.left.message;
-};
+    );
+    if (Either.isRight(outcome)) throw new Error('expected a refusal');
+    return outcome.left.message;
+  });
 
 describe('phaseAwareRefusal', () => {
-  test('a refusal raised after the phase ended leads with the phase fact', async () => {
-    const message = await underRefusal(
+  awaitTest('a refusal raised after the phase ended leads with the phase fact', function* () {
+    const message = yield* underRefusal(
       HEADER('inactive_done', 'no'),
       playerError('unknown or expired action ID')
     );
@@ -387,26 +384,26 @@ describe('phaseAwareRefusal', () => {
     );
   });
 
-  test('a live phase leaves the refusal exactly as it was', async () => {
-    const message = await underRefusal(
+  awaitTest('a live phase leaves the refusal exactly as it was', function* () {
+    const message = yield* underRefusal(
       HEADER('awaiting_agent', 'yes'),
       playerError('unknown or expired action ID')
     );
     expect(message).toBe('unknown or expired action ID');
   });
 
-  test('a refusal that already leads with the note is not double-prefixed', async () => {
+  awaitTest('a refusal that already leads with the note is not double-prefixed', function* () {
     const note = 'your phase is not active (state ending) — just wait';
-    const message = await underRefusal(HEADER('ending', 'no'), playerError(`${note}\nand more`));
+    const message = yield* underRefusal(HEADER('ending', 'no'), playerError(`${note}\nand more`));
     expect(message).toBe(`${note}\nand more`);
   });
 
-  test('no mirror at all means no rewrite', async () => {
-    expect(await underRefusal(null, playerError('cold cache'))).toBe('cold cache');
+  awaitTest('no mirror at all means no rewrite', function* () {
+    expect(yield* underRefusal(null, playerError('cold cache'))).toBe('cold cache');
   });
 
-  test('a validated wire refusal is rewritten too, exactly as CPython subclasses it', async () => {
-    const message = await underRefusal(
+  awaitTest('a validated wire refusal is rewritten too, exactly as CPython subclasses it', function* () {
+    const message = yield* underRefusal(
       HEADER('phase_not_ready', 'no'),
       new V2ResponseError({ message: 'HTTP 409: no (conflict)', status: 409, payload: null })
     );
@@ -498,12 +495,12 @@ describe('defaultArguments and orderReceiptOk', () => {
   });
 
   test('only accepted and applied mean the seat was configured', () => {
-    const of = (state: string): unknown => ({ receipt: { receipt_state: state } });
-    expect(orderReceiptOk(of('applied') as never)).toBe(true);
-    expect(orderReceiptOk(of('accepted') as never)).toBe(true);
-    expect(orderReceiptOk(of('rejected') as never)).toBe(false);
-    expect(orderReceiptOk(of('ambiguous') as never)).toBe(false);
-    expect(orderReceiptOk({ receipt: null } as never)).toBe(false);
+    const withoutReceipt: BatchDisposition = { ...receiptDisposition('applied'), receipt: null };
+    expect(orderReceiptOk(receiptDisposition('applied'))).toBe(true);
+    expect(orderReceiptOk(receiptDisposition('accepted'))).toBe(true);
+    expect(orderReceiptOk(receiptDisposition('rejected'))).toBe(false);
+    expect(orderReceiptOk(receiptDisposition('ambiguous'))).toBe(false);
+    expect(orderReceiptOk(withoutReceipt)).toBe(false);
   });
 });
 

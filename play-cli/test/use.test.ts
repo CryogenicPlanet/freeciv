@@ -12,24 +12,23 @@
  * checked for the command that repairs it, because that string is the agent's
  * whole recovery surface.
  */
-import * as fs from 'node:fs';
-import * as os from 'node:os';
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
-import { Command } from '@effect/cli';
+import { Command, ValidationError } from '@effect/cli';
 import { BunContext } from '@effect/platform-bun';
-import { Effect, Either, Layer } from 'effect';
-import { FULL_CONTROL_V2, SEAT_BINDING_NAME } from 'src/constants';
+import { Effect, Either, Layer, Option, Schema } from 'effect';
+import type { MappedError } from 'src/cli-main';
+import { FULL_CONTROL_V2 } from 'src/constants';
 import {
   commandUse,
   resolveUseTarget,
   useCommand,
   workspaceRelative,
 } from 'src/commands/use.cmd';
+import type { PlayerError } from 'src/errors';
+import type { JsonObject } from 'src/schema/primitives';
 import {
-  PrivateFs,
-  Workspace,
-  privateFsFor,
+  type PrivateFs,
+  type Workspace,
   type PrivateFsApi,
   type WorkspacePaths,
 } from 'src/services/private-fs';
@@ -39,32 +38,26 @@ import {
   sessionStoreFor,
   type SessionStoreApi,
 } from 'src/services/session-store';
-import type { JsonObject } from 'src/schema/primitives';
-import { scalar } from 'src/render/primitives';
-import { compactJson } from 'src/services/json-output';
+import { scratchWorkspace, type Scratch } from 'test/_fixtures';
+import { captureEffect } from 'test/_capture';
+import { awaitTest, provideTestLayer } from 'test/_effect-test';
+import { path, withTestFileSystem } from 'test/_test-platform';
 
 const FIRST = 'game_Hsit9YEuBjKdJPPouFoGVYlk';
 const SECOND = 'game_9SecondBoundGame00000000';
 const MISSING = 'game_NeverJoinedByThisSeat00';
 
-const roots: string[] = [];
+const scratches: Scratch[] = [];
 
-afterEach(() => {
-  while (roots.length > 0) {
-    const root = roots.pop();
-    if (root !== undefined) fs.rmSync(root, { recursive: true, force: true });
-  }
-});
+afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
 
 const schema = {
   empty: emptyV2ClientState,
   validate: () => Effect.void,
-  cursorExpired: (expiresAt: string | null): boolean =>
-    expiresAt === null ? false : Date.parse(expiresAt) <= Date.now(),
+  cursorExpired: (): boolean => false,
 };
 
 interface Bench {
-  readonly root: string;
   readonly workspace: WorkspacePaths;
   readonly files: PrivateFsApi;
   readonly store: SessionStoreApi;
@@ -74,22 +67,15 @@ interface Bench {
 }
 
 const bench = (): Bench => {
-  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'play-cli-u02-')));
-  roots.push(root);
-  const workspace: WorkspacePaths = { root, stateRoot: path.join(root, '.sessions') };
-  fs.mkdirSync(workspace.stateRoot, { mode: 0o700, recursive: true });
-  const files = privateFsFor(workspace);
+  const scratch = scratchWorkspace();
+  scratches.push(scratch);
+  const { workspace, files } = scratch;
   const store = sessionStoreFor(workspace, files, schema, {});
   return {
-    root,
     workspace,
     files,
     store,
-    layer: Layer.mergeAll(
-      Layer.succeed(Workspace, workspace),
-      Layer.succeed(PrivateFs, files),
-      Layer.succeed(SessionStore, store)
-    ),
+    layer: Layer.merge(scratch.layer, Layer.succeed(SessionStore, store)),
     seat: (gameId, name, overrides = {}) => {
       const target = path.join(workspace.stateRoot, gameId, `${name}.json`);
       Effect.runSync(
@@ -111,35 +97,45 @@ const bench = (): Bench => {
 
 interface Captured {
   readonly out: string;
-  readonly result: Either.Either<void, { readonly message: string }>;
+  readonly result: Either.Either<void, PlayerError>;
 }
 
-const use = async (
+const useJsonPayload = Schema.Struct({
+  game_id: Schema.String,
+  session_file: Schema.String,
+  bound_at: Schema.String,
+  rebound_from: Schema.NullOr(Schema.String),
+});
+
+const decodeUseJson = Schema.decodeUnknownSync(Schema.parseJson(useJsonPayload));
+
+const gameIdJson = Schema.decodeUnknownSync(
+  Schema.parseJson(Schema.Struct({ game_id: Schema.String }))
+);
+
+const captureUse = (
   fixture: Bench,
   target = '',
   options: { readonly json?: boolean; readonly env?: Record<string, string | undefined> } = {}
-): Promise<Captured> => {
-  const lines: string[] = [];
-  const originalLog = console.log;
-  console.log = (...parts: ReadonlyArray<unknown>) => lines.push(parts.join(' '));
-  try {
-    const result = await Effect.runPromise(
-      Effect.either(
-        Effect.provide(
-          commandUse({ target, json: options.json ?? false }, options.env ?? {}),
-          fixture.layer
-        )
+): Effect.Effect<Captured> =>
+  captureEffect(
+    Effect.either(
+      provideTestLayer(
+        commandUse({ target, json: options.json ?? false }, options.env ?? {}),
+        fixture.layer
       )
-    );
-    return { out: lines.join('\n'), result };
-  } finally {
-    console.log = originalLog;
-  }
-};
+    )
+  ).pipe(
+    Effect.map(({ value, captured }) => ({
+      out: captured.out.join('\n'),
+      result: value,
+    }))
+  );
 
-const failure = <A>(either: Either.Either<A, { readonly message: string }>): string => {
+const failure = (either: Either.Either<unknown, PlayerError>): string => {
   expect(Either.isLeft(either)).toBe(true);
-  return Either.isLeft(either) ? either.left.message : '';
+  if (Either.isLeft(either)) return either.left.message;
+  return '';
 };
 
 const ok = <A, E>(either: Either.Either<A, E>): void => {
@@ -149,10 +145,42 @@ const ok = <A, E>(either: Either.Either<A, E>): void => {
 };
 
 const boundGame = (fixture: Bench): string => {
-  const value = JSON.parse(
-    fs.readFileSync(path.join(fixture.workspace.stateRoot, SEAT_BINDING_NAME), 'utf8')
-  ) as JsonObject;
-  return scalar(value['game_id'] ?? null);
+  const binding = Effect.runSync(fixture.store.readSeatBinding());
+  if (Option.isNone(binding)) throw new Error('expected bound workspace');
+  return binding.value.gameId;
+};
+
+const resolve = (fixture: Bench, value: string) =>
+  Effect.runSync(
+    Effect.either(resolveUseTarget(fixture.workspace, fixture.files, fixture.store, value))
+  );
+
+const cliFailureText = (error: MappedError | ValidationError.ValidationError): string => {
+  if (ValidationError.isValidationError(error)) return error._tag;
+  if (error._tag === 'ExitCodeSignal') return String(error.code);
+  return error.message;
+};
+
+const cli = (
+  fixture: Bench,
+  argv: ReadonlyArray<string>
+): Effect.Effect<{ readonly failure: string | null; readonly out: string }> => {
+  const root = Command.make('play', {}, () => Effect.void).pipe(
+    Command.withSubcommands([useCommand])
+  );
+  return captureEffect(
+    Effect.either(
+      provideTestLayer(
+        Command.run(root, { name: 'play', version: '0.1.0' })(['bun', 'play', ...argv]),
+        Layer.merge(fixture.layer, BunContext.layer)
+      )
+    )
+  ).pipe(
+    Effect.map(({ value, captured }) => ({
+      failure: value._tag === 'Left' ? cliFailureText(value.left) : null,
+      out: captured.out.join('\n'),
+    }))
+  );
 };
 
 // ---------------------------------------------------------------------------
@@ -175,11 +203,6 @@ describe('_workspace_relative', () => {
 });
 
 describe('_resolve_use_target', () => {
-  const resolve = (fixture: Bench, value: string) =>
-    Effect.runSync(
-      Effect.either(resolveUseTarget(fixture.workspace, fixture.files, fixture.store, value))
-    );
-
   test('a game ID with exactly one seat resolves to that seat', () => {
     const fixture = bench();
     const seat = fixture.seat(FIRST, 'codex-first-model');
@@ -224,28 +247,28 @@ describe('bare `use`', () => {
   /**
    * `(getattr(args, "target", "") or "").strip()` uses CPython's whitespace
    * class, which is not `String.prototype.trim`'s: the four ASCII separators
-   * and NEL are blank to Python and not to JavaScript, and `﻿` is the
+   * and NEL are blank to Python and not to JavaScript, and `\uFEFF` is the
    * reverse.  Getting it wrong decides whether `use` reports the bound seat or
    * goes looking for a session file named after a control character.
    */
   for (const [character, label] of [
-    ['', 'FS'],
-    ['', 'US'],
-    ['', 'NEL'],
+    ['\u001c', 'FS'],
+    ['\u001f', 'US'],
+    ['\u0085', 'NEL'],
   ] as const) {
-    test(`a target of a lone ${label} is blank, so bare \`use\` answers`, async () => {
-      const message = failure((await use(bench(), character)).result);
+    awaitTest(`a target of a lone ${label} is blank, so bare \`use\` answers`, function* (wait) {
+      const message = failure((yield* wait(captureUse(bench(), character))).result);
       expect(message).toContain('this workspace is not bound to a seat.');
     });
   }
 
-  test('a target of a lone ZWNBSP is NOT blank, so it is resolved as a path', async () => {
-    const message = failure((await use(bench(), '﻿')).result);
+  awaitTest('a target of a lone ZWNBSP is NOT blank, so it is resolved as a path', function* (wait) {
+    const message = failure((yield* wait(captureUse(bench(), '\uFEFF'))).result);
     expect(message).not.toContain('this workspace is not bound to a seat.');
   });
 
-  test('an unbound workspace names the join command', async () => {
-    const { result } = await use(bench());
+  awaitTest('an unbound workspace names the join command', function* (wait) {
+    const { result } = yield* wait(captureUse(bench()));
     const message = failure(result);
     expect(message).toBe(
       'this workspace is not bound to a seat. Join one with ' +
@@ -256,35 +279,43 @@ describe('bare `use`', () => {
     expect(message).toContain('just join --game_id GAME_ID');
   });
 
-  test('a pre-configured workspace names bare `just join`, never the generic form', async () => {
-    const fixture = bench();
-    fs.writeFileSync(
-      path.join(fixture.root, '.playconfig.json'),
-      JSON.stringify({
-        schema_version: 1,
-        game_id: FIRST,
-        name: 'codex-test-model',
-        place: null,
-      }),
-      'utf8'
-    );
-    const message = failure((await use(fixture)).result);
-    expect(message).toBe(
-      'run `just join` first — this workspace is ' +
-        `pre-configured for ${FIRST}, and joining binds the ` +
-        'seat this command reports'
-    );
-    expect(message).toContain('`just join`');
-    expect(message).toContain(FIRST);
-    expect(message).not.toContain('--game_id');
-    expect(message).not.toContain('multiple private sessions');
-  });
+  awaitTest(
+    'a pre-configured workspace names bare `just join`, never the generic form',
+    function* (wait) {
+      const fixture = bench();
+      yield* wait(
+        withTestFileSystem((files) =>
+          files
+            .writeFileString(
+              path.join(fixture.workspace.root, '.playconfig.json'),
+              JSON.stringify({
+                schema_version: 1,
+                game_id: FIRST,
+                name: 'codex-test-model',
+                place: null,
+              })
+            )
+            .pipe(Effect.orDie)
+        )
+      );
+      const message = failure((yield* wait(captureUse(fixture))).result);
+      expect(message).toBe(
+        'run `just join` first — this workspace is ' +
+          `pre-configured for ${FIRST}, and joining binds the ` +
+          'seat this command reports'
+      );
+      expect(message).toContain('`just join`');
+      expect(message).toContain(FIRST);
+      expect(message).not.toContain('--game_id');
+      expect(message).not.toContain('multiple private sessions');
+    }
+  );
 
-  test('a bound workspace reports the seat, never a token', async () => {
+  awaitTest('a bound workspace reports the seat, never a token', function* (wait) {
     const fixture = bench();
     const seat = fixture.seat(FIRST, 'codex-first-model');
-    ok((await use(fixture, seat)).result);
-    const report = await use(fixture);
+    ok((yield* wait(captureUse(fixture, seat))).result);
+    const report = yield* wait(captureUse(fixture));
     ok(report.result);
     expect(report.out).toContain(`playing ${FIRST} | seat `);
     expect(report.out).toContain(workspaceRelative(fixture.workspace, seat));
@@ -294,54 +325,57 @@ describe('bare `use`', () => {
     expect(report.out).not.toContain('agent-v2-secret');
   });
 
-  test('--json reports the binding as a payload with no rebind', async () => {
+  awaitTest('--json reports the binding as a payload with no rebind', function* (wait) {
     const fixture = bench();
     const seat = fixture.seat(FIRST, 'codex-first-model');
-    ok((await use(fixture, seat)).result);
-    const report = await use(fixture, '', { json: true });
+    ok((yield* wait(captureUse(fixture, seat))).result);
+    const report = yield* wait(captureUse(fixture, '', { json: true }));
     ok(report.result);
-    const payload = JSON.parse(report.out) as JsonObject;
-    expect(payload['game_id']).toBe(FIRST);
-    expect(payload['session_file']).toBe(seat);
-    expect(payload['rebound_from']).toBeNull();
-    expect(scalar(payload['bound_at'] ?? null)).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/);
+    const payload = decodeUseJson(report.out);
+    expect(payload.game_id).toBe(FIRST);
+    expect(payload.session_file).toBe(seat);
+    expect(payload.rebound_from).toBeNull();
+    expect(payload.bound_at).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/);
     expect(report.out).not.toContain('agent-v2-secret');
   });
 });
 
 describe('`use TARGET`', () => {
-  test('it binds by exact path, then by game ID, saying what it left each time', async () => {
-    const fixture = bench();
-    const first = fixture.seat(FIRST, 'codex-first-model');
-    fixture.seat(SECOND, 'codex-second-model');
+  awaitTest(
+    'it binds by exact path, then by game ID, saying what it left each time',
+    function* (wait) {
+      const fixture = bench();
+      const first = fixture.seat(FIRST, 'codex-first-model');
+      fixture.seat(SECOND, 'codex-second-model');
 
-    const initial = await use(fixture, SECOND);
-    ok(initial.result);
-    expect(initial.out).toBe(
-      `this workspace is now playing ${SECOND} — commands need no --session`
-    );
+      const initial = yield* wait(captureUse(fixture, SECOND));
+      ok(initial.result);
+      expect(initial.out).toBe(
+        `this workspace is now playing ${SECOND} — commands need no --session`
+      );
 
-    const byPath = await use(fixture, workspaceRelative(fixture.workspace, first));
-    ok(byPath.result);
-    expect(byPath.out).toContain(
-      `this workspace is now playing ${FIRST}, rebound from ${SECOND}`
-    );
-    expect(boundGame(fixture)).toBe(FIRST);
+      const byPath = yield* wait(captureUse(fixture, workspaceRelative(fixture.workspace, first)));
+      ok(byPath.result);
+      expect(byPath.out).toContain(
+        `this workspace is now playing ${FIRST}, rebound from ${SECOND}`
+      );
+      expect(boundGame(fixture)).toBe(FIRST);
 
-    const byGame = await use(fixture, SECOND);
-    ok(byGame.result);
-    expect(byGame.out).toContain(
-      `this workspace is now playing ${SECOND}, rebound from ${FIRST}`
-    );
-    expect(boundGame(fixture)).toBe(SECOND);
-  });
+      const byGame = yield* wait(captureUse(fixture, SECOND));
+      ok(byGame.result);
+      expect(byGame.out).toContain(
+        `this workspace is now playing ${SECOND}, rebound from ${FIRST}`
+      );
+      expect(boundGame(fixture)).toBe(SECOND);
+    }
+  );
 
-  test('rebinding to another seat in the same game says exactly that', async () => {
+  awaitTest('rebinding to another seat in the same game says exactly that', function* (wait) {
     const fixture = bench();
     const first = fixture.seat(FIRST, 'codex-first-model');
     const sibling = fixture.seat(FIRST, 'codex-sibling-model');
-    ok((await use(fixture, workspaceRelative(fixture.workspace, first))).result);
-    const rebound = await use(fixture, workspaceRelative(fixture.workspace, sibling));
+    ok((yield* wait(captureUse(fixture, workspaceRelative(fixture.workspace, first)))).result);
+    const rebound = yield* wait(captureUse(fixture, workspaceRelative(fixture.workspace, sibling)));
     ok(rebound.result);
     expect(rebound.out).toBe(
       `this workspace is now playing ${FIRST}, rebound to another seat in ` +
@@ -349,133 +383,113 @@ describe('`use TARGET`', () => {
     );
   });
 
-  test('re-binding the seat already bound reports no rebind at all', async () => {
+  awaitTest('re-binding the seat already bound reports no rebind at all', function* (wait) {
     const fixture = bench();
     const seat = fixture.seat(FIRST, 'codex-first-model');
-    ok((await use(fixture, seat)).result);
-    const again = await use(fixture, seat);
+    ok((yield* wait(captureUse(fixture, seat))).result);
+    const again = yield* wait(captureUse(fixture, seat));
     ok(again.result);
     expect(again.out).toBe(
       `this workspace is now playing ${FIRST} — commands need no --session`
     );
   });
 
-  test('an ambiguous game leaves the previous binding untouched', async () => {
+  awaitTest('an ambiguous game leaves the previous binding untouched', function* (wait) {
     const fixture = bench();
     fixture.seat(FIRST, 'codex-first-model');
     fixture.seat(FIRST, 'codex-sibling-model');
     fixture.seat(SECOND, 'codex-second-model');
-    ok((await use(fixture, SECOND)).result);
-    expect(failure((await use(fixture, FIRST)).result)).toContain(
+    ok((yield* wait(captureUse(fixture, SECOND))).result);
+    expect(failure((yield* wait(captureUse(fixture, FIRST))).result)).toContain(
       'name the one you are playing'
     );
     expect(boundGame(fixture)).toBe(SECOND);
   });
 
-  test('a file that is not a session this workspace joined is refused by name', async () => {
+  awaitTest('a file that is not a session this workspace joined is refused by name', function* (wait) {
     const fixture = bench();
     const stray = path.join(fixture.workspace.stateRoot, FIRST, 'not-a-session.json');
     Effect.runSync(fixture.files.writeJson(stray, { hello: 'world' }));
     const target = workspaceRelative(fixture.workspace, stray);
-    expect(failure((await use(fixture, target)).result)).toBe(
+    expect(failure((yield* wait(captureUse(fixture, target))).result)).toBe(
       `${target} is not a session this workspace joined. Bind a seat ` +
         'by its game with `just use GAME_ID`.'
     );
   });
 
-  test('a session without a bearer token is refused too', async () => {
+  awaitTest('a session without a bearer token is refused too', function* (wait) {
     const fixture = bench();
     const seat = fixture.seat(FIRST, 'codex-first-model', { agent_token: null });
-    expect(failure((await use(fixture, seat)).result)).toContain(
+    expect(failure((yield* wait(captureUse(fixture, seat))).result)).toContain(
       'is not a session this workspace joined'
     );
   });
 
-  test('--json reports the game it rebound from', async () => {
+  awaitTest('--json reports the game it rebound from', function* (wait) {
     const fixture = bench();
     fixture.seat(FIRST, 'codex-first-model');
     const second = fixture.seat(SECOND, 'codex-second-model');
-    ok((await use(fixture, FIRST)).result);
-    const rebound = await use(fixture, second, { json: true });
+    ok((yield* wait(captureUse(fixture, FIRST))).result);
+    const rebound = yield* wait(captureUse(fixture, second, { json: true }));
     ok(rebound.result);
-    const payload = JSON.parse(rebound.out) as JsonObject;
-    expect(payload['game_id']).toBe(SECOND);
-    expect(payload['session_file']).toBe(second);
-    expect(payload['rebound_from']).toBe(FIRST);
+    const payload = decodeUseJson(rebound.out);
+    expect(payload.game_id).toBe(SECOND);
+    expect(payload.session_file).toBe(second);
+    expect(payload.rebound_from).toBe(FIRST);
   });
 
-  test('binding also repoints the current-session pointer', async () => {
+  awaitTest('binding also repoints the current-session pointer', function* (wait) {
     const fixture = bench();
     const seat = fixture.seat(FIRST, 'codex-first-model');
-    ok((await use(fixture, seat)).result);
-    expect(
-      fs.readFileSync(path.join(fixture.workspace.stateRoot, 'current'), 'utf8')
-    ).toBe(`${path.join(FIRST, 'codex-first-model.json')}\n`);
-    expect(
-      Effect.runSync(Effect.either(fixture.store.sessionPath('')))
-    ).toEqual(Either.right(seat));
+    ok((yield* wait(captureUse(fixture, seat))).result);
+    yield* wait(
+      withTestFileSystem((files) =>
+        Effect.gen(function* () {
+          const current = yield* files.readFileString(
+            path.join(fixture.workspace.stateRoot, 'current')
+          );
+          expect(current).toBe(`${path.join(FIRST, 'codex-first-model.json')}\n`);
+        }).pipe(Effect.orDie)
+      )
+    );
+    expect(Effect.runSync(Effect.either(fixture.store.sessionPath('')))).toEqual(
+      Either.right(seat)
+    );
   });
 
-  test('a whitespace-only target is bare `use`, not a path', async () => {
-    expect(failure((await use(bench(), '   ')).result)).toContain('not bound to a seat');
+  awaitTest('a whitespace-only target is bare `use`, not a path', function* (wait) {
+    expect(failure((yield* wait(captureUse(bench(), '   '))).result)).toContain(
+      'not bound to a seat'
+    );
   });
 });
 
 describe('the CLI surface', () => {
-  const cli = async (
-    fixture: Bench,
-    argv: ReadonlyArray<string>
-  ): Promise<{ readonly failure: string | null; readonly out: string }> => {
-    const root = Command.make('play', {}, () => Effect.void).pipe(
-      Command.withSubcommands([useCommand])
-    );
-    const lines: string[] = [];
-    const originalLog = console.log;
-    console.log = (...parts: ReadonlyArray<unknown>) => lines.push(parts.join(' '));
-    try {
-      const outcome = await Effect.runPromise(
-        Command.run(root, { name: 'play', version: '0.1.0' })(['bun', 'play', ...argv]).pipe(
-          Effect.provide(Layer.merge(fixture.layer, BunContext.layer)),
-          Effect.either
-        )
-      );
-      return {
-        failure:
-          outcome._tag === 'Left'
-            ? ((outcome.left as { readonly message?: string }).message ?? compactJson(outcome.left))
-            : null,
-        out: lines.join('\n'),
-      };
-    } finally {
-      console.log = originalLog;
-    }
-  };
-
-  test('the positional target is optional — bare `play use` reports the seat', async () => {
+  awaitTest('the positional target is optional — bare `play use` reports the seat', function* (wait) {
     const fixture = bench();
     const seat = fixture.seat(FIRST, 'codex-first-model');
-    expect((await cli(fixture, ['use', seat])).failure).toBeNull();
-    const report = await cli(fixture, ['use']);
+    expect((yield* wait(cli(fixture, ['use', seat]))).failure).toBeNull();
+    const report = yield* wait(cli(fixture, ['use']));
     expect(report.failure).toBeNull();
     expect(report.out).toContain(`playing ${FIRST} | seat`);
   });
 
-  test('`play use GAME_ID --json` takes the flag after the positional', async () => {
+  awaitTest('`play use GAME_ID --json` takes the flag after the positional', function* (wait) {
     const fixture = bench();
     fixture.seat(FIRST, 'codex-first-model');
-    const run = await cli(fixture, ['use', FIRST, '--json']);
+    const run = yield* wait(cli(fixture, ['use', FIRST, '--json']));
     expect(run.failure).toBeNull();
-    expect((JSON.parse(run.out) as JsonObject)['game_id']).toBe(FIRST);
+    expect(gameIdJson(run.out).game_id).toBe(FIRST);
   });
 });
 
 describe('PLAY_JSON', () => {
-  test('it turns the report into a payload without a flag', async () => {
+  awaitTest('it turns the report into a payload without a flag', function* (wait) {
     const fixture = bench();
     const seat = fixture.seat(FIRST, 'codex-first-model');
-    ok((await use(fixture, seat)).result);
-    const report = await use(fixture, '', { env: { PLAY_JSON: 'yes' } });
+    ok((yield* wait(captureUse(fixture, seat))).result);
+    const report = yield* wait(captureUse(fixture, '', { env: { PLAY_JSON: 'yes' } }));
     ok(report.result);
-    expect((JSON.parse(report.out) as JsonObject)['game_id']).toBe(FIRST);
+    expect(gameIdJson(report.out).game_id).toBe(FIRST);
   });
 });

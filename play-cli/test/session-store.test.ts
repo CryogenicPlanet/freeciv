@@ -5,10 +5,8 @@
  * (explicit → `PLAY_SESSION` → binding → sole session → pointer) and the refusal
  * to guess between two unbound seats are the tests that matter.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
-import { Effect, Either, Option } from 'effect';
+import { Clock, Effect, Either, Option, Schema } from 'effect';
 import {
   controllerName,
   emptyV2ClientState,
@@ -17,13 +15,23 @@ import {
   sessionStoreFor,
   type SessionStoreApi,
 } from 'src/services/session-store';
+import type { JsonValue } from 'src/schema/primitives';
 import { FIXTURE_GAME_ID, scratchWorkspace, sessionFile, type Scratch } from 'test/_fixtures';
+import { effectTest } from 'test/_effect-test';
+import { path } from 'test/_test-platform';
+
+const bindingSchema = Schema.parseJson(
+  Schema.Struct({
+    schema_version: Schema.Literal(1),
+    game_id: Schema.String,
+    session: Schema.String,
+  })
+);
+const configSchema = Schema.parseJson(Schema.Struct({ game_id: Schema.String }));
 
 const scratches: Scratch[] = [];
 
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
 
 /**
  * The core placeholder for the U03 seam.  When U03 lands its real validators
@@ -34,13 +42,15 @@ const schema = {
   empty: emptyV2ClientState,
   validate: () => Effect.void,
   cursorExpired: (expiresAt: string | null): boolean =>
-    expiresAt === null ? false : Date.parse(expiresAt) <= Date.now(),
+    expiresAt === null
+      ? false
+      : Date.parse(expiresAt) <= Effect.runSync(Clock.currentTimeMillis),
 };
 
 interface Fixture {
   readonly scratch: Scratch;
   readonly store: SessionStoreApi;
-  readonly write: (relative: string, value: unknown) => string;
+  readonly write: (relative: string, value: JsonValue) => string;
 }
 
 const fresh = (environment: Record<string, string | undefined> = {}): Fixture => {
@@ -117,14 +127,16 @@ describe('session resolution', () => {
     expect(right(run(fixture.store.sessionPath('')))).toBe(two);
   });
 
-  test('a binding whose seat file is gone is stale, not authoritative', () => {
-    const fixture = fresh();
-    const one = fixture.write(`${FIXTURE_GAME_ID}/one.json`, sessionFile());
-    const two = fixture.write(`${FIXTURE_GAME_ID}/two.json`, sessionFile());
-    Effect.runSync(fixture.store.bindWorkspaceSeat(two, FIXTURE_GAME_ID));
-    fs.unlinkSync(two);
-    expect(right(run(fixture.store.sessionPath('')))).toBe(one);
-  });
+  effectTest('a binding whose seat file is gone is stale, not authoritative', () =>
+    Effect.gen(function* () {
+      const fixture = fresh();
+      const one = fixture.write(`${FIXTURE_GAME_ID}/one.json`, sessionFile());
+      const two = fixture.write(`${FIXTURE_GAME_ID}/two.json`, sessionFile());
+      yield* fixture.store.bindWorkspaceSeat(two, FIXTURE_GAME_ID);
+      yield* Effect.promise(() => Bun.file(two).delete());
+      expect(yield* fixture.store.sessionPath('')).toBe(one);
+    }).pipe(Effect.orDie)
+  );
 
   test('PLAY_SESSION is honoured when no --session is given', () => {
     // A relative PLAY_SESSION is workspace-relative, not state-relative — the
@@ -150,32 +162,39 @@ describe('session resolution', () => {
     );
   });
 
-  test('a pre-configured workspace gets the argument-free remedy instead', () => {
-    const fixture = fresh();
-    fs.writeFileSync(
-      path.join(fixture.scratch.workspace.root, '.playconfig.json'),
-      JSON.stringify({ game_id: FIXTURE_GAME_ID })
-    );
-    expect(message(run(fixture.store.sessionPath('')))).toBe(
-      'run `just join` first — this workspace is pre-configured for ' +
-        `${FIXTURE_GAME_ID}, and every other command needs the seat it creates`
-    );
-  });
+  effectTest('a pre-configured workspace gets the argument-free remedy instead', () =>
+    Effect.gen(function* () {
+      const fixture = fresh();
+      const config = yield* Schema.encode(configSchema)({ game_id: FIXTURE_GAME_ID });
+      yield* Effect.promise(() =>
+        Bun.write(path.join(fixture.scratch.workspace.root, '.playconfig.json'), config)
+      );
+      expect(message(yield* Effect.either(fixture.store.sessionPath('')))).toBe(
+        'run `just join` first — this workspace is pre-configured for ' +
+          `${FIXTURE_GAME_ID}, and every other command needs the seat it creates`
+      );
+    }).pipe(Effect.orDie)
+  );
 });
 
 describe('seat binding', () => {
-  test('binding writes a pointer, never a credential', () => {
-    const fixture = fresh();
-    const target = fixture.write(`${FIXTURE_GAME_ID}/seat.json`, sessionFile());
-    Effect.runSync(fixture.store.bindWorkspaceSeat(target, FIXTURE_GAME_ID));
-    const raw = fs.readFileSync(fixture.store.seatBindingPath, 'utf8');
-    expect(raw).not.toContain('secret-token');
-    expect(JSON.parse(raw)).toMatchObject({
-      schema_version: 1,
-      game_id: FIXTURE_GAME_ID,
-      session: path.join(FIXTURE_GAME_ID, 'seat.json'),
-    });
-  });
+  effectTest('binding writes a pointer, never a credential', () =>
+    Effect.gen(function* () {
+      const fixture = fresh();
+      const target = fixture.write(`${FIXTURE_GAME_ID}/seat.json`, sessionFile());
+      yield* fixture.store.bindWorkspaceSeat(target, FIXTURE_GAME_ID);
+      const raw = yield* fixture.scratch.files.readText(
+        fixture.store.seatBindingPath,
+        'seat binding'
+      );
+      expect(raw).not.toContain('secret-token');
+      expect(yield* Schema.decode(bindingSchema)(raw)).toEqual({
+        schema_version: 1,
+        game_id: FIXTURE_GAME_ID,
+        session: path.join(FIXTURE_GAME_ID, 'seat.json'),
+      });
+    }).pipe(Effect.orDie)
+  );
 
   test('re-binding the same seat reports no replacement', () => {
     const fixture = fresh();
@@ -245,35 +264,39 @@ describe('v2 sessions', () => {
 });
 
 describe('.v2-state', () => {
-  test('a missing cache reads as the empty schema-5 shape', async () => {
-    const fixture = fresh();
-    const target = fixture.write(`${FIXTURE_GAME_ID}/seat.json`, sessionFile());
-    const loaded = right(run(fixture.store.resolveV2('')));
-    const state = await Effect.runPromise(fixture.store.readState(target, loaded.session));
-    expect(state.schema_version).toBe(5);
-    expect(state.drained_actors).toEqual([]);
-    expect(state.action_aliases).toEqual({ state_revision: null, by_alias: {} });
-  });
+  effectTest('a missing cache reads as the empty schema-5 shape', () =>
+    Effect.gen(function* () {
+      const fixture = fresh();
+      const target = fixture.write(`${FIXTURE_GAME_ID}/seat.json`, sessionFile());
+      const loaded = right(run(fixture.store.resolveV2('')));
+      const state = yield* fixture.store.readState(target, loaded.session);
+      expect(state.schema_version).toBe(5);
+      expect(state.drained_actors).toEqual([]);
+      expect(state.action_aliases).toEqual({ state_revision: null, by_alias: {} });
+    }).pipe(Effect.orDie)
+  );
 
-  test('a written cache round-trips', async () => {
-    const fixture = fresh();
-    const target = fixture.write(`${FIXTURE_GAME_ID}/seat.json`, sessionFile());
-    const loaded = right(run(fixture.store.resolveV2('')));
-    const next = {
-      ...emptyV2ClientState(loaded.session),
-      batches: { batch_one: '{"a":1}' },
-    };
-    await Effect.runPromise(fixture.store.writeState(target, next));
-    const read = await Effect.runPromise(fixture.store.readState(target, loaded.session));
-    expect(read.batches).toEqual({ batch_one: '{"a":1}' });
-  });
+  effectTest('a written cache round-trips', () =>
+    Effect.gen(function* () {
+      const fixture = fresh();
+      const target = fixture.write(`${FIXTURE_GAME_ID}/seat.json`, sessionFile());
+      const loaded = right(run(fixture.store.resolveV2('')));
+      const next = {
+        ...emptyV2ClientState(loaded.session),
+        batches: { batch_one: '{"a":1}' },
+      };
+      yield* fixture.store.writeState(target, next);
+      const read = yield* fixture.store.readState(target, loaded.session);
+      expect(read.batches).toEqual({ batch_one: '{"a":1}' });
+    }).pipe(Effect.orDie)
+  );
 
-  test('a schema-1 cache is migrated and every executable action is dropped', async () => {
-    const fixture = fresh();
-    const target = fixture.write(`${FIXTURE_GAME_ID}/seat.json`, sessionFile());
-    const loaded = right(run(fixture.store.resolveV2('')));
-    Effect.runSync(
-      fixture.scratch.files.writeJson(fixture.store.statePath(target), {
+  effectTest('a schema-1 cache is migrated and every executable action is dropped', () =>
+    Effect.gen(function* () {
+      const fixture = fresh();
+      const target = fixture.write(`${FIXTURE_GAME_ID}/seat.json`, sessionFile());
+      const loaded = right(run(fixture.store.resolveV2('')));
+      yield* fixture.scratch.files.writeJson(fixture.store.statePath(target), {
         schema_version: 1,
         game_id: FIXTURE_GAME_ID,
         agent_id: loaded.session.agentId,
@@ -281,44 +304,40 @@ describe('.v2-state', () => {
         actions: { action_old: { anything: true } },
         batches: { batch_one: '{"a":1}' },
         receipts: { batch_one: { kept: true } },
-      })
-    );
-    const state = await Effect.runPromise(fixture.store.readState(target, loaded.session));
-    expect(state.schema_version).toBe(5);
-    expect(state.actions).toEqual({});
-    expect(state.batches).toEqual({ batch_one: '{"a":1}' });
-    expect(state.receipts).toEqual({ batch_one: { kept: true } });
-  });
+      });
+      const state = yield* fixture.store.readState(target, loaded.session);
+      expect(state.schema_version).toBe(5);
+      expect(state.actions).toEqual({});
+      expect(state.batches).toEqual({ batch_one: '{"a":1}' });
+      expect(state.receipts).toEqual({ batch_one: { kept: true } });
+    }).pipe(Effect.orDie)
+  );
 
-  test('a persisted batch body must be the exact bytes, not a re-parsed object', async () => {
-    const fixture = fresh();
-    const target = fixture.write(`${FIXTURE_GAME_ID}/seat.json`, sessionFile());
-    const loaded = right(run(fixture.store.resolveV2('')));
-    Effect.runSync(
-      fixture.scratch.files.writeJson(fixture.store.statePath(target), {
+  effectTest('a persisted batch body must be the exact bytes, not a re-parsed object', () =>
+    Effect.gen(function* () {
+      const fixture = fresh();
+      const target = fixture.write(`${FIXTURE_GAME_ID}/seat.json`, sessionFile());
+      const loaded = right(run(fixture.store.resolveV2('')));
+      yield* fixture.scratch.files.writeJson(fixture.store.statePath(target), {
         ...emptyV2ClientState(loaded.session),
         batches: { batch_one: { a: 1 } },
-      })
-    );
-    const either = await Effect.runPromise(
-      Effect.either(fixture.store.readState(target, loaded.session))
-    );
-    expect(message(either)).toContain('is invalid');
-  });
+      });
+      const either = yield* Effect.either(fixture.store.readState(target, loaded.session));
+      expect(message(either)).toContain('is invalid');
+    }).pipe(Effect.orDie)
+  );
 
-  test('a cache belonging to another agent is refused', async () => {
-    const fixture = fresh();
-    const target = fixture.write(`${FIXTURE_GAME_ID}/seat.json`, sessionFile());
-    const loaded = right(run(fixture.store.resolveV2('')));
-    Effect.runSync(
-      fixture.scratch.files.writeJson(fixture.store.statePath(target), {
+  effectTest('a cache belonging to another agent is refused', () =>
+    Effect.gen(function* () {
+      const fixture = fresh();
+      const target = fixture.write(`${FIXTURE_GAME_ID}/seat.json`, sessionFile());
+      const loaded = right(run(fixture.store.resolveV2('')));
+      yield* fixture.scratch.files.writeJson(fixture.store.statePath(target), {
         ...emptyV2ClientState(loaded.session),
         agent_id: 'agent_someoneelse',
-      })
-    );
-    const either = await Effect.runPromise(
-      Effect.either(fixture.store.readState(target, loaded.session))
-    );
-    expect(message(either)).toContain('is invalid');
-  });
+      });
+      const either = yield* Effect.either(fixture.store.readState(target, loaded.session));
+      expect(message(either)).toContain('is invalid');
+    }).pipe(Effect.orDie)
+  );
 });

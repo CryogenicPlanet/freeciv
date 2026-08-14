@@ -12,9 +12,8 @@
  * decision: rebind by meaning, refuse when the meaning vanished, refuse when it
  * became ambiguous, and never spend a request under `--no-refresh`.
  */
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
-import { Effect, Either, Layer, Option } from 'effect';
+import { Effect, Either, Layer, Option, Schema } from 'effect';
 import { FULL_CONTROL_V2 } from 'src/constants';
 import { playerError } from 'src/errors';
 import { decodeLegalPage, decodePage } from 'src/schema/page';
@@ -36,15 +35,18 @@ import {
   type LegalPageFetcher,
 } from 'src/services/alias-refresh';
 import { FIXTURE_GAME_ID, scratchWorkspace, sessionFile, type Scratch } from 'test/_fixtures';
+import { provideTestLayer } from 'test/_effect-test';
+import { fixtureString } from 'test/_expect';
+import { path } from 'test/_test-platform';
 
 // ---------------------------------------------------------------------------
 // Fixture
 // ---------------------------------------------------------------------------
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() =>
+  Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup()))
+);
 
 interface TestRevision {
   readonly turn: number;
@@ -79,7 +81,7 @@ const fixture = (): Fixture => {
     store,
     sessionPath,
     session: loaded.session,
-    run: (effect) => Effect.runSync(Effect.either(Effect.provide(effect, layer))),
+    run: (effect) => Effect.runSync(Effect.either(provideTestLayer(effect, layer))),
   };
 };
 
@@ -221,10 +223,7 @@ const stageStaleAliases = (fx: Fixture): V2ClientState => {
 };
 
 /** A `LegalPageFetcher` that ingests one page and counts its own calls. */
-const fetcherFor = (
-  fx: Fixture,
-  page: JsonObject
-): { readonly fetch: LegalPageFetcher; readonly calls: string[] } => {
+const fetcherFor = (_fixture: Fixture, page: JsonObject) => {
   const calls: string[] = [];
   const fetch: LegalPageFetcher = (sessionPath, session, actorId) =>
     Effect.gen(function* () {
@@ -237,14 +236,14 @@ const fetcherFor = (
   return { fetch, calls };
 };
 
-const aliasEntries = (state: V2ClientState): Record<string, string> => {
+const aliasEntries = (state: V2ClientState) => {
   const table = state.action_aliases['by_alias'];
   const mapped: Record<string, string> = {};
   if (!isJsonObject(table)) return mapped;
   for (const [alias, entry] of Object.entries(table)) {
-    if (isJsonObject(entry) && typeof entry['action_id'] === 'string') {
-      mapped[alias] = entry['action_id'];
-    }
+    if (!isJsonObject(entry)) continue;
+    const actionId = Schema.decodeUnknownOption(Schema.String)(entry['action_id']);
+    if (Option.isSome(actionId)) mapped[alias] = actionId.value;
   }
   return mapped;
 };
@@ -274,14 +273,14 @@ describe('a stale alias is rebound by meaning and keeps its number', () => {
       )
     );
     expect(outcome.note).toBe('a1 rebound at rev9');
-    expect(outcome.identifier).toBe(freshFound['action_id'] as string);
+    expect(outcome.identifier).toBe(fixtureString(freshFound['action_id']));
     expect(calls).toEqual([UNIT_ONE]);
 
     // a1 still means "found this city"; a2 still means that move.
     const reloaded = ok(fx.run(fx.store.readState(fx.sessionPath, fx.session)));
     expect(aliasEntries(reloaded)).toEqual({
-      a1: freshFound['action_id'] as string,
-      a2: freshMove['action_id'] as string,
+      a1: fixtureString(freshFound['action_id']),
+      a2: fixtureString(freshMove['action_id']),
     });
     // The expired handle never survives the rebind.
     expect(Object.values(aliasEntries(reloaded))).not.toContain(`action_found${'7'.repeat(20)}`);
@@ -441,7 +440,7 @@ describe('resolveAliasArguments', () => {
       )
     );
     expect(resolved.notes).toEqual(['a1 rebound at rev9']);
-    expect(resolved.values['action_id']).toBe(freshFound['action_id'] as string);
+    expect(resolved.values['action_id']).toBe(fixtureString(freshFound['action_id']));
     expect(calls).toEqual([UNIT_ONE]);
   });
 

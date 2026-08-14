@@ -14,8 +14,7 @@
 import { describe, expect, test } from 'bun:test';
 import { Effect, Either } from 'effect';
 import { V2_WITHHELD } from 'src/constants';
-import type { JsonObject, JsonValue } from 'src/schema/primitives';
-import type { Revision } from 'src/schema/revision';
+import type { JsonObject } from 'src/schema/primitives';
 import {
   COMPACT_LIMIT_REFUSAL,
   OFFSET_REFUSAL,
@@ -41,7 +40,7 @@ const failure = <A, E extends { readonly message: string }>(
   return either.left.message;
 };
 
-const revision = (number: number, turn = 3): Revision => ({
+const revision = (number: number, turn = 3): JsonObject => ({
   turn,
   revision: number,
   state_token: `state_${String(number).padStart(32, '0')}`,
@@ -56,7 +55,7 @@ const descriptor = (overrides: JsonObject): JsonObject => ({
   label: 'End phase',
   subject: { operation: 'end' },
   arguments_schema: { type: 'object' },
-  state_revision: revision(12) as unknown as JsonValue,
+  state_revision: revision(12),
   ...overrides,
 });
 
@@ -130,7 +129,7 @@ describe('compactLegalAction', () => {
 
   test('the certain-probability envelope is the only one that renders away', () => {
     const compact = ok(run(compactLegalAction(order)));
-    expect(Object.keys(compact).sort()).toEqual([
+    expect(Object.keys(compact).toSorted()).toEqual([
       'action_id',
       'argument_schema',
       'kind',
@@ -150,8 +149,8 @@ describe('compactLegalAction', () => {
       maximum_percent: 100,
     });
     // A probability this client cannot interpret is still a probability.
-    const unshaped = descriptor({ subject: { operation: 'end', probability: 'maybe' } });
-    expect(ok(run(compactLegalAction(unshaped)))['probability']).toBe('maybe');
+    const opaqueProbability = descriptor({ subject: { operation: 'end', probability: 'maybe' } });
+    expect(ok(run(compactLegalAction(opaqueProbability)))['probability']).toBe('maybe');
   });
 
   test('gold falls back to the target, and the schema supplies the range', () => {

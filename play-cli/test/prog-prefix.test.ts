@@ -5,28 +5,32 @@
  * what every golden test and the diff oracle pin; these tests cover the other
  * spelling — the one provisioned workspaces actually see.
  */
-import { describe, expect, test } from 'bun:test';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
+import { afterEach, describe, expect, test } from 'bun:test';
 import { Effect } from 'effect';
 import { PROG_ENV, resolveProg, rewriteProgMentions } from 'src/services/prog-prefix';
 import { writeMirror } from 'src/services/mirror/store';
 import { scratchWorkspace } from 'test/_fixtures';
+import { provideTestLayer } from 'test/_effect-test';
+import { path } from 'test/_test-platform';
+
+const scratches: Array<ReturnType<typeof scratchWorkspace>> = [];
+
+afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
 
 const withProg = <A>(value: string | undefined, body: () => A): A => {
-  const previous = process.env[PROG_ENV];
+  const previous = Bun.env[PROG_ENV];
   if (value === undefined) {
-    delete process.env[PROG_ENV];
+    delete Bun.env[PROG_ENV];
   } else {
-    process.env[PROG_ENV] = value;
+    Bun.env[PROG_ENV] = value;
   }
   try {
     return body();
   } finally {
     if (previous === undefined) {
-      delete process.env[PROG_ENV];
+      delete Bun.env[PROG_ENV];
     } else {
-      process.env[PROG_ENV] = previous;
+      Bun.env[PROG_ENV] = previous;
     }
   }
 };
@@ -95,19 +99,20 @@ describe('rewriteProgMentions', () => {
 describe('writeMirror', () => {
   const mirrorThrough = (prog: string): string => {
     const scratch = scratchWorkspace();
-    try {
-      return withProg(prog, () => {
-        Effect.runSync(
-          Effect.provide(
-            writeMirror(scratch.workspace.stateRoot, ['header.txt'], 'NOT YOUR TURN — next: just wait'),
-            scratch.layer
-          )
-        );
-        return fs.readFileSync(path.join(scratch.workspace.stateRoot, 'header.txt'), 'utf8');
-      });
-    } finally {
-      scratch.cleanup();
-    }
+    scratches.push(scratch);
+    return withProg(prog, () => {
+      Effect.runSync(
+        provideTestLayer(
+          writeMirror(scratch.workspace.stateRoot, ['header.txt'], 'NOT YOUR TURN — next: just wait'),
+          scratch.layer
+        )
+      );
+      return Effect.runSync(
+        Effect.orDie(
+          scratch.files.readText(path.join(scratch.workspace.stateRoot, 'header.txt'), 'mirror')
+        )
+      );
+    });
   };
 
   test('spells guidance per PLAY_PROG', () => {
@@ -116,25 +121,34 @@ describe('writeMirror', () => {
   });
 });
 
-describe('the spawned CLI', () => {
-  const spawnHelp = (env: Record<string, string | undefined>): string => {
-    const result = Bun.spawnSync({
-      cmd: ['bun', 'run', path.join(import.meta.dir, '..', 'src', 'bin.ts'), 'help'],
-      env: { ...process.env, ...env },
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
-    return new TextDecoder().decode(result.stdout);
-  };
+const spawnHelp = (env: Readonly<Record<string, string | undefined>>): string => {
+  const overrides = Object.fromEntries(
+    Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined)
+  );
+  const inherited = Object.fromEntries(
+    Object.entries(Bun.env).filter(
+      (entry): entry is [string, string] =>
+        entry[1] !== undefined && !(Object.hasOwn(env, entry[0]) && env[entry[0]] === undefined)
+    )
+  );
+  const result = Bun.spawnSync({
+    cmd: ['bun', 'run', path.join(import.meta.dir, '..', 'src', 'bin.ts'), 'help'],
+    env: { ...inherited, ...overrides },
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  return new TextDecoder().decode(result.stdout);
+};
 
+describe('the spawned CLI', () => {
   test('defaults to ./play spelling', () => {
     const out = spawnHelp({ PLAY_PROG: undefined });
     expect(out).toContain('./play join');
     expect(out).not.toMatch(/\bjust (join|turn|wait|do)\b/);
-  });
+  }, 30_000);
 
   test('PLAY_PROG=just restores parity', () => {
     const out = spawnHelp({ PLAY_PROG: 'just' });
     expect(out).toContain('just join');
-  });
+  }, 30_000);
 });

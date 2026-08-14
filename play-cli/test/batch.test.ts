@@ -12,15 +12,15 @@
  * command reached, because that value is what `retry` (U14) and `do` (U16) read
  * to decide whether another request is allowed at all.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
-import { Effect, Either, Layer } from 'effect';
+import { Effect, Either, Layer, Schema } from 'effect';
+import type { PlayError } from 'src/errors';
+import type { ExitCodeSignal } from 'src/exit';
 import { FULL_CONTROL_V2 } from 'src/constants';
 import { runBatch, liveBatchHooks } from 'src/commands/batch.cmd';
-import type { BatchDisposition } from 'src/schema/batch';
 import { decodeLegalPage } from 'src/schema/page';
 import { decodeReceipt } from 'src/schema/receipt';
+import type { Disposition } from 'src/schema/batch';
 import type { JsonObject, JsonValue } from 'src/schema/primitives';
 import {
   batchDisposition,
@@ -53,15 +53,19 @@ import {
   sessionFile,
   type Scratch,
 } from 'test/_fixtures';
+import { captureEffect } from 'test/_capture';
+import { awaitTest, provideTestLayer } from 'test/_effect-test';
+import { fixtureObject, fixtureString, parseFixtureObject } from 'test/_expect';
+import { fileSystem, path } from 'test/_test-platform';
 
 // ---------------------------------------------------------------------------
 // Fixture
 // ---------------------------------------------------------------------------
 
 const scratches: Scratch[] = [];
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() =>
+  Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup()))
+);
 
 interface TestRevision {
   readonly turn: number;
@@ -146,7 +150,89 @@ const errorBody = (
 });
 
 /** A `fetch` the test drives directly, so a POST body can be inspected. */
-type Responder = (url: string, body: string | null) => { status: number; body: unknown };
+type Responder = (url: string, body: string | null) => { status: number; body: JsonValue };
+
+type FetchInput = Parameters<typeof fetch>[0];
+type FetchArguments = Parameters<typeof fetch>;
+type BatchFailure = PlayError | ExitCodeSignal;
+type BatchServices = SessionStore | PrivateFs | V2Client;
+
+const completeFetch = (
+  handler: (...args: FetchArguments) => ReturnType<typeof fetch>
+): typeof fetch => Object.assign(handler, { preconnect: fetch.preconnect });
+
+const urlOf = (input: FetchInput): string =>
+  input instanceof Request ? input.url : new URL(input).href;
+
+const requestBodyText = (init: RequestInit | undefined): Effect.Effect<string | null> => {
+  const body = init?.body;
+  return body === undefined || body === null
+    ? Effect.succeed(null)
+    : Effect.promise(() => new Response(body).text());
+};
+
+const postBatchId = (body: string | null): string =>
+  Schema.decodeUnknownSync(Schema.parseJson(Schema.Struct({ batch_id: Schema.String })))(
+    body ?? '{}'
+  ).batch_id;
+
+const batchKeysOnDisk = (f: Fixture): ReadonlyArray<string> => {
+  const state = Effect.runSync(f.store.readState(f.sessionPath, f.session));
+  return Object.keys(state.batches);
+};
+
+const parseArguments = (text: string): Either.Either<PyObject, { readonly message: string }> =>
+  Effect.runSync(Effect.either(parseJsonObject(text, '--arguments')));
+
+const canonicalArguments = (text: string): string =>
+  Effect.runSync(canonicalText(ok(parseArguments(text))));
+
+const deepJson = (depth: number): string => `${'{"a":'.repeat(depth)}1${'}'.repeat(depth)}`;
+
+const stateWith = (batches: JsonObject, actions: JsonObject = {}): V2ClientState => ({
+  schema_version: 5,
+  game_id: FIXTURE_GAME_ID,
+  agent_id: FIXTURE_AGENT_ID,
+  last_revision: null,
+  actions,
+  pending_catalogs: {},
+  batches,
+  receipts: {},
+  action_aliases: { state_revision: null, by_alias: {} },
+  entity_aliases: {},
+  tile_aliases: {},
+  drained_actors: [],
+});
+
+const commandBody = (command: JsonValue): string =>
+  JSON.stringify({ batch_id: 'batch_x', commands: [command] });
+
+const jsonResponse = (status: number, body: JsonObject): JsonResponse => ({
+  status,
+  value: body,
+  headers: {},
+});
+
+const recoveryContract = (batchId: string, safeNext: string): JsonObject => ({
+  batch_id: batchId,
+  acceptance: 'not_accepted',
+  safe_next: safeNext,
+});
+
+type DispositionPayloadInput = {
+  readonly receipt?: JsonObject;
+  readonly error?: JsonObject;
+};
+
+const dispositionPayload = (
+  receipt: JsonObject | null,
+  err: JsonObject | null
+): DispositionPayloadInput => {
+  if (receipt !== null && err !== null) return { receipt, error: err };
+  if (receipt !== null) return { receipt };
+  if (err !== null) return { error: err };
+  return {};
+};
 
 interface Fixture {
   readonly store: SessionStoreApi;
@@ -154,9 +240,8 @@ interface Fixture {
   readonly session: Session;
   readonly statePath: string;
   readonly posts: ReadonlyArray<string>;
-  readonly run: <A, E>(
-    effect: Effect.Effect<A, E, SessionStore | PrivateFs | V2Client>
-  ) => Promise<Either.Either<A, E>>;
+  readonly layer: Layer.Layer<BatchServices>;
+  readonly run: <A, E>(effect: Effect.Effect<A, E, BatchServices>) => Promise<Either.Either<A, E>>;
 }
 
 const fixture = (responder: Responder = () => ({ status: 200, body: {} })): Fixture => {
@@ -167,16 +252,19 @@ const fixture = (responder: Responder = () => ({ status: 200, body: {} })): Fixt
   Effect.runSync(scratch.files.writeJson(sessionPath, sessionFile()));
   const loaded = Effect.runSync(store.resolveV2(sessionPath));
   const posts: string[] = [];
-  const fakeFetch = (async (input: unknown, init?: RequestInit): Promise<Response> => {
-    const url = typeof input === 'string' ? input : String(input);
-    const body = typeof init?.body === 'string' ? init.body : null;
-    if (body !== null) posts.push(body);
-    const answer = responder(url, body);
-    return new Response(JSON.stringify(answer.body), {
-      status: answer.status,
-      headers: { 'content-type': 'application/json' },
-    });
-  }) as typeof fetch;
+  const fakeFetch = completeFetch((input, init) =>
+    Effect.runPromise(
+      Effect.gen(function* () {
+        const body = yield* requestBodyText(init);
+        if (body !== null) posts.push(body);
+        const answer = responder(urlOf(input), body);
+        return new Response(compactJson(answer.body), {
+          status: answer.status,
+          headers: { 'content-type': 'application/json' },
+        });
+      })
+    )
+  );
   const client = v2ClientFor(httpFor(fakeFetch), () => Effect.void);
   const layer = Layer.mergeAll(
     Layer.succeed(SessionStore, store),
@@ -189,7 +277,8 @@ const fixture = (responder: Responder = () => ({ status: 200, body: {} })): Fixt
     session: loaded.session,
     statePath: store.statePath(sessionPath),
     posts,
-    run: (effect) => Effect.runPromise(Effect.either(Effect.provide(effect, layer))),
+    layer,
+    run: (effect) => Effect.runPromise(Effect.either(provideTestLayer(effect, layer))),
   };
 };
 
@@ -205,57 +294,67 @@ const failure = <A>(either: Either.Either<A, { readonly message: string }>): str
   return Either.isLeft(either) ? either.left.message : '';
 };
 
-const seed = async (fx: Fixture, stateRevision: TestRevision): Promise<void> => {
-  ok(
-    await fx.run(
+const seed = (fx: Fixture, stateRevision: TestRevision): Promise<void> =>
+  fx
+    .run(
       Effect.flatMap(
-        Effect.mapError(decodeLegalPage(legalPage(stateRevision, [descriptor(stateRevision)]), fx.session), (
-          error
-        ) => ({ message: error.message })),
+        Effect.mapError(
+          decodeLegalPage(legalPage(stateRevision, [descriptor(stateRevision)]), fx.session),
+          (error) => ({ message: error.message })
+        ),
         (decoded) => rememberPage(fx.sessionPath, fx.session, { legal: true, page: decoded })
       )
     )
-  );
-};
+    .then((result) => {
+      ok(result);
+    });
 
-/** Capture stdout and stderr the way the Python tests redirect them. */
+const stale = (fx: Fixture): Promise<void> =>
+  seed(fx, revision(7)).then(() =>
+    fx
+      .run(
+        Effect.flatMap(
+          Effect.mapError(
+            decodeReceipt(receiptBody(`batch_${'Z'.repeat(24)}`, 'applied'), fx.session, {
+              batchId: `batch_${'Z'.repeat(24)}`,
+            }),
+            (error) => ({ message: error.message })
+          ),
+          (receipt) => rememberReceipt(fx.sessionPath, fx.session, receipt)
+        )
+      )
+      .then((result) => {
+        ok(result);
+      })
+  );
+
 interface Captured {
   readonly out: ReadonlyArray<string>;
   readonly err: ReadonlyArray<string>;
-  readonly outcome: Either.Either<void, { readonly _tag: string }>;
+  readonly outcome: Either.Either<void, BatchFailure>;
 }
 
-const capture = async (
-  effect: Effect.Effect<void, { readonly _tag: string }, SessionStore | PrivateFs | V2Client>,
+const capture = (
+  effect: Effect.Effect<void, BatchFailure, BatchServices>,
   fx: Fixture
-): Promise<Captured> => {
-  const out: string[] = [];
-  const err: string[] = [];
-  const log = console.log;
-  const error = console.error;
-  console.log = (...parts: ReadonlyArray<unknown>) => out.push(parts.join(' '));
-  console.error = (...parts: ReadonlyArray<unknown>) => err.push(parts.join(' '));
-  try {
-    const outcome = await fx.run(effect);
-    return { out, err, outcome };
-  } finally {
-    console.log = log;
-    console.error = error;
-  }
+): Effect.Effect<Captured> =>
+  Effect.map(
+    captureEffect(Effect.either(provideTestLayer(effect, fx.layer))),
+    ({ value, captured }) => ({
+      out: captured.out,
+      err: captured.err,
+      outcome: value,
+    })
+  );
+
+const exitCodeOf = (outcome: Either.Either<void, BatchFailure>): number => {
+  if (Either.isRight(outcome)) return 0;
+  return outcome.left._tag === 'ExitCodeSignal' ? outcome.left.code : -1;
 };
 
-const exitCodeOf = (outcome: Either.Either<void, { readonly _tag: string }>): number => {
-  if (Either.isRight(outcome)) return 0;
-  const failed: unknown = outcome.left;
-  if (
-    typeof failed === 'object' &&
-    failed !== null &&
-    (failed as { readonly _tag: unknown })._tag === 'ExitCodeSignal' &&
-    typeof (failed as { readonly code: unknown }).code === 'number'
-  ) {
-    return (failed as { readonly code: number }).code;
-  }
-  return -1;
+const refusalMessage = (outcome: Either.Either<void, BatchFailure>): string => {
+  if (Either.isRight(outcome)) return '';
+  return outcome.left._tag === 'ExitCodeSignal' ? '' : outcome.left.message;
 };
 
 const args = (overrides: Partial<Parameters<typeof runBatch>[0]> = {}) => ({
@@ -287,74 +386,66 @@ describe('_limit', () => {
 });
 
 describe('--arguments', () => {
-  const parse = (text: string): Either.Either<PyObject, { readonly message: string }> =>
-    Effect.runSync(Effect.either(parseJsonObject(text, '--arguments')));
-
-  /** What the parsed object would be persisted and POSTed as. */
-  const canonical = (text: string): string =>
-    Effect.runSync(canonicalText(ok(parse(text))));
 
   test('a strict JSON object is copied through', () => {
-    expect(canonical('{"name":"London","size":3}')).toBe('{"name":"London","size":3}');
-    expect(canonical('{}')).toBe('{}');
-    expect(canonical('{"a":[1,{"b":null},true,"x"]}')).toBe('{"a":[1,{"b":null},true,"x"]}');
+    expect(canonicalArguments('{"name":"London","size":3}')).toBe('{"name":"London","size":3}');
+    expect(canonicalArguments('{}')).toBe('{}');
+    expect(canonicalArguments('{"a":[1,{"b":null},true,"x"]}')).toBe('{"a":[1,{"b":null},true,"x"]}');
   });
 
   test('a number keeps the Python type its literal named', () => {
     // The one that reaches the wire: `--arguments` is agent input, and
     // CPython persists these four spellings exactly as written.
-    expect(canonical('{"tax":40.0}')).toBe('{"tax":40.0}');
-    expect(canonical('{"a":1e16}')).toBe('{"a":1e+16}');
-    expect(canonical('{"a":0.00001}')).toBe('{"a":1e-05}');
-    expect(canonical('{"a":10000000000000000001}')).toBe('{"a":10000000000000000001}');
+    expect(canonicalArguments('{"tax":40.0}')).toBe('{"tax":40.0}');
+    expect(canonicalArguments('{"a":1e16}')).toBe('{"a":1e+16}');
+    expect(canonicalArguments('{"a":0.00001}')).toBe('{"a":1e-05}');
+    expect(canonicalArguments('{"a":10000000000000000001}')).toBe('{"a":10000000000000000001}');
   });
 
   test('an unrepresentable number is refused by _json_value, not silently sent', () => {
-    expect(failure(parse('{"a":1e400}'))).toBe('invalid --arguments: number is not finite');
+    expect(failure(parseArguments('{"a":1e400}'))).toBe('invalid --arguments: number is not finite');
   });
 
   test("_json_value's limits are the ones CPython closes", () => {
-    const deep = (depth: number): string =>
-      `${'{"a":'.repeat(depth)}1${'}'.repeat(depth)}`;
-    expect(ok(parse(deep(12)))).toBeDefined();
-    expect(failure(parse(deep(13)))).toBe('invalid --arguments: JSON is nested too deeply');
-    expect(failure(parse(`{"${'k'.repeat(129)}":1}`))).toBe('invalid --arguments: invalid object');
-    expect(failure(parse('{"":1}'))).toBe('invalid --arguments: invalid object');
+    expect(ok(parseArguments(deepJson(12)))).toBeDefined();
+    expect(failure(parseArguments(deepJson(13)))).toBe('invalid --arguments: JSON is nested too deeply');
+    expect(failure(parseArguments(`{"${'k'.repeat(129)}":1}`))).toBe('invalid --arguments: invalid object');
+    expect(failure(parseArguments('{"":1}'))).toBe('invalid --arguments: invalid object');
     // A pathological document costs a refusal, not a stack: the parser stops
     // descending long before the runtime would, and says the same sentence
     // `_json_value` says for anything past 12.
-    expect(failure(parse(deep(200_000)))).toBe(
+    expect(failure(parseArguments(deepJson(200_000)))).toBe(
       'invalid --arguments: JSON is nested too deeply'
     );
   });
 
   test('a duplicate key is a refusal, never a silent last-one-wins', () => {
-    expect(failure(parse('{"name":"A","name":"B"}'))).toBe(
+    expect(failure(parseArguments('{"name":"A","name":"B"}'))).toBe(
       '--arguments must not contain duplicate keys'
     );
     // Nested, and escaped into the same key: both are the same key.
-    expect(failure(parse('{"a":{"k":1,"k":2}}'))).toBe(
+    expect(failure(parseArguments('{"a":{"k":1,"k":2}}'))).toBe(
       '--arguments must not contain duplicate keys'
     );
-    expect(failure(parse('{"n\\u0061me":1,"name":2}'))).toBe(
+    expect(failure(parseArguments('{"n\\u0061me":1,"name":2}'))).toBe(
       '--arguments must not contain duplicate keys'
     );
   });
 
   test('a repeated key inside two sibling objects is not a duplicate', () => {
-    expect(canonical('{"a":{"k":1},"b":{"k":2}}')).toBe('{"a":{"k":1},"b":{"k":2}}');
-    expect(canonical('{"a":[{"k":1},{"k":2}]}')).toBe('{"a":[{"k":1},{"k":2}]}');
+    expect(canonicalArguments('{"a":{"k":1},"b":{"k":2}}')).toBe('{"a":{"k":1},"b":{"k":2}}');
+    expect(canonicalArguments('{"a":[{"k":1},{"k":2}]}')).toBe('{"a":[{"k":1},{"k":2}]}');
     // A `:` inside a string value must not be read as a key separator.
-    expect(canonical('{"a":"k\\":1,\\"k","b":2}')).toBe('{"a":"k\\":1,\\"k","b":2}');
+    expect(canonicalArguments('{"a":"k\\":1,\\"k","b":2}')).toBe('{"a":"k\\":1,\\"k","b":2}');
     // A literal `__proto__` argument name is a key like any other.
-    expect(canonical('{"__proto__":{"x":1}}')).toBe('{"__proto__":{"x":1}}');
+    expect(canonicalArguments('{"__proto__":{"x":1}}')).toBe('{"__proto__":{"x":1}}');
   });
 
   test('a non-object and a non-JSON value are each named for what they are', () => {
-    expect(failure(parse('[1,2]'))).toBe('--arguments must be a JSON object');
-    expect(failure(parse('"text"'))).toBe('--arguments must be a JSON object');
-    expect(failure(parse('null'))).toBe('--arguments must be a JSON object');
-    expect(failure(parse('1'))).toBe('--arguments must be a JSON object');
+    expect(failure(parseArguments('[1,2]'))).toBe('--arguments must be a JSON object');
+    expect(failure(parseArguments('"text"'))).toBe('--arguments must be a JSON object');
+    expect(failure(parseArguments('null'))).toBe('--arguments must be a JSON object');
+    expect(failure(parseArguments('1'))).toBe('--arguments must be a JSON object');
   });
 
   /**
@@ -393,14 +484,14 @@ describe('--arguments', () => {
       ['{"a":[NaN]}', 'non-finite number NaN'],
     ];
     for (const [text, detail] of cases) {
-      expect(failure(parse(text))).toBe(`--arguments must be valid strict JSON: ${detail}`);
+      expect(failure(parseArguments(text))).toBe(`--arguments must be valid strict JSON: ${detail}`);
     }
   });
 
   test('a position is a code point offset, as CPython\u2019s is', () => {
     // An astral character is one character to Python and two UTF-16 units to
     // JavaScript; reading the second as a position would name the wrong column.
-    expect(failure(parse('{"a":"\u{1F600}"x}'))).toBe(
+    expect(failure(parseArguments('{"a":"\u{1F600}"x}'))).toBe(
       "--arguments must be valid strict JSON: Expecting ',' delimiter: line 1 column 9 (char 8)"
     );
   });
@@ -408,12 +499,12 @@ describe('--arguments', () => {
   test('a duplicate key beats a later syntax error, and a trailing comma beats it', () => {
     // `object_pairs_hook` fires when the object *closes*, so which refusal wins
     // is decided by which one the scanner reaches first.
-    expect(failure(parse('{"a":1,"a":2}x'))).toBe('--arguments must not contain duplicate keys');
-    expect(failure(parse('{"a":1,"a":2,}'))).toBe(
+    expect(failure(parseArguments('{"a":1,"a":2}x'))).toBe('--arguments must not contain duplicate keys');
+    expect(failure(parseArguments('{"a":1,"a":2,}'))).toBe(
       '--arguments must be valid strict JSON: Illegal trailing comma before end of ' +
         'object: line 1 column 13 (char 12)'
     );
-    expect(failure(parse('{"a":1,"a":2'))).toBe(
+    expect(failure(parseArguments('{"a":1,"a":2'))).toBe(
       "--arguments must be valid strict JSON: Expecting ',' delimiter: line 1 " +
         'column 13 (char 12)'
     );
@@ -423,12 +514,12 @@ describe('--arguments', () => {
     // `"\ud800"` *is* strict JSON, so the parser must accept it; the refusal
     // belongs to `_canonical_body`'s `.encode("utf-8")` (see
     // test/batch-persist.test.ts), not here.
-    const parsed = ok(parse('{"a":"\\ud800"}'));
+    const parsed = ok(parseArguments('{"a":"\\ud800"}'));
     expect(parsed['a']).toBe('\ud800');
-    expect(ok(parse('{"a":"\\ud83d\\ude00"}'))['a']).toBe('\u{1F600}');
+    expect(ok(parseArguments('{"a":"\\ud83d\\ude00"}'))['a']).toBe('\u{1F600}');
     // A lead with no trail keeps its lone surrogate, and a reversed pair is two.
-    expect(ok(parse('{"a":"\\ud800x"}'))['a']).toBe('\ud800x');
-    expect(ok(parse('{"a":"\\udc00\\ud800"}'))['a']).toBe('\udc00\ud800');
+    expect(ok(parseArguments('{"a":"\\ud800x"}'))['a']).toBe('\ud800x');
+    expect(ok(parseArguments('{"a":"\\udc00\\ud800"}'))['a']).toBe('\udc00\ud800');
   });
 });
 
@@ -437,28 +528,10 @@ describe('--arguments', () => {
 // ---------------------------------------------------------------------------
 
 describe('batchIntent', () => {
-  const stateWith = (batches: JsonObject, actions: JsonObject = {}): V2ClientState =>
-    ({
-      schema_version: 5,
-      game_id: FIXTURE_GAME_ID,
-      agent_id: FIXTURE_AGENT_ID,
-      last_revision: null,
-      actions,
-      pending_catalogs: {},
-      batches,
-      receipts: {},
-      action_aliases: { state_revision: null, by_alias: {} },
-      entity_aliases: {},
-      tile_aliases: {},
-      drained_actors: [],
-    });
-
-  const body = (command: JsonValue): string =>
-    JSON.stringify({ batch_id: 'batch_x', commands: [command] });
 
   test('a cached descriptor names the batch by kind and label', () => {
     const state = stateWith(
-      { batch_x: body({ action_id: ACTION_ONE, arguments: {} }) },
+      { batch_x: commandBody({ action_id: ACTION_ONE, arguments: {} }) },
       { [ACTION_ONE]: { kind: 'unit.found_city', label: 'Found city' } }
     );
     expect(batchIntent(state, 'batch_x')).toBe('unit.found_city Found city');
@@ -467,7 +540,7 @@ describe('batchIntent', () => {
   test('arguments are appended in the order the persisted body carries them', () => {
     const state = stateWith(
       {
-        batch_x: body({
+        batch_x: commandBody({
           action_id: ACTION_ONE,
           arguments: { name: 'München', size: 3, ready: true },
         }),
@@ -490,8 +563,8 @@ describe('batchIntent', () => {
         ),
         'batch_x'
       );
-    const persisted = (args: string): string =>
-      `{"batch_id":"batch_x","commands":[{"action_id":"${ACTION_ONE}","arguments":${args}}]}`;
+    const persisted = (argumentsJson: string): string =>
+      `{"batch_id":"batch_x","commands":[{"action_id":"${ACTION_ONE}","arguments":${argumentsJson}}]}`;
     expect(intent(persisted('{"tax":1234567.0}'))).toBe(
       'unit.found_city Found city {tax=1.23457e+06}'
     );
@@ -507,7 +580,7 @@ describe('batchIntent', () => {
   });
 
   test('an expired descriptor degrades to the action ID, never to a request', () => {
-    const state = stateWith({ batch_x: body({ action_id: ACTION_ONE, arguments: {} }) });
+    const state = stateWith({ batch_x: commandBody({ action_id: ACTION_ONE, arguments: {} }) });
     expect(batchIntent(state, 'batch_x')).toBe(ACTION_ONE);
   });
 
@@ -528,13 +601,13 @@ describe('batchIntent', () => {
 describe('batchDisposition', () => {
   const fx = (): Fixture => fixture();
 
-  test('a disposition outside the closed set is refused', async () => {
+  awaitTest('a disposition outside the closed set is refused', function* (wait) {
     const f = fx();
-    const outcome = await f.run(batchDisposition(f.session, 'batch_x', 'looks_fine'));
+    const outcome = yield* wait(f.run(batchDisposition(f.session, 'batch_x', 'looks_fine')));
     expect(failure(outcome)).toBe('invalid batch disposition');
   });
 
-  test('every disposition whose payload would lie about the outcome is refused', async () => {
+  awaitTest('every disposition whose payload would lie about the outcome is refused', function* (wait) {
     const f = fx();
     const applied = receiptBody('batch_x', 'applied');
     const accepted = receiptBody('batch_x', 'accepted');
@@ -553,35 +626,32 @@ describe('batchDisposition', () => {
       ['receipt_first', applied, null],
     ];
     for (const [disposition, receipt, err] of cases) {
-      const outcome = await f.run(
-        batchDisposition(f.session, 'batch_x', disposition, {
-          ...(receipt === null ? {} : { receipt }),
-          ...(err === null ? {} : { error: err }),
-        })
-      );
+      const outcome = yield* wait(f.run(
+        batchDisposition(f.session, 'batch_x', disposition, dispositionPayload(receipt, err))
+      ));
       expect(failure(outcome)).toBe('invalid batch disposition payload');
     }
     // And the shapes that do agree are accepted.
     expect(
       ok(
-        await f.run(
+        yield* wait(f.run(
           batchDisposition(f.session, 'batch_x', 'receipt_terminal', { receipt: applied })
-        )
+        ))
       ).disposition
     ).toBe('receipt_terminal');
     expect(
       ok(
-        await f.run(
+        yield* wait(f.run(
           batchDisposition(f.session, 'batch_x', 'receipt_poll', { receipt: accepted })
-        )
+        ))
       ).disposition
     ).toBe('receipt_poll');
     expect(
-      ok(await f.run(batchDisposition(f.session, 'batch_x', 'refresh', { error })))
+      ok(yield* wait(f.run(batchDisposition(f.session, 'batch_x', 'refresh', { error }))))
         .disposition
     ).toBe('refresh');
     expect(
-      ok(await f.run(batchDisposition(f.session, 'batch_x', 'receipt_first'))).disposition
+      ok(yield* wait(f.run(batchDisposition(f.session, 'batch_x', 'receipt_first')))).disposition
     ).toBe('receipt_first');
   });
 });
@@ -591,19 +661,8 @@ describe('batchDisposition', () => {
 // ---------------------------------------------------------------------------
 
 describe('batchErrorDisposition', () => {
-  const response = (status: number, body: JsonObject): JsonResponse => ({
-    status,
-    value: body,
-    headers: {},
-  });
 
-  const contract = (batchId: string, safeNext: string): JsonObject => ({
-    batch_id: batchId,
-    acceptance: 'not_accepted',
-    safe_next: safeNext,
-  });
-
-  test('a refusal that never claimed the batch was unaccepted proves nothing', async () => {
+  awaitTest('a refusal that never claimed the batch was unaccepted proves nothing', function* (wait) {
     const f = fixture();
     for (const details of [
       {},
@@ -611,32 +670,32 @@ describe('batchErrorDisposition', () => {
       { batch_id: 'batch_x', acceptance: 'accepted', safe_next: 'refresh' },
       { batch_id: 'batch_x', acceptance: 'not_accepted', safe_next: 'receipt_poll' },
     ]) {
-      const outcome = await f.run(
+      const outcome = yield* wait(f.run(
         batchErrorDisposition(
-          response(409, errorBody('stale_revision', details as JsonObject)),
+          jsonResponse(409, errorBody('stale_revision', details)),
           f.session,
           'batch_x'
         )
-      );
+      ));
       expect(failure(outcome)).toBe('batch error omitted its safe recovery contract');
     }
   });
 
-  test('a contract that contradicts its own error code is refused', async () => {
+  awaitTest('a contract that contradicts its own error code is refused', function* (wait) {
     const f = fixture();
-    const outcome = await f.run(
+    const outcome = yield* wait(f.run(
       batchErrorDisposition(
-        response(503, errorBody('sidecar_unavailable', contract('batch_x', 'retry_exact'), false)),
+        jsonResponse(503, errorBody('sidecar_unavailable', recoveryContract('batch_x', 'retry_exact'), false)),
         f.session,
         'batch_x'
       )
-    );
+    ));
     expect(failure(outcome)).toBe('batch error recovery contract contradicts its code');
   });
 
-  test('the code decides the safe next step, and the server has to agree with it', async () => {
+  awaitTest('the code decides the safe next step, and the server has to agree with it', function* (wait) {
     const f = fixture();
-    const cases: ReadonlyArray<readonly [number, string, boolean, string]> = [
+    const cases: ReadonlyArray<readonly [number, string, boolean, Disposition]> = [
       [409, 'conflict', false, 'receipt_first'],
       [500, 'internal_error', false, 'receipt_first'],
       [409, 'action_outcome_ambiguous', false, 'receipt_first'],
@@ -650,15 +709,15 @@ describe('batchErrorDisposition', () => {
     ];
     for (const [status, code, retryable, expected] of cases) {
       const built = ok(
-        await f.run(
+        yield* wait(f.run(
           batchErrorDisposition(
-            response(status, errorBody(code, contract('batch_x', expected), retryable)),
+            jsonResponse(status, errorBody(code, recoveryContract('batch_x', expected), retryable)),
             f.session,
             'batch_x'
           )
-        )
+        ))
       );
-      expect(built.disposition as string).toBe(expected);
+      expect(built.disposition).toBe(expected);
       expect(built.receipt).toBeNull();
       expect(built.error?.error.code).toBe(code);
     }
@@ -670,50 +729,48 @@ describe('batchErrorDisposition', () => {
 // ---------------------------------------------------------------------------
 
 describe('submitBatch', () => {
-  test('a batch that was never persisted is refused before any request', async () => {
+  awaitTest('a batch that was never persisted is refused before any request', function* (wait) {
     const f = fixture();
-    const outcome = await f.run(submitBatch(f.sessionPath, f.session, 'batch_missing'));
+    const outcome = yield* wait(f.run(submitBatch(f.sessionPath, f.session, 'batch_missing')));
     expect(failure(outcome)).toBe("no persisted command batch 'batch_missing'");
     expect(f.posts).toHaveLength(0);
   });
 
-  test('the exact persisted bytes are what goes on the wire', async () => {
+  awaitTest('the exact persisted bytes are what goes on the wire', function* (wait) {
     const f = fixture((_url, body) => ({
       status: 200,
       body: receiptBody(
-        (JSON.parse(body ?? '{}') as { readonly batch_id: string }).batch_id,
+        postBatchId(body),
         'applied'
       ),
     }));
-    await seed(f, revision(7));
+    yield* wait(seed(f, revision(7)));
     const batchId = ok(
-      await f.run(
+      yield* wait(f.run(
         persistBatchForAction(f.sessionPath, f.session, ACTION_ONE, { city: 'München' }, {
           token: () => 'A'.repeat(24),
         })
-      )
+      ))
     );
-    const stored = ok(await f.run(f.store.readState(f.sessionPath, f.session))).batches[
-      batchId
-    ] as string;
-    const submitted = ok(await f.run(submitBatch(f.sessionPath, f.session, batchId)));
+    const stored = fixtureString(ok(yield* wait(f.run(f.store.readState(f.sessionPath, f.session)))).batches[batchId]);
+    const submitted = ok(yield* wait(f.run(submitBatch(f.sessionPath, f.session, batchId))));
     expect(f.posts).toEqual([stored]);
     expect(submitted.disposition.disposition).toBe('receipt_terminal');
     expect(submitted.exitCode).toBe(0);
     expect(submitted.warning).toBeNull();
   });
 
-  test('an unreadable success response is receipt-first, never a retry', async () => {
+  awaitTest('an unreadable success response is receipt-first, never a retry', function* (wait) {
     const f = fixture(() => ({ status: 200, body: { fine: true } }));
-    await seed(f, revision(7));
+    yield* wait(seed(f, revision(7)));
     const batchId = ok(
-      await f.run(
+      yield* wait(f.run(
         persistBatchForAction(f.sessionPath, f.session, ACTION_ONE, {}, {
           token: () => 'A'.repeat(24),
         })
-      )
+      ))
     );
-    const submitted = ok(await f.run(submitBatch(f.sessionPath, f.session, batchId)));
+    const submitted = ok(yield* wait(f.run(submitBatch(f.sessionPath, f.session, batchId))));
     expect(submitted.disposition.disposition).toBe('receipt_first');
     expect(submitted.warning).toBe(
       'the server returned an invalid success response; resolve the persisted batch ' +
@@ -722,17 +779,17 @@ describe('submitBatch', () => {
     expect(submitted.exitCode).toBe(2);
   });
 
-  test('a refusal without its recovery contract is receipt-first too', async () => {
+  awaitTest('a refusal without its recovery contract is receipt-first too', function* (wait) {
     const f = fixture(() => ({ status: 503, body: errorBody('sidecar_unavailable', {}, true) }));
-    await seed(f, revision(7));
+    yield* wait(seed(f, revision(7)));
     const batchId = ok(
-      await f.run(
+      yield* wait(f.run(
         persistBatchForAction(f.sessionPath, f.session, ACTION_ONE, {}, {
           token: () => 'Z'.repeat(24),
         })
-      )
+      ))
     );
-    const submitted = ok(await f.run(submitBatch(f.sessionPath, f.session, batchId)));
+    const submitted = ok(yield* wait(f.run(submitBatch(f.sessionPath, f.session, batchId))));
     expect(submitted.disposition.disposition).toBe('receipt_first');
     expect(submitted.warning).toBe(
       'the server response did not prove that this persisted batch was unaccepted; ' +
@@ -740,27 +797,27 @@ describe('submitBatch', () => {
     );
   });
 
-  test('an accepted receipt is pollable, not terminal', async () => {
+  awaitTest('an accepted receipt is pollable, not terminal', function* (wait) {
     const f = fixture((_url, body) => ({
       status: 202,
       body: receiptBody(
-        (JSON.parse(body ?? '{}') as { readonly batch_id: string }).batch_id,
+        postBatchId(body),
         'accepted'
       ),
     }));
-    await seed(f, revision(7));
+    yield* wait(seed(f, revision(7)));
     const batchId = ok(
-      await f.run(
+      yield* wait(f.run(
         persistBatchForAction(f.sessionPath, f.session, ACTION_ONE, {}, {
           token: () => 'A'.repeat(24),
         })
-      )
+      ))
     );
-    const submitted = ok(await f.run(submitBatch(f.sessionPath, f.session, batchId)));
+    const submitted = ok(yield* wait(f.run(submitBatch(f.sessionPath, f.session, batchId))));
     expect(submitted.disposition.disposition).toBe('receipt_poll');
     // The receipt is cached, so `retry` can read it without a request.
-    const cached = ok(await f.run(f.store.readState(f.sessionPath, f.session)));
-    expect((cached.receipts[batchId] as JsonObject)['receipt_state']).toBe('accepted');
+    const cached = ok(yield* wait(f.run(f.store.readState(f.sessionPath, f.session))));
+    expect(fixtureString(fixtureObject(cached.receipts[batchId])['receipt_state'])).toBe('accepted');
   });
 });
 
@@ -769,44 +826,39 @@ describe('submitBatch', () => {
 // ---------------------------------------------------------------------------
 
 describe('play batch', () => {
-  test('the batch is on disk before the request, so a dead transport is recoverable', async () => {
+  awaitTest('the batch is on disk before the request, so a dead transport is recoverable', function* (wait) {
     const dying = fixture((): never => {
       throw new Error('connection reset');
     });
-    await seed(dying, revision(7));
-    const captured = await capture(
+    yield* wait(seed(dying, revision(7)));
+    const captured = yield* wait(capture(
       runBatch(args({ arguments: '{"city":"München"}' }), pinned('A'.repeat(24))),
       dying
-    );
+    ));
     expect(exitCodeOf(captured.outcome)).toBe(2);
-    const printed = JSON.parse(captured.out[0] ?? '{}') as BatchDisposition;
+    const printed = parseFixtureObject(captured.out[0] ?? '');
     expect(printed.batch_id).toBe(`batch_${'A'.repeat(24)}`);
     expect(printed.disposition).toBe('receipt_first');
     expect(captured.err[0]).toContain('transport outcome is unknown for batch');
     // The record survived the failure: `retry` has something to resolve.
-    const persisted = JSON.parse(fs.readFileSync(dying.statePath, 'utf8')) as {
-      readonly batches: Record<string, string>;
-    };
-    expect(Object.keys(persisted.batches)).toEqual([`batch_${'A'.repeat(24)}`]);
+    const persisted = batchKeysOnDisk(dying);
+    expect(persisted).toEqual([`batch_${'A'.repeat(24)}`]);
   });
 
-  test('the state file already holds the batch when the request is made', async () => {
+  awaitTest('the state file already holds the batch when the request is made', function* (wait) {
     let onDisk: ReadonlyArray<string> = [];
     const f: Fixture = fixture((_url, _body) => {
-      const state = JSON.parse(fs.readFileSync(f.statePath, 'utf8')) as {
-        readonly batches: Record<string, string>;
-      };
-      onDisk = Object.keys(state.batches);
+      onDisk = batchKeysOnDisk(f);
       throw new Error('connection reset');
     });
-    await seed(f, revision(7));
-    await capture(runBatch(args(), pinned('B'.repeat(24))), f);
+    yield* wait(seed(f, revision(7)));
+    yield* wait(capture(runBatch(args(), pinned('B'.repeat(24))), f));
     expect(onDisk).toEqual([`batch_${'B'.repeat(24)}`]);
   });
 
-  test('each closed disposition is reached exactly once, and printed as one object', async () => {
+  awaitTest('each closed disposition is reached exactly once, and printed as one object', function* (wait) {
     const cases: ReadonlyArray<
-      readonly [string, number, string | null, string | null, string, number]
+      readonly [string, number, string | null, string | null, Disposition, number]
     > = [
       ['poll', 202, 'accepted', null, 'receipt_poll', 0],
       ['terminal', 200, 'applied', null, 'receipt_terminal', 0],
@@ -820,25 +872,26 @@ describe('play batch', () => {
     for (const [label, status, receiptState, code, expected, expectedExit] of cases) {
       const token = label.padEnd(24, 'x');
       const batchId = `batch_${token}`;
-      const f = fixture(() => ({
-        status,
-        body:
-          receiptState !== null
-            ? receiptBody(batchId, receiptState)
-            : errorBody(
-                code as string,
-                {
-                  batch_id: batchId,
-                  acceptance: 'not_accepted',
-                  safe_next: expected,
-                },
-                code === 'rate_limited' || label === 'busy'
-              ),
-      }));
-      await seed(f, revision(7));
-      const captured = await capture(runBatch(args(), pinned(token)), f);
+      let responseBody: JsonObject;
+      if (receiptState !== null) {
+        responseBody = receiptBody(batchId, receiptState);
+      } else {
+        if (code === null) throw new Error(`missing error code for ${label}`);
+        responseBody = errorBody(
+          code,
+          {
+            batch_id: batchId,
+            acceptance: 'not_accepted',
+            safe_next: expected,
+          },
+          code === 'rate_limited' || label === 'busy'
+        );
+      }
+      const f = fixture(() => ({ status, body: responseBody }));
+      yield* wait(seed(f, revision(7)));
+      const captured = yield* wait(capture(runBatch(args(), pinned(token)), f));
       expect(captured.out).toHaveLength(1);
-      const printed = JSON.parse(captured.out[0] ?? '{}') as BatchDisposition;
+      const printed = parseFixtureObject(captured.out[0] ?? '');
       expect([label, printed.batch_id, printed.disposition]).toEqual([
         label,
         batchId,
@@ -848,30 +901,29 @@ describe('play batch', () => {
     }
   });
 
-  test('--json prints exactly one canonical object, and the text form is a projection', async () => {
+  awaitTest('--json prints exactly one canonical object, and the text form is a projection', function* (wait) {
     const token = 'J'.repeat(24);
     const batchId = `batch_${token}`;
-    const build = (): Fixture =>
-      fixture(() => ({ status: 200, body: receiptBody(batchId, 'applied') }));
+    const build = () => fixture(() => ({ status: 200, body: receiptBody(batchId, 'applied') }));
 
     const jsonRun = build();
-    await seed(jsonRun, revision(7));
-    const raw = await capture(
+    yield* wait(seed(jsonRun, revision(7)));
+    const raw = yield* wait(capture(
       runBatch(args({ arguments: '{"ready":true}' }), pinned(token)),
       jsonRun
-    );
+    ));
     expect(raw.out).toHaveLength(1);
     // Exactly one canonical object: no pretty-printing, no second line, nothing
     // a machine consumer must strip.
-    const parsed = JSON.parse(raw.out[0] ?? '{}') as JsonObject;
+    const parsed = parseFixtureObject(raw.out[0] ?? '');
     expect(raw.out[0]).toBe(compactJson(parsed));
 
     const textRun = build();
-    await seed(textRun, revision(7));
-    const text = await capture(
+    yield* wait(seed(textRun, revision(7)));
+    const text = yield* wait(capture(
       runBatch(args({ arguments: '{"ready":true}', json: false }), pinned(token)),
       textRun
-    );
+    ));
     expect(text.out[0]).not.toStartWith('{');
     // `_batch_command` (client.py:8595-8600) closes an OK receipt with
     // `_next_focus_line(path, state, {actor})`, and this mirror holds no unit
@@ -891,16 +943,16 @@ describe('play batch', () => {
    * the projection prints strictly fewer lines than CPython on every later
    * `show`.
    */
-  test('the receipt is projected into state/delta.md, as _submit_persisted_batch does', async () => {
+  awaitTest('the receipt is projected into state/delta.md, as _submit_persisted_batch does', function* (wait) {
     const token = 'P'.repeat(24);
     const batchId = `batch_${token}`;
     const f = fixture(() => ({ status: 200, body: receiptBody(batchId, 'applied') }));
-    await seed(f, revision(7));
-    const captured = await capture(runBatch(args(), pinned(token)), f);
+    yield* wait(seed(f, revision(7)));
+    const captured = yield* wait(capture(runBatch(args(), pinned(token)), f));
     expect(exitCodeOf(captured.outcome)).toBe(0);
     const delta = path.join(Effect.runSync(mirrorDir(f.sessionPath)), 'state', 'delta.md');
-    expect(fs.existsSync(delta)).toBe(true);
-    expect(fs.readFileSync(delta, 'utf8')).toContain(
+    expect(yield* wait(Effect.runPromise(fileSystem.exists(delta)))).toBe(true);
+    expect(yield* wait(Effect.runPromise(fileSystem.readFileString(delta)))).toContain(
       `applied batch ${batchId.slice(0, 16)} at rev 8`
     );
   });
@@ -912,11 +964,11 @@ describe('play batch', () => {
    * the `a3` it was told about must not be refused for it.  With the drain
    * unwired every invocation behaved as though `--no-refresh` had been passed.
    */
-  test('a stale action alias re-enumerates and re-binds, and --no-refresh does not', async () => {
+  awaitTest('a stale action alias re-enumerates and re-binds, and --no-refresh does not', function* (wait) {
     const token = 'R'.repeat(24);
     const batchId = `batch_${token}`;
     const rebound = `action_${'2'.repeat(26)}`;
-    const build = (): { readonly fx: Fixture; readonly urls: ReadonlyArray<string> } => {
+    const build = () => {
       const urls: string[] = [];
       const fx = fixture((url) => {
         urls.push(url);
@@ -932,40 +984,23 @@ describe('play batch', () => {
 
     // The alias table is pinned at rev7 while a receipt has moved the seat to
     // rev8: `a1` still names an action, but not one this revision knows.
-    const stale = async (fx: Fixture): Promise<void> => {
-      await seed(fx, revision(7));
-      ok(
-        await fx.run(
-          Effect.flatMap(
-            Effect.mapError(
-              decodeReceipt(receiptBody(`batch_${'Z'.repeat(24)}`, 'applied'), fx.session, {
-                batchId: `batch_${'Z'.repeat(24)}`,
-              }),
-              (error) => ({ message: error.message })
-            ),
-            (receipt) => rememberReceipt(fx.sessionPath, fx.session, receipt)
-          )
-        )
-      );
-    };
-
     const refreshing = build();
-    await stale(refreshing.fx);
-    const captured = await capture(
+    yield* wait(stale(refreshing.fx));
+    const captured = yield* wait(capture(
       runBatch(args({ actionId: 'a1', json: false }), pinned(token)),
       refreshing.fx
-    );
+    ));
     expect(exitCodeOf(captured.outcome)).toBe(0);
     expect(refreshing.urls.some((url) => url.includes('legal-actions'))).toBe(true);
     expect(captured.out[0]).toBe('a1 rebound at rev8');
     expect(refreshing.fx.posts[0]).toContain(rebound);
 
     const refusing = build();
-    await stale(refusing.fx);
-    const refused = await capture(
+    yield* wait(stale(refusing.fx));
+    const refused = yield* wait(capture(
       runBatch(args({ actionId: 'a1', noRefresh: true, json: false }), pinned(token)),
       refusing.fx
-    );
+    ));
     expect(exitCodeOf(refused.outcome)).toBe(-1);
     expect(refusing.urls.some((url) => url.includes('legal-actions'))).toBe(false);
     expect(refusing.fx.posts).toHaveLength(0);
@@ -978,7 +1013,7 @@ describe('play batch', () => {
    * descriptor out of `.v2-state` *before* the send, because applying the
    * action wipes it.
    */
-  test('a refused batch prints what its actor can still do', async () => {
+  awaitTest('a refused batch prints what its actor can still do', function* (wait) {
     const token = 'S'.repeat(24);
     const batchId = `batch_${token}`;
     const f = fixture((url) =>
@@ -991,14 +1026,14 @@ describe('play batch', () => {
             }),
           }
     );
-    await seed(f, revision(7));
-    const captured = await capture(runBatch(args({ json: false }), pinned(token)), f);
+    yield* wait(seed(f, revision(7)));
+    const captured = yield* wait(capture(runBatch(args({ json: false }), pinned(token)), f));
     expect(exitCodeOf(captured.outcome)).toBe(0);
     expect(captured.out.some((line) => line.startsWith('u1 can (rev7/t3):'))).toBe(true);
     expect(captured.out.some((line) => line.includes('unit.found_city'))).toBe(true);
   });
 
-  test('an ambiguous receipt says so on stderr, because it must never be replayed', async () => {
+  awaitTest('an ambiguous receipt says so on stderr, because it must never be replayed', function* (wait) {
     const token = 'M'.repeat(24);
     const batchId = `batch_${token}`;
     const ambiguousRevision = revision(8);
@@ -1013,41 +1048,41 @@ describe('play batch', () => {
         ),
       }),
     }));
-    await seed(f, revision(7));
-    const captured = await capture(runBatch(args(), pinned(token)), f);
+    yield* wait(seed(f, revision(7)));
+    const captured = yield* wait(capture(runBatch(args(), pinned(token)), f));
     expect(exitCodeOf(captured.outcome)).toBe(0);
     expect(captured.err).toContain('Ambiguous is terminal; never replay this batch.');
   });
 
-  test('an unknown action is refused before anything is sent', async () => {
+  awaitTest('an unknown action is refused before anything is sent', function* (wait) {
     const f = fixture(() => ({ status: 200, body: {} }));
-    await seed(f, revision(7));
-    const captured = await capture(
+    yield* wait(seed(f, revision(7)));
+    const captured = yield* wait(capture(
       runBatch(args({ actionId: `action_${'9'.repeat(26)}` }), pinned('N'.repeat(24))),
       f
-    );
+    ));
     expect(Either.isLeft(captured.outcome)).toBe(true);
     expect(f.posts).toHaveLength(0);
   });
 
-  test('a stale action alias keeps its plain refusal when no drain is available', async () => {
+  awaitTest('a stale action alias keeps its plain refusal when no drain is available', function* (wait) {
     const f = fixture(() => ({ status: 200, body: {} }));
-    await seed(f, revision(7));
+    yield* wait(seed(f, revision(7)));
     // A newer state page retires the catalog, so `a1` names an expired handle.
-    const state = ok(await f.run(f.store.readState(f.sessionPath, f.session)));
+    const state = ok(yield* wait(f.run(f.store.readState(f.sessionPath, f.session))));
     ok(
-      await f.run(
+      yield* wait(f.run(
         f.store.writeState(f.sessionPath, {
           ...state,
           last_revision: { turn: 3, revision: 9, state_token: revision(9).state_token },
           actions: {},
         })
-      )
+      ))
     );
-    const captured = await capture(
+    const captured = yield* wait(capture(
       runBatch(args({ actionId: 'a1', noRefresh: true }), pinned('P'.repeat(24))),
       f
-    );
+    ));
     expect(Either.isLeft(captured.outcome)).toBe(true);
     expect(f.posts).toHaveLength(0);
   });
@@ -1069,45 +1104,47 @@ describe('play batch', () => {
 describe('a refusal after the phase ended', () => {
   const STALLED = 'your phase is not active (state ending) — just wait';
 
-  const stall = async (f: Fixture): Promise<void> => {
-    const dir = ok(await f.run(mirrorDir(f.sessionPath)));
-    ok(
-      await f.run(
-        writeMirror(dir, HEADER_FILE, 'phase     ending · turn 3 phase 0 · active yes\n')
-      )
-    );
-  };
+  const stall = (f: Fixture): Promise<void> =>
+    f.run(mirrorDir(f.sessionPath)).then((either) => {
+      const dir = ok(either);
+      return f
+        .run(writeMirror(dir, HEADER_FILE, 'phase     ending · turn 3 phase 0 · active yes\n'))
+        .then((result) => {
+          ok(result);
+        });
+    });
 
-  const refusal = async (f: Fixture, batchArgs: Parameters<typeof runBatch>[0]): Promise<string> => {
-    const captured = await capture(runBatch(batchArgs, pinned('Q'.repeat(24))), f);
-    expect(Either.isLeft(captured.outcome)).toBe(true);
-    const failed: unknown = Either.isLeft(captured.outcome) ? captured.outcome.left : null;
-    return typeof failed === 'object' && failed !== null && 'message' in failed
-      ? String((failed as { readonly message: unknown }).message)
-      : '';
-  };
+  const refusal = (
+    f: Fixture,
+    batchArgs: Parameters<typeof runBatch>[0]
+  ): Effect.Effect<string> =>
+    Effect.gen(function* () {
+      const captured = yield* capture(runBatch(batchArgs, pinned('Q'.repeat(24))), f);
+      expect(Either.isLeft(captured.outcome)).toBe(true);
+      return refusalMessage(captured.outcome);
+    });
 
-  test('leads an invalid action ID, which is a DriftError here and a PlayerError there', async () => {
+  awaitTest('leads an invalid action ID, which is a DriftError here and a PlayerError there', function* (wait) {
     const f = fixture();
-    await seed(f, revision(7));
-    await stall(f);
-    expect(await refusal(f, args({ actionId: '' }))).toBe(`${STALLED}\ninvalid action ID`);
-    expect(await refusal(f, args({ actionId: 'not an id' }))).toBe(
+    yield* wait(seed(f, revision(7)));
+    yield* wait(stall(f));
+    expect(yield* wait(refusal(f, args({ actionId: '' })))).toBe(`${STALLED}\ninvalid action ID`);
+    expect(yield* wait(refusal(f, args({ actionId: 'not an id' })))).toBe(
       `${STALLED}\ninvalid action ID`
     );
     expect(f.posts).toHaveLength(0);
   });
 
-  test('leads a plain PlayerError too, and says the phase fact exactly once', async () => {
+  awaitTest('leads a plain PlayerError too, and says the phase fact exactly once', function* (wait) {
     const f = fixture();
-    await seed(f, revision(7));
-    await stall(f);
-    expect(await refusal(f, args({ actionId: `action_${'9'.repeat(26)}` }))).toBe(
+    yield* wait(seed(f, revision(7)));
+    yield* wait(stall(f));
+    expect(yield* wait(refusal(f, args({ actionId: `action_${'9'.repeat(26)}` })))).toBe(
       `${STALLED}\nunknown or expired action ID; run the matching \`just legal\` query`
     );
     // The whole sentence, through the command: CPython's message reaches
     // stderr unchanged behind the phase fact.
-    expect(await refusal(f, args({ arguments: '{"a":' }))).toBe(
+    expect(yield* wait(refusal(f, args({ arguments: '{"a":' })))).toBe(
       `${STALLED}\n--arguments must be valid strict JSON: Expecting value: line 1 ` +
         'column 6 (char 5)'
     );
@@ -1118,23 +1155,23 @@ describe('a refusal after the phase ended', () => {
    * The whole fail-open in one command: `"\ud800"` parses, so only
    * `_canonical_body`'s `.encode("utf-8")` stands between it and the wire.
    */
-  test('a lone --arguments surrogate never reaches .v2-state or the wire', async () => {
+  awaitTest('a lone --arguments surrogate never reaches .v2-state or the wire', function* (wait) {
     const f = fixture();
-    await seed(f, revision(7));
-    expect(await refusal(f, args({ arguments: '{"name":"\\ud800"}' }))).toContain(
+    yield* wait(seed(f, revision(7)));
+    expect(yield* wait(refusal(f, args({ arguments: '{"name":"\\ud800"}' })))).toContain(
       "command batch is not canonical JSON: 'utf-8' codec can't encode character " +
         "'\\ud800' in position "
     );
     expect(f.posts).toHaveLength(0);
   });
 
-  test('says nothing extra while the mirror does not claim the phase is dead', async () => {
+  awaitTest('says nothing extra while the mirror does not claim the phase is dead', function* (wait) {
     const f = fixture();
-    await seed(f, revision(7));
-    expect(await refusal(f, args({ actionId: '' }))).toBe('invalid action ID');
+    yield* wait(seed(f, revision(7)));
+    expect(yield* wait(refusal(f, args({ actionId: '' })))).toBe('invalid action ID');
   });
 
-  test('never touches the quiet exit-2 signal a reported disposition carries', async () => {
+  awaitTest('never touches the quiet exit-2 signal a reported disposition carries', function* (wait) {
     const token = 'R'.repeat(24);
     const batchId = `batch_${token}`;
     const f = fixture(() => ({
@@ -1145,9 +1182,9 @@ describe('a refusal after the phase ended', () => {
         safe_next: 'receipt_first',
       }),
     }));
-    await seed(f, revision(7));
-    await stall(f);
-    const captured = await capture(runBatch(args(), pinned(token)), f);
+    yield* wait(seed(f, revision(7)));
+    yield* wait(stall(f));
+    const captured = yield* wait(capture(runBatch(args(), pinned(token)), f));
     // The disposition is *reported*: stdout carries it, the exit code is 2, and
     // no `error:` line is invented — least of all a phase note.
     expect(exitCodeOf(captured.outcome)).toBe(2);
@@ -1165,14 +1202,14 @@ describe('a refusal after the phase ended', () => {
 // ---------------------------------------------------------------------------
 
 describe('the disposition line', () => {
-  test('a receipt-carrying disposition renders the receipt', async () => {
+  awaitTest('a receipt-carrying disposition renders the receipt', function* (wait) {
     const f = fixture();
     const built = ok(
-      await f.run(
+      yield* wait(f.run(
         batchDisposition(f.session, 'batch_x', 'receipt_poll', {
           receipt: receiptBody('batch_x', 'accepted', revision(8), { idempotent: true }),
         })
-      )
+      ))
     );
     expect(renderDisposition(built, 'unit.found_city Found city')).toEqual([
       'unit.found_city Found city → accepted idempotent (not final; resolve with ' +
@@ -1180,14 +1217,14 @@ describe('the disposition line', () => {
     ]);
   });
 
-  test('a not-accepted disposition names the error and the safe next step', async () => {
+  awaitTest('a not-accepted disposition names the error and the safe next step', function* (wait) {
     const f = fixture();
     const built = ok(
-      await f.run(
+      yield* wait(f.run(
         batchDisposition(f.session, 'batch_x', 'refresh', {
           error: errorBody('stale_revision', {}),
         })
-      )
+      ))
     );
     expect(renderDisposition(built, 'a1')).toEqual([
       'a1 → not accepted: stale_revision: the supervisor refused with stale_revision ' +
@@ -1195,9 +1232,9 @@ describe('the disposition line', () => {
     ]);
   });
 
-  test('an unknown outcome says so rather than implying a retry is safe', async () => {
+  awaitTest('an unknown outcome says so rather than implying a retry is safe', function* (wait) {
     const f = fixture();
-    const built = ok(await f.run(batchDisposition(f.session, 'batch_x', 'receipt_first')));
+    const built = ok(yield* wait(f.run(batchDisposition(f.session, 'batch_x', 'receipt_first'))));
     expect(renderDisposition(built, 'a1')).toEqual([
       'a1 → outcome unknown next=receipt_first  batch_x',
     ]);

@@ -6,7 +6,7 @@
  * 75/66 passes straight through without an `error:` line.
  */
 import { describe, expect, test } from 'bun:test';
-import { Effect, Layer, Option } from 'effect';
+import { Effect, Layer, Option, Schema } from 'effect';
 import { PlayerError, V2ResponseError, playerError } from 'src/errors';
 import {
   EXIT_NOINPUT,
@@ -32,32 +32,8 @@ import { RefusalRenderDefault, errorText } from 'src/render/refusal-seam';
 import { COMMAND_NAMES } from 'src/constants';
 import { errorPayload } from 'test/_fixtures';
 
-interface Captured {
-  readonly out: ReadonlyArray<string>;
-  readonly err: ReadonlyArray<string>;
-}
-
-/** Run an effect with stdout/stderr collected instead of printed. */
-const capture = async <A>(effect: Effect.Effect<A, never>): Promise<{
-  readonly value: A;
-  readonly captured: Captured;
-}> => {
-  const out: string[] = [];
-  const err: string[] = [];
-  const originalLog = console.log;
-  const originalError = console.error;
-  console.log = (...parts: ReadonlyArray<unknown>) => out.push(parts.join(' '));
-  console.error = (...parts: ReadonlyArray<unknown>) => err.push(parts.join(' '));
-  try {
-    const value = await Effect.runPromise(effect);
-    return { value, captured: { out, err } };
-  } finally {
-    console.log = originalLog;
-    console.error = originalError;
-  }
-};
-
-const withRenderer = <A>(effect: Effect.Effect<A, never>): Effect.Effect<A> => effect;
+import { captureEffect } from 'test/_capture';
+import { effectTest, provideTestLayer } from 'test/_effect-test';
 
 describe('exit codes', () => {
   test('the contract is exactly four statuses', () => {
@@ -115,7 +91,7 @@ describe('the dual-spelling helper', () => {
 
 describe('the command registry', () => {
   test('every name in the surface is registered exactly once', () => {
-    expect([...SUBCOMMAND_NAMES].sort()).toEqual([...COMMAND_NAMES].sort());
+    expect([...SUBCOMMAND_NAMES].toSorted()).toEqual([...COMMAND_NAMES].toSorted());
     expect(new Set(SUBCOMMAND_NAMES).size).toBe(SUBCOMMAND_NAMES.length);
   });
 
@@ -129,25 +105,31 @@ describe('the command registry', () => {
     }
   });
 
-  test('--help exits 0 and lists the commands', async () => {
-    const { value, captured } = await capture(runCli(['bun', 'play', '--help']));
+  effectTest('--help exits 0 and lists the commands', () =>
+    Effect.gen(function* () {
+    const { value, captured } = yield* captureEffect(runCli(['bun', 'play', '--help']));
     expect(value).toBe(EXIT_OK);
     const text = captured.out.join('\n');
     for (const name of ['prompt', 'join', 'do', 'wait', 'monitor', 'result']) {
       expect(text).toContain(name);
     }
-  });
+    })
+  );
 
-  test('an unknown subcommand exits 2', async () => {
-    const { value } = await capture(runCli(['bun', 'play', 'nonsense']));
-    expect(value).toBe(EXIT_REFUSED);
-  });
+  effectTest('an unknown subcommand exits 2', () =>
+    Effect.gen(function* () {
+      const { value } = yield* captureEffect(runCli(['bun', 'play', 'nonsense']));
+      expect(value).toBe(EXIT_REFUSED);
+    })
+  );
 
-  test('a bare invocation is a refusal that names --help', async () => {
-    const { value, captured } = await capture(runCli(['bun', 'play']));
-    expect(value).toBe(EXIT_REFUSED);
-    expect(captured.err.join('\n')).toContain('a subcommand is required');
-  });
+  effectTest('a bare invocation is a refusal that names --help', () =>
+    Effect.gen(function* () {
+      const { value, captured } = yield* captureEffect(runCli(['bun', 'play']));
+      expect(value).toBe(EXIT_REFUSED);
+      expect(captured.err.join('\n')).toContain('a subcommand is required');
+    })
+  );
 });
 
 describe('argv introspection', () => {
@@ -169,74 +151,86 @@ describe('error mapping', () => {
     payload: errorPayload(),
   });
 
-  test('a refusal renders its body on stdout and reports on stderr, exit 2', async () => {
-    const { value, captured } = await capture(
-      withRenderer(
-        handleError(refusal, ['bun', 'play', 'state']).pipe(Effect.provide(RefusalRenderDefault))
-      )
+  effectTest('a refusal renders its body on stdout and reports on stderr, exit 2', () =>
+    Effect.gen(function* () {
+    const { value, captured } = yield* captureEffect(
+      provideTestLayer(handleError(refusal, ['bun', 'play', 'state']), RefusalRenderDefault)
     );
     expect(value).toBe(EXIT_REFUSED);
     expect(captured.out).toEqual([errorText(errorPayload())]);
     expect(captured.err).toEqual(['error: HTTP 409: nope (illegal_action)']);
-  });
+    })
+  );
 
-  test('--json keeps the byte-identical wire payload', async () => {
-    const { captured } = await capture(
-      withRenderer(
-        handleError(refusal, ['bun', 'play', 'state', '--json']).pipe(
-          Effect.provide(RefusalRenderDefault)
-        )
+  effectTest('--json keeps the byte-identical wire payload', () =>
+    Effect.gen(function* () {
+    const { captured } = yield* captureEffect(
+      provideTestLayer(
+        handleError(refusal, ['bun', 'play', 'state', '--json']),
+        RefusalRenderDefault
       )
     );
     expect(captured.out).toHaveLength(1);
-    expect(JSON.parse(captured.out[0] ?? '')).toEqual(errorPayload());
-  });
-
-  test('a JSON-only command keeps its refusal JSON with no flag at all', async () => {
-    const { captured } = await capture(
-      withRenderer(
-        handleError(refusal, ['bun', 'play', 'next']).pipe(Effect.provide(RefusalRenderDefault))
+    expect(
+      yield* Effect.orDie(
+        Schema.decodeUnknown(Schema.parseJson(Schema.Unknown))(captured.out[0] ?? '')
       )
-    );
-    expect(JSON.parse(captured.out[0] ?? '')).toEqual(errorPayload());
-  });
+    ).toEqual(errorPayload());
+    })
+  );
 
-  test('a PlayerError is one stderr line and exit 2', async () => {
-    const { value, captured } = await capture(
-      withRenderer(
-        handleError(playerError('no current session'), ['bun', 'play', 'state']).pipe(
-          Effect.provide(RefusalRenderDefault)
+  effectTest('a JSON-only command keeps its refusal JSON with no flag at all', () =>
+    Effect.gen(function* () {
+      const { captured } = yield* captureEffect(
+        provideTestLayer(handleError(refusal, ['bun', 'play', 'next']), RefusalRenderDefault)
+      );
+      expect(
+        yield* Effect.orDie(
+          Schema.decodeUnknown(Schema.parseJson(Schema.Unknown))(captured.out[0] ?? '')
         )
+      ).toEqual(errorPayload());
+    })
+  );
+
+  effectTest('a PlayerError is one stderr line and exit 2', () =>
+    Effect.gen(function* () {
+    const { value, captured } = yield* captureEffect(
+      provideTestLayer(
+        handleError(playerError('no current session'), ['bun', 'play', 'state']),
+        RefusalRenderDefault
       )
     );
     expect(value).toBe(EXIT_REFUSED);
     expect(captured.out).toEqual([]);
     expect(captured.err).toEqual(['error: no current session']);
-  });
+    })
+  );
 
-  test('an exit signal passes 75 through and prints nothing', async () => {
-    const { value, captured } = await capture(
-      withRenderer(
-        handleError(exitWith(EXIT_TEMPFAIL), ['bun', 'play', 'wait']).pipe(
-          Effect.provide(RefusalRenderDefault)
-        )
+  effectTest('an exit signal passes 75 through and prints nothing', () =>
+    Effect.gen(function* () {
+    const { value, captured } = yield* captureEffect(
+      provideTestLayer(
+        handleError(exitWith(EXIT_TEMPFAIL), ['bun', 'play', 'wait']),
+        RefusalRenderDefault
       )
     );
     expect(value).toBe(EXIT_TEMPFAIL);
     expect(captured.out).toEqual([]);
     expect(captured.err).toEqual([]);
-  });
+    })
+  );
 
-  test('an exit signal passes 66 through as well', async () => {
-    const { value } = await capture(
-      withRenderer(
-        handleError(exitWith(EXIT_NOINPUT), ['bun', 'play', 'wait']).pipe(
-          Effect.provide(RefusalRenderDefault)
+  effectTest('an exit signal passes 66 through as well', () =>
+    Effect.gen(function* () {
+      const { value } = yield* captureEffect(
+        provideTestLayer(
+          handleError(exitWith(EXIT_NOINPUT), ['bun', 'play', 'wait']),
+          RefusalRenderDefault
         )
-      )
-    );
-    expect(value).toBe(EXIT_NOINPUT);
-  });
+      );
+      expect(value).toBe(EXIT_NOINPUT);
+    })
+  );
 
   test('every mapped failure keeps a user-facing message', () => {
     const failures = [

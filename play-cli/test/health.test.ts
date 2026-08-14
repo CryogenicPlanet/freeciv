@@ -20,10 +20,8 @@
  * The mirror write `_mirror_health` makes (client.py:6552) is asserted off
  * disk, because it is the only observable this command has besides stdout.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
-import { Effect, Either, Layer } from 'effect';
+import { Effect, Either, Layer, Schema } from 'effect';
 import { BLOCKED_NEXT_LINE, renderHealth } from 'src/render/health';
 import { healthLines, runHealth } from 'src/commands/health.cmd';
 import { decodeHealth, type HealthEnvelope, type JsonObject } from 'src/schema/index';
@@ -58,12 +56,12 @@ import {
   phaseHealthPayload,
   priorEndPayload,
 } from 'test/_fixtures/phase-goldens';
+import { awaitTest, provideTestLayer } from 'test/_effect-test';
+import { path, withTestFileSystem } from 'test/_test-platform';
 
 const scratches: Scratch[] = [];
 
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() => Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup())));
 
 const decode = (payload: JsonObject): HealthEnvelope =>
   Effect.runSync(decodeHealth(payload, identity()));
@@ -396,60 +394,61 @@ const commandFixture = (payload: JsonObject, status = 200): Fixture => {
   };
 };
 
-const capture = async <E>(
+const capture = <E>(
   effect: Effect.Effect<void, E, PrivateFs | SessionStore | V2Client>,
   fixture: Fixture
-): Promise<ReadonlyArray<string>> => {
+): Effect.Effect<ReadonlyArray<string>, E> => {
   const out: string[] = [];
   const original = console.log;
   console.log = (...parts: ReadonlyArray<unknown>) => out.push(parts.join(' '));
-  try {
-    await Effect.runPromise(Effect.provide(effect, fixture.layer));
-    return out;
-  } finally {
-    console.log = original;
-  }
+  return provideTestLayer(effect, fixture.layer).pipe(
+    Effect.ensuring(Effect.sync(() => {
+      console.log = original;
+    })),
+    Effect.as(out)
+  );
 };
 
 describe('play health', () => {
-  test('it prints the rendered block and nothing else', async () => {
+  awaitTest('it prints the rendered block and nothing else', function* (wait) {
     const payload = phaseHealthPayload({ mine: true, remainingS: 592, elapsedS: 8 });
     const fixture = commandFixture(payload);
-    const out = await capture(runHealth({ session: '', json: false }), fixture);
+    const out = yield* wait(capture(runHealth({ session: '', json: false }), fixture));
     expect(out).toEqual([
       `health running | ${PHASE_HEADLINE.yourTurn} | ${SIDECAR}`,
       IDENTITY_LINE,
     ]);
   });
 
-  test('a blocked seat gets the block plus the remedy, in that order', async () => {
+  awaitTest('a blocked seat gets the block plus the remedy, in that order', function* (wait) {
     const payload = phaseHealthPayload({ mine: false, remainingS: 13, elapsedS: 587 });
     const fixture = commandFixture(payload);
-    const out = await capture(runHealth({ session: '', json: false }), fixture);
+    const out = yield* wait(capture(runHealth({ session: '', json: false }), fixture));
     expect(out[0]).toBe(`health running | ${PHASE_HEADLINE.holder} | ${SIDECAR}`);
     expect(out.at(-1)).toBe(BLOCKED_NEXT_LINE);
   });
 
-  test('--json prints the validated envelope, not the raw body', async () => {
+  awaitTest('--json prints the validated envelope, not the raw body', function* (wait) {
     const payload = phaseHealthPayload({ mine: true });
     const fixture = commandFixture(payload);
-    const out = await capture(runHealth({ session: '', json: true }), fixture);
+    const out = yield* wait(capture(runHealth({ session: '', json: true }), fixture));
     expect(out).toHaveLength(1);
-    expect(JSON.parse(out[0] ?? '')).toEqual(
-      JSON.parse(JSON.stringify(decode(payload))) as unknown
+    const jsonValue = Schema.parseJson(Schema.Unknown);
+    expect(Schema.decodeUnknownSync(jsonValue)(out[0] ?? '')).toEqual(
+      Schema.decodeUnknownSync(jsonValue)(JSON.stringify(decode(payload)))
     );
     // The envelope the server sent carries no agent_id at the top level, and the
     // validated one does not invent it.
     expect(out[0]).not.toContain('state_token');
   });
 
-  test('--json is byte-identical to json.dumps(sort_keys, separators)', async () => {
+  awaitTest('--json is byte-identical to json.dumps(sort_keys, separators)', function* (wait) {
     const fixture = commandFixture(phaseHealthPayload({ mine: true }));
-    const out = await capture(runHealth({ session: '', json: true }), fixture);
+    const out = yield* wait(capture(runHealth({ session: '', json: true }), fixture));
     expect(out[0]).toBe(JSON_GOLDEN.simple);
   });
 
-  test('--json keeps every wire float a float, on all twelve timing fields', async () => {
+  awaitTest('--json keeps every wire float a float, on all twelve timing fields', function* (wait) {
     const fixture = commandFixture({
       ...phaseHealthPayload({
         mine: true,
@@ -458,38 +457,47 @@ describe('play health', () => {
       }),
       last_phase_end: LAST_PHASE_END,
     });
-    const out = await capture(runHealth({ session: '', json: true }), fixture);
+    const out = yield* wait(capture(runHealth({ session: '', json: true }), fixture));
     expect(out[0]).toBe(JSON_GOLDEN.full);
   });
 
-  test('it refreshes the state mirror between validating and rendering', async () => {
+  awaitTest('it refreshes the state mirror between validating and rendering', function* (wait) {
     const payload = phaseHealthPayload({ mine: false, remainingS: 13, elapsedS: 587 });
     const fixture = commandFixture(payload);
-    await capture(runHealth({ session: '', json: false }), fixture);
-    // `_mirror_health` writes exactly these two files, and `show`'s header and
-    // `wait`'s cached-phase note read them back.
-    const header = fs.readFileSync(fixture.mirror('header.txt'), 'utf8');
-    expect(header).toContain('phase     awaiting_agent · turn 3 phase 1 · active no');
-    expect(header).toContain('game_state running · observation yes · legal_actions yes');
-    const marker: unknown = JSON.parse(fs.readFileSync(fixture.mirror('phase.json'), 'utf8'));
-    expect(marker).toMatchObject({ turn: 3, phase: 1, active: false, state: 'awaiting_agent' });
+    yield* wait(capture(runHealth({ session: '', json: false }), fixture));
+    yield* wait(withTestFileSystem((files) =>
+      Effect.gen(function* () {
+        const header = yield* files.readFileString(fixture.mirror('header.txt'));
+        expect(header).toContain('phase     awaiting_agent · turn 3 phase 1 · active no');
+        expect(header).toContain('game_state running · observation yes · legal_actions yes');
+        const markerText = yield* files.readFileString(fixture.mirror('phase.json'));
+        const marker = yield* Schema.decodeUnknown(Schema.parseJson(Schema.Unknown))(markerText);
+        expect(marker).toMatchObject({ turn: 3, phase: 1, active: false, state: 'awaiting_agent' });
+      }).pipe(Effect.orDie)
+    ));
   });
 
-  test('--json refreshes the mirror too — the write is not part of the render', async () => {
+  awaitTest('--json refreshes the mirror too — the write is not part of the render', function* (wait) {
     const fixture = commandFixture(phaseHealthPayload({ mine: true }));
-    await capture(runHealth({ session: '', json: true }), fixture);
-    expect(fs.existsSync(fixture.mirror('header.txt'))).toBe(true);
-    expect(fs.existsSync(fixture.mirror('phase.json'))).toBe(true);
+    yield* wait(capture(runHealth({ session: '', json: true }), fixture));
+    yield* wait(withTestFileSystem((files) =>
+      Effect.gen(function* () {
+        expect(yield* files.exists(fixture.mirror('header.txt'))).toBe(true);
+        expect(yield* files.exists(fixture.mirror('phase.json'))).toBe(true);
+      }).pipe(Effect.orDie)
+    ));
   });
 
-  test('a drifted controller label is a refusal, not a rendered line', async () => {
+  awaitTest('a drifted controller label is a refusal, not a rendered line', function* (wait) {
     const payload = {
       ...phaseHealthPayload({ mine: true }),
       agent: { agent_id: identity().agentId, controller_label: 'claude-other-model' },
     };
     const fixture = commandFixture(payload);
-    const outcome = await Effect.runPromise(
-      Effect.either(Effect.provide(runHealth({ session: '', json: false }), fixture.layer))
+    const outcome = yield* wait(
+      Effect.runPromise(
+        Effect.either(provideTestLayer(runHealth({ session: '', json: false }), fixture.layer))
+      )
     );
     expect(Either.isLeft(outcome)).toBe(true);
     if (Either.isLeft(outcome)) {
@@ -497,10 +505,12 @@ describe('play health', () => {
     }
   });
 
-  test('a non-2xx body is raised as a validated refusal', async () => {
+  awaitTest('a non-2xx body is raised as a validated refusal', function* (wait) {
     const fixture = commandFixture(errorPayload(), 404);
-    const outcome = await Effect.runPromise(
-      Effect.either(Effect.provide(runHealth({ session: '', json: false }), fixture.layer))
+    const outcome = yield* wait(
+      Effect.runPromise(
+        Effect.either(provideTestLayer(runHealth({ session: '', json: false }), fixture.layer))
+      )
     );
     expect(Either.isLeft(outcome)).toBe(true);
     if (Either.isLeft(outcome)) {

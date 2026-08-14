@@ -10,23 +10,21 @@
  * "still not your turn", a briefing printed for a phase the caller did not
  * hold, and a marker file frozen for the whole of somebody else's ten minutes.
  */
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { Command } from '@effect/cli';
 import { BunContext } from '@effect/platform-bun';
-import { afterEach, describe, expect, test } from 'bun:test';
-import { Effect, Either, Layer } from 'effect';
+import { afterEach, describe, expect } from 'bun:test';
+import { Effect, Either, Layer, Schema } from 'effect';
 import { V2_SATISFIED_WAKE_REASONS, V2_WAKE_REASONS } from 'src/constants';
 import { V2_WAIT_EXIT_ACTIVE, V2_WAIT_EXIT_RETRY, V2_WAIT_EXIT_TERMINAL } from 'src/exit';
 import { decodeHealth, type HealthEnvelope } from 'src/schema/health';
-import type { JsonObject } from 'src/schema/primitives';
+import type { JsonObject, JsonValue } from 'src/schema/primitives';
 import { decodeWait, type WaitEnvelope } from 'src/schema/wait';
 import { liveWaitHooks, waitCommandWith, type WaitHooksFor } from 'src/commands/wait.cmd';
 import { V2_PROTOCOL_CARD } from 'src/render/join';
 import { renderWait } from 'src/render/wait';
 import { httpFor } from 'src/services/http';
 import { DEFAULT_COMMAND_CARD, mirrorDir } from 'src/services/mirror';
-import { PrivateFs, type PrivateFsApi } from 'src/services/private-fs';
+import { type PrivateFsApi } from 'src/services/private-fs';
 import { pyJsonDumps } from 'src/services/json-output';
 import {
   SessionStore,
@@ -48,6 +46,9 @@ import {
   type WaitClock,
   type WaitHooks,
 } from 'src/services/wait';
+import { captureEffect } from 'test/_capture';
+import { awaitTest, provideTestLayer } from 'test/_effect-test';
+import { fixtureBoolean, fixtureNumber, fixtureObject, leftValue, rightValue } from 'test/_expect';
 import {
   healthPayload,
   jsonResponse,
@@ -57,16 +58,60 @@ import {
   waitPayload,
   type Scratch,
 } from 'test/_fixtures';
+import { fileSystem, path } from 'test/_test-platform';
 
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
 
+type FetchInput = Parameters<typeof fetch>[0];
+type FetchArguments = Parameters<typeof fetch>;
+
+const urlOf = (input: FetchInput): string =>
+  input instanceof Request ? input.url : new URL(input).href;
+
+const completeFetch = (
+  handler: (...args: FetchArguments) => ReturnType<typeof fetch>
+): typeof fetch => Object.assign(handler, { preconnect: fetch.preconnect });
+
+interface AnsweringServer {
+  readonly fetch: typeof fetch;
+  readonly urls: ReadonlyArray<string>;
+}
+
+interface LegacyRevisionServer {
+  readonly fetch: typeof fetch;
+  readonly urls: ReadonlyArray<string>;
+}
+
+const OpenApiWakeReasons = Schema.Struct({
+  components: Schema.Struct({
+    schemas: Schema.Struct({
+      WaitEnvelope: Schema.Struct({
+        properties: Schema.Struct({
+          wake_reason: Schema.Struct({
+            enum: Schema.Array(Schema.String),
+          }),
+        }),
+      }),
+    }),
+  }),
+});
+
+const OPENAPI_PATH = path.resolve(
+  import.meta.dir,
+  '..',
+  '..',
+  'play',
+  'docs',
+  'full-control-v2.openapi.json'
+);
+
 const scratches: Scratch[] = [];
 
-afterEach(() => {
-  while (scratches.length > 0) scratches.pop()?.cleanup();
-});
+afterEach(() =>
+  Promise.all(scratches.splice(0).map((scratch) => scratch.cleanup()))
+);
 
 const stateSchema = {
   empty: emptyV2ClientState,
@@ -75,6 +120,7 @@ const stateSchema = {
 };
 
 interface Bench {
+  readonly scratch: Scratch;
   readonly sessionPath: string;
   readonly session: Session;
   readonly store: SessionStoreApi;
@@ -88,12 +134,12 @@ const bench = (): Bench => {
   Effect.runSync(scratch.files.writeJson(sessionPath, sessionFile()));
   const store = sessionStoreFor(scratch.workspace, scratch.files, stateSchema, {});
   const loaded = Effect.runSync(store.resolveV2(sessionPath));
-  return { sessionPath, session: loaded.session, store, files: scratch.files };
+  return { scratch, sessionPath, session: loaded.session, store, files: scratch.files };
 };
 
 /** `_holder_seat`; U06 owns the real one, the engine takes it as a hook. */
 const holderSeat: HolderSeatFn = (phase) => {
-  if (phase === null ||  phase.active) return null;
+  if (phase === null || phase.active) return null;
   const waitingOn = phase.waiting_on;
   if (waitingOn === undefined || waitingOn === null) return null;
   const others = waitingOn.seats.filter((row) => row.is_self === false);
@@ -142,30 +188,23 @@ const run = <A, E>(
   effect: Effect.Effect<A, E, V2Client | SessionStore>,
   fetchImpl: typeof fetch,
   store: SessionStoreApi
-): Promise<Either.Either<A, E>> =>
-  Effect.runPromise(Effect.either(Effect.provide(effect, layers(fetchImpl, store))));
+): Effect.Effect<Either.Either<A, E>> =>
+  Effect.either(provideTestLayer(effect, layers(fetchImpl, store)));
 
-const right = <A, E>(either: Either.Either<A, E>): A => {
-  expect(Either.isRight(either)).toBe(true);
-  if (Either.isLeft(either)) throw new Error(`expected success, got ${JSON.stringify(either.left)}`);
-  return either.right;
-};
+const right = <A, E>(either: Either.Either<A, E>): A => rightValue(either);
 
-const message = <A>(either: Either.Either<A, { readonly message: string }>): string => {
-  expect(Either.isLeft(either)).toBe(true);
-  return Either.isLeft(either) ? either.left.message : '';
-};
+const message = <A>(either: Either.Either<A, { readonly message: string }>): string =>
+  leftValue(either).message;
 
-const urlOf = (input: Parameters<typeof fetch>[0]): string =>
-  typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-
-const answering = (body: unknown): { readonly fetch: typeof fetch; readonly urls: string[] } => {
+const answering = (body: JsonValue): AnsweringServer => {
   const urls: string[] = [];
-  const impl = (async (input: Parameters<typeof fetch>[0]): Promise<Response> => {
-    urls.push(urlOf(input));
-    return jsonResponse(body);
-  }) as typeof fetch;
-  return { fetch: impl, urls };
+  return {
+    urls,
+    fetch: completeFetch((input) => {
+      urls.push(urlOf(input));
+      return Promise.resolve(jsonResponse(body));
+    }),
+  };
 };
 
 // ---------------------------------------------------------------------------
@@ -181,20 +220,58 @@ const OPPONENT: JsonObject = {
   is_self: false,
 };
 
-interface PvpShape {
+interface PvpWaitFixture {
   readonly mine: boolean;
   readonly remainingS?: number;
   readonly elapsedS?: number;
   readonly gameState?: string;
 }
 
-const pvpHealth = (shape: PvpShape): JsonObject => {
-  const elapsedS = shape.elapsedS ?? 13;
-  const remainingS = shape.remainingS ?? 587;
-  const terminal = shape.gameState !== undefined && shape.gameState !== 'running';
+const pvpPhaseBody = (
+  fixture: PvpWaitFixture,
+  elapsedS: number,
+  remainingS: number
+): JsonObject => {
+  const timing: JsonObject = {
+    mode: 'default',
+    timeout_s: 600,
+    deadline_started_at: 1000,
+    deadline_at: 1600,
+    elapsed_s: elapsedS,
+    remaining_s: remainingS,
+  };
+  if (fixture.mine) {
+    return {
+      state: 'awaiting_agent',
+      turn: 3,
+      phase: 1,
+      active: true,
+      timing,
+    };
+  }
+  return {
+    state: 'awaiting_agent',
+    turn: 3,
+    phase: 1,
+    active: false,
+    timing,
+    waiting_on: {
+      kind: 'other_seat',
+      summary:
+        'Seat 2 AgentPlace2 (pi-gpt-5.6-sol) holds turn 3 phase 1 and has not ended it.',
+      waiting_s: elapsedS,
+      seats: [OPPONENT],
+    },
+  };
+};
+
+const pvpHealth = (fixture: PvpWaitFixture): JsonObject => {
+  const elapsedS = fixture.elapsedS ?? 13;
+  const remainingS = fixture.remainingS ?? 587;
+  const terminal = fixture.gameState !== undefined && fixture.gameState !== 'running';
   if (terminal) {
     return healthPayload({
-      game_state: shape.gameState ?? 'completed',
+      game_state: fixture.gameState ?? 'completed',
       phase: null,
       observation_available: false,
       legal_actions_available: false,
@@ -202,73 +279,47 @@ const pvpHealth = (shape: PvpShape): JsonObject => {
   }
   return healthPayload({
     game_state: 'running',
-    phase: {
-      state: 'awaiting_agent',
-      turn: 3,
-      phase: 1,
-      active: shape.mine,
-      timing: {
-        mode: 'default',
-        timeout_s: 600,
-        deadline_started_at: 1000,
-        deadline_at: 1600,
-        elapsed_s: elapsedS,
-        remaining_s: remainingS,
-      },
-      ...(shape.mine
-        ? {}
-        : {
-            waiting_on: {
-              kind: 'other_seat',
-              summary:
-                'Seat 2 AgentPlace2 (pi-gpt-5.6-sol) holds turn 3 phase 1 and has not ended it.',
-              waiting_s: elapsedS,
-              seats: [OPPONENT],
-            },
-          }),
-    },
+    phase: pvpPhaseBody(fixture, elapsedS, remainingS),
   });
 };
 
-const pvpWake = (reason: string, shape: PvpShape): JsonObject =>
-  waitPayload({ wake_reason: reason, health: pvpHealth(shape) });
+const pvpWake = (reason: string, fixture: PvpWaitFixture): JsonObject =>
+  waitPayload({ wake_reason: reason, health: pvpHealth(fixture) });
 
-const decodedWake = (payload: JsonObject, session: Session): Promise<WaitEnvelope> =>
-  Effect.runPromise(decodeWait(payload, session, { until: 'phase', afterStateToken: null }));
+const decodedWake = (payload: JsonObject, session: Session): Effect.Effect<WaitEnvelope> =>
+  decodeWait(payload, session, { until: 'phase', afterStateToken: null }).pipe(Effect.orDie);
+
+const loadOpenApiWakeReasons = (): Effect.Effect<ReadonlyArray<string>> =>
+  Effect.gen(function* () {
+    const contractText = yield* fileSystem.readFileString(OPENAPI_PATH);
+    const parsed = yield* Schema.decodeUnknown(Schema.parseJson(Schema.Unknown))(contractText);
+    const contract = yield* Schema.decodeUnknown(OpenApiWakeReasons)(parsed);
+    return contract.components.schemas.WaitEnvelope.properties.wake_reason.enum;
+  }).pipe(Effect.orDie);
 
 // ---------------------------------------------------------------------------
 // P0a: the wake reason the server could always send
 // ---------------------------------------------------------------------------
 
 describe('boundary_recovered', () => {
-  test('is a wake reason the client accepts, and a satisfied one', async () => {
+  awaitTest('is a wake reason the client accepts, and a satisfied one', function* () {
     // It arrives when this seat's native boundary was republished under a wait
     // — and on the `--end --await` path it surfaced as `await failed:` *after*
     // the phase end had applied, which is the one moment a client must not be
     // telling the agent it does not understand the server.
     expect(V2_WAKE_REASONS.has('boundary_recovered')).toBe(true);
     const seat = bench();
-    const wake = await decodedWake(pvpWake('boundary_recovered', { mine: true }), seat.session);
+    const wake = yield* decodedWake(pvpWake('boundary_recovered', { mine: true }), seat.session);
     expect(wake.wake_reason).toBe('boundary_recovered');
     expect(waitExitCode(wake)).toBe(V2_WAIT_EXIT_ACTIVE);
     expect(V2_SATISFIED_WAKE_REASONS.has('boundary_recovered')).toBe(true);
   });
 
-  test('the served OpenAPI lists every wake reason the client takes', () => {
-    const contract = JSON.parse(
-      fs.readFileSync(
-        path.join(import.meta.dir, '..', '..', 'play', 'docs', 'full-control-v2.openapi.json'),
-        'utf-8'
-      )
-    ) as {
-      components: {
-        schemas: {
-          WaitEnvelope: { properties: { wake_reason: { enum: ReadonlyArray<string> } } };
-        };
-      };
-    };
-    const enumerated = contract.components.schemas.WaitEnvelope.properties.wake_reason.enum;
-    expect([...enumerated].sort()).toEqual([...V2_WAKE_REASONS].sort());
+  awaitTest('the served OpenAPI lists every wake reason the client takes', function* () {
+    const enumerated = yield* loadOpenApiWakeReasons();
+    expect([...enumerated].toSorted((a, b) => a.localeCompare(b))).toEqual(
+      [...V2_WAKE_REASONS].toSorted((a, b) => a.localeCompare(b))
+    );
   });
 });
 
@@ -284,23 +335,22 @@ describe('the exit status', () => {
     ['game_terminal', { mine: false, gameState: 'completed' }, V2_WAIT_EXIT_TERMINAL],
   ] as const;
 
-  test.each(CASES.map(([reason, shape, code]) => [reason, code, shape] as const))(
-    'a real %s wake exits %p',
-    async (reason, code, shape) => {
+  for (const [reason, fixture, code] of CASES) {
+    awaitTest(`a real ${reason} wake exits ${code}`, function* (wait) {
       const seat = bench();
       const kit = recorder();
-      const server = answering(pvpWake(reason, shape));
+      const server = answering(pvpWake(reason, fixture));
       const ctx = waitCtx({
         sessionPath: seat.sessionPath,
         session: seat.session,
         hooks: kit.hooks,
       });
-      const wake = right(await run(waitCommandValue(ctx, waitArgs({})), server.fetch, seat.store));
+      const wake = right(yield* wait(run(waitCommandValue(ctx, waitArgs({})), server.fetch, seat.store)));
       expect(waitExitCode(wake)).toBe(code);
-    }
-  );
+    });
+  }
 
-  test('a lobby timeout is EX_TEMPFAIL, not success, and calls no state route', async () => {
+  awaitTest('a lobby timeout is EX_TEMPFAIL, not success, and calls no state route', function* (wait) {
     const seat = bench();
     const kit = recorder();
     const server = answering(
@@ -327,7 +377,7 @@ describe('the exit status', () => {
     );
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: kit.hooks });
     const wake = right(
-      await run(waitCommandValue(ctx, waitArgs({ waitS: 0 })), server.fetch, seat.store)
+      yield* wait(run(waitCommandValue(ctx, waitArgs({ waitS: 0 })), server.fetch, seat.store))
     );
     // A timeout means "still not yours, call me again", which is EX_TEMPFAIL
     // and not success — and the lobby never costs a `/state` round trip.
@@ -337,22 +387,22 @@ describe('the exit status', () => {
     expect(waitExitCode(wake)).toBe(V2_WAIT_EXIT_RETRY);
   });
 
-  test('a terminal game stops the loop with EX_NOINPUT', async () => {
+  awaitTest('a terminal game stops the loop with EX_NOINPUT', function* (wait) {
     const seat = bench();
     const kit = recorder();
     const server = answering(pvpWake('game_terminal', { mine: false, gameState: 'completed' }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: kit.hooks });
-    const wake = right(await run(waitCommandValue(ctx, waitArgs({})), server.fetch, seat.store));
+    const wake = right(yield* wait(run(waitCommandValue(ctx, waitArgs({})), server.fetch, seat.store)));
     expect(waitExitCode(wake)).toBe(V2_WAIT_EXIT_TERMINAL);
   });
 
-  test('the JSON payload is unchanged by the exit status', async () => {
+  awaitTest('the JSON payload is unchanged by the exit status', function* (wait) {
     const seat = bench();
     const kit = recorder();
     const payload = pvpWake('timeout', { mine: false });
     const server = answering(payload);
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: kit.hooks });
-    const wake = right(await run(waitCommandValue(ctx, waitArgs({})), server.fetch, seat.store));
+    const wake = right(yield* wait(run(waitCommandValue(ctx, waitArgs({})), server.fetch, seat.store)));
     expect(waitExitCode(wake)).toBe(V2_WAIT_EXIT_RETRY);
     // What `--json` prints is the *validated* envelope, and it must round-trip
     // to the wire payload byte for byte.
@@ -371,18 +421,17 @@ interface Clocked {
   readonly now: { seconds: number };
 }
 
-const clocked = (script: (elapsed: number) => unknown): Clocked => {
+const clocked = (script: (elapsed: number) => JsonValue): Clocked => {
   const now = { seconds: 0 };
   const blocked: number[] = [];
-  const impl = (async (input: Parameters<typeof fetch>[0]): Promise<Response> => {
-    const url = new URL(urlOf(input));
-    const waited = Number(url.searchParams.get('wait_s') ?? '0');
-    blocked.push(waited);
-    now.seconds += waited;
-    return jsonResponse(script(now.seconds));
-  }) as typeof fetch;
   return {
-    fetch: impl,
+    fetch: completeFetch((input) => {
+      const url = new URL(urlOf(input));
+      const waited = Number(url.searchParams.get('wait_s') ?? '0');
+      blocked.push(waited);
+      now.seconds += waited;
+      return Promise.resolve(jsonResponse(script(now.seconds)));
+    }),
     blocked,
     now,
     clock: {
@@ -396,22 +445,22 @@ const clocked = (script: (elapsed: number) => unknown): Clocked => {
 };
 
 describe('the wait ceiling', () => {
-  test('covers a whole opponent phase', async () => {
+  awaitTest('covers a whole opponent phase', function* (wait) {
     expect(V2_WAIT_S_MAX).toBe(615);
     const seat = bench();
     const kit = recorder();
     const server = answering(pvpWake('phase_active', { mine: true }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: kit.hooks });
-    right(await run(waitCommandValue(ctx, waitArgs({ waitS: 615 })), server.fetch, seat.store));
+    right(yield* wait(run(waitCommandValue(ctx, waitArgs({ waitS: 615 })), server.fetch, seat.store)));
     expect(server.urls[0]).toContain('wait_s=615');
     expect(
-      message(await run(waitCommandValue(ctx, waitArgs({ waitS: 616 })), server.fetch, seat.store))
+      message(yield* wait(run(waitCommandValue(ctx, waitArgs({ waitS: 616 })), server.fetch, seat.store)))
     ).toContain('[0, 615]');
   });
 });
 
 describe('--for-turn', () => {
-  test('is bounded by the holder remaining deadline', async () => {
+  awaitTest('is bounded by the holder remaining deadline', function* (wait) {
     const seat = bench();
     const kit = recorder();
     const fake = clocked((elapsed) =>
@@ -428,10 +477,12 @@ describe('--for-turn', () => {
       clock: fake.clock,
     });
     const wake = right(
-      await run(
-        waitCommandValue(ctx, waitArgs({}), { forTurn: true, echo: kit.echo }),
-        fake.fetch,
-        seat.store
+      yield* wait(
+        run(
+          waitCommandValue(ctx, waitArgs({}), { forTurn: true, echo: kit.echo }),
+          fake.fetch,
+          seat.store
+        )
       )
     );
     expect(waitExitCode(wake)).toBe(V2_WAIT_EXIT_RETRY);
@@ -444,7 +495,7 @@ describe('--for-turn', () => {
     expect(kit.ticks[0]?.phase?.waiting_on?.seats[0]?.player_name).toBe('AgentPlace2');
   });
 
-  test('returns the moment the phase is ours', async () => {
+  awaitTest('returns the moment the phase is ours', function* (wait) {
     const seat = bench();
     const kit = recorder();
     const fake = clocked((elapsed) =>
@@ -460,13 +511,13 @@ describe('--for-turn', () => {
       clock: fake.clock,
     });
     const wake = right(
-      await run(waitCommandValue(ctx, waitArgs({}), { forTurn: true }), fake.fetch, seat.store)
+      yield* wait(run(waitCommandValue(ctx, waitArgs({}), { forTurn: true }), fake.fetch, seat.store))
     );
     expect(waitExitCode(wake)).toBe(V2_WAIT_EXIT_ACTIVE);
     expect(fake.now.seconds).toBe(30);
   });
 
-  test('--max is a hard ceiling over the holder deadline', async () => {
+  awaitTest('--max is a hard ceiling over the holder deadline', function* (wait) {
     const seat = bench();
     const kit = recorder();
     const fake = clocked((elapsed) =>
@@ -479,34 +530,36 @@ describe('--for-turn', () => {
       clock: fake.clock,
     });
     const wake = right(
-      await run(
-        waitCommandValue(ctx, waitArgs({}), { forTurn: true, maxS: 45 }),
-        fake.fetch,
-        seat.store
+      yield* wait(
+        run(
+          waitCommandValue(ctx, waitArgs({}), { forTurn: true, maxS: 45 }),
+          fake.fetch,
+          seat.store
+        )
       )
     );
     expect(waitExitCode(wake)).toBe(V2_WAIT_EXIT_RETRY);
     expect(fake.now.seconds).toBe(45);
   });
 
-  test('--max without --for-turn is refused rather than ignored', async () => {
+  awaitTest('--max without --for-turn is refused rather than ignored', function* (wait) {
     const seat = bench();
     const kit = recorder();
     const server = answering(pvpWake('phase_active', { mine: true }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: kit.hooks });
     expect(
       message(
-        await run(waitCommandValue(ctx, waitArgs({}), { maxS: 30 }), server.fetch, seat.store)
+        yield* wait(run(waitCommandValue(ctx, waitArgs({}), { maxS: 30 }), server.fetch, seat.store))
       )
     ).toContain('--for-turn');
   });
 
-  test('a plain wait still makes exactly one request', async () => {
+  awaitTest('a plain wait still makes exactly one request', function* (wait) {
     const seat = bench();
     const kit = recorder();
     const server = answering(pvpWake('timeout', { mine: false }));
     const ctx = waitCtx({ sessionPath: seat.sessionPath, session: seat.session, hooks: kit.hooks });
-    right(await run(waitCommandValue(ctx, waitArgs({})), server.fetch, seat.store));
+    right(yield* wait(run(waitCommandValue(ctx, waitArgs({})), server.fetch, seat.store)));
     expect(server.urls).toHaveLength(1);
     expect(server.urls[0]).toContain('wait_s=120');
   });
@@ -517,7 +570,7 @@ describe('--for-turn', () => {
 // ---------------------------------------------------------------------------
 
 describe('the phase marker', () => {
-  test('is written on every tick of a wait, not once at the end', async () => {
+  awaitTest('is written on every tick of a wait, not once at the end', function* (wait) {
     const seat = bench();
     const kit = recorder();
     const fake = clocked((elapsed) =>
@@ -534,10 +587,12 @@ describe('the phase marker', () => {
       clock: fake.clock,
     });
     right(
-      await run(
-        waitCommandValue(ctx, waitArgs({}), { forTurn: true, echo: kit.echo }),
-        fake.fetch,
-        seat.store
+      yield* wait(
+        run(
+          waitCommandValue(ctx, waitArgs({}), { forTurn: true, echo: kit.echo }),
+          fake.fetch,
+          seat.store
+        )
       )
     );
     // One write per request: refreshed between every pair of polls.
@@ -553,9 +608,9 @@ describe('the phase marker', () => {
 // ---------------------------------------------------------------------------
 
 describe('the rendered wake', () => {
-  test('a timeout wake names the holder instead of calling it a wake', async () => {
+  awaitTest('a timeout wake names the holder instead of calling it a wake', function* () {
     const seat = bench();
-    const wake = await decodedWake(pvpWake('timeout', { mine: false }), seat.session);
+    const wake = yield* decodedWake(pvpWake('timeout', { mine: false }), seat.session);
     const lines = renderWait(wake);
     expect(lines[0]).toContain('still seat 2 AgentPlace2 (pi-gpt-5.6-sol)');
     expect(lines[0]).toContain('held 13s');
@@ -567,9 +622,9 @@ describe('the rendered wake', () => {
     expect(lines[1]).toContain('NOT YOUR TURN · seat 2 AgentPlace2');
   });
 
-  test('text is the default and nothing raw leaks into it', async () => {
+  awaitTest('text is the default and nothing raw leaks into it', function* () {
     const seat = bench();
-    const wake = await decodedWake(pvpWake('phase_active', { mine: true }), seat.session);
+    const wake = yield* decodedWake(pvpWake('phase_active', { mine: true }), seat.session);
     const text = renderWait(wake).join('\n');
     expect(text.startsWith('{')).toBe(false);
     expect(text).toContain('YOUR TURN · t3/p1');
@@ -590,57 +645,52 @@ describe('the rendered wake', () => {
  * care about the wire and the exit status, and `liveWaitHooks` for the cases
  * that must see what the command actually writes into the mirror.
  */
-const runCommandWith = async (
+const runCommandWith = (
   seat: Bench,
   makeHooks: WaitHooksFor,
   fetchImpl: typeof fetch,
   flags: ReadonlyArray<string>
-): Promise<{ readonly code: number; readonly out: ReadonlyArray<string> }> => {
+): Effect.Effect<{ readonly code: number; readonly out: ReadonlyArray<string> }> => {
   const command = waitCommandWith(makeHooks);
-  const out: string[] = [];
-  const originalLog = console.log;
-  console.log = (...parts: ReadonlyArray<unknown>) => out.push(parts.join(' '));
-  try {
-    const either = await Effect.runPromise(
-      Effect.either(
-        Effect.provide(
-          Command.run(command, { name: 'play', version: '0.1.0' })([
-            'bun',
-            'play',
-            '--session',
-            seat.sessionPath,
-            ...flags,
-          ]),
-          Layer.mergeAll(
-            layers(fetchImpl, seat.store),
-            BunContext.layer,
-            Layer.succeed(PrivateFs, seat.files)
-          )
-        )
+  return captureEffect(
+    Effect.either(
+      provideTestLayer(
+        Command.run(command, { name: 'play', version: '0.1.0' })([
+          'bun',
+          'play',
+          '--session',
+          seat.sessionPath,
+          ...flags,
+        ]),
+        Layer.mergeAll(layers(fetchImpl, seat.store), BunContext.layer, seat.scratch.layer)
       )
-    );
-    if (Either.isRight(either)) return { code: 0, out };
-    const failure = either.left;
-    return {
-      code: failure._tag === 'ExitCodeSignal' ? failure.code : 2,
-      out,
-    };
-  } finally {
-    console.log = originalLog;
-  }
+    )
+  ).pipe(
+    Effect.map(({ value, captured }) => {
+      const out = captured.out;
+      if (Either.isRight(value)) return { code: 0, out };
+      const failure = value.left;
+      return {
+        code: failure._tag === 'ExitCodeSignal' ? failure.code : 2,
+        out,
+      };
+    })
+  );
 };
 
 /** Blocked once, then ours: exactly one internal tick, then the wake. */
 const oneTickThenOurs = (): typeof fetch => {
   const calls = { count: 0 };
-  return (async (_input: Parameters<typeof fetch>[0]): Promise<Response> => {
+  return completeFetch(() => {
     calls.count += 1;
-    return jsonResponse(
+    return Promise.resolve(
       calls.count === 1
-        ? pvpWake('timeout', { mine: false, remainingS: 30 })
-        : pvpWake('phase_active', { mine: true })
+        ? jsonResponse(
+            pvpWake('timeout', { mine: false, remainingS: 30 })
+          )
+        : jsonResponse(pvpWake('phase_active', { mine: true }))
     );
-  }) as typeof fetch;
+  });
 };
 
 /** The recorder seam: the wire and the exit status, no filesystem writes. */
@@ -649,7 +699,7 @@ const runWaitCommand = (
   kit: Kit,
   fetchImpl: typeof fetch,
   flags: ReadonlyArray<string>
-): Promise<{ readonly code: number; readonly out: ReadonlyArray<string> }> =>
+): Effect.Effect<{ readonly code: number; readonly out: ReadonlyArray<string> }> =>
   runCommandWith(seat, () => Effect.succeed(kit.hooks), fetchImpl, flags);
 
 describe('play wait', () => {
@@ -660,21 +710,20 @@ describe('play wait', () => {
     ['game_terminal', { mine: false, gameState: 'completed' }, V2_WAIT_EXIT_TERMINAL],
   ] as const;
 
-  test.each(CASES.map(([reason, shape, code]) => [reason, code, shape] as const))(
-    'exits %p → %p on a real wake',
-    async (reason, code, shape) => {
+  for (const [reason, fixture, code] of CASES) {
+    awaitTest(`exits ${reason} → ${code} on a real wake`, function* (wait) {
       const seat = bench();
       const kit = recorder();
-      const result = await runWaitCommand(seat, kit, answering(pvpWake(reason, shape)).fetch, []);
+      const result = yield* wait(runWaitCommand(seat, kit, answering(pvpWake(reason, fixture)).fetch, []));
       expect(result.code).toBe(code);
-    }
-  );
+    });
+  }
 
-  test('prints compact text and keeps JSON behind the flag', async () => {
+  awaitTest('prints compact text and keeps JSON behind the flag', function* (wait) {
     const seat = bench();
     const payload = pvpWake('phase_active', { mine: true });
 
-    const text = await runWaitCommand(seat, recorder(), answering(payload).fetch, []);
+    const text = yield* wait(runWaitCommand(seat, recorder(), answering(payload).fetch, []));
     expect(text.code).toBe(V2_WAIT_EXIT_ACTIVE);
     expect(text.out[0]?.startsWith('{')).toBe(false);
     expect(text.out[0]).toContain('YOUR TURN · t3/p1');
@@ -682,60 +731,57 @@ describe('play wait', () => {
     expect(text.out[1]?.startsWith('health running')).toBe(true);
     expect(text.out.join('\n')).not.toContain('deadline_started_at');
 
-    const json = await runWaitCommand(seat, recorder(), answering(payload).fetch, ['--json']);
+    const json = yield* wait(runWaitCommand(seat, recorder(), answering(payload).fetch, ['--json']));
     expect(json.code).toBe(V2_WAIT_EXIT_ACTIVE);
     expect(JSON.parse(json.out.join('\n'))).toEqual(payload);
   });
 
-  test('the JSON payload is unchanged by the exit status', async () => {
+  awaitTest('the JSON payload is unchanged by the exit status', function* (wait) {
     const seat = bench();
     const payload = pvpWake('timeout', { mine: false });
-    const json = await runWaitCommand(seat, recorder(), answering(payload).fetch, ['--json']);
+    const json = yield* wait(runWaitCommand(seat, recorder(), answering(payload).fetch, ['--json']));
     expect(json.code).toBe(V2_WAIT_EXIT_RETRY);
     expect(JSON.parse(json.out.join('\n'))).toEqual(payload);
   });
 
-  test('a --for-turn tick is prose on stdout, and the wake follows it', async () => {
+  awaitTest('a --for-turn tick is prose on stdout, and the wake follows it', function* (wait) {
     const seat = bench();
-    const result = await runWaitCommand(seat, recorder(), oneTickThenOurs(), ['--for-turn']);
+    const result = yield* wait(runWaitCommand(seat, recorder(), oneTickThenOurs(), ['--for-turn']));
     expect(result.code).toBe(V2_WAIT_EXIT_ACTIVE);
     expect(result.out[0]).toContain('… waiting on seat 2 AgentPlace2 (pi-gpt-5.6-sol)');
     expect(result.out[1]).toContain('YOUR TURN · t3/p1');
   });
 
-  test('--json prints one object and no tick prose', async () => {
+  awaitTest('--json prints one object and no tick prose', function* (wait) {
     const seat = bench();
-    const result = await runWaitCommand(seat, recorder(), oneTickThenOurs(), [
-      '--json',
-      '--for-turn',
-    ]);
+    const result = yield* wait(runWaitCommand(seat, recorder(), oneTickThenOurs(), ['--json', '--for-turn']));
     expect(result.code).toBe(V2_WAIT_EXIT_ACTIVE);
     expect(result.out.join('\n')).not.toContain('… waiting');
     expect(JSON.parse(result.out.join('\n')).wake_reason).toBe('phase_active');
   });
 
-  test('both spellings of --wait-s are accepted, and never together', async () => {
+  awaitTest('both spellings of --wait-s are accepted, and never together', function* (wait) {
     const seat = bench();
     const payload = pvpWake('phase_active', { mine: true });
     for (const spelling of ['--wait-s', '--wait_s']) {
       const server = answering(payload);
-      const result = await runWaitCommand(seat, recorder(), server.fetch, [spelling, '30']);
+      const result = yield* wait(runWaitCommand(seat, recorder(), server.fetch, [spelling, '30']));
       expect(result.code).toBe(V2_WAIT_EXIT_ACTIVE);
       expect(server.urls[0]).toContain('wait_s=30');
     }
-    const both = await runWaitCommand(seat, recorder(), answering(payload).fetch, [
+    const both = yield* wait(runWaitCommand(seat, recorder(), answering(payload).fetch, [
       '--wait-s',
       '30',
       '--wait_s',
       '30',
-    ]);
+    ]));
     expect(both.code).toBe(2);
   });
 
-  test('--max without --for-turn refuses instead of ignoring the flag', async () => {
+  awaitTest('--max without --for-turn refuses instead of ignoring the flag', function* (wait) {
     const seat = bench();
     const server = answering(pvpWake('phase_active', { mine: true }));
-    const result = await runWaitCommand(seat, recorder(), server.fetch, ['--max', '30']);
+    const result = yield* wait(runWaitCommand(seat, recorder(), server.fetch, ['--max', '30']));
     expect(result.code).toBe(2);
     expect(server.urls).toHaveLength(0);
   });
@@ -744,6 +790,58 @@ describe('play wait', () => {
 // ---------------------------------------------------------------------------
 // The live hook record
 // ---------------------------------------------------------------------------
+
+const headerText = (seat: Bench): Effect.Effect<string> =>
+  Effect.gen(function* () {
+    const dir = yield* mirrorDir(seat.sessionPath);
+    return yield* fileSystem.readFileString(path.join(dir, 'state', 'header.txt'));
+  }).pipe(Effect.orDie);
+
+const OVERVIEW_PAGE: JsonObject = pagePayload([], {
+  state_revision: { turn: 5, revision: 13, state_token: 'token_5_13' },
+  page: {
+    section: 'overview',
+    items: [
+      {
+        client_state: 'running',
+        turn: 5,
+        map: { width: 64, height: 48 },
+        player: {
+          government: 'Despotism',
+          economy: { gold: 50, tax: 40, luxury: 0, science: 60 },
+        },
+        counts: { cities: 1, units: 2, known_tiles: 40, legal_actions: 9, chat: 4 },
+      },
+    ],
+    total_items: 1,
+    next_cursor: null,
+    cursor_expires_at: null,
+  },
+});
+
+/**
+ * `_legacy_wait_value` (client.py:9976-9977) runs `_remember_page` *and*
+ * `_mirror_page(path, cached, overview, "wait")` on the overview page it
+ * polled.  The wake is identical either way, which is exactly why an inert
+ * `mirrorPage` was invisible: the divergence only shows up in the *next*
+ * command, which reads a `state/*.tsv` still stamped at the old revision.
+ *
+ * The route this reaches is the pre-private-`/wait` supervisor's bare
+ * `{"error": "..."}` 404 — the shape `isMissingRouteRefusal` detects.
+ */
+const legacyRevisionServer = (overview: JsonObject): LegacyRevisionServer => {
+  const urls: string[] = [];
+  return {
+    urls,
+    fetch: completeFetch((input) => {
+      const url = urlOf(input);
+      urls.push(url);
+      if (url.includes('/me/wait?')) return Promise.resolve(jsonResponse({ error: 'Not Found' }, 404));
+      if (url.includes('/me/health')) return Promise.resolve(jsonResponse(pvpHealth({ mine: false })));
+      return Promise.resolve(jsonResponse(overview));
+    }),
+  };
+};
 
 /**
  * Everything above drives the command through the recorder seam, which proves
@@ -763,25 +861,16 @@ describe('play wait', () => {
  * (tests/test_client.py:7194-7254).
  */
 describe('liveWaitHooks', () => {
-  const headerText = (seat: Bench): string => {
-    const dir = Effect.runSync(mirrorDir(seat.sessionPath));
-    return fs.readFileSync(path.join(dir, 'state', 'header.txt'), 'utf-8');
-  };
-
-  test('mirrorHealth writes the full protocol card into state/header.txt', async () => {
+  awaitTest('mirrorHealth writes the full protocol card into state/header.txt', function* () {
     const seat = bench();
-    const health = await Effect.runPromise(
-      decodeHealth(pvpHealth({ mine: true }), seat.session)
+    const health = yield* decodeHealth(pvpHealth({ mine: true }), seat.session);
+    const hooks = yield* provideTestLayer(
+      liveWaitHooks(seat.sessionPath, seat.session),
+      Layer.merge(seat.scratch.layer, Layer.succeed(SessionStore, seat.store))
     );
-    const hooks = await Effect.runPromise(
-      Effect.provide(
-        liveWaitHooks(seat.sessionPath, seat.session),
-        Layer.merge(Layer.succeed(PrivateFs, seat.files), Layer.succeed(SessionStore, seat.store))
-      )
-    );
-    await Effect.runPromise(hooks.mirrorHealth(health, 'wait'));
+    yield* hooks.mirrorHealth(health, 'wait');
 
-    const header = headerText(seat);
+    const header = yield* headerText(seat);
     for (const line of V2_PROTOCOL_CARD) expect(header).toContain(line);
     // The default card is what a dropped option falls back to; none of its
     // lines belong in a header written by the client.
@@ -791,77 +880,30 @@ describe('liveWaitHooks', () => {
     expect(header).not.toContain('state_token');
   });
 
-  test('a --for-turn wait leaves a header a later `show header` can still read', async () => {
+  awaitTest('a --for-turn wait leaves a header a later `show header` can still read', function* (wait) {
     const seat = bench();
-    const result = await runCommandWith(seat, liveWaitHooks, oneTickThenOurs(), ['--for-turn']);
+    const result = yield* wait(runCommandWith(seat, liveWaitHooks, oneTickThenOurs(), ['--for-turn']));
     expect(result.code).toBe(V2_WAIT_EXIT_ACTIVE);
     // Two ticks wrote the header; the last write must still carry the card.
-    const header = headerText(seat);
+    const header = yield* headerText(seat);
     for (const line of V2_PROTOCOL_CARD) expect(header).toContain(line);
     expect(header).toContain('ONE CALL PER TURN');
     expect(header).toContain('MULTIPLAYER');
     expect(header).toContain('WHICH BINDING');
   });
 
-  test('the marker file is refreshed on the way through, not only at the wake', async () => {
+  awaitTest('the marker file is refreshed on the way through, not only at the wake', function* (wait) {
     const seat = bench();
-    const result = await runCommandWith(seat, liveWaitHooks, oneTickThenOurs(), ['--for-turn']);
+    const result = yield* wait(runCommandWith(seat, liveWaitHooks, oneTickThenOurs(), ['--for-turn']));
     expect(result.code).toBe(V2_WAIT_EXIT_ACTIVE);
-    const dir = Effect.runSync(mirrorDir(seat.sessionPath));
-    const marker = JSON.parse(
-      fs.readFileSync(path.join(dir, 'state', 'phase.json'), 'utf-8')
-    ) as { readonly turn: number; readonly active: boolean };
-    expect(marker.turn).toBe(3);
-    expect(marker.active).toBe(true);
+    const dir = yield* mirrorDir(seat.sessionPath);
+    const markerText = yield* fileSystem.readFileString(path.join(dir, 'state', 'phase.json'));
+    const marker = fixtureObject(JSON.parse(markerText));
+    expect(fixtureNumber(marker['turn'])).toBe(3);
+    expect(fixtureBoolean(marker['active'])).toBe(true);
   });
 
-  /**
-   * `_legacy_wait_value` (client.py:9976-9977) runs `_remember_page` *and*
-   * `_mirror_page(path, cached, overview, "wait")` on the overview page it
-   * polled.  The wake is identical either way, which is exactly why an inert
-   * `mirrorPage` was invisible: the divergence only shows up in the *next*
-   * command, which reads a `state/*.tsv` still stamped at the old revision.
-   *
-   * The route this reaches is the pre-private-`/wait` supervisor's bare
-   * `{"error": "..."}` 404 — the shape `isMissingRouteRefusal` detects.
-   */
-  const legacyRevisionServer = (
-    overview: JsonObject
-  ): { readonly fetch: typeof fetch; readonly urls: string[] } => {
-    const urls: string[] = [];
-    const impl = (async (input: Parameters<typeof fetch>[0]): Promise<Response> => {
-      const url = urlOf(input);
-      urls.push(url);
-      if (url.includes('/me/wait?')) return jsonResponse({ error: 'Not Found' }, 404);
-      if (url.includes('/me/health')) return jsonResponse(pvpHealth({ mine: false }));
-      return jsonResponse(overview);
-    }) as typeof fetch;
-    return { fetch: impl, urls };
-  };
-
-  const OVERVIEW_PAGE: JsonObject = pagePayload([], {
-    state_revision: { turn: 5, revision: 13, state_token: 'token_5_13' },
-    page: {
-      section: 'overview',
-      items: [
-        {
-          client_state: 'running',
-          turn: 5,
-          map: { width: 64, height: 48 },
-          player: {
-            government: 'Despotism',
-            economy: { gold: 50, tax: 40, luxury: 0, science: 60 },
-          },
-          counts: { cities: 1, units: 2, known_tiles: 40, legal_actions: 9, chat: 4 },
-        },
-      ],
-      total_items: 1,
-      next_cursor: null,
-      cursor_expires_at: null,
-    },
-  });
-
-  test('the legacy --until revision fallback projects the page it woke on', async () => {
+  awaitTest('the legacy --until revision fallback projects the page it woke on', function* (wait) {
     const seat = bench();
     Effect.runSync(
       seat.store.writeState(seat.sessionPath, {
@@ -870,28 +912,25 @@ describe('liveWaitHooks', () => {
       })
     );
     const server = legacyRevisionServer(OVERVIEW_PAGE);
-    const result = await runCommandWith(seat, liveWaitHooks, server.fetch, [
-      '--until',
-      'revision',
-    ]);
+    const result = yield* wait(runCommandWith(seat, liveWaitHooks, server.fetch, ['--until', 'revision']));
 
     // `revision_changed` is a satisfied wake, so the status is 0 either way —
     // the mirror is the only place the missing projection was ever visible.
     expect(result.code).toBe(V2_WAIT_EXIT_ACTIVE);
     expect(server.urls.some((url) => url.includes('section=overview&limit=16'))).toBe(true);
 
-    const dir = Effect.runSync(mirrorDir(seat.sessionPath));
-    const overview = fs.readFileSync(path.join(dir, 'state', 'overview.tsv'), 'utf-8');
+    const dir = yield* mirrorDir(seat.sessionPath);
+    const overview = yield* fileSystem.readFileString(path.join(dir, 'state', 'overview.tsv'));
     // Stamped at the revision the wake carried, not the baseline it started at.
     expect(overview.split('\n')[0]).toBe('# rev 13 turn 5');
     expect(overview).toContain('64x48');
     expect(overview).toContain('tax40 lux0 sci60');
     expect(overview).toContain('count_chat');
     // `state/delta.md` moves with it, exactly as `update_from_page` writes it.
-    expect(fs.existsSync(path.join(dir, 'state', 'delta.md'))).toBe(true);
+    expect(yield* fileSystem.exists(path.join(dir, 'state', 'delta.md'))).toBe(true);
   });
 
-  test('the projection uses the aliases this seat just learned from the page', async () => {
+  awaitTest('the projection uses the aliases this seat just learned from the page', function* (wait) {
     const seat = bench();
     Effect.runSync(
       seat.store.writeState(seat.sessionPath, {
@@ -899,11 +938,13 @@ describe('liveWaitHooks', () => {
         last_revision: { turn: 5, revision: 12, state_token: 'token_5_12' },
       })
     );
-    const result = await runCommandWith(
-      seat,
-      liveWaitHooks,
-      legacyRevisionServer(OVERVIEW_PAGE).fetch,
-      ['--until', 'revision']
+    const result = yield* wait(
+      runCommandWith(
+        seat,
+        liveWaitHooks,
+        legacyRevisionServer(OVERVIEW_PAGE).fetch,
+        ['--until', 'revision']
+      )
     );
     expect(result.code).toBe(V2_WAIT_EXIT_ACTIVE);
     // `_remember_page` runs before `_mirror_page` and CPython passes

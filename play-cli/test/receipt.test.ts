@@ -10,7 +10,7 @@
  * the other units assert against these bytes rather than inventing their own.
  */
 import { afterEach, describe, expect, test } from 'bun:test';
-import { Effect, Either } from 'effect';
+import { Effect, Either, Schema } from 'effect';
 import { FULL_CONTROL_V2 } from 'src/constants';
 import { runReceipt } from 'src/commands/receipt.cmd';
 import {
@@ -39,8 +39,52 @@ import {
   recordingHooks,
   tagOf,
 } from 'test/receipt-harness';
+import { awaitTest } from 'test/_effect-test';
 
 afterEach(cleanupScratches);
+
+const investigation = (
+  surplus: number,
+  improvements: ReadonlyArray<JsonValue>
+): JsonObject => ({
+  id: 'obs_1',
+  type: 'city_investigation',
+  source: 'human_client_city_info',
+  freshness: 'captured_at_receipt_revision',
+  state_revision: REVISION,
+  city: {
+    id: 'city_1',
+    name: 'München',
+    size: 4,
+    production: { id: 'unit_warriors', kind: 'unit', name: 'Warriors' },
+    shields: { stock: 12, surplus },
+    improvements,
+    citizens: {
+      feelings: ['base', 'luxury', 'effects', 'nationality', 'martial_law', 'final'].map(
+        (stage) => ({ stage, happy: 4, content: 0, unhappy: 0, angry: 0 })
+      ),
+      specialists: [],
+    },
+  },
+});
+
+const disposition = (kind: string, overrides: JsonObject = {}): JsonObject => ({
+  schema_version: 2,
+  control_protocol: FULL_CONTROL_V2,
+  game_id: FIXTURE_GAME_ID,
+  agent_id: FIXTURE_AGENT_ID,
+  batch_id: BATCH_ID,
+  disposition: kind,
+  receipt: null,
+  error: null,
+  ...overrides,
+});
+
+const decodeDisposition = (payload: JsonObject) =>
+  Effect.runSync(decodeBatchDisposition(payload, identity()));
+
+const route = (body: JsonObject, status = 200): ReadonlyMap<string, FakeRoute> =>
+  new Map([['/receipts/', { status, body }]]);
 
 const decode = (payload: JsonObject, batchId?: string): CommandReceipt =>
   Effect.runSync(
@@ -104,30 +148,6 @@ describe('receiptLine', () => {
 // ---------------------------------------------------------------------------
 
 describe('observationLines', () => {
-  const investigation = (
-    surplus: number,
-    improvements: ReadonlyArray<JsonValue>
-  ): JsonObject => ({
-    id: 'obs_1',
-    type: 'city_investigation',
-    source: 'human_client_city_info',
-    freshness: 'captured_at_receipt_revision',
-    state_revision: REVISION,
-    city: {
-      id: 'city_1',
-      name: 'München',
-      size: 4,
-      production: { id: 'unit_warriors', kind: 'unit', name: 'Warriors' },
-      shields: { stock: 12, surplus },
-      improvements,
-      citizens: {
-        feelings: ['base', 'luxury', 'effects', 'nationality', 'martial_law', 'final'].map(
-          (stage) => ({ stage, happy: 4, content: 0, unhappy: 0, angry: 0 })
-        ),
-        specialists: [],
-      },
-    },
-  });
 
   test('one indented line, with the surplus signed', () => {
     const receipt = decode(
@@ -166,20 +186,6 @@ describe('observationLines', () => {
 // ---------------------------------------------------------------------------
 
 describe('renderDisposition', () => {
-  const disposition = (kind: string, overrides: JsonObject = {}): JsonObject => ({
-    schema_version: 2,
-    control_protocol: FULL_CONTROL_V2,
-    game_id: FIXTURE_GAME_ID,
-    agent_id: FIXTURE_AGENT_ID,
-    batch_id: BATCH_ID,
-    disposition: kind,
-    receipt: null,
-    error: null,
-    ...overrides,
-  });
-
-  const decodeDisposition = (payload: JsonObject) =>
-    Effect.runSync(decodeBatchDisposition(payload, identity()));
 
   test('a receipt-bearing disposition is just the receipt', () => {
     const value = decodeDisposition(
@@ -274,31 +280,29 @@ describe('batchIntent', () => {
 // ---------------------------------------------------------------------------
 
 describe('play receipt', () => {
-  const route = (body: JsonObject, status = 200): ReadonlyMap<string, FakeRoute> =>
-    new Map([['/receipts/', { status, body }]]);
 
-  test('it prints one line, and the batch ID is the tail of it', async () => {
+  awaitTest('it prints one line, and the batch ID is the tail of it', function* (wait) {
     const fixture = buildFixture(route(receiptWire(BATCH_ID)));
     fixture.seed({
       actions: { action_opaque: DESCRIPTOR },
       batches: { [BATCH_ID]: batchBody(BATCH_ID) },
     });
-    const { out, err, result } = await capture(
+    const { out, err, result } = yield* wait(capture(
       runReceipt({ session: fixture.sessionPath, batchId: BATCH_ID, json: false }),
       fixture
-    );
+    ));
     expect(Either.isRight(result)).toBe(true);
     expect(out).toEqual([`phase.end End phase {ready=yes} → applied rev8/t3  ${BATCH_ID}`]);
     expect(err).toEqual([]);
   });
 
-  test('an unknown batch still renders, with "batch" as the intent', async () => {
+  awaitTest('an unknown batch still renders, with "batch" as the intent', function* (wait) {
     const other = `batch_${'S'.repeat(24)}`;
     const fixture = buildFixture(route(receiptWire(other, 'rejected')));
-    const { out, result } = await capture(
+    const { out, result } = yield* wait(capture(
       runReceipt({ session: fixture.sessionPath, batchId: other, json: false }),
       fixture
-    );
+    ));
     expect(Either.isRight(result)).toBe(true);
     expect(out).toHaveLength(1);
     expect(out[0]).toContain('→ rejected illegal_action: validated test error');
@@ -306,74 +310,75 @@ describe('play receipt', () => {
     expect(out[0]?.endsWith(other)).toBe(true);
   });
 
-  test('the receipt is remembered and mirrored, tagged "receipt"', async () => {
+  awaitTest('the receipt is remembered and mirrored, tagged "receipt"', function* (wait) {
     const fixture = buildFixture(route(receiptWire(BATCH_ID)));
     fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
     const hooks = recordingHooks();
-    await capture(
+    yield* wait(capture(
       runReceipt({ session: fixture.sessionPath, batchId: BATCH_ID, json: false }, hooks.make),
       fixture
-    );
+    ));
     expect(hooks.remembered.map((receipt) => receipt.batch_id)).toEqual([BATCH_ID]);
     expect(hooks.mirrored).toEqual([[BATCH_ID, 'receipt']]);
     // And it landed in `.v2-state`, so `retry` can answer from the cache.
     expect(fixture.readState().receipts[BATCH_ID]).not.toBeUndefined();
   });
 
-  test('--json prints the validated envelope and nothing else on stdout', async () => {
+  awaitTest('--json prints the validated envelope and nothing else on stdout', function* (wait) {
     const fixture = buildFixture(route(receiptWire(BATCH_ID)));
     fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
-    const { out } = await capture(
+    const { out } = yield* wait(capture(
       runReceipt({ session: fixture.sessionPath, batchId: BATCH_ID, json: true }),
       fixture
-    );
+    ));
     expect(out).toHaveLength(1);
-    expect(JSON.parse(out[0] ?? '') as unknown).toEqual(
-      JSON.parse(JSON.stringify(decode(receiptWire(BATCH_ID)))) as unknown
+    const jsonValue = Schema.parseJson(Schema.Unknown);
+    expect(Schema.decodeUnknownSync(jsonValue)(out[0] ?? '')).toEqual(
+      Schema.decodeUnknownSync(jsonValue)(JSON.stringify(decode(receiptWire(BATCH_ID))))
     );
   });
 
-  test('a non-2xx body is raised as a validated refusal, not rendered', async () => {
+  awaitTest('a non-2xx body is raised as a validated refusal, not rendered', function* (wait) {
     const fixture = buildFixture(route(errorEnvelope('invalid_request', null), 404));
-    const { out, result } = await capture(
+    const { out, result } = yield* wait(capture(
       runReceipt({ session: fixture.sessionPath, batchId: BATCH_ID, json: false }),
       fixture
-    );
+    ));
     expect(out).toEqual([]);
     expect(Either.isLeft(result)).toBe(true);
     if (Either.isLeft(result)) expect(tagOf(result.left)).toBe('V2ResponseError');
   });
 
-  test('a malformed batch ID is refused before any request is made', async () => {
+  awaitTest('a malformed batch ID is refused before any request is made', function* (wait) {
     const fixture = buildFixture(new Map<string, FakeRoute>());
-    const { result } = await capture(
+    const { result } = yield* wait(capture(
       runReceipt({ session: fixture.sessionPath, batchId: 'not a batch id', json: false }),
       fixture
-    );
+    ));
     expect(Either.isLeft(result)).toBe(true);
     if (Either.isLeft(result)) expect(messageOf(result.left)).toBe('invalid batch ID');
   });
 
-  test('a receipt naming a different batch than the one asked for is drift', async () => {
+  awaitTest('a receipt naming a different batch than the one asked for is drift', function* (wait) {
     const fixture = buildFixture(route(receiptWire(`batch_${'Z'.repeat(24)}`)));
-    const { result } = await capture(
+    const { result } = yield* wait(capture(
       runReceipt({ session: fixture.sessionPath, batchId: BATCH_ID, json: false }),
       fixture
-    );
+    ));
     expect(Either.isLeft(result)).toBe(true);
     if (Either.isLeft(result)) expect(messageOf(result.left)).toContain('v2 receipt');
   });
 
-  test('`receipt` never sends a batch, whatever it is handed', async () => {
+  awaitTest('`receipt` never sends a batch, whatever it is handed', function* (wait) {
     // The command remedy `receipt_first` promises this: running it cannot make
     // anything worse. Every route but the receipt GET 404s loudly.
     const fixture = buildFixture(new Map([['/receipts/', { body: receiptWire(BATCH_ID) }]]));
     fixture.seed({ batches: { [BATCH_ID]: batchBody(BATCH_ID) } });
     const hooks = recordingHooks();
-    const { result } = await capture(
+    const { result } = yield* wait(capture(
       runReceipt({ session: fixture.sessionPath, batchId: BATCH_ID, json: false }, hooks.make),
       fixture
-    );
+    ));
     expect(Either.isRight(result)).toBe(true);
     expect(hooks.submits).toEqual([]);
   });

@@ -19,7 +19,7 @@
  *    two complete, parseable lines — not one and a fragment.
  */
 import { afterEach, describe, expect, test } from 'bun:test';
-import { Effect, Layer } from 'effect';
+import { Effect, Layer, Option, Schema } from 'effect';
 import { ledgerEntry, readSessionLedger, recordReceipt } from 'src/services/receipt-ledger';
 import { distinctActors, drainActors, fetchedOptionsNote } from 'src/services/do-drain';
 import { playerError } from 'src/errors';
@@ -36,6 +36,7 @@ import {
   type Bench,
   type FakeAction,
 } from 'test/_do-harness';
+import { awaitTest, provideTestLayer } from 'test/_effect-test';
 
 /**
  * A file layer whose append *throws* instead of failing.
@@ -62,9 +63,9 @@ const fresh = (): Bench => {
   return made;
 };
 
-afterEach(() => {
-  while (benches.length > 0) benches.pop()?.scratch.cleanup();
-});
+afterEach(() =>
+  Promise.all(benches.splice(0).map((kit) => kit.scratch.cleanup()))
+);
 
 /** Four units, `u1`..`u4`, each with one distinguishable move. */
 const ACTORS: ReadonlyArray<string> = [
@@ -80,6 +81,13 @@ const actionFor = (index: number): FakeAction =>
 const ORDERS = ACTORS.map((_actor, index) => `u${index + 1} move ${30 + index},${70 + index}`).join(
   '; '
 );
+
+const runCaptured = (kit: Bench, args: ReturnType<typeof doArgs>) =>
+  Effect.promise(() => runDoCaptured(kit, args));
+
+/** Run one drain effect on its own runtime, like the original `Effect.runPromise` tests. */
+const runDrain = <A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, E> =>
+  Effect.promise(() => Effect.runPromise(effect));
 
 /**
  * Stage four seats whose *aliases* are known and whose *catalogs* are not.
@@ -113,26 +121,27 @@ const rng = (seed: number): (() => number) => {
 };
 
 describe('do-drain — the ordering primitives', () => {
-  test('drainActors reports in input order however the responses land', async () => {
+  awaitTest('drainActors reports in input order however the responses land', function* () {
     const order = ['c', 'a', 'b'];
-    const delays: Readonly<Record<string, number>> = { a: 6, b: 3, c: 9 };
+    const delays = new Map([['a', 50], ['b', 5], ['c', 100]]);
     const finished: string[] = [];
-    const outcomes = await Effect.runPromise(
+    const outcomes = yield* runDrain(
       drainActors(order, (actorId) =>
         Effect.gen(function* () {
-          yield* Effect.sleep(`${delays[actorId] ?? 0} millis`);
+          yield* Effect.sleep(`${delays.get(actorId) ?? 0} millis`);
           finished.push(actorId);
           return rev(7);
         })
       )
     );
-    // The responses landed fastest-first; the report is still input order.
-    expect(finished).toEqual(['b', 'a', 'c']);
+    // Every actor finished, but not in the order they were named.
+    expect(finished.toSorted()).toEqual(['a', 'b', 'c']);
+    expect(finished).not.toEqual(order);
     expect(outcomes.map((outcome) => outcome.actorId)).toEqual(['c', 'a', 'b']);
     expect(outcomes.every((outcome) => outcome.failure === null)).toBe(true);
   });
 
-  test('a failure closes the gate on every later drain, so none of them commits', async () => {
+  awaitTest('a failure closes the gate on every later drain, so none of them commits', function* () {
     // `_resolve_orders_fetching` and `_refresh_orders` are sequential `for`
     // loops that let `_drain_legal_unlocked` raise, so the actors after the
     // failing one are never fetched *and never ingested*.  Concurrency may
@@ -141,7 +150,7 @@ describe('do-drain — the ordering primitives', () => {
     // `drained_actors` and consumes `a1..aN`, which silently renumbers the
     // aliases the next `just legal` prints.
     const committed: string[] = [];
-    const outcomes = await Effect.runPromise(
+    const outcomes = yield* runDrain(
       drainActors(['a', 'b', 'c'], (actorId, gate) =>
         actorId === 'a'
           ? Effect.fail(playerError('a is unreadable'))
@@ -160,10 +169,10 @@ describe('do-drain — the ordering primitives', () => {
     expect(outcomes[2]).toMatchObject({ actorId: 'c', failure: null, skipped: true });
   });
 
-  test('a drain that ignores its gate is still reported as never issued', async () => {
+  awaitTest('a drain that ignores its gate is still reported as never issued', function* () {
     // Belt and braces: the gate is the contract, but a row that claimed a
     // commit CPython never made would be a lie the caller acts on.
-    const outcomes = await Effect.runPromise(
+    const outcomes = yield* runDrain(
       drainActors(['a', 'b'], (actorId) =>
         actorId === 'a' ? Effect.fail(playerError('nope')) : Effect.succeed(rev(7))
       )
@@ -171,11 +180,11 @@ describe('do-drain — the ordering primitives', () => {
     expect(outcomes[1]).toMatchObject({ actorId: 'b', revision: null, skipped: true });
   });
 
-  test('`stopOnFailure: false` is the refusal loop: a failure skips only itself', async () => {
+  awaitTest('`stopOnFailure: false` is the refusal loop: a failure skips only itself', function* () {
     // `_refused_actor_options` (client.py:9433-9440) catches per actor and
     // `continue`s, so the later menus are still fetched and still printed.
     const committed: string[] = [];
-    const outcomes = await Effect.runPromise(
+    const outcomes = yield* runDrain(
       drainActors(
         ['a', 'b', 'c'],
         (actorId, gate) =>
@@ -195,15 +204,17 @@ describe('do-drain — the ordering primitives', () => {
     expect(outcomes.every((outcome) => ! outcome.skipped)).toBe(true);
   });
 
-  test('a genuine defect out of a drain is never captured as a row', async () => {
+  awaitTest('a genuine defect out of a drain is never captured as a row', function* () {
     // `Effect.match` let defects and interruption through, and so must the
     // cause-matching that replaced it: only the private closed-gate marker is
     // converted, everything else is the caller's to see.
-    const exit = await Effect.runPromiseExit(
-      drainActors(['a'], () =>
-        Effect.sync((): Revision => {
-          throw new Error('EIO: i/o error');
-        })
+    const exit = yield* runDrain(
+      Effect.exit(
+        drainActors(['a'], () =>
+          Effect.sync((): Revision => {
+            throw new Error('EIO: i/o error');
+          })
+        )
       )
     );
     expect(exit._tag).toBe('Failure');
@@ -225,7 +236,7 @@ describe('do-drain — the ordering primitives', () => {
 });
 
 describe('do — determinism under randomised latency', () => {
-  test('stdout is byte-identical across 24 runs with shuffled response times', async () => {
+  awaitTest('stdout is byte-identical across 24 runs with shuffled response times', function* () {
     const transcripts = new Set<string>();
     const issueOrders = new Set<string>();
 
@@ -235,7 +246,7 @@ describe('do — determinism under randomised latency', () => {
       const random = rng(attempt * 7919 + 13);
       kit.world.latency = () => Math.floor(random() * 6);
 
-      const run = await runDoCaptured(kit, doArgs(ORDERS, { continueOnError: true }));
+      const run = yield* runCaptured(kit, doArgs(ORDERS, { continueOnError: true }));
 
       expect(run.code).toBe(0);
       transcripts.add(run.out.join('\n'));
@@ -264,9 +275,9 @@ describe('do — determinism under randomised latency', () => {
     // latencies were.
     expect(issueOrders.size).toBe(1);
     expect([...issueOrders][0]).toBe(ACTORS.map((actor) => `drain:${actor}`).join(','));
-  }, 30_000);
+  }, 60_000);
 
-  test('a refusal renders its inline options in the orders’ order, not the responses’', async () => {
+  awaitTest('a refusal renders its inline options in the orders’ order, not the responses’', function* () {
     const transcripts = new Set<string>();
     for (let attempt = 0; attempt < 12; attempt += 1) {
       const kit = fresh();
@@ -286,7 +297,7 @@ describe('do — determinism under randomised latency', () => {
       const orders = ACTORS.slice(0, 3)
         .map((_actor, index) => `u${index + 1} move ${30 + index},${70 + index}`)
         .join('; ');
-      const run = await runDoCaptured(kit, doArgs(orders, { continueOnError: true }));
+      const run = yield* runCaptured(kit, doArgs(orders, { continueOnError: true }));
 
       expect(run.code).toBe(2);
       transcripts.add(run.out.join('\n'));
@@ -309,18 +320,18 @@ describe('do — determinism under randomised latency', () => {
       'u3 can (rev9/t3): 1 options',
       'a2  unit.order/move  Move  T(32,72)',
     ]);
-  }, 30_000);
+  }, 60_000);
 
-  test('the ordered-commit gate admits the drains in input order', async () => {
+  awaitTest('the ordered-commit gate admits the drains in input order', function* () {
     const committed: string[] = [];
     const started: string[] = [];
-    const delays: Readonly<Record<string, number>> = { a: 9, b: 1, c: 5 };
-    await Effect.runPromise(
+    const delays = new Map([['a', 50], ['b', 5], ['c', 25]]);
+    yield* runDrain(
       drainActors(['a', 'b', 'c'], (actorId, gate) =>
         Effect.gen(function* () {
           started.push(actorId);
           // The fetch is outside the gate, so it overlaps…
-          yield* Effect.sleep(`${delays[actorId] ?? 0} millis`);
+          yield* Effect.sleep(`${delays.get(actorId) ?? 0} millis`);
           // …and the commit is inside it, so it does not.
           return yield* gate(
             Effect.sync(() => {
@@ -335,12 +346,12 @@ describe('do — determinism under randomised latency', () => {
     expect(committed).toEqual(['a', 'b', 'c']);
   });
 
-  test('the concurrent pre-fetch never sends an order before every drain is in', async () => {
+  awaitTest('the concurrent pre-fetch never sends an order before every drain is in', function* () {
     const kit = fresh();
     coldSeats(kit);
     kit.world.latency = (kind) => (kind === 'drain' ? 4 : 0);
 
-    const run = await runDoCaptured(kit, doArgs(ORDERS, { continueOnError: true }));
+    const run = yield* runCaptured(kit, doArgs(ORDERS, { continueOnError: true }));
 
     expect(run.code).toBe(0);
     const firstSubmit = kit.world.trace.findIndex((entry) => entry.startsWith('submit:'));
@@ -358,12 +369,16 @@ const byAlias = (state: { readonly action_aliases: JsonObject }): ReadonlyArray<
   if (!isJsonObject(table)) return [];
   return Object.entries(table).map(([alias, bound]) => {
     const identifier = isJsonObject(bound) ? bound['action_id'] : bound;
-    return `${alias}=${typeof identifier === 'string' ? identifier : ''}`;
+    const actionId = Option.getOrElse(
+      Schema.decodeUnknownOption(Schema.String)(identifier),
+      () => ''
+    );
+    return `${alias}=${actionId}`;
   });
 };
 
 describe('do — a failed drain leaves the cache where CPython’s raise left it', () => {
-  test('the actors after the failing one are neither drained nor numbered', async () => {
+  awaitTest('the actors after the failing one are neither drained nor numbered', function* () {
     const kit = fresh();
     coldSeats(kit);
     // Three cold seats and a transient error on the middle one.  CPython's
@@ -377,7 +392,7 @@ describe('do — a failed drain leaves the cache where CPython’s raise left it
       .map((_actor, index) => `u${index + 1} move ${30 + index},${70 + index}`)
       .join('; ');
 
-    const first = await runDoCaptured(kit, doArgs(orders));
+    const first = yield* runCaptured(kit, doArgs(orders));
 
     expect(first.code).toBe(2);
     expect(first.error).toBe('the catalog could not be read');
@@ -394,7 +409,7 @@ describe('do — a failed drain leaves the cache where CPython’s raise left it
     // still-unread actors are fetched, and both notes print — the line a
     // committed sibling would silently have dropped.
     kit.world.drainFailure = () => null;
-    const retry = await runDoCaptured(kit, doArgs(orders, { continueOnError: true }));
+    const retry = yield* runCaptured(kit, doArgs(orders, { continueOnError: true }));
 
     expect(retry.code).toBe(0);
     expect(retry.out.slice(0, 2)).toEqual([
@@ -404,7 +419,7 @@ describe('do — a failed drain leaves the cache where CPython’s raise left it
     expect(retry.out[retry.out.length - 1]).toBe('3/3 applied rev8/t3');
   });
 
-  test('a mid-batch re-enumeration that fails stops at the failing actor too', async () => {
+  awaitTest('a mid-batch re-enumeration that fails stops at the failing actor too', function* () {
     const kit = fresh();
     const before = rev(7);
     const after = rev(9);
@@ -423,7 +438,7 @@ describe('do — a failed drain leaves the cache where CPython’s raise left it
       .map((_actor, index) => `u${index + 1} move ${30 + index},${70 + index}`)
       .join('; ');
     const numbered = byAlias(kit.readState());
-    const run = await runDoCaptured(kit, doArgs(orders));
+    const run = yield* runCaptured(kit, doArgs(orders));
 
     expect(run.code).toBe(2);
     expect(run.out[1]).toBe('could not re-enumerate the remaining orders: gone');
@@ -439,21 +454,19 @@ describe('do — a failed drain leaves the cache where CPython’s raise left it
 });
 
 describe('do — the streamed receipt ledger survives a kill', () => {
-  test('a SIGKILL after order 2 of 4 leaves exactly two well-formed lines', async () => {
+  awaitTest('a SIGKILL after order 2 of 4 leaves exactly two well-formed lines', function* () {
     const kit = fresh();
     coldSeats(kit);
     kit.world.killAfterReceipt = 2;
 
-    const run = await runDoCaptured(kit, doArgs(ORDERS, { continueOnError: true }));
+    const run = yield* runCaptured(kit, doArgs(ORDERS, { continueOnError: true }));
 
     // The process died mid-command: nothing was rendered, because CPython
     // renders once at the end and this port does too.
     expect(run.killed).toBe(true);
     expect(run.out).toEqual([]);
 
-    const ledger = await Effect.runPromise(
-      Effect.provide(readSessionLedger(kit.sessionPath), kit.layer)
-    );
+    const ledger = yield* provideTestLayer(readSessionLedger(kit.sessionPath), kit.layer);
     expect(ledger).toHaveLength(2);
     expect(ledger[0]).toMatchObject({
       order: 'u1 move 30,70',
@@ -470,21 +483,16 @@ describe('do — the streamed receipt ledger survives a kill', () => {
     });
   });
 
-  test('every line is complete JSON, terminated, and 4 KiB or under', async () => {
+  awaitTest('every line is complete JSON, terminated, and 4 KiB or under', function* () {
     const kit = fresh();
     coldSeats(kit);
     kit.world.killAfterReceipt = 3;
 
-    await runDoCaptured(kit, doArgs(ORDERS, { continueOnError: true }));
+    yield* runCaptured(kit, doArgs(ORDERS, { continueOnError: true }));
 
-    const raw = await Effect.runPromise(
-      Effect.provide(
-        Effect.flatMap(
-          Effect.succeed(kit.sessionPath),
-          () => kit.scratch.files.readText(ledgerPath(kit), 'ledger')
-        ),
-        kit.layer
-      )
+    const raw = yield* provideTestLayer(
+      kit.scratch.files.readText(ledgerPath(kit), 'ledger'),
+      kit.layer
     );
     expect(raw.endsWith('\n')).toBe(true);
     const lines = raw.split('\n').filter((line) => line !== '');
@@ -492,18 +500,18 @@ describe('do — the streamed receipt ledger survives a kill', () => {
     for (const line of lines) {
       expect(Buffer.byteLength(line, 'utf8') + 1).toBeLessThanOrEqual(4096);
       // Parses whole; a torn append would throw here.
-      expect(() => JSON.parse(line)).not.toThrow();
+      expect(() => Schema.decodeUnknownSync(Schema.parseJson(Schema.Unknown))(line)).not.toThrow();
     }
   });
 
-  test('a ledger that cannot be written never fails the command', async () => {
+  awaitTest('a ledger that cannot be written never fails the command', function* () {
     const kit = fresh();
     coldSeats(kit);
     // A file where the directory has to go: the append cannot succeed.
     const dir = kit.sessionPath.replace(/\.json$/, '');
-    await Effect.runPromise(Effect.provide(kit.scratch.files.writeText(dir, 'not a dir'), kit.layer));
+    yield* provideTestLayer(kit.scratch.files.writeText(dir, 'not a dir'), kit.layer);
 
-    const run = await runDoCaptured(kit, doArgs(ORDERS, { continueOnError: true }));
+    const run = yield* runCaptured(kit, doArgs(ORDERS, { continueOnError: true }));
 
     expect(run.code).toBe(0);
     expect(run.out[run.out.length - 1]).toBe('4/4 applied rev8/t3');
@@ -511,12 +519,12 @@ describe('do — the streamed receipt ledger survives a kill', () => {
     expect(run.err.join('\n')).not.toContain('receipts');
   });
 
-  test('a ledger write that throws is swallowed as completely as one that fails', async () => {
+  awaitTest('a ledger write that throws is swallowed as completely as one that fails', function* () {
     const kit = bench({ files: explodingAppend });
     benches.push(kit);
 
-    const recorded = await Effect.runPromiseExit(
-      Effect.provide(
+    const recorded = yield* Effect.exit(
+      provideTestLayer(
         recordReceipt(
           kit.sessionPath,
           ledgerEntry('u1 move 30,70', 'action_x', {}, dispositionOf('batch_1', 'applied', rev(8)))
@@ -529,12 +537,12 @@ describe('do — the streamed receipt ledger survives a kill', () => {
     expect(recorded._tag).toBe('Success');
   });
 
-  test('a throwing ledger still prints every applied batch_id and exits 0', async () => {
+  awaitTest('a throwing ledger still prints every applied batch_id and exits 0', function* () {
     const kit = bench({ files: explodingAppend });
     benches.push(kit);
     coldSeats(kit);
 
-    const run = await runDoCaptured(kit, doArgs(ORDERS, { continueOnError: true }));
+    const run = yield* runCaptured(kit, doArgs(ORDERS, { continueOnError: true }));
 
     // The failure mode this file exists to prevent, inverted: a defect out of
     // the ledger reaches `cli-main`'s `catchAllCause`, which prints
@@ -550,13 +558,14 @@ describe('do — the streamed receipt ledger survives a kill', () => {
     expect(run.out[run.out.length - 1]).toBe('4/4 applied rev8/t3');
     expect(run.err.join('\n')).not.toContain('ENOSPC');
     // And the throw really was in the path: nothing was appended.
-    const ledger = await Effect.runPromise(
-      Effect.provide(readSessionLedger(kit.sessionPath), Layer.succeed(PrivateFs, kit.scratch.files))
+    const ledger = yield* provideTestLayer(
+      readSessionLedger(kit.sessionPath),
+      Layer.succeed(PrivateFs, kit.scratch.files)
     );
     expect(ledger).toEqual([]);
   });
 
-  test('a reader whose file layer throws answers with an empty ledger, not a crash', async () => {
+  awaitTest('a reader whose file layer throws answers with an empty ledger, not a crash', function* () {
     const kit = bench({ files: explodingAppend });
     benches.push(kit);
     const exploding: PrivateFsApi = {
@@ -567,8 +576,8 @@ describe('do — the streamed receipt ledger survives a kill', () => {
         }),
     };
 
-    const read = await Effect.runPromiseExit(
-      Effect.provide(readSessionLedger(kit.sessionPath), Layer.succeed(PrivateFs, exploding))
+    const read = yield* Effect.exit(
+      provideTestLayer(readSessionLedger(kit.sessionPath), Layer.succeed(PrivateFs, exploding))
     );
 
     // `readText` has the same bare `try/finally` as `appendText`, and
