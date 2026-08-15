@@ -1,10 +1,14 @@
-/**
- * Barrel for `@arena/telemetry`.
- *
- * Phase 0 of the port: the package exists and its dependency on `evlog` is
- * pinned and resolving.  The wide-event drain and the run-trace writer land
- * here; callers import them from this file rather than from `src/`.
- */
+/** One wide event per unit of work, with ordered NDJSON delivery. */
 
-/** Identity of this package, used by the harness to report its stack. */
 export const TELEMETRY_PACKAGE = '@arena/telemetry' as const;
+
+export { telemetryConfigLayer } from './config.ts';
+export { withWideEvent } from './middleware.ts';
+export {
+  Observability,
+  ObservabilityLive,
+  ObservabilityNoop,
+  ObservabilityTest,
+  TelemetryCapture,
+} from './observability.ts';
+export { annotate } from './wide-event.ts';
