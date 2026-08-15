@@ -338,7 +338,7 @@ const runOracle = (
     stderr: 'pipe',
     env: {
       ...process.env,
-      ARENA_REPO_ROOT: REPO_ROOT,
+      ARENA_REPO_ROOT: join(REPO_ROOT, 'arena', 'archive'),
       ARENA_RUNS_ROOT: root,
       ARENA_LIVE_IDS: JSON.stringify(liveIds),
       ARENA_PROBE_IDS: JSON.stringify(probeIds),
@@ -668,7 +668,7 @@ describe('RunsRepository', () => {
         {
           stdout: 'pipe',
           stderr: 'pipe',
-          env: { ...process.env, ARENA_REPO_ROOT: REPO_ROOT, ARENA_TAIL_ROOT: root },
+          env: { ...process.env, ARENA_REPO_ROOT: join(REPO_ROOT, 'arena', 'archive'), ARENA_TAIL_ROOT: root },
         },
       );
       expect(oracle.stderr.toString()).toBe('');

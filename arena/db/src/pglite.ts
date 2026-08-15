@@ -45,6 +45,21 @@ const dataDir = (location: PgliteLocation): string | undefined =>
 const sqlFail = (message: string) => (cause: unknown): SqlError => new SqlError({ cause, message })
 
 /**
+ * PGlite's single-user Postgres bootstrap returns 99 as its internal success
+ * sentinel. Bun 1.4 exposes that WASM return through `process.exitCode`, even
+ * though PGlite handles it as success, so restore the caller's status once the
+ * database is ready instead of making an otherwise-green process exit 99.
+ */
+const create = async (location: PgliteLocation): Promise<PGlite> => {
+  const previousExitCode = process.exitCode ?? 0
+  try {
+    return await PGlite.create(dataDir(location))
+  } finally {
+    if (process.exitCode === 99) process.exitCode = previousExitCode
+  }
+}
+
+/**
  * Acquire a PGlite instance as a scoped resource. The database is closed when the
  * scope closes, so a test's layer teardown is also the database teardown.
  */
@@ -53,7 +68,7 @@ export const make = (
 ): Effect.Effect<PGlite, SqlError, Scope.Scope> =>
   Effect.acquireRelease(
     Effect.tryPromise({
-      try: () => PGlite.create(dataDir(location)),
+      try: () => create(location),
       catch: sqlFail("Failed to start PGlite")
     }),
     (db) => Effect.ignoreLogged(Effect.promise(() => db.close()))

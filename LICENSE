@@ -6,7 +6,7 @@ SCOPE. This license applies to the agent evaluation harness contained in
 this repository — including the supervisor, control protocols, sidecar
 integration, player workspace and client, replay and telemetry pipeline,
 viewer, evaluation tooling, and associated documentation under
-`agent_eval/`, `play/`, `docs/`, and the repository-root recipes
+`arena/` (including `arena/archive/`) and the repository-root recipes
 (collectively, the "Software"). It does NOT apply to Freeciv itself:
 the Freeciv game engine and all modifications to the Freeciv source tree
 (including `client/`, `server/`, `common/`, `data/`, and related

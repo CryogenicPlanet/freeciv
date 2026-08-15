@@ -713,7 +713,7 @@ const askOracle = (): OracleBodies => {
     stderr: 'pipe',
     env: {
       ...process.env,
-      ARENA_REPO_ROOT: REPO_ROOT,
+      ARENA_REPO_ROOT: join(REPO_ROOT, 'arena', 'archive'),
       ARENA_RUNS_ROOT: runsRootRef.current,
       ARENA_BASE: `http://127.0.0.1:${String(BOUND_PORT)}`,
       ARENA_GAME_ID: COMPLETED,

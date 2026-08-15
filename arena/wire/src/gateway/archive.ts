@@ -6,7 +6,7 @@
  *
  * | Route | Producer (disk) | Producer (upstream) |
  * |---|---|---|
- * | `GET /v1/games/{id}/frames` | `_archive_frames`, `agent_eval/replay_gateway.py:968-1004` | `Game.frame_manifest`, `agent_eval/supervisor.py:10206-10244` |
+ * | `GET /v1/games/{id}/frames` | `_archive_frames`, `arena/archive/agent_eval/replay_gateway.py:968-1004` | `Game.frame_manifest`, `arena/archive/agent_eval/supervisor.py:10206-10244` |
  * | `GET /v1/games/{id}/watch.json` | `_archive_watch`, `replay_gateway.py:1033-1063` | `Game.watch_state`, `supervisor.py:9613-9633` |
  * | `GET /v1/games/{id}/frames/{n}.png`, `/frames/latest.png`, `/video.mp4` | `_archive_binary_route`, `replay_gateway.py:1935-1963` | streamed through |
  *
@@ -40,7 +40,7 @@
  *    matched with the `i`-th `saves/turn-<n>-*.map.ppm` sorted by file name
  *    (`replay_gateway.py:975-982`).  One missing PPM shifts every later label.
  *    The viewer defends itself by re-deriving the turn from `source_name`
- *    (`agent_eval/viewer/src/api.ts:84-90`), which is why {@link ReplayFrame}
+ *    (`arena/viewer/src/api.ts:84-90`), which is why {@link ReplayFrame}
  *    keeps `source_name` verbatim and {@link legacyFrameTurn} ports that
  *    fallback exactly.
  *
@@ -177,7 +177,7 @@ export const ARCHIVE_PPM_RE: RegExp = /^turn-(\d+)-.*\.map\.ppm$/;
 export const SUPERVISOR_FRAME_TURN_RE: RegExp = /(?:^|[^A-Za-z0-9])turn-(\d+)(?:-|[^0-9]|$)/;
 
 /**
- * The viewer's third rule (`agent_eval/viewer/src/api.ts:84-90`):
+ * The viewer's third rule (`arena/viewer/src/api.ts:84-90`):
  * `^turn-(\d+)(?:-|\.|$)`, used only when `frame.turn` is missing.  Anchored,
  * unlike the supervisor's.  Ported by {@link legacyFrameTurn}.
  */

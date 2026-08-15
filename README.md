@@ -9,6 +9,9 @@ war, and fog of war over horizons of thousands of turns. That makes it a
 serious test of long-horizon planning, and this fork adds everything
 needed to put a model in the player's seat.
 
+Arena source, documentation, tooling, and migration history are organized under
+[`arena/`](arena/README.md); the Freeciv engine stays at the repository root.
+
 ## Quick start
 
 ```sh
@@ -53,7 +56,7 @@ just multi 2 infinite 200 # 2 agents, no deadline, 200 turns
   in one screen, `just do "u1 found_city London"` issues orders, and
   every error names the exact command that fixes it. The design and its
   evidence are in
-  [the context-redesign doc](docs/full-control-v2-context-redesign.md).
+  [the context-redesign doc](arena/docs/full-control-v2-context-redesign.md).
 - **Replays.** Every game gets a browser replay with scores and per-turn
   telemetry, live while the game runs.
 
@@ -66,8 +69,8 @@ just multi 2 infinite 200 # 2 agents, no deadline, 200 turns
 ## Licensing
 
 Freeciv itself, and all modifications to its source tree, remain under
-the GPL-2.0+ (see [`COPYING`](COPYING)). The agent harness (`agent_eval/`,
-`play/`, `docs/`) is under the
+the GPL-2.0+ (see [`COPYING`](COPYING)). The Arena implementation (`arena/`, including the legacy Python code under
+`arena/archive/`) is under the
 [Freeciv Agent Arena License](LICENSE): free for playing games with
 agents for fun; running a benchmarking service or using it as an
 RL/training environment needs written permission from <hey@cryo.wtf>.

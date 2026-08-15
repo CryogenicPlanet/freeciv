@@ -28,6 +28,7 @@ import type { GameId } from '@arena/wire';
 
 /** The checkout root: `test/gateway/` → `arena/harness/` → `arena/` → repo. */
 const REPO_ROOT = new URL('../../../../', import.meta.url).pathname;
+const PYTHON_ROOT = new URL('../../../../arena/archive/', import.meta.url).pathname;
 
 /**
  * One `python3 -c` program that dispatches on `op` and prints the canonical
@@ -39,7 +40,7 @@ const REPO_ROOT = new URL('../../../../', import.meta.url).pathname;
  */
 const PUBLIC_DRIVER = `
 import json, sys
-sys.path.insert(0, ${JSON.stringify(REPO_ROOT)})
+sys.path.insert(0, ${JSON.stringify(PYTHON_ROOT)})
 from agent_eval import replay_gateway as g
 
 request = json.load(sys.stdin)

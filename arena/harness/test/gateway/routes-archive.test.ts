@@ -284,7 +284,7 @@ const runOracle = (
     stderr: 'pipe',
     env: {
       ...process.env,
-      ARENA_REPO_ROOT: REPO_ROOT,
+      ARENA_REPO_ROOT: join(REPO_ROOT, 'arena', 'archive'),
       ARENA_RUNS_ROOT: root,
       ARENA_BASE: options.base,
       ARENA_ABSOLUTE: options.absoluteWatch ? '1' : '0',

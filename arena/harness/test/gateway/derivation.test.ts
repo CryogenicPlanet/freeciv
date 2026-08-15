@@ -433,6 +433,8 @@ const FIXTURE_GAME_ID = 'game_mEUltpqtzauPGfjI9IlhWJ5x';
 const FIXTURE_TURN = 52;
 const FIXTURE_SAVE = join(
   REPO_ROOT,
+  'arena',
+  'archive',
   'agent_eval',
   'tests',
   'fixtures',
@@ -503,6 +505,7 @@ const directDerivation = (request: DirectRequest): Uint8Array<ArrayBuffer> => {
     cwd: REPO_ROOT,
     env: {
       ...process.env,
+      PYTHONPATH: join(REPO_ROOT, 'arena', 'archive'),
       DERIVE_OP: request.operation,
       DERIVE_RUNS: COMMITTED_RUN.runsRoot,
       DERIVE_GAME: request.gameId,
@@ -707,7 +710,7 @@ describe('additivity', () => {
         '--include=*.py',
         '--exclude=replay_derive_cli.py',
         'replay_derive_cli',
-        join(REPO_ROOT, 'agent_eval'),
+        join(REPO_ROOT, 'arena', 'archive', 'agent_eval'),
       ],
       { stdout: 'pipe', stderr: 'pipe' },
     );

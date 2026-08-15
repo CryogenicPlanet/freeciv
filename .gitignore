@@ -17,7 +17,7 @@
 /.play/
 /session-runs/
 /pi-session-*.html
-/agent_eval/viewer/dist/
+/arena/viewer/dist/
 
 .claude/settings.local.json
 

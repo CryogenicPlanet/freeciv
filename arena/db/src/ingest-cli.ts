@@ -145,7 +145,7 @@ const cacheRoot = Options.text("cache-root").pipe(
 
 const repoRoot = Options.text("repo-root").pipe(
   Options.withDefault(Ingest.PACKAGE_REPO_ROOT),
-  Options.withDescription("The checkout holding agent_eval/ — the bridge's working directory.")
+  Options.withDescription("The checkout holding arena/archive/agent_eval/ — the bridge's working directory.")
 )
 
 const boardTurnLimit = Options.integer("board-turn-limit").pipe(

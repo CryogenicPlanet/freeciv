@@ -49,7 +49,7 @@ def main() -> None:
     header = (
         "/**\n"
         " * Spike S2 fixture: the structure `_derive_native_schema_id` hashes,\n"
-        " * transcribed from agent_eval/v2_control.py into TypeScript values.\n"
+        " * transcribed from arena/archive/agent_eval/v2_control.py into TypeScript values.\n"
         " *\n"
         " * Mechanically generated once (see the spike report) — the real port\n"
         " * hand-writes this from the row/action tables.  Python ints are bigints\n"

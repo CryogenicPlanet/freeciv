@@ -7,6 +7,7 @@
 
 import type { CanonRecord, JsonObject } from '@arena/wire';
 import { Context, Data, Duration, Effect, Either, Layer } from 'effect';
+import { resolve } from 'node:path';
 import { parsePythonJsonObject } from '../python-json.ts';
 
 // ---------------------------------------------------------------------------
@@ -197,7 +198,7 @@ export const layerFromRunner = (run: DerivationRunner): Layer.Layer<ReplayDeriva
 
 /** How to reach the interim Python bridge. */
 export interface PythonDerivationOptions {
-  /** The checkout containing `agent_eval/` — the child's working directory. */
+  /** The Freeciv checkout; archived Python is loaded from `arena/archive/`. */
   readonly repoRoot: string;
   /** `--runs-root`. Read-only to the loaders. */
   readonly runsRoot: string;
@@ -344,6 +345,10 @@ const spawnBridge = (
           try: () =>
             Bun.spawn([...derivationArgv(options, request)], {
               cwd: options.repoRoot,
+              env: {
+                ...process.env,
+                PYTHONPATH: resolve(options.repoRoot, 'arena/archive'),
+              },
               stdin: 'pipe',
               stdout: 'pipe',
               stderr: 'pipe',

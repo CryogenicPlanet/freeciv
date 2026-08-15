@@ -42,6 +42,7 @@ import {
   PARITY_REQUIRED,
   paritySkipWarning,
   PYTHON_LAUNCHER,
+  PYTHON_ROOT,
   registerBooted,
   readyFileFor,
   REPO_ROOT,
@@ -378,7 +379,11 @@ const spawnGateway = (
         cwd: impl === 'python' ? REPO_ROOT : HARNESS_ROOT,
         stdout: 'pipe',
         stderr: 'pipe',
-        env: { ...process.env, ARENA_GATEWAY_TELEMETRY_DIR: undefined },
+        env: {
+          ...process.env,
+          ARENA_GATEWAY_TELEMETRY_DIR: undefined,
+          PYTHONPATH: PYTHON_ROOT,
+        },
       },
     ),
   );

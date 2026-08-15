@@ -3,7 +3,7 @@
  *
  * The Python sidecar builds a `socketpair(AF_UNIX, SOCK_STREAM)`, marks the
  * child end inheritable, and passes it through `subprocess.Popen(pass_fds=...)`
- * together with `--ipc-fd <n>` (`agent_eval/headless_sidecar.py:1156-1176`).
+ * together with `--ipc-fd <n>` (`arena/archive/agent_eval/headless_sidecar.py:1156-1176`).
  * The C client then talks framed IPC over that fd
  * (`client/gui-agent/gui_main.c:851`).  If Bun could not reproduce that, the
  * port would need a Unix-socket-path handshake and a change on the C side.

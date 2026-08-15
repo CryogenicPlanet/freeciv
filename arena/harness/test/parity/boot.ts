@@ -29,8 +29,9 @@ import {
 // Where things are
 // ---------------------------------------------------------------------------
 
-/** The checkout that contains `agent_eval/` — the Python's `REPO_ROOT`. */
+/** The Freeciv checkout and archived Python import root. */
 export const REPO_ROOT: string = resolve(import.meta.dir, '../../../..');
+export const PYTHON_ROOT: string = join(REPO_ROOT, 'arena', 'archive');
 
 /** `arena/harness` — the TypeScript gateway's package root. */
 export const HARNESS_ROOT: string = resolve(import.meta.dir, '../..');
@@ -236,7 +237,7 @@ export const PG_SLOT_SUFFIX = 'pg' as const;
 /**
  * The flags the Postgres slot adds, and the *only* ones it may.
  *
- * They are TS-only by construction: `agent_eval/replay_gateway.py`'s parser has
+ * They are TS-only by construction: `arena/archive/agent_eval/replay_gateway.py`'s parser has
  * nine options and knows neither of these, so they can never be part of the
  * shared array {@link gatewayFlags} builds.  {@link SLOT_SCOPED_FLAGS} is not
  * the right home for them either — that list is about two processes disagreeing
@@ -602,9 +603,8 @@ const bootGateway = async (spec: ResolvedBootSpec, slot: GatewaySlot): Promise<B
   const cacheRoot = cacheRootForSuffix(spec.scratch, spec.scenario, slot.suffix);
   const child = registry.add(
     Bun.spawn(argv, {
-      // CPython needs the checkout on `sys.path` for `-m agent_eval…`; the
-      // TypeScript entry point is absolute but still resolves `node_modules`
-      // from its package.
+      // CPython loads the archived package through PYTHONPATH; the TypeScript
+      // entry point is absolute but still resolves `node_modules` from its package.
       cwd: impl === 'python' ? spec.repoRoot : HARNESS_ROOT,
       stdout: 'pipe',
       stderr: 'pipe',
@@ -614,6 +614,7 @@ const bootGateway = async (spec: ResolvedBootSpec, slot: GatewaySlot): Promise<B
         // Python has none, so a corpus directory appearing beside one of them
         // would be a filesystem difference the parity claim does not want.
         ARENA_GATEWAY_TELEMETRY_DIR: undefined,
+        PYTHONPATH: join(spec.repoRoot, 'arena', 'archive'),
         ...spec.env,
       },
     }),

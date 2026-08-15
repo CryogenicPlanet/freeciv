@@ -421,7 +421,11 @@ const spawnGateway = async (
     // The gateways must not inherit this test's telemetry configuration: the
     // Python has none, and a corpus directory appearing beside one of them is
     // a filesystem difference the parity claim does not want.
-    env: { ...process.env, ARENA_GATEWAY_TELEMETRY_DIR: undefined },
+    env: {
+      ...process.env,
+      ARENA_GATEWAY_TELEMETRY_DIR: undefined,
+      PYTHONPATH: join(REPO_ROOT, 'arena', 'archive'),
+    },
   });
   spawned.push(child);
   const record = await awaitReady(child, readyFile);

@@ -4,12 +4,12 @@
  *
  * These three routes share a property none of the other gateway routes have:
  * **the supervisor cannot answer them**.  `board.json` and `events.json` have
- * no upstream handler at all (`agent_eval/supervisor.py`'s dispatcher has no
+ * no upstream handler at all (`arena/archive/agent_eval/supervisor.py`'s dispatcher has no
  * such suffix), and `replay.json` is the one route where the proxied and the
  * on-disk documents agree key-for-key — the upstream `Game.replay_state`
- * (`agent_eval/supervisor.py:10035-10052`) is a live mirror of the same nine
+ * (`arena/archive/agent_eval/supervisor.py:10035-10052`) is a live mirror of the same nine
  * keys `save_replay.replay_from_autosaves` builds
- * (`agent_eval/save_replay.py:1327-1337`).  So one schema per payload is
+ * (`arena/archive/agent_eval/save_replay.py:1327-1337`).  So one schema per payload is
  * enough here; no `Archive*`/`Upstream*` split is needed.
  *
  * Producers, in the order the bytes are built:
@@ -182,7 +182,7 @@ export const decodeResearchState: WireDecoder<ResearchState> = decodeWire(
  *   not an independent statistic.
  *
  * `ai_difficulty` is declared optional-nullable because the viewer's type
- * declares it (`agent_eval/viewer/src/types.ts:169`); no producer path emits
+ * declares it (`arena/viewer/src/types.ts:169`); no producer path emits
  * it on a replay player today.
  */
 export const ReplayPlayer = Schema.Struct({

@@ -31,8 +31,8 @@ export const DEFAULT_UPSTREAM_TIMEOUT_SECONDS = '10' as const;
 
 /**
  * `--repo-root` default: `str(REPO_ROOT)` (`:2181`), where `REPO_ROOT` is
- * `Path(__file__).resolve().parent.parent` (`:34`) — the checkout that
- * contains `agent_eval/`.
+ * `Path(__file__).resolve().parents[3]` (`:34`) — the Freeciv checkout;
+ * `arena/archive/agent_eval/` itself now lives under `arena/archive/`.
  *
  * This module lives at `arena/harness/src/gateway/cli.ts`, so the same
  * directory is four levels up.  It is *not* resolved here: the Python's

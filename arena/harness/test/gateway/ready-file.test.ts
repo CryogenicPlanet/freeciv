@@ -44,8 +44,9 @@ class RigError extends Data.TaggedError('RigError')<{
 const run = <A, E>(effect: Effect.Effect<A, E, Scope.Scope>): Promise<A> =>
   Effect.runPromise(Effect.scoped(effect));
 
-/** The checkout, so `python3 -c "import agent_eval…"` resolves. */
+/** The Freeciv checkout and archived Python import root. */
 const REPO_ROOT = join(import.meta.dir, '..', '..', '..', '..');
+const PYTHON_ROOT = join(REPO_ROOT, 'arena', 'archive');
 
 /** A private directory that is deleted with the scope that made it. */
 const scratchDirectory: Effect.Effect<string, RigError, Scope.Scope> = Effect.acquireRelease(
@@ -140,7 +141,7 @@ const LOCK_VARIABLE = 'READY_LOCK_PATH';
 
 const childEnvironment = (
   variables: Readonly<Record<string, string>>,
-): NodeJS.ProcessEnv => ({ ...process.env, ...variables });
+): NodeJS.ProcessEnv => ({ ...process.env, PYTHONPATH: PYTHON_ROOT, ...variables });
 
 const pythonRun = (
   source: string,

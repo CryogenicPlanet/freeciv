@@ -47,7 +47,10 @@ const bytesOf = (value: CanonValue, ensureAscii = true): Uint8Array =>
 
 /** CPython, spawned as the oracle.  `null` when it is unavailable or errored. */
 const python = (source: string): Uint8Array | null => {
-  const run = Bun.spawnSync(['python3', '-c', source], { cwd: REPO_ROOT });
+  const run = Bun.spawnSync(['python3', '-c', source], {
+    cwd: REPO_ROOT,
+    env: { ...process.env, PYTHONPATH: `${REPO_ROOT}/arena/archive` },
+  });
   return run.success ? new Uint8Array(run.stdout) : null;
 };
 

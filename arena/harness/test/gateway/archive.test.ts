@@ -71,14 +71,14 @@ const readFixture = (kind: 'manifest' | 'report', name: string): Untrusted =>
   record(JSON.parse(readFileSync(`${FIXTURES}/${kind}/${name}`, 'utf-8')));
 
 const BASE = 'http://127.0.0.1:48261';
-const REPO_ROOT = new URL('../../../../', import.meta.url).pathname;
+const PYTHON_ROOT = new URL('../../../../arena/archive/', import.meta.url).pathname;
 
 /** CPython's file-backed PPM header projection for one in-memory test case. */
 const ppmOracle = (text: string, manifest: Untrusted): string => {
   const source = `
 import json, os, sys, tempfile
 from pathlib import Path
-sys.path.insert(0, ${JSON.stringify(REPO_ROOT)})
+sys.path.insert(0, ${JSON.stringify(PYTHON_ROOT)})
 from agent_eval.replay_gateway import _archive_ppm_players, _canonical, _public_places
 request = json.load(sys.stdin)
 with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="", delete=False) as stream:

@@ -1,6 +1,6 @@
 /**
  * Spike S2 fixture: the structure `_derive_native_schema_id` hashes,
- * transcribed from agent_eval/v2_control.py into TypeScript values.
+ * transcribed from arena/archive/agent_eval/v2_control.py into TypeScript values.
  *
  * Mechanically generated once (see the spike report) — the real port
  * hand-writes this from the row/action tables.  Python ints are bigints

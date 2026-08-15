@@ -3,7 +3,7 @@
  * channel, expressed in Bun primitives.
  *
  * This is the piece the Python sidecar gets for free from `socket.socketpair`
- * + `subprocess(pass_fds=...)` (see `agent_eval/headless_sidecar.py:1156`).
+ * + `subprocess(pass_fds=...)` (see `arena/archive/agent_eval/headless_sidecar.py:1156`).
  * Bun ships no `socketpair`, so we reach for libc through `bun:ffi`; the
  * spawn side needs nothing special because `Bun.spawn`'s `stdio` array
  * accepts raw fds past index 2 and remaps them onto the child's fd 3, 4, ...

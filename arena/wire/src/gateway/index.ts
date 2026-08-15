@@ -1,7 +1,7 @@
 /**
  * Barrel for the replay gateway's read-only payloads.
  *
- * These are the documents `agent_eval/replay_gateway.py` serves and the four
+ * These are the documents `arena/archive/agent_eval/replay_gateway.py` serves and the four
  * on-disk files it serves them from — the protocol a spectator sees.
  *
  * Reached as `Gateway` from the package barrel: `Wire.Gateway.decodeManifest`.

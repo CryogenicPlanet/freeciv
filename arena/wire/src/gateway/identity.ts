@@ -2,7 +2,7 @@
  * `GET /health` — the replay gateway's identity payload.
  *
  * Produced by `ReplayGatewayHTTPServer.identity_payload`
- * (`agent_eval/replay_gateway.py:1301-1325`) and served by the `/health`
+ * (`arena/archive/agent_eval/replay_gateway.py:1301-1325`) and served by the `/health`
  * route (`:1970-1978`, which 400s on *any* query string).  The same dict is
  * written to the on-disk ready file at mode 0600 (`_write_private_json`,
  * `:221-240`) and printed as one canonical line on stdout (`main`, `:2201`),
@@ -44,14 +44,14 @@ import { decodeWire, encodeWire, isWire } from '../codec.ts';
 import type { WireDecoder, WireEncoder, WireGuard } from '../codec.ts';
 
 /**
- * `GATEWAY_KIND` — `agent_eval/replay_gateway.py:52`.  The self-identifying
+ * `GATEWAY_KIND` — `arena/archive/agent_eval/replay_gateway.py:52`.  The self-identifying
  * discriminator, and the only field that distinguishes this payload from the
  * supervisor's own `/health` (which carries no `kind` at all).
  */
 export const GATEWAY_KIND = 'freeciv-replay-gateway' as const;
 
 /**
- * `GATEWAY_PROTOCOL_VERSION` — `agent_eval/replay_gateway.py:53`.  The
+ * `GATEWAY_PROTOCOL_VERSION` — `arena/archive/agent_eval/replay_gateway.py:53`.  The
  * revision of the route contract this build was written against; see the
  * module doc for why the schema does not pin it.
  */

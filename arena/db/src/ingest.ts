@@ -210,7 +210,7 @@ const O_NOFOLLOW = 0x0000_0100
 const O_CLOEXEC = 0x0100_0000
 
 /**
- * `SAVE_NAME_RE` — `agent_eval/save_replay.py:35`. The autosaves the python
+ * `SAVE_NAME_RE` — `arena/archive/agent_eval/save_replay.py:35`. The autosaves the python
  * bridge discovers, and therefore the only turns a board can be derived for.
  */
 export const SAVE_NAME_RE: RegExp = /^turn-(\d+)-(?:auto|final)\.sav(?:\.gz|\.bz2|\.xz|\.zst)?$/
@@ -258,7 +258,7 @@ export interface BoardOptions {
    * whole cache away.
    */
   readonly cacheRoot: string
-  /** The checkout holding `agent_eval/` — the bridge's working directory. */
+  /** The checkout holding `arena/archive/agent_eval/` — the bridge's working directory. */
   readonly repoRoot: string
   /** At most this many turns per game per sweep; `0` is "no limit". */
   readonly turnLimit: number

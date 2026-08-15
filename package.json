@@ -3,13 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Root Bun workspace for the arena TypeScript packages, play-cli, replay viewer, and video renderer",
+  "description": "Root Bun workspace for the active Freeciv Arena TypeScript packages",
   "workspaces": [
     "arena/*",
-    "agent_eval/video",
-    "agent_eval/viewer",
-    "play-cli",
-    "tools/oxlint-config"
+    "arena/tools/*"
   ],
   "scripts": {
     "prepare": "effect-tsgo patch --oxlint",

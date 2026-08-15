@@ -67,6 +67,7 @@ const REPO_ROOT = decodeURIComponent(new URL('../../../../', import.meta.url).pa
   /\/$/,
   '',
 );
+const PYTHON_ROOT = join(REPO_ROOT, 'arena', 'archive');
 
 const ORACLE_SOURCE = `
 import json, os, struct, sys
@@ -161,7 +162,7 @@ interface OracleAnswer {
 }
 
 const askOracle = async (job: OracleJob): Promise<OracleAnswer> => {
-  const child = Bun.spawn(['python3', '-c', ORACLE_SOURCE, REPO_ROOT], {
+  const child = Bun.spawn(['python3', '-c', ORACLE_SOURCE, PYTHON_ROOT], {
     cwd: REPO_ROOT,
     stdin: new TextEncoder().encode(JSON.stringify(job)),
     stdout: 'pipe',
@@ -735,14 +736,16 @@ describe('_parser() — the flag surface', () => {
   });
 
   test('--repo-root defaults to the same checkout REPO_ROOT names', async () => {
-    expect(await Bun.file(join(DEFAULT_REPO_ROOT, 'agent_eval', 'replay_gateway.py')).exists()).toBe(
-      true,
-    );
+    expect(
+      await Bun.file(
+        join(DEFAULT_REPO_ROOT, 'arena', 'archive', 'agent_eval', 'replay_gateway.py'),
+      ).exists(),
+    ).toBe(true);
     const child = Bun.spawnSync([
       'python3',
       '-c',
       'import sys; sys.path.insert(0, sys.argv[1]); from agent_eval.replay_gateway import REPO_ROOT; print(REPO_ROOT, end="")',
-      REPO_ROOT,
+      PYTHON_ROOT,
     ]);
     expect(DEFAULT_REPO_ROOT).toBe(child.stdout.toString());
   });

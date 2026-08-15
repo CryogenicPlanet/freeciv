@@ -14,53 +14,6 @@
         "typescript": "^7",
       },
     },
-    "agent_eval/video": {
-      "name": "freeciv-agent-arena-video",
-      "version": "0.1.0",
-      "dependencies": {
-        "@remotion/cli": "4.0.506",
-        "@remotion/renderer": "4.0.506",
-        "@remotion/tailwind-v4": "4.0.506",
-        "react": "19.2.0",
-        "react-dom": "19.2.0",
-        "remotion": "4.0.506",
-        "tailwindcss": "^4.3.3",
-        "zod": "^4.4.3",
-      },
-      "devDependencies": {
-        "@freeciv/oxlint-config": "workspace:*",
-        "@types/react": "19.2.14",
-        "@types/react-dom": "19.2.3",
-        "oxlint": "1.77.0",
-        "oxlint-tsgolint": "^7.0.2001",
-        "typescript": "5.9.3",
-        "vitest": "^4.1.10",
-      },
-    },
-    "agent_eval/viewer": {
-      "name": "freeciv-agent-replay-viewer",
-      "version": "0.1.0",
-      "dependencies": {
-        "react": "19.2.8",
-        "react-dom": "19.2.8",
-        "three": "0.185.1",
-        "zod": "4.4.3",
-      },
-      "devDependencies": {
-        "@freeciv/oxlint-config": "workspace:*",
-        "@tailwindcss/vite": "4.3.3",
-        "@types/react": "19.2.14",
-        "@types/react-dom": "19.2.3",
-        "@types/three": "0.185.3",
-        "@vitejs/plugin-react": "6.0.5",
-        "oxlint": "1.77.0",
-        "oxlint-tsgolint": "7.0.2001",
-        "tailwindcss": "4.3.3",
-        "typescript": "7.0.2",
-        "vite": "8.2.0",
-        "vitest": "4.1.10",
-      },
-    },
     "arena/db": {
       "name": "@arena/db",
       "version": "0.1.0",
@@ -113,38 +66,7 @@
         "typescript": "^7",
       },
     },
-    "arena/telemetry": {
-      "name": "@arena/telemetry",
-      "version": "0.1.0",
-      "dependencies": {
-        "effect": "^3.22.1",
-        "evlog": "^2.26.0",
-      },
-      "devDependencies": {
-        "@effect/language-service": "^0.87.2",
-        "@effect/tsgo": "^0.36.4",
-        "@types/bun": "^1.3.14",
-        "oxlint": "1.77.0",
-        "oxlint-tsgolint": "^7.0.2001",
-        "typescript": "^7",
-      },
-    },
-    "arena/wire": {
-      "name": "@arena/wire",
-      "version": "0.1.0",
-      "dependencies": {
-        "effect": "^3.22.1",
-      },
-      "devDependencies": {
-        "@effect/language-service": "^0.87.2",
-        "@effect/tsgo": "^0.36.4",
-        "@types/bun": "^1.3.14",
-        "oxlint": "1.77.0",
-        "oxlint-tsgolint": "^7.0.2001",
-        "typescript": "^7",
-      },
-    },
-    "play-cli": {
+    "arena/play": {
       "name": "play-cli",
       "version": "0.1.0",
       "bin": {
@@ -166,11 +88,89 @@
         "typescript": "^7",
       },
     },
-    "tools/oxlint-config": {
+    "arena/telemetry": {
+      "name": "@arena/telemetry",
+      "version": "0.1.0",
+      "dependencies": {
+        "effect": "^3.22.1",
+        "evlog": "^2.26.0",
+      },
+      "devDependencies": {
+        "@effect/language-service": "^0.87.2",
+        "@effect/tsgo": "^0.36.4",
+        "@types/bun": "^1.3.14",
+        "oxlint": "1.77.0",
+        "oxlint-tsgolint": "^7.0.2001",
+        "typescript": "^7",
+      },
+    },
+    "arena/tools/oxlint-config": {
       "name": "@freeciv/oxlint-config",
       "version": "0.1.0",
       "devDependencies": {
         "@oxlint/plugins": "1.77.0",
+      },
+    },
+    "arena/video": {
+      "name": "freeciv-agent-arena-video",
+      "version": "0.1.0",
+      "dependencies": {
+        "@remotion/cli": "4.0.506",
+        "@remotion/renderer": "4.0.506",
+        "@remotion/tailwind-v4": "4.0.506",
+        "react": "19.2.0",
+        "react-dom": "19.2.0",
+        "remotion": "4.0.506",
+        "tailwindcss": "^4.3.3",
+        "zod": "^4.4.3",
+      },
+      "devDependencies": {
+        "@freeciv/oxlint-config": "workspace:*",
+        "@types/react": "19.2.14",
+        "@types/react-dom": "19.2.3",
+        "oxlint": "1.77.0",
+        "oxlint-tsgolint": "^7.0.2001",
+        "typescript": "5.9.3",
+        "vitest": "^4.1.10",
+      },
+    },
+    "arena/viewer": {
+      "name": "freeciv-agent-replay-viewer",
+      "version": "0.1.0",
+      "dependencies": {
+        "react": "19.2.8",
+        "react-dom": "19.2.8",
+        "three": "0.185.1",
+        "zod": "4.4.3",
+      },
+      "devDependencies": {
+        "@freeciv/oxlint-config": "workspace:*",
+        "@tailwindcss/vite": "4.3.3",
+        "@types/react": "19.2.14",
+        "@types/react-dom": "19.2.3",
+        "@types/three": "0.185.3",
+        "@vitejs/plugin-react": "6.0.5",
+        "oxlint": "1.77.0",
+        "oxlint-tsgolint": "7.0.2001",
+        "tailwindcss": "4.3.3",
+        "typescript": "7.0.2",
+        "vite": "8.2.0",
+        "vitest": "4.1.10",
+      },
+    },
+    "arena/wire": {
+      "name": "@arena/wire",
+      "version": "0.1.0",
+      "dependencies": {
+        "effect": "^3.22.1",
+      },
+      "devDependencies": {
+        "@effect/language-service": "^0.87.2",
+        "@effect/tsgo": "^0.36.4",
+        "@types/bun": "^1.3.14",
+        "oxlint": "1.77.0",
+        "oxlint-tsgolint": "^7.0.2001",
+        "typescript": "^7",
       },
     },
   },
@@ -333,7 +333,7 @@
 
     "@esbuild/win32-x64": ["@esbuild/win32-x64@0.25.12", "", { "os": "win32", "cpu": "x64" }, "sha512-alJC0uCZpTFrSL0CCDjcgleBXPnCrEAhTBILpeAp7M/OFgoqtAetfBzX0xM00MUsVVPpVjlPuMbREqnZCXaTnA=="],
 
-    "@freeciv/oxlint-config": ["@freeciv/oxlint-config@workspace:tools/oxlint-config"],
+    "@freeciv/oxlint-config": ["@freeciv/oxlint-config@workspace:arena/tools/oxlint-config"],
 
     "@jridgewell/gen-mapping": ["@jridgewell/gen-mapping@0.3.13", "", { "dependencies": { "@jridgewell/sourcemap-codec": "^1.5.0", "@jridgewell/trace-mapping": "^0.3.24" } }, "sha512-2kkt/7niJ6MgEPxF0bYdQ6etZaA+fQvDcLKckhy1yIQOzaoKjBBjSj63/aLVjYE3qhRt5dvM+uUyfCg6UKCBbA=="],
 
@@ -859,9 +859,9 @@
 
     "find-my-way-ts": ["find-my-way-ts@0.1.6", "", {}, "sha512-a85L9ZoXtNAey3Y6Z+eBWW658kO/MwR7zIafkIUPUMf3isZG0NCs2pjW2wtjxAKuJPxMAsHUIP4ZPGv0o5gyTA=="],
 
-    "freeciv-agent-arena-video": ["freeciv-agent-arena-video@workspace:agent_eval/video"],
+    "freeciv-agent-arena-video": ["freeciv-agent-arena-video@workspace:arena/video"],
 
-    "freeciv-agent-replay-viewer": ["freeciv-agent-replay-viewer@workspace:agent_eval/viewer"],
+    "freeciv-agent-replay-viewer": ["freeciv-agent-replay-viewer@workspace:arena/viewer"],
 
     "fs-monkey": ["fs-monkey@1.0.3", "", {}, "sha512-cybjIfiiE+pTWicSCLFHSrXZ6EilF30oh91FDP9S2B051prEa7QWfrVTQm10/dDpswBDXZugPa1Ogu8Yh+HV0Q=="],
 
@@ -1045,7 +1045,7 @@
 
     "picomatch": ["picomatch@4.0.5", "", {}, "sha512-RvwwcruNjI1ncT5xRakeyS9Lf8lcItv34KD+aif+VH9kduAyfYBipGh12274xtenIPZ119/R9BdTBa8gAwSh0A=="],
 
-    "play-cli": ["play-cli@workspace:play-cli"],
+    "play-cli": ["play-cli@workspace:arena/play"],
 
     "postcss": ["postcss@8.5.26", "", { "dependencies": { "nanoid": "^3.3.17", "picocolors": "^1.1.1", "source-map-js": "^1.2.1" } }, "sha512-u82N74LFzG8ca+dD8puPnplTXoGH4fTPpVGuIbt36G3qvNlkvfD0lEAZSxaly3KX8TS/L1A1gsCEmvKmBcVbkQ=="],
 

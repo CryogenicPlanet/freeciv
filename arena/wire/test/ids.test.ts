@@ -205,12 +205,12 @@ describe('run states', () => {
  * in production — and the line-number citations in `src/ids.ts` cannot rot
  * unnoticed.
  */
-const AGENT_EVAL = `${import.meta.dir}/../../../agent_eval`;
+const AGENT_EVAL = `${import.meta.dir}/../../archive/agent_eval`;
 
 /**
  * Read a Python source file the parity assertions below are written against.
  *
- * **Ungated on purpose.**  A missing `agent_eval/` used to make these tests
+ * **Ungated on purpose.**  A missing `arena/archive/agent_eval/` used to make these tests
  * *skip*, so a checkout without the Python side reported the whole parity story
  * green while checking nothing. This throws at module load instead, matching
  * the canonical-JSON oracle: a missing authority fails, it does not disappear.
@@ -220,7 +220,7 @@ const readPythonSource = (path: string): Promise<string> => Bun.file(path).text(
 const source = await readPythonSource(`${AGENT_EVAL}/replay_gateway.py`);
 const supervisorSource = await readPythonSource(`${AGENT_EVAL}/supervisor.py`);
 
-describe('parity with agent_eval/replay_gateway.py', () => {
+describe('parity with arena/archive/agent_eval/replay_gateway.py', () => {
   test('the Python sources are present — ungated, so a missing authority fails instead of skipping', () => {
     expect(source.length).toBeGreaterThan(0);
     expect(supervisorSource.length).toBeGreaterThan(0);

@@ -3,8 +3,8 @@
  * served by `/v1/games/{id}` and `/v1/games/{id}/status`, and the two
  * unrelated documents that both answer `/v1/games/{id}/result`.
  *
- * Line numbers cite `agent_eval/replay_gateway.py` (the producer being
- * ported) and `agent_eval/supervisor.py` (the upstream service whose bodies
+ * Line numbers cite `arena/archive/agent_eval/replay_gateway.py` (the producer being
+ * ported) and `arena/archive/agent_eval/supervisor.py` (the upstream service whose bodies
  * the gateway relays verbatim) at the commit this file was written against.
  * Captured current payloads and differential gateway tests pin the contract.
  *

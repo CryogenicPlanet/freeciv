@@ -4,7 +4,7 @@
  *
  * Every rule here is transcribed from the Python gateway, which remains the
  * authority while both implementations run side by side. `test/ids.test.ts`
- * re-reads `agent_eval/replay_gateway.py` and compares the patterns and
+ * re-reads `arena/archive/agent_eval/replay_gateway.py` and compares the patterns and
  * vocabularies directly.
  *
  * @module
@@ -14,7 +14,7 @@ import { Either, Schema } from 'effect';
 import { decodeWire, type WireDecoder } from './codec.ts';
 
 /**
- * `GAME_ID_RE` — `agent_eval/replay_gateway.py:35`:
+ * `GAME_ID_RE` — `arena/archive/agent_eval/replay_gateway.py:35`:
  * `re.compile(r"^[A-Za-z0-9_-]{20,80}$")`.
  *
  * The gateway applies it with `re.fullmatch` at every trust boundary: reading
@@ -52,7 +52,7 @@ export const decodeGameId: WireDecoder<GameId> = decodeWire(GameId, 'GameId');
 export const isGameId = (input: string): input is GameId => GAME_ID_RE.test(input);
 
 /**
- * `FRAME_INDEX_RE` — `agent_eval/replay_gateway.py:36`:
+ * `FRAME_INDEX_RE` — `arena/archive/agent_eval/replay_gateway.py:36`:
  * `re.compile(r"^(?:0|[1-9][0-9]*)\.png$")`.
  *
  * Matched against the last path segment of `/v1/games/{id}/frames/{n}.png`
@@ -160,7 +160,7 @@ export const decodeFrameIndexFromPngName: WireDecoder<FrameIndex> =
   decodeWire(FrameIndexFromPngName);
 
 /**
- * `TERMINAL_STATES` — `agent_eval/replay_gateway.py:43`:
+ * `TERMINAL_STATES` — `arena/archive/agent_eval/replay_gateway.py:43`:
  * `{"completed", "invalid", "failed", "cancelled"}`.
  *
  * A run in one of these states has a finalized manifest, so the gateway will
@@ -174,7 +174,7 @@ export const TERMINAL_RUN_STATES = ['completed', 'invalid', 'failed', 'cancelled
  * States a run reports while the supervisor still owns it.  These reach the
  * gateway index verbatim from the upstream live rows (`:1637`); the
  * supervisor writes `"lobby"` when the game is created
- * (`agent_eval/supervisor.py:10769`) and advances through `"starting"` to
+ * (`arena/archive/agent_eval/supervisor.py:10769`) and advances through `"starting"` to
  * `"running"` (`supervisor.py:4063`, `supervisor.py:3916`).
  */
 export const LIVE_RUN_STATES = ['lobby', 'starting', 'running'] as const;

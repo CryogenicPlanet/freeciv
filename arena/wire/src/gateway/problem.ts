@@ -4,7 +4,7 @@
  *
  * ## One shape, no negotiation
  *
- * `_problem` (`agent_eval/replay_gateway.py:1381`) is the single funnel for
+ * `_problem` (`arena/archive/agent_eval/replay_gateway.py:1381`) is the single funnel for
  * every non-2xx body the gateway writes: `self._json(status, {"error":
  * message})`.  There is no RFC-7807 problem document here, no `code`, no
  * `detail`, no `type` — one key, a string value, serialized by `_canonical`
@@ -25,7 +25,7 @@
  * response bodies byte-for-byte with Python.
  *
  * Line citations are the `raise` statement in
- * `agent_eval/replay_gateway.py` at the commit this file was written against.
+ * `arena/archive/agent_eval/replay_gateway.py` at the commit this file was written against.
  *
  * ## What this schema deliberately does *not* do
  *
@@ -35,7 +35,7 @@
  * Nor does it cover full-control-v2 structured errors.  Those are a different
  * envelope entirely — `{schema_version, control_protocol, error: {code,
  * message, retryable, details}, state_revision}` from
- * `agent_eval/full_control_v2.py:522-541`, carried as `APIProblem.payload` by
+ * `arena/archive/agent_eval/full_control_v2.py:522-541`, carried as `APIProblem.payload` by
  * the *supervisor* (`supervisor.py:11411`) — where `error` is an object, not a
  * string.  {@link decodeGatewayProblem} rejects those, which is the correct
  * answer: they belong to the v2 agent contract, not to this one.

@@ -4,6 +4,9 @@ set quiet
 export AGENT_EVAL_SERVICE_URL := env_var_or_default("AGENT_EVAL_SERVICE_URL", "https://freeciv-api.localhost")
 export AGENT_EVAL_ADMIN_TOKEN := env_var_or_default("AGENT_EVAL_ADMIN_TOKEN", "freeciv-local-dev")
 export AGENT_EVAL_STATE_DIR := env_var_or_default("AGENT_EVAL_STATE_DIR", ".agent-eval")
+# The Python implementation is archived but remains importable while parity
+# tests and migration tooling still depend on it.
+export PYTHONPATH := "arena/archive"
 
 # Show the short local workflow.
 default:
@@ -97,15 +100,15 @@ replay-install:
 
 # Typecheck and build the committed browser replay viewer served by `just start`.
 replay-build: replay-install
-    bun run --cwd agent_eval/viewer build
+    bun run --cwd arena/viewer build
 
 # Run only Vite on its legacy raw port (advanced UI development).
 replay-dev: replay-install
-    bun run --cwd agent_eval/viewer dev -- --host 127.0.0.1 --port 5173 --strictPort
+    bun run --cwd arena/viewer dev -- --host 127.0.0.1 --port 5173 --strictPort
 
 # Run browser replay typechecks, unit tests, and the production build.
 replay-check: replay-install
-    bun run --cwd agent_eval/viewer check
+    bun run --cwd arena/viewer check
 
 # Start the complete local stack. Ctrl-C stops only children from this invocation.
 start: build replay-build
@@ -275,7 +278,7 @@ _create game_mode protocol difficulty mode_or_places places_or_turns turns max_t
       --difficulty "{{ difficulty }}" \
       --lobby-timeout-s 0 \
       --credentials "$AGENT_EVAL_STATE_DIR/games/{game_id}/owner.json" \
-      --player-invite "play/.invites/{game_id}.json"
+      --player-invite "arena/archive/play/.invites/{game_id}.json"
 
 # Rebuild one player-only invitation from its owner credentials.
 invite game_id:
@@ -283,7 +286,7 @@ invite game_id:
     set -euo pipefail
     python3 -B -m agent_eval game stage-invite "{{ game_id }}" \
       --credentials "$AGENT_EVAL_STATE_DIR/games/{{ game_id }}/owner.json" \
-      --output "play/.invites/{{ game_id }}.json" \
+      --output "arena/archive/play/.invites/{{ game_id }}.json" \
       --require-open-lobby
 
 # Print the prompt to paste into a fresh Codex, Claude, Pi, or other harness.
@@ -300,7 +303,7 @@ prompt game_id="" name="" place="":
       controller_name=HARNESS-MODEL
     fi
     repo_root="$(pwd -P)"
-    player_workspace="$repo_root/play"
+    player_workspace="$repo_root/arena/archive/play"
     join_command=(just join --game_id "$game_id" --name "$controller_name")
     if [[ -n "{{ place }}" ]]; then
       join_command+=(--place "{{ place }}")
@@ -384,7 +387,7 @@ join game_id="" name="Agent" place="":
     if [[ -n "{{ place }}" ]]; then
       args+=(--place "{{ place }}")
     fi
-    cd play
+    cd arena/archive/play
     exec "${args[@]}"
 
 # Run the model-free reference bot for one game-scoped controller session.
@@ -460,11 +463,11 @@ video game_id out="" preset="full": video-install
       --runs-root "$AGENT_EVAL_STATE_DIR/runs" --out "$export_dir"
     # Remotion serves the dataset from its own public directory, so the run
     # artifacts themselves are never exposed to the renderer.
-    public_dir="$repo/agent_eval/video/public/exports/{{ game_id }}"
+    public_dir="$repo/arena/video/public/exports/{{ game_id }}"
     mkdir -p "$public_dir"
     cp "$export_dir/meta.json" "$export_dir/frames.json" \
       "$export_dir/events.json" "$public_dir/"
-    cd "$repo/agent_eval/video"
+    cd "$repo/arena/video"
     # Bash 3.2 treats an empty array as unset under `set -u`, so the full
     # preset's empty flag list needs the guarded expansion.
     bunx remotion render src/index.ts GameFilm "$output" \
@@ -474,13 +477,13 @@ video game_id out="" preset="full": video-install
 
 # Typecheck the offline video renderer and run its unit tests.
 video-check: video-install
-    bun run --cwd agent_eval/video check
+    bun run --cwd arena/video check
 
 # Open the video renderer's studio against an already-exported game.
 video-studio: video-install
     #!/usr/bin/env bash
     set -euo pipefail
-    cd agent_eval/video
+    cd arena/video
     bunx remotion studio src/index.ts
 
 # Show current public game state.
@@ -490,4 +493,4 @@ status game_id:
 # Run the complete Python suite; set e2e=0 for unit tests only.
 test e2e="1":
     FREECIV_AGENT_E2E="{{ e2e }}" python3 -B -W error::ResourceWarning \
-      -m unittest discover -s agent_eval/tests -v
+      -m unittest discover -s arena/archive/agent_eval/tests -t arena/archive -v
