@@ -31,6 +31,8 @@ import {
 } from '../../errors.ts';
 import {
   archiveRegularFiles,
+  type BinaryArtifact,
+  isArchiveBytes,
   O_CLOEXEC,
   O_NOFOLLOW,
   O_RDONLY,
@@ -559,6 +561,73 @@ const sendLocalFile = (
       ),
   );
 
+/**
+ * {@link fileStream}, over bytes a backend already holds.
+ *
+ * Same 64 KiB slices, same `Stream`, and therefore the **same framing**: Bun
+ * drops `Content-Length` from any streamed body and answers
+ * `Transfer-Encoding: chunked`, so a bytes-backed frame goes out exactly as a
+ * disk-backed one does.  That is the whole point of doing it this way instead
+ * of handing the `Uint8Array` to `HttpServerResponse.uint8Array`, which would
+ * keep the length and put the Postgres backend on the *other* side of
+ * `waivers.ts#binary-disk-fallback-chunked` — a second waiver for a second
+ * framing, on legs whose bytes are identical.  `subarray` is a view, so the
+ * slicing copies nothing.
+ */
+const bytesStream = (bytes: Uint8Array): Stream.Stream<Uint8Array> =>
+  Stream.unfold(0, (position) => {
+    if (position >= bytes.byteLength) {
+      return Option.none();
+    }
+    const end = Math.min(position + ARCHIVE_STREAM_CHUNK_BYTES, bytes.byteLength);
+    return Option.some([bytes.subarray(position, end), end] as const);
+  });
+
+/**
+ * {@link sendLocalFile}'s bytes twin.
+ *
+ * The two refusals `_send_local_file` makes on a descriptor — not a regular
+ * file, zero length — have exactly one counterpart here: an empty artifact is
+ * the same 404 a zero-byte file is.  "Regular file" has no meaning for a row,
+ * and a backend that stored a directory as a `bytea` is not a case that exists.
+ * Every header, the `Cache-Control` and `contentLength` are the same values
+ * from the same constants.
+ */
+const sendArchiveBytes = (
+  bytes: Uint8Array,
+  contentType: string,
+): Effect.Effect<HttpServerResponse.HttpServerResponse, GatewayError> =>
+  bytes.byteLength <= 0
+    ? Effect.fail(NOT_FOUND('archiveFileNotFound'))
+    : Effect.succeed(
+        withSecurityHeaders(
+          HttpServerResponse.stream(bytesStream(bytes), {
+            status: 200,
+            contentType,
+            contentLength: bytes.byteLength,
+            headers: { 'cache-control': Gateway.ARCHIVE_BINARY_CACHE_CONTROL },
+          }),
+        ),
+      );
+
+/**
+ * `_send_local_file`'s dispatcher: one binary artifact, whichever backend
+ * produced it.
+ *
+ * The filesystem repository answers with a path and reaches
+ * {@link sendLocalFile} — `O_NOFOLLOW`, `fstat` on the descriptor, 64 KiB
+ * reads — byte for byte the code that was here before Postgres existed.  A
+ * repository that answers with bytes reaches {@link sendArchiveBytes}, whose
+ * response differs in nothing a client can observe.
+ */
+const sendArtifact = (
+  artifact: BinaryArtifact,
+  contentType: string,
+): Effect.Effect<HttpServerResponse.HttpServerResponse, GatewayError, Scope.Scope> =>
+  isArchiveBytes(artifact)
+    ? sendArchiveBytes(artifact.bytes, contentType)
+    : sendLocalFile(artifact, contentType);
+
 /** The disk arm of `_archive_binary_route` (`:1956-1963`). */
 const archiveBinaryFromDisk = (
   route: ArchiveBinaryRoute,
@@ -573,7 +642,7 @@ const archiveBinaryFromDisk = (
         route._tag === 'VideoMp4'
           ? runs.videoFile(archive)
           : runs.frameFile(archive, frameIndex(route)),
-        (path) => sendLocalFile(path, localContentType(route)),
+        (artifact) => sendArtifact(artifact, localContentType(route)),
       ),
     ),
   );

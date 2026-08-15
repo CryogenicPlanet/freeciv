@@ -226,7 +226,7 @@ const asJsonObject = (value: CanonValue): Option.Option<CanonRecord> =>
   isCanonRecord(value) ? Option.some(value) : Option.none();
 
 /** A Python-aware document converted only for a strict wire-schema decode. */
-const canonToJson = (value: CanonValue): JsonValue => {
+export const canonToJson = (value: CanonValue): JsonValue => {
   if (Predicate.isBigInt(value)) return Number(value);
   if (Array.isArray(value)) return value.map(canonToJson);
   if (isCanonRecord(value)) {
@@ -261,6 +261,49 @@ export interface TerminalArchive extends ArchiveView {
   /** The resolved run directory, for the binary routes and nothing else. */
   readonly runRoot: string;
 }
+
+/**
+ * Bytes a backend already holds, as opposed to a file the route may open.
+ *
+ * The tag exists so that {@link BinaryArtifact}'s two arms are distinguishable
+ * without a `typeof` at every use site; `isArchiveBytes` is the narrowing.
+ */
+export interface ArchiveBytes {
+  readonly _tag: 'Bytes';
+  readonly bytes: Uint8Array;
+}
+
+/**
+ * Where a served binary lives.
+ *
+ * A **path** is the filesystem backend's answer and the *only* thing that
+ * existed before Postgres: `http/routes/archive.ts` opens it with `O_NOFOLLOW`,
+ * `fstat`s the descriptor and streams it 64 KiB at a time, and that sequence is
+ * a security property (a frame replaced by a symlink to `auth.json` is a 404,
+ * not a secret), not an implementation detail.  A backend that holds the bytes
+ * already — every row of `run_frames`/`run_videos` — answers with
+ * {@link ArchiveBytes} instead, and the route sends it through the *same*
+ * chunked stream so the two backends are indistinguishable on the wire.
+ *
+ * ## Why the path arm is a bare `string`
+ *
+ * A `{ _tag: 'FilePath'; path }` wrapper would read better and would have
+ * changed every existing implementation, every existing test and — the part
+ * that matters — the expression that produces the filesystem gateway's frame
+ * and video responses.  The parity claim for this refactor is "the filesystem
+ * leg did not move", and leaving `frameFile`/`videoFile` returning exactly the
+ * strings they returned makes that claim checkable with `git diff` instead of
+ * with an argument.  The union is unambiguous either way: a path is a `string`,
+ * bytes are an object.
+ */
+export type BinaryArtifact = string | ArchiveBytes;
+
+/** {@link ArchiveBytes}, for a backend that reads a `bytea` column. */
+export const archiveBytes = (bytes: Uint8Array): ArchiveBytes => ({ _tag: 'Bytes', bytes });
+
+/** Which arm of {@link BinaryArtifact} this is. */
+export const isArchiveBytes = (artifact: BinaryArtifact): artifact is ArchiveBytes =>
+  !Predicate.isString(artifact);
 
 /** Options for {@link RunsRepositoryApi.diskGamesIndex}. */
 export interface DiskGamesIndexOptions {
@@ -297,14 +340,20 @@ export interface RunsRepositoryApi {
     liveIds: ReadonlySet<string>,
   ) => Effect.Effect<readonly Canonical<Gateway.GameRow>[]>;
 
-  /** `_archive_frame_path` (`:1007`); {@link Option.none} is `latest.png`. */
+  /**
+   * `_archive_frame_path` (`:1007`); {@link Option.none} is `latest.png`.
+   *
+   * A {@link BinaryArtifact} rather than a path since the Postgres backend
+   * exists: the filesystem repository answers with the same path it always
+   * did, and a backend holding the bytes answers with {@link archiveBytes}.
+   */
   readonly frameFile: (
     archive: TerminalArchive,
     index: Option.Option<FrameIndex>,
-  ) => Effect.Effect<string, RunsError>;
+  ) => Effect.Effect<BinaryArtifact, RunsError>;
 
-  /** `_archive_video_path` (`:1022`). */
-  readonly videoFile: (archive: TerminalArchive) => Effect.Effect<string, RunsError>;
+  /** `_archive_video_path` (`:1022`), as a {@link BinaryArtifact}. */
+  readonly videoFile: (archive: TerminalArchive) => Effect.Effect<BinaryArtifact, RunsError>;
 }
 
 /** The `runs_root` reader, as a service. */

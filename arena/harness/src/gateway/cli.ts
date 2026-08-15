@@ -1,7 +1,7 @@
 /** Gateway CLI surface. Numeric flags deliberately use Python `int()`/`float()` semantics. */
 
 import { Command, HelpDoc, Options, ValidationError } from '@effect/cli';
-import { Effect } from 'effect';
+import { Effect, Option, Redacted } from 'effect';
 import type { Either } from 'effect';
 import {
   GatewayConfigError,
@@ -9,7 +9,7 @@ import {
   pythonInt,
   pythonRepr,
 } from './config.ts';
-import type { GatewayConfigInput } from './config.ts';
+import type { GatewayConfigInput, PostgresBackendInput } from './config.ts';
 
 /**
  * The command's name.  `@effect/cli` uses it for usage text and subcommand
@@ -61,8 +61,89 @@ const pythonTyped =
       ),
     );
 
+// ---------------------------------------------------------------------------
+// The two TypeScript-only flags
+// ---------------------------------------------------------------------------
+
+/** `--backend`'s flag name, without its dashes (`Options.choice` takes it bare). */
+export const GATEWAY_BACKEND_OPTION = 'backend' as const;
+
+/** `--backend`, as a user types it. */
+export const GATEWAY_BACKEND_FLAG = `--${GATEWAY_BACKEND_OPTION}` as const;
+
+/** `--database-url`'s flag name, without its dashes. */
+export const DATABASE_URL_OPTION = 'database-url' as const;
+
+/** `--database-url`, as a user types it. */
+export const DATABASE_URL_FLAG = `--${DATABASE_URL_OPTION}` as const;
+
+/** The values `--backend` accepts; anything else is `@effect/cli`'s own error. */
+export const GATEWAY_BACKENDS = ['fs', 'postgres'] as const;
+
+/** One of {@link GATEWAY_BACKENDS}. */
+export type GatewayBackendName = (typeof GATEWAY_BACKENDS)[number];
+
 /**
- * The nine flags of `_parser()`, in declaration order.
+ * `--backend`'s default: the filesystem, i.e. the gateway that already
+ * exists.  An absent flag must not change a single byte of a response.
+ */
+export const DEFAULT_GATEWAY_BACKEND: GatewayBackendName = 'fs';
+
+/**
+ * `@effect/cli`'s own sentence for a required option that was not supplied
+ * (`@effect/cli/internal/options.js:697`, `:990`, `:1064`).
+ *
+ * `--database-url` cannot be *declared* required — it is required only when
+ * `--backend postgres` is, and `@effect/cli` has no conditional requirement —
+ * so the requirement is enforced by hand and has to report itself in the same
+ * words, through the same {@link ValidationError.missingValue}, as the four
+ * flags the parser declares required.  Spelled once here so a change in
+ * `@effect/cli`'s wording shows up as one failing assertion rather than as a
+ * pair of messages that quietly drifted apart.
+ */
+export const missingOptionMessage = (flag: string): string =>
+  `Expected to find option: '${flag}'`;
+
+/** What a flag that no backend asked for is told. */
+export const withoutPostgresMessage = (flag: string): string =>
+  `${flag} is only used with ${GATEWAY_BACKEND_FLAG} postgres`;
+
+/** What a `--database-url` that no backend asked for is told. */
+export const DATABASE_URL_WITHOUT_POSTGRES: string = withoutPostgresMessage(DATABASE_URL_FLAG);
+
+/**
+ * The two TypeScript-only flags, resolved into the one value
+ * {@link GatewayConfigInput.backend} carries.
+ *
+ * They are parsed as a group because they are one decision, and the rejection
+ * is the point: a `--database-url` typed without `--backend postgres` is a
+ * *silent* fallback to the filesystem otherwise — an operator who believed they
+ * were serving from Postgres would get correct-looking answers from the wrong
+ * storage.
+ */
+const selectBackend = (parsed: {
+  readonly backend: GatewayBackendName;
+  readonly databaseUrl: Option.Option<string>;
+}): Effect.Effect<PostgresBackendInput | undefined, ValidationError.ValidationError> =>
+  parsed.backend === 'postgres'
+    ? Option.match(parsed.databaseUrl, {
+        onNone: () =>
+          Effect.fail(
+            ValidationError.missingValue(HelpDoc.p(missingOptionMessage(DATABASE_URL_FLAG))),
+          ),
+        onSome: (url) =>
+          Effect.succeed<PostgresBackendInput>({
+            _tag: 'Postgres',
+            databaseUrl: Redacted.make(url),
+          }),
+      })
+    : Option.isSome(parsed.databaseUrl)
+      ? Effect.fail(ValidationError.invalidValue(HelpDoc.p(DATABASE_URL_WITHOUT_POSTGRES)))
+      : Effect.succeed(undefined);
+
+/**
+ * The nine flags of `_parser()`, in declaration order, plus the two
+ * TypeScript-only ones the module doc scopes out of the parity claim.
  *
  * Exported as the config object rather than as a finished command so that a
  * test — and `main.ts` — can build the command with whichever handler it
@@ -93,6 +174,26 @@ export const gatewayCliOptions = {
   ),
   /** `--viewer-public-url`, optional with no default — `None` (`:2184`). */
   viewerPublicUrl: Options.optional(Options.text('viewer-public-url')),
+  /**
+   * `--backend fs|postgres` and `--database-url`, as one field.
+   *
+   * They are parsed together because neither is meaningful alone: they are one
+   * decision — which storage the repository reads — and resolving it here means
+   * `main.ts` matches on a value that cannot be inconsistent, instead of
+   * re-deriving the rule from two loose fields.  `fs` (and the absent flags)
+   * resolve to `undefined`, so the record is unchanged for every caller that
+   * does not ask for Postgres.
+   *
+   * *Where* the python bridge reads its files used to be part of this decision,
+   * as `--materialize-root`.  It is not a decision any more: both backends
+   * point the bridge at `--runs-root`.
+   */
+  backend: Options.all({
+    backend: Options.choice(GATEWAY_BACKEND_OPTION, GATEWAY_BACKENDS).pipe(
+      Options.withDefault(DEFAULT_GATEWAY_BACKEND),
+    ),
+    databaseUrl: Options.optional(Options.text(DATABASE_URL_OPTION)),
+  }).pipe(Options.mapEffect(selectBackend)),
 } as const;
 
 /**
@@ -102,8 +203,26 @@ export const gatewayCliOptions = {
  * Structurally identical to {@link GatewayConfigInput}; the alias exists so a
  * reader can tell "what the parser produced" from "what the config consumes"
  * at a glance, and so the assignment is checked by the compiler.
+ *
+ * `backend` is the one field where "produced" and "consumed" are spelled
+ * differently, and {@link GatewayCommandArgs} is where that is written down.
  */
 export type GatewayCliArgs = GatewayConfigInput;
+
+/**
+ * What {@link gatewayCommand} actually yields.
+ *
+ * A parse always produces the `backend` key — `undefined` when no backend was
+ * named — whereas {@link GatewayConfigInput} accepts it as optional, so that
+ * the flag pair is additive for every caller that constructs a configuration
+ * without going through argv.  The two are not interchangeable, because
+ * `Command.Command` is invariant in its parsed type: this alias is the one the
+ * command is annotated with, and it is assignable to {@link GatewayCliArgs},
+ * which is what every consumer takes.
+ */
+export interface GatewayCommandArgs extends GatewayConfigInput {
+  readonly backend: PostgresBackendInput | undefined;
+}
 
 /**
  * The command itself, with no handler attached.
@@ -116,7 +235,7 @@ export const gatewayCommand: Command.Command<
   typeof GATEWAY_CLI_NAME,
   never,
   never,
-  GatewayCliArgs
+  GatewayCommandArgs
 > = Command.make(GATEWAY_CLI_NAME, gatewayCliOptions);
 
 /**
