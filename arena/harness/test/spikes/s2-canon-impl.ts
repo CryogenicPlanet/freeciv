@@ -18,7 +18,7 @@
  * The real implementation lands in `@arena/wire` as `canon.ts`; this file exists
  * to prove the shape is reachable before that package commits to it.
  */
-import { Either } from 'effect';
+import { Either, Predicate } from 'effect';
 
 /** A value with an unambiguous CPython JSON spelling. */
 export type CanonValue =
@@ -52,7 +52,11 @@ export const compareCodePoints = (left: string, right: string): number => {
   return other === undefined ? 1 : a[firstDiff]! - other;
 };
 
-const SHORT_ESCAPES: Readonly<Record<string, string>> = {
+interface ShortEscapes {
+  readonly [character: string]: string;
+}
+
+const SHORT_ESCAPES: ShortEscapes = {
   '"': '\\"',
   '\\': '\\\\',
   '\b': '\\b',
@@ -127,18 +131,12 @@ const write = (
   path: string,
 ): Either.Either<string, CanonError> => {
   if (value === null) return Either.right('null');
-  switch (typeof value) {
-    case 'boolean':
-      return Either.right(value ? 'true' : 'false');
-    case 'bigint':
-      return Either.right(value.toString(10));
-    case 'number':
-      return Either.mapLeft(formatFloat(value), () => nonFinite(path));
-    case 'string':
-      return Either.right(encodeString(value, ensureAscii));
-    default:
-      break;
+  if (Predicate.isBoolean(value)) return Either.right(value ? 'true' : 'false');
+  if (Predicate.isBigInt(value)) return Either.right(value.toString(10));
+  if (Predicate.isNumber(value)) {
+    return Either.mapLeft(formatFloat(value), () => nonFinite(path));
   }
+  if (Predicate.isString(value)) return Either.right(encodeString(value, ensureAscii));
   // `Array.isArray` does not narrow the negative branch of a `ReadonlyArray`
   // union, so the object case gets the explicit guard.
   if (!isCanonRecord(value)) {

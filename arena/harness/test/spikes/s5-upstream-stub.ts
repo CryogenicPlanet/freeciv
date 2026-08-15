@@ -74,6 +74,10 @@ const endlessBody = (onCancel: () => void): ReadableStream<Uint8Array> => {
   });
 };
 
+interface ResponseHandlers {
+  readonly [path: string]: () => Response;
+}
+
 export interface UpstreamStub {
   readonly url: string;
   /** performance.now() at which the server enqueued the final binary chunk. */
@@ -90,7 +94,7 @@ export const startUpstreamStub = (): UpstreamStub => {
   const binaryChunk = crypto.getRandomValues(new Uint8Array(CHUNK_BYTES));
   const errorChunk = new Uint8Array(SMALL_CHUNK_BYTES).fill(0x45); // 'E'
 
-  const handlers: Record<string, () => Response> = {
+  const handlers: ResponseHandlers = {
     // ~9MiB of syntactically valid JSON, streamed in 256KiB chunks.
     '/json-9mib': () =>
       new Response(

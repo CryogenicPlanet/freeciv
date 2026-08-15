@@ -18,7 +18,7 @@
  * testing the wrong thing.
  */
 import { describe, expect, test } from 'bun:test';
-import { Either } from 'effect';
+import { Predicate, Either } from 'effect';
 import {
   type CanonValue,
   canonicalBytes,
@@ -241,7 +241,7 @@ describe('S2 - property-style parity against a live python3', () => {
 });
 
 const isRecord = (value: CanonValue | undefined): value is { readonly [k: string]: CanonValue } =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
+  Predicate.isRecord(value);
 
 const field = (value: CanonValue | undefined, key: string): CanonValue | undefined =>
   isRecord(value) ? value[key] : undefined;
@@ -259,8 +259,8 @@ describe('S2 - THE GATE: NATIVE_OBSERVATION_ACTION_SCHEMA_ID', () => {
   test('the naive JS route does not reach this digest by accident', () => {
     // `JSON.stringify` with bigints coerced to numbers: the basis is gone, and
     // so is the id.  This is why the writer above exists.
-    const naive = JSON.stringify(NATIVE_SCHEMA_CANONICAL, (_key, value: unknown) =>
-      typeof value === 'bigint' ? Number(value) : value,
+    const naive = JSON.stringify(NATIVE_SCHEMA_CANONICAL, <Value>(_key: string, value: Value) =>
+      Predicate.isBigInt(value) ? Number(value) : value,
     );
     expect(naive).not.toContain('14695981039346656037');
     expect(`sha256-${new Bun.CryptoHasher('sha256').update(naive).digest('hex')}`).not.toBe(

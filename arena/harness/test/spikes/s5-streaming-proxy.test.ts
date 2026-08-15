@@ -49,7 +49,11 @@ const report = (label: string, value: string): void => {
   console.log(`  [S5] ${label}: ${value}`);
 };
 
-const stub: { current: UpstreamStub | null } = { current: null };
+interface StubState {
+  current: UpstreamStub | null;
+}
+
+const stub: StubState = { current: null };
 const upstream = (): UpstreamStub => {
   const current = stub.current;
   if (current === null) throw new Error('upstream stub not started');

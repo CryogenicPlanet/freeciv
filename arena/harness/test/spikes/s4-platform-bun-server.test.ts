@@ -18,9 +18,10 @@
  */
 import { describe, expect, test } from 'bun:test';
 import { HttpServerRequest, HttpServerResponse } from '@effect/platform';
-import { BunHttpServer } from '@effect/platform-bun';
+import { NodeHttpServer } from '@effect/platform-node';
 import { Data, Effect } from 'effect';
 import type { Scope } from 'effect';
+import { createServer } from 'node:http';
 
 const HOST = '127.0.0.1';
 const EXCHANGE_TIMEOUT = '5 seconds';
@@ -178,7 +179,10 @@ interface Bound {
 /** Bind on port 0 and attach `gatewayApp`; the port is read from the server. */
 const boundGateway: Effect.Effect<Bound, never, Scope.Scope> = Effect.gen(
   function* () {
-    const server = yield* BunHttpServer.make({ port: 0, hostname: HOST });
+    const server = yield* NodeHttpServer.make(createServer, {
+      port: 0,
+      host: HOST,
+    }).pipe(Effect.orDie);
     const before = server.address;
     // (a) the ephemeral port is known here — no request has been made yet.
     const portBeforeServe = before._tag === 'TcpAddress' ? before.port : -1;
@@ -198,32 +202,29 @@ const runScoped = <A, E>(
 // ---------------------------------------------------------------------------
 
 describe('S4 (a) the real ephemeral port is knowable before serving traffic', () => {
-  test('BunHttpServer.make on port 0 exposes a TcpAddress with the real port', async () => {
+  test('NodeHttpServer.make on port 0 exposes a TcpAddress with the real port', async () => {
     const bound = await runScoped(boundGateway);
     expect(bound.portBeforeServe).toBeGreaterThan(0);
     expect(bound.portBeforeServe).not.toBe(0);
     expect(bound.portAfterServe).toBe(bound.portBeforeServe);
   });
 
-  test('the port is bound and answering 404 before serve attaches the app', async () => {
-    // THE GOTCHA: BunHttpServer.make calls Bun.serve immediately, with a
-    // built-in `404 not found` handler. The socket is live and reachable the
-    // instant the address is readable — so the ready-file must be written
-    // AFTER server.serve(app) returns, never merely after the address is read,
-    // or a fast client can race in and be told 404 by code that is not ours.
+  test('the port is bound before serve attaches the app', async () => {
+    // Node starts listening in `make`, but installs no fallback request
+    // handler. The ready-file must therefore still be published only after
+    // `serve(app)`: a request in this window would wait without a response.
     const program = Effect.gen(function* () {
-      const server = yield* BunHttpServer.make({ port: 0, hostname: HOST });
+      const server = yield* NodeHttpServer.make(createServer, { port: 0, host: HOST });
       const address = server.address;
       const port = address._tag === 'TcpAddress' ? address.port : -1;
-      const beforeServe = yield* request(port, { method: 'GET' });
+      const beforeServe = yield* probeConnect(port);
       yield* server.serve(gatewayApp);
       const afterServe = yield* request(port, { method: 'GET' });
       return { beforeServe, afterServe };
     });
     const { beforeServe, afterServe } = await runScoped(program);
 
-    expect(beforeServe.status).toBe(404);
-    expect(beforeServe.body).toBe('not found');
+    expect(beforeServe).toBe('open');
     expect(afterServe.status).toBe(200);
     expect(afterServe.body).toBe('ok');
   });
@@ -321,15 +322,13 @@ describe('S4 (c) a GET that carries a body is detectable', () => {
     expect(chunked.body).toBe('get-with-body:chunked');
   });
 
-  test('but the BYTES are gone: Bun nulls the body of a GET request', async () => {
-    // Definitive answer to (c): detection yes, payload no. Bun's HTTP parser
-    // discards a GET entity-body, so `request.text` yields '' and the
-    // underlying Request has `body === null`. The Python gateway's 400 is
-    // reproducible from headers alone; a design that needs to READ a GET body
-    // is not implementable on this server.
+  test('Node retains GET entity bytes even though the gateway rejects from headers', async () => {
+    // The production handler deliberately never reads these bytes; it matches
+    // Python's header-only refusal. This assertion records the Node adapter's
+    // transport behavior so a future edge change is visible.
     const observed = await runScoped(
       Effect.gen(function* () {
-        const server = yield* BunHttpServer.make({ port: 0, hostname: HOST });
+        const server = yield* NodeHttpServer.make(createServer, { port: 0, host: HOST });
         const address = server.address;
         const port = address._tag === 'TcpAddress' ? address.port : -1;
         yield* server.serve(
@@ -359,10 +358,8 @@ describe('S4 (c) a GET that carries a body is detectable', () => {
       }),
     );
     const [get, post] = observed;
-    expect(get?.body).toBe('text=<> bodyNull=true');
-    // Contrast: an identical POST body IS readable, so this is a GET-specific
-    // parser behaviour and not a broken test client.
-    expect(post?.body).toBe('text=<{"hello":"y"}> bodyNull=false');
+    expect(get?.body).toBe('text=<{"hello":"x"}> bodyNull=n/a');
+    expect(post?.body).toBe('text=<{"hello":"y"}> bodyNull=n/a');
   });
 });
 
