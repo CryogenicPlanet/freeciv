@@ -417,6 +417,18 @@ describe('the two serializers', () => {
     // no separator spaces.  This is `_canonical`, not `JSON.stringify`.
     expect(text(payload)).toBe('{"score":7.0,"turn":7}');
   });
+
+  test('non-finite disk values use Python json.dumps spellings', async () => {
+    const payload = await Effect.runPromise(
+      gatewayJson({
+        literal: '__arena_python_nonfinite_0__',
+        nested: [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY],
+      }),
+    );
+    expect(text(payload)).toBe(
+      '{"literal":"__arena_python_nonfinite_0__","nested":[NaN,Infinity,-Infinity]}',
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------

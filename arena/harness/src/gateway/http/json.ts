@@ -5,9 +5,10 @@
 
 import { CANON_UTF8, canonicalBytes, type CanonValue, Gateway } from '@arena/wire';
 import type { HttpServerResponse } from '@effect/platform';
-import { Either } from 'effect';
+import { Either, Option, Predicate } from 'effect';
 import { MAX_PROXY_JSON_BYTES } from '../constants.ts';
 import { ArchiveUnavailable, InternalError } from '../errors.ts';
+import { isCanonRecord } from '../python-json.ts';
 import { gatewayJsonResponse } from './respond.ts';
 
 // ---------------------------------------------------------------------------
@@ -35,14 +36,63 @@ export interface GatewayJsonPayload {
  * `_canonical(value)` (`:123-126`) — `sort_keys=True`, `(",", ":")`,
  * `ensure_ascii=False`, UTF-8.
  *
- * The failure is Python's `UnicodeEncodeError` / `ValueError` escaping
- * `_canonical` *inside* the handler, which the `except Exception` at `:2040`
- * turns into a 500 with the fixed message.  Unreachable from the projections —
- * they emit no lone surrogates, no `NaN`, no 1000-deep nesting — and modelled
- * anyway so that this module contains no partial function.
+ * Python's default `json.dumps` also emits `NaN` and `±Infinity`. Wire's
+ * repository-wide canonical writer deliberately uses `allow_nan=False`, so
+ * this gateway-only fallback substitutes those tokens after canonicalizing a
+ * collision-free string marker. Ordinary values still use the shared writer.
  */
+const pythonNonFiniteBytes = (value: CanonValue): Option.Option<Uint8Array> => {
+  const strings = new Set<string>();
+  const rememberStrings = (item: CanonValue): void => {
+    if (Predicate.isString(item)) strings.add(item);
+    else if (Array.isArray(item)) item.forEach(rememberStrings);
+    else if (isCanonRecord(item)) {
+      Object.entries(item).forEach(([key, child]) => {
+        strings.add(key);
+        rememberStrings(child);
+      });
+    }
+  };
+  rememberStrings(value);
+
+  const markers = new Map<string, string>();
+  let next = 0;
+  const freshMarker = (): string => {
+    let marker = '';
+    do {
+      marker = `__arena_python_nonfinite_${String(next)}__`;
+      next += 1;
+    } while (strings.has(marker));
+    strings.add(marker);
+    return marker;
+  };
+  const replace = (item: CanonValue): CanonValue => {
+    if (Predicate.isNumber(item) && !Number.isFinite(item)) {
+      const marker = freshMarker();
+      markers.set(marker, Number.isNaN(item) ? 'NaN' : item > 0 ? 'Infinity' : '-Infinity');
+      return marker;
+    }
+    if (Array.isArray(item)) return item.map(replace);
+    if (isCanonRecord(item)) {
+      return Object.fromEntries(Object.entries(item).map(([key, child]) => [key, replace(child)]));
+    }
+    return item;
+  };
+  const encoded = Either.getRight(canonicalBytes(replace(value), CANON_UTF8));
+  if (Option.isNone(encoded) || markers.size === 0) return Option.none();
+  let text = new TextDecoder().decode(encoded.value);
+  for (const [marker, token] of markers) text = text.replaceAll(JSON.stringify(marker), token);
+  return Option.some(new TextEncoder().encode(text));
+};
+
 const canonicalPayload = (value: CanonValue): Either.Either<Uint8Array, InternalError> =>
-  Either.mapLeft(canonicalBytes(value, CANON_UTF8), (cause) => new InternalError({ cause }));
+  Either.match(canonicalBytes(value, CANON_UTF8), {
+    onLeft: (cause) => Option.match(pythonNonFiniteBytes(value), {
+      onNone: () => Either.left(new InternalError({ cause })),
+      onSome: Either.right,
+    }),
+    onRight: Either.right,
+  });
 
 /**
  * `_json(200, value)` (`:1367`) — canonical bytes, **no size ceiling**.

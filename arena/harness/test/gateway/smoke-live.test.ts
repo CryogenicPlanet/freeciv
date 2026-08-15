@@ -15,13 +15,8 @@ import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
-/**
- * `flock` through `bun:ffi` against `libSystem.B.dylib`, and the `python3` that
- * owns the oracle, are both darwin facts here.  Everything else in this file is
- * portable; the tag is on the whole suite because a partial run would report a
- * parity result the platform cannot support.
- */
-const DARWIN = process.platform === 'darwin';
+/** Ready-file locking supports the full live rig on Linux and Darwin. */
+const PLATFORM_SUPPORTED = process.platform === 'darwin' || process.platform === 'linux';
 
 const REPO_ROOT = resolve(import.meta.dir, '../../../..');
 const HARNESS_ROOT = resolve(import.meta.dir, '../..');
@@ -743,7 +738,7 @@ const runPhase = async (
 const RIG_TIMEOUT_MS = 600_000;
 
 beforeAll(async () => {
-  if (!DARWIN) return;
+  if (!PLATFORM_SUPPORTED) return;
   const runsRoot = buildRunsRoot();
   const scratch = realpathSync(mkdtempSync(join(tmpdir(), 'arena-smoke-rt-')));
   state.roots = [runsRoot, scratch];
@@ -789,36 +784,28 @@ const problem = (name: Gateway.GatewayProblemName): ExpectedProblem => {
   };
 };
 
-/**
- * Set `ARENA_REQUIRE_PARITY=1` to make a skipped rig a **failure** rather than
- * a silent pass.
- *
- * `describe.skipIf(!DARWIN)` is the right gate — `flock` through `bun:ffi`
- * against `libSystem.B.dylib` and a `python3` that owns the oracle are darwin
- * facts, and a partial run would report a parity result the platform cannot
- * support — but a gate that vanishes is indistinguishable from a gate that
- * passed: on a Linux CI box `bun test` would print `N pass, 0 fail` with this
- * file contributing zero assertions, and a green run would not be evidence of
- * anything.  So the skip is announced, loudly, and a job that means to *depend*
- * on the parity claim can set the flag and get an error instead.
- */
-const REQUIRE_PARITY = process.env['ARENA_REQUIRE_PARITY'] !== undefined;
+/** `ARENA_REQUIRE_PARITY=1` forbids an unsupported-platform skip. */
+const REQUIRE_PARITY = process.env['ARENA_REQUIRE_PARITY'] === '1';
 
 test('the live parity rig is not silently skipped', () => {
-  if (!DARWIN) {
+  if (!PLATFORM_SUPPORTED) {
+    // oxlint-disable-next-line effecttsgo/global-console -- a skipped oracle must be visible.
     console.warn(
-      `\n!! live smoke parity DID NOT RUN: platform is ${process.platform}, not darwin.\n` +
+      `\n!! live smoke parity DID NOT RUN: platform ${process.platform} is unsupported; expected linux or darwin.\n` +
         '!! ~50 legs x 2 phases of Python-vs-TypeScript byte parity contributed ZERO\n' +
-        '!! assertions to this run.  Set ARENA_REQUIRE_PARITY=1 to make this a failure.\n',
+        '!! assertions to this run. ARENA_REQUIRE_PARITY=1 forbids this platform skip.\n',
     );
   }
-  expect({ platform: process.platform, ranParityRig: DARWIN || !REQUIRE_PARITY }).toEqual({
+  expect({
+    platform: process.platform,
+    ranParityRig: PLATFORM_SUPPORTED || !REQUIRE_PARITY,
+  }).toEqual({
     platform: process.platform,
     ranParityRig: true,
   });
 });
 
-describe.skipIf(!DARWIN)('live smoke parity', () => {
+describe.skipIf(!PLATFORM_SUPPORTED)('live smoke parity', () => {
   describe('the rig itself', () => {
     test('both implementations published a ready record and a working url', () => {
       (['offline', 'upstream'] as const).forEach((name) => {
@@ -1139,12 +1126,15 @@ describe.skipIf(!DARWIN)('live smoke parity', () => {
       expect(headerSubset(result.ts)).toEqual(COMPARED_HEADERS.map((name) => [name, null]));
     });
 
-    test('a Transfer-Encoding on a GET is likewise answered by Bun', () => {
+    test('Transfer-Encoding is either parser-rejected or handled, but never served', () => {
       const result = row('offline', 'get-transfer-encoding');
       expect(result.py.status).toBe(problem('getRequestBody').status);
       expect(result.py.body.toString('utf8')).toBe(problem('getRequestBody').body);
       expect(result.ts.status).toBe(400);
-      expect(result.ts.body).toHaveLength(0);
+      expect([
+        '',
+        problem('getRequestBody').body,
+      ]).toContain(result.ts.body.toString('utf8'));
     });
 
     test('a GET with a *well-framed* body does reach the handler and matches', () => {
@@ -1154,14 +1144,14 @@ describe.skipIf(!DARWIN)('live smoke parity', () => {
       expect(result.headersEqual).toBe(true);
     });
 
-    test('a space in the request target: CPython 400-HTML, Bun 505', () => {
+    test('a space in the request target is rejected before routing on both platforms', () => {
       const result = row('offline', 'space-in-request-target');
       // CPython's `parse_request` cannot split it and sends the stdlib page.
       expect(result.py.status).toBe(400);
       expect(result.py.reason).toBe("Bad request syntax ('GET /v1/games?a= b HTTP/1.1')");
       expect(result.py.headers.get('content-type')).toBe('text/html;charset=utf-8');
-      // Bun reads the trailing `b HTTP/1.1` as the version and refuses that.
-      expect(result.ts.status).toBe(505);
+      // Node rejects before the gateway on both hosts; its parser status differs.
+      expect(result.ts.status).toBe(process.platform === 'darwin' ? 505 : 400);
       expect(result.ts.body).toHaveLength(0);
     });
 

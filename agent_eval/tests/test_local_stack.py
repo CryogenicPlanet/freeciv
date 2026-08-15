@@ -2,6 +2,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from argparse import Namespace
@@ -10,9 +11,11 @@ from unittest.mock import patch
 
 from agent_eval.client import write_private_json
 from agent_eval.local_stack import (
+    TS_GATEWAY_ENTRY,
     PortlessAliases,
     Route,
     StackError,
+    _gateway_command,
     _parser,
     _read_routes,
     _resolve_agent_binary,
@@ -240,8 +243,9 @@ class ReplayCommandTests(unittest.TestCase):
         self.assertEqual(
             run.call_args_list[0].args[0], ["portless", "get", "freeciv"],
         )
+        opener = "open" if sys.platform == "darwin" else "xdg-open"
         run.assert_called_with(
-            ["open", f"https://freeciv.localhost/watch/{game_id}"],
+            [opener, f"https://freeciv.localhost/watch/{game_id}"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
@@ -269,8 +273,9 @@ class ReplayCommandTests(unittest.TestCase):
             "agent_eval.local_stack.subprocess.run", side_effect=fake_run,
         ) as run:
             self.assertEqual(replay(Namespace(game_id=game_id, no_open=False)), 0)
+        opener = "open" if sys.platform == "darwin" else "xdg-open"
         self.assertEqual(
-            run.call_args_list[-1].args[0], ["open", f"{base}/watch/{game_id}"],
+            run.call_args_list[-1].args[0], [opener, f"{base}/watch/{game_id}"],
         )
 
     def test_replay_failure_tells_user_to_start_stack(self):
@@ -334,6 +339,100 @@ class AgentBinaryWiringTests(unittest.TestCase):
             Path(__file__).resolve().parents[1] / "local_stack.py"
         ).read_text(encoding="utf-8")
         self.assertIn('"--agent-binary", str(agent_binary)', local_stack_source)
+
+
+class GatewayImplementationSwitchTests(unittest.TestCase):
+    """`--ts-gateway` swaps the runtime and nothing else."""
+
+    flags = [
+        "--host", "127.0.0.1", "--port", "0",
+        "--service-url", "http://127.0.0.1:51234",
+        "--viewer-public-url", "https://freeciv.localhost",
+        "--runs-root", "/state/runs",
+        "--cache-root", "/state/replay-cache",
+        "--repo-root", "/checkout",
+        "--ready-file", "/state/local-stack/gateway-1-a.json",
+    ]
+
+    class RecordingRunner:
+        def __init__(self, returncode=0):
+            self.returncode = returncode
+            self.commands = []
+
+        def __call__(self, command):
+            self.commands.append(tuple(command))
+            return subprocess.CompletedProcess(list(command), self.returncode, "", "")
+
+    def test_default_argv_is_the_python_gateway_and_shells_out_to_nothing(self):
+        runner = self.RecordingRunner()
+        command = _gateway_command(
+            "/usr/bin/python3", Path("/checkout"), self.flags,
+            ts_gateway=False, runner=runner,
+        )
+        self.assertEqual(command, [
+            "/usr/bin/python3", "-B", "-m", "agent_eval.replay_gateway", *self.flags,
+        ])
+        self.assertEqual(runner.commands, [])
+
+    def test_ts_gateway_keeps_every_flag_and_only_changes_the_runtime(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            entry = repo / TS_GATEWAY_ENTRY
+            entry.parent.mkdir(parents=True)
+            entry.write_text("// gateway", encoding="utf-8")
+            runner = self.RecordingRunner()
+            command = _gateway_command(
+                "/usr/bin/python3", repo, self.flags,
+                ts_gateway=True, runner=runner,
+            )
+        self.assertEqual(command, ["bun", str(entry.resolve()), *self.flags])
+        self.assertEqual(runner.commands, [("bun", "--version")])
+        self.assertEqual(
+            command[2:],
+            _gateway_command(
+                "/usr/bin/python3", repo, self.flags,
+                ts_gateway=False, runner=runner,
+            )[4:],
+        )
+
+    def test_ts_gateway_refuses_a_missing_entrypoint_or_a_missing_bun(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            with self.assertRaisesRegex(StackError, TS_GATEWAY_ENTRY):
+                _gateway_command(
+                    "python3", repo, self.flags,
+                    ts_gateway=True, runner=self.RecordingRunner(),
+                )
+            entry = repo / TS_GATEWAY_ENTRY
+            entry.parent.mkdir(parents=True)
+            entry.write_text("// gateway", encoding="utf-8")
+            with self.assertRaisesRegex(StackError, "Bun is required"):
+                _gateway_command(
+                    "python3", repo, self.flags,
+                    ts_gateway=True, runner=self.RecordingRunner(returncode=127),
+                )
+
+    def test_the_flag_defaults_off_and_the_repo_entrypoint_exists(self):
+        self.assertIs(_parser().parse_args(["start"]).ts_gateway, False)
+        self.assertIs(
+            _parser().parse_args(["start", "--ts-gateway"]).ts_gateway, True,
+        )
+        repo_root = Path(__file__).resolve().parents[2]
+        self.assertTrue((repo_root / TS_GATEWAY_ENTRY).is_file())
+
+    def test_the_switch_lives_at_the_single_gateway_spawn_site(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "local_stack.py"
+        ).read_text(encoding="utf-8")
+        # One spawn, one place that names either implementation: a second
+        # spelling of the argv is how the two runtimes drift apart.
+        self.assertEqual(source.count('"agent_eval.replay_gateway"'), 1)
+        self.assertEqual(source.count('spawn(\n            "replay gateway"'), 1)
+        self.assertIn(
+            "_gateway_command(\n                python, repo_root, gateway_flags, "
+            "ts_gateway=args.ts_gateway,\n            )",
+            source,
+        )
 
 
 if __name__ == "__main__":

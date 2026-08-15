@@ -328,12 +328,17 @@ export const handleRequest = (
  * its upstream reader cancellation and its open file descriptor on, so a
  * client that disconnects mid-video releases both.  It is not the server's
  * scope and must not be confused with it.
+ *
+ * `HttpApp.toHandled` scopes applications in an uninterruptible region.
+ * Restoring interruptibility here is required for upstream timeouts, stream
+ * cancellation, and client-abort cleanup; Effect's routers do the same for
+ * routes by default, but this gateway intentionally serves a bare app.
  */
 export const gatewayApp: Effect.Effect<
   HttpServerResponse.HttpServerResponse,
   never,
   GatewayRouteServices | HttpServerRequest.HttpServerRequest | Observability
-> = Effect.flatMap(HttpServerRequest.HttpServerRequest, handleRequest);
+> = Effect.interruptible(Effect.flatMap(HttpServerRequest.HttpServerRequest, handleRequest));
 
 // ---------------------------------------------------------------------------
 // Startup

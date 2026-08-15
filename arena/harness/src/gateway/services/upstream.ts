@@ -45,16 +45,37 @@ export const DEFAULT_UPSTREAM_TIMEOUT: Duration.Duration = Duration.seconds(
 
 const PYTHON_INT_RE = /^[+-]?\p{Nd}(?:_?\p{Nd})*$/u;
 const DECIMAL_DIGIT_RE = /^\p{Nd}$/u;
-const DIGIT_OFFSETS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9] as const;
+
+/**
+ * Whitespace accepted around CPython `int()` input. This intentionally differs
+ * from both JavaScript `trim()` (which strips U+FEFF) and Python `isspace()`
+ * (which also accepts U+001C–U+001F); `int()` strips U+0085 but rejects those.
+ */
+const PYTHON_SPACE_CLASS =
+  '[\\t\\n\\v\\f\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]';
+
+const PYTHON_STRIP_RE = new RegExp(`^${PYTHON_SPACE_CLASS}+|${PYTHON_SPACE_CLASS}+$`, 'gu');
+
+/** `int(text.strip())`'s strip, with Python's whitespace set. */
+const pythonStrip = (text: string): string => text.replace(PYTHON_STRIP_RE, '');
+
+/** CPython's default decimal-conversion limit; signs and underscores do not count. */
+const PYTHON_MAX_STR_DIGITS = 4300;
+
+/** Distance to the preceding non-digit; Unicode decimal blocks can be adjacent. */
+const digitRunOffset = (code: number, distance: number): number =>
+  code - distance - 1 >= 0 &&
+  DECIMAL_DIGIT_RE.test(String.fromCodePoint(code - distance - 1))
+    ? digitRunOffset(code, distance + 1)
+    : distance;
 
 const digitValue = (character: string): bigint => {
   const code = character.codePointAt(0) ?? 0;
   // Every Unicode decimal block is ten contiguous code points starting at its
-  // own zero, so the value is the distance down to the first non-digit.
-  const offset = DIGIT_OFFSETS.find(
-    (candidate) => !DECIMAL_DIGIT_RE.test(String.fromCodePoint(code - candidate - 1)),
-  );
-  return BigInt(offset ?? 0);
+  // own zero, so the value is the distance down to the first non-digit —
+  // modulo ten, which is what makes an abutting block's zero come out as zero
+  // rather than as ten.
+  return BigInt(digitRunOffset(code, 0) % 10);
 };
 
 /**
@@ -75,12 +96,13 @@ const digitValue = (character: string): bigint => {
  * import this function rather than transcribing `int()` again.
  */
 export const parsePythonInt = (text: string): Option.Option<bigint> => {
-  const trimmed = text.trim();
+  const trimmed = pythonStrip(text);
   if (!PYTHON_INT_RE.test(trimmed)) return Option.none();
   const signed = trimmed.startsWith('+') || trimmed.startsWith('-');
   const digits = [...(signed ? trimmed.slice(1) : trimmed)].filter(
     (character) => character !== '_',
   );
+  if (digits.length > PYTHON_MAX_STR_DIGITS) return Option.none();
   const magnitude = digits.reduce((total, character) => total * 10n + digitValue(character), 0n);
   return Option.some(trimmed.startsWith('-') ? -magnitude : magnitude);
 };

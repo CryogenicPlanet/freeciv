@@ -1,0 +1,8 @@
+{
+  "benchmark_valid": false,
+  "bridge_status_file": "bridge-status.jsonl",
+  "checkpoints": 2,
+  "commands_file": "server.commands",
+  "config": {
+    "action_timeout_s": 180.0,
+    "control_protoco

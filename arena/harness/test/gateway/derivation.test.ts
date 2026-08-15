@@ -104,13 +104,13 @@ describe('request keys', () => {
         operation: 'replay',
         gameId: GAME_ID,
         places: [],
-        afterTurn: 12,
-        limit: 7,
+        afterTurn: 12n,
+        limit: 7n,
         complete: true,
       }),
     ).toBe(`replay:${GAME_ID}:12:7:true`);
     expect(
-      derivationRequestKey({ operation: 'board', gameId: GAME_ID, places: [], turn: 3 }),
+      derivationRequestKey({ operation: 'board', gameId: GAME_ID, places: [], turn: 3n }),
     ).toBe(`board:${GAME_ID}:3`);
     expect(
       derivationRequestKey({
@@ -140,14 +140,14 @@ describe('fixture layer', () => {
     expect(
       await provide(
         Effect.flatMap(ReplayDerivation, (service) =>
-          service.replay({ gameId: GAME_ID, afterTurn: 0, limit: 250, complete: true }),
+          service.replay({ gameId: GAME_ID, afterTurn: 0n, limit: 250n, complete: true }),
         ),
         layer,
       ),
     ).toEqual({ available: true, snapshots: [] });
     expect(
       await provide(
-        Effect.flatMap(ReplayDerivation, (service) => service.board({ gameId: GAME_ID, turn: 1 })),
+        Effect.flatMap(ReplayDerivation, (service) => service.board({ gameId: GAME_ID, turn: 1n })),
         layer,
       ),
     ).toEqual({ turn: 1 });
@@ -163,7 +163,7 @@ describe('fixture layer', () => {
 
   test('a missing fixture fails the way a missing artifact fails', async () => {
     const outcome = await attempt(
-      Effect.flatMap(ReplayDerivation, (service) => service.board({ gameId: GAME_ID, turn: 99 })),
+      Effect.flatMap(ReplayDerivation, (service) => service.board({ gameId: GAME_ID, turn: 99n })),
       layer,
     );
     expect(outcome._tag).toBe('Left');
@@ -186,8 +186,8 @@ describe('fixture layer', () => {
           service.replay({
             gameId: GAME_ID,
             places: [{ place: 1, seat_id: 'seat-1' }],
-            afterTurn: 4,
-            limit: 9,
+            afterTurn: 4n,
+            limit: 9n,
             complete: false,
           }),
         ]),
@@ -208,8 +208,8 @@ describe('fixture layer', () => {
       operation: 'replay',
       gameId: GAME_ID,
       places: [{ place: 1, seat_id: 'seat-1' }],
-      afterTurn: 4,
-      limit: 9,
+      afterTurn: 4n,
+      limit: 9n,
       complete: false,
     });
   });
@@ -242,9 +242,9 @@ describe('single flight (replay_lock)', () => {
 
       const service = yield* Effect.provide(ReplayDerivation, ReplayDerivationFixture(entries));
 
-      const first = yield* Effect.fork(service.board({ gameId: GAME_ID, turn: 1 }));
+      const first = yield* Effect.fork(service.board({ gameId: GAME_ID, turn: 1n }));
       yield* Deferred.await(firstStarted);
-      const second = yield* Effect.fork(service.board({ gameId: GAME_ID, turn: 2 }));
+      const second = yield* Effect.fork(service.board({ gameId: GAME_ID, turn: 2n }));
 
       // The second derivation is runnable and its fixture is instant; if the
       // semaphore were missing it would have set the flag by now.
@@ -292,8 +292,8 @@ describe('single flight (replay_lock)', () => {
       const service = yield* Effect.provide(ReplayDerivation, ReplayDerivationFixture(entries));
       const values = yield* Effect.all(
         [
-          service.replay({ gameId: GAME_ID, afterTurn: 0, limit: 250, complete: true }),
-          service.board({ gameId: GAME_ID, turn: 1 }),
+          service.replay({ gameId: GAME_ID, afterTurn: 0n, limit: 250n, complete: true }),
+          service.board({ gameId: GAME_ID, turn: 1n }),
           service.events({ gameId: GAME_ID, complete: true }),
         ],
         { concurrency: 'unbounded' },
@@ -319,10 +319,15 @@ describe('unavailable layer', () => {
       [
         'replay',
         Effect.flatMap(ReplayDerivation, (service) =>
-          service.replay({ gameId: GAME_ID, afterTurn: 0, limit: 1, complete: false }),
+          service.replay({ gameId: GAME_ID, afterTurn: 0n, limit: 1n, complete: false }),
         ),
       ],
-      ['board', Effect.flatMap(ReplayDerivation, (service) => service.board({ gameId: GAME_ID, turn: 1 }))],
+      [
+        'board',
+        Effect.flatMap(ReplayDerivation, (service) =>
+          service.board({ gameId: GAME_ID, turn: 1n }),
+        ),
+      ],
       [
         'events',
         Effect.flatMap(ReplayDerivation, (service) =>
@@ -354,7 +359,7 @@ const transportRequest = (places: DerivationRequest['places'] = []): DerivationR
   operation: 'board',
   gameId: GAME_ID,
   places,
-  turn: 1,
+  turn: 1n,
 });
 
 const transportOptions = (python: string, timeout?: Duration.DurationInput) => {
@@ -439,7 +444,7 @@ const FIXTURE_SAVE = join(
 
 interface RunFixture {
   readonly gameId: string;
-  readonly turn: number;
+  readonly turn: bigint;
 }
 
 /**
@@ -457,7 +462,7 @@ const makeCommittedRun = (): CommittedRun => {
   const saves = join(runsRoot, FIXTURE_GAME_ID, 'saves');
   mkdirSync(saves, { recursive: true });
   copyFileSync(FIXTURE_SAVE, join(saves, 'turn-0052-auto.sav.gz'));
-  return { fixture: { gameId: FIXTURE_GAME_ID, turn: FIXTURE_TURN }, runsRoot };
+  return { fixture: { gameId: FIXTURE_GAME_ID, turn: BigInt(FIXTURE_TURN) }, runsRoot };
 };
 
 const COMMITTED_RUN = makeCommittedRun();
@@ -488,7 +493,7 @@ const DIRECT_PY = [
 interface DirectRequest {
   readonly operation: 'replay' | 'board' | 'events';
   readonly gameId: string;
-  readonly turn: number;
+  readonly turn: bigint;
   readonly cacheRoot: string;
 }
 
@@ -533,8 +538,8 @@ describe('python bridge', () => {
         operation: 'replay',
         gameId: run.gameId,
         places: [],
-        afterTurn: 2,
-        limit: 3,
+        afterTurn: 2n,
+        limit: 3n,
         complete: true,
       }),
     ).toEqual([
@@ -564,7 +569,7 @@ describe('python bridge', () => {
       }).includes('--complete'),
     ).toBe(false);
     expect(
-      derivationArgv(options, { operation: 'board', gameId: run.gameId, places: [], turn: 5 }),
+      derivationArgv(options, { operation: 'board', gameId: run.gameId, places: [], turn: 5n }),
     ).toEqual([
       'python3',
       '-m',
@@ -597,7 +602,7 @@ describe('python bridge', () => {
       const values = await provide(
         Effect.flatMap(ReplayDerivation, (service) =>
           Effect.all([
-            service.replay({ gameId: run.gameId, afterTurn: 0, limit: 250, complete: true }),
+            service.replay({ gameId: run.gameId, afterTurn: 0n, limit: 250n, complete: true }),
             service.board({ gameId: run.gameId, turn: run.turn }),
             service.events({ gameId: run.gameId, complete: true }),
           ]),
@@ -650,7 +655,7 @@ describe('python bridge', () => {
       });
       const outcome = await attempt(
         Effect.flatMap(ReplayDerivation, (service) =>
-          service.board({ gameId: run.gameId, turn: 999_999 }),
+          service.board({ gameId: run.gameId, turn: 999_999n }),
         ),
         layer,
       );

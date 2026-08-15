@@ -4,7 +4,14 @@
  */
 
 import { Array as Arr, Either, Option } from 'effect';
-import { decodeFrameIndexFromPngName, type FrameIndex, type GameId, isGameId } from '@arena/wire';
+import {
+  decodeFrameIndexFromPngName,
+  FRAME_INDEX_RE,
+  FrameIndex as FrameIndexBrand,
+  type FrameIndex,
+  type GameId,
+  isGameId,
+} from '@arena/wire';
 import {
   GATEWAY_GAMES_INDEX_PATH,
   GATEWAY_GAMES_PREFIX,
@@ -260,6 +267,27 @@ const onSuffix = (
 const viewerUpstreamPath = (gameId: GameId, segment: string): string =>
   `${GATEWAY_GAMES_INDEX_PATH}/${gameId}/${segment}`;
 
+/** A valid but unrepresentable frame index that cannot match a six-digit disk name. */
+const UNREACHABLE_FRAME_INDEX: FrameIndex = FrameIndexBrand.make(Number.MAX_SAFE_INTEGER);
+
+/**
+ * Preserve Python's archive-specific 404 for arbitrary-width indices.
+ * Safe values use wire's decoder; larger values route with an impossible
+ * sentinel rather than failing at the router or overflowing `FrameIndex`.
+ */
+const frameIndexFromPngName = (name: string): Option.Option<FrameIndex> => {
+  if (!FRAME_INDEX_RE.test(name)) return Option.none();
+  const digits = name.slice(0, -4);
+  return Option.some(
+    Number.isSafeInteger(Number(digits))
+      ? Option.getOrElse(
+          Either.getRight(decodeFrameIndexFromPngName(name)),
+          () => UNREACHABLE_FRAME_INDEX,
+        )
+      : UNREACHABLE_FRAME_INDEX,
+  );
+};
+
 /**
  * `:1996-2004` — matched **before** the query gate, which is the only reason
  * any route may carry a query string.
@@ -337,17 +365,12 @@ const POST_QUERY_ROUTES: ReadonlyArray<SuffixRule> = [
     // `FrameIndexFromPngName` *is* `FRAME_INDEX_RE` followed by that `int`, so
     // a name the decoder refuses is a name Python's regex refuses — `00.png`
     // and `007.png` fall through to the `:2037` 404 without touching upstream,
-    // exactly as they do in Python.
-    //
-    // One bounded divergence: Python's `int` is arbitrary-precision, so a
-    // ~310-digit index routes there and 404s later at the archive lookup,
-    // while here it is not a finite JS number and 404s now.  Same status, a
-    // different message (`not found` vs `map frame does not exist`), only for
-    // inputs no archive can hold — six digits is the on-disk width.
+    // exactly as they do in Python. Arbitrary-width indices are normalized by
+    // `frameIndexFromPngName` so they still reach the archive-specific 404.
     decide: (context) =>
       context.suffix.length === 2 && context.suffix[0] === GATEWAY_ROUTE_SEGMENTS.frames
         ? Option.map(
-            Either.getRight(decodeFrameIndexFromPngName(context.suffix[1] ?? '')),
+            frameIndexFromPngName(context.suffix[1] ?? ''),
             (index): RouteDecision => ({
               _tag: 'FramePng',
               gameId: context.gameId,

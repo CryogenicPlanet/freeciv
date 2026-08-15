@@ -515,6 +515,11 @@ const fileStream = (fd: number, size: number): Stream.Stream<Uint8Array> =>
  *
  * The immutable `Cache-Control` (`:1510`) lives here and nowhere else; every
  * gateway-built JSON body is `no-store`.
+ *
+ * Bun omits `Content-Length` from asynchronous streamed responses and uses
+ * chunked framing. The parity waiver owns this known framing difference; a
+ * `Blob` is not equivalent because Bun then applies `Range` and returns 206
+ * where Python deliberately returns the full 200 response.
  */
 const sendLocalFile = (
   path: string,

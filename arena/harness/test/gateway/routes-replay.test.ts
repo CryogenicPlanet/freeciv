@@ -37,7 +37,6 @@ import {
   pythonUnquote,
   replayQuery,
   replayRoute,
-  toLoaderInteger,
   type ViewerRouteEffect,
   type ViewerRouteServices,
 } from 'src/gateway/http/routes/replay';
@@ -362,10 +361,6 @@ describe('the two query parsers', () => {
     expect(pythonUnquote('nothing')).toBe('nothing');
   });
 
-  test('a Python int past 2**53 saturates at the loader seam, and only there', () => {
-    expect(toLoaderInteger(7n)).toBe(7);
-    expect(toLoaderInteger(BigInt(Number.MAX_SAFE_INTEGER) + 10n)).toBe(Number.MAX_SAFE_INTEGER);
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -528,7 +523,7 @@ describe('the disk fallback, and only for the three triggers', () => {
    */
   const REPLAY_BODY: CanonRecord = { schema_version: 1n, next_after_turn: 4n, snapshots: [] };
 
-  const replayFixture = (afterTurn: number, limit: number, complete: boolean, gameId: string) =>
+  const replayFixture = (afterTurn: bigint, limit: bigint, complete: boolean, gameId: string) =>
     ReplayDerivationFixture(
       derivationFixture({
         [derivationRequestKey({
@@ -553,7 +548,7 @@ describe('the disk fallback, and only for the three triggers', () => {
     test(`${label} serves the derivation`, async () => {
       const rig = makeRig({
         fetch,
-        derivationLayer: replayFixture(0, 250, true, TERMINAL_GAME),
+        derivationLayer: replayFixture(0n, 250n, true, TERMINAL_GAME),
       });
       const observed = await serve(replayOf(TERMINAL_GAME, ''), rig);
       expect(observed.status).toBe(200);
@@ -568,7 +563,7 @@ describe('the disk fallback, and only for the three triggers', () => {
     // protects (`:1687-1693`): `_terminal_archive` would 404 on this run.
     const rig = makeRig({
       fetch: OFFLINE_PORTLESS,
-      derivationLayer: replayFixture(0, 250, false, LIVE_GAME),
+      derivationLayer: replayFixture(0n, 250n, false, LIVE_GAME),
     });
     const observed = await serve(replayOf(LIVE_GAME, ''), rig);
     expect(observed.status).toBe(200);
@@ -579,7 +574,7 @@ describe('the disk fallback, and only for the three triggers', () => {
     const terminal = makeRig({ fetch: answering(404, '') });
     await serve(replayOf(TERMINAL_GAME, 'after_turn=3&limit=7'), terminal);
     expect(terminal.derivations()).toMatchObject([
-      { operation: 'replay', gameId: TERMINAL_GAME, afterTurn: 3, limit: 7, complete: true },
+      { operation: 'replay', gameId: TERMINAL_GAME, afterTurn: 3n, limit: 7n, complete: true },
     ]);
 
     const live = makeRig({ fetch: answering(404, '') });
@@ -593,7 +588,36 @@ describe('the disk fallback, and only for the three triggers', () => {
     const rig = makeRig({ fetch: answering(405, '') });
     await serve(boardOf(TERMINAL_GAME, 'turn=12'), rig);
     expect(rig.derivations()).toMatchObject([
-      { operation: 'board', gameId: TERMINAL_GAME, turn: 12 },
+      { operation: 'board', gameId: TERMINAL_GAME, turn: 12n },
+    ]);
+  });
+
+  /**
+   * The seam that used to saturate.  `toLoaderInteger` clamped a query integer
+   * to `Number.MAX_SAFE_INTEGER` on the way into the derivation service, and the
+   * loader echoes `after_turn` back in `next_after_turn`, so
+   * `?after_turn=9007199254740993` came out of the parity rig as
+   * `"next_after_turn":9007199254740991` where CPython echoed the digits it was
+   * given.  Both loader inputs are `bigint` now; this asserts the *exact* value
+   * reaches the runner, and the parity leg `replay-after-turn-2-53-plus-1`
+   * asserts the byte it produces.
+   */
+  test('an after_turn past 2**53 reaches the loader exactly, not saturated', async () => {
+    const rig = makeRig({ fetch: answering(404, '') });
+    await serve(replayOf(TERMINAL_GAME, 'after_turn=9007199254740993&limit=250'), rig);
+    expect(rig.derivations()).toMatchObject([
+      {
+        operation: 'replay',
+        gameId: TERMINAL_GAME,
+        afterTurn: 9_007_199_254_740_993n,
+        limit: 250n,
+      },
+    ]);
+
+    const board = makeRig({ fetch: answering(404, '') });
+    await serve(boardOf(TERMINAL_GAME, 'turn=9007199254740993'), board);
+    expect(board.derivations()).toMatchObject([
+      { operation: 'board', gameId: TERMINAL_GAME, turn: 9_007_199_254_740_993n },
     ]);
   });
 
@@ -947,8 +971,8 @@ describe('the module surface', () => {
         operation: 'replay',
         gameId: TERMINAL_GAME,
         places: [],
-        afterTurn: 0,
-        limit: 250,
+        afterTurn: 0n,
+        limit: 250n,
         complete: true,
       }),
     ).toBe(`replay:${TERMINAL_GAME}:0:250:true`);

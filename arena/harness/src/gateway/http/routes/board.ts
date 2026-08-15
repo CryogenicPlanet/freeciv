@@ -5,12 +5,7 @@ import { BadRequest } from '../../errors.ts';
 import { ReplayDerivation } from '../../services/derivation.ts';
 import { parsePythonInt } from '../../services/upstream.ts';
 import type { BoardJsonRoute } from '../dispatch.ts';
-import {
-  parseQuery,
-  toLoaderInteger,
-  type ViewerRouteEffect,
-  viewerJsonRoute,
-} from './replay.ts';
+import { parseQuery, type ViewerRouteEffect, viewerJsonRoute } from './replay.ts';
 
 /** The one key `_board_query` accepts (`:1802`). */
 export const BOARD_QUERY_KEY = 'turn';
@@ -66,7 +61,7 @@ export const boardRoute = (route: BoardJsonRoute): ViewerRouteEffect =>
             derivation.board({
               gameId: route.gameId,
               places: context.places,
-              turn: toLoaderInteger(query.turn),
+              turn: query.turn,
             }),
           ),
         // `_bounded_json(200, board)` (`:1879`): the loader's document, whole.

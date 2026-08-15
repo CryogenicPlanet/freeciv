@@ -31,13 +31,19 @@ export type DerivationOperation = (typeof DERIVATION_OPERATIONS)[number];
  */
 export type ResolvedPlaces = ReadonlyArray<JsonObject>;
 
-/** `replay_from_autosaves(runs_root, game_id, places, *, after_turn, limit, cache_root, complete)`. */
+/**
+ * `replay_from_autosaves(runs_root, game_id, places, *, after_turn, limit, cache_root, complete)`.
+ *
+ * These values are `bigint` because CPython's `int()` is unbounded and the
+ * loader echoes `after_turn` in `next_after_turn`. This also keeps the bridge
+ * argv in exact decimal notation beyond JavaScript's safe-integer range.
+ */
 export interface ReplayDerivationInput {
   readonly gameId: string;
   /** Defaults to `[]`, which is the loader's own default (`()`). */
   readonly places?: ResolvedPlaces;
-  readonly afterTurn: number;
-  readonly limit: number;
+  readonly afterTurn: bigint;
+  readonly limit: bigint;
   /** `state in TERMINAL_STATES`, computed from the manifest — never from upstream (`:1700`). */
   readonly complete: boolean;
 }
@@ -46,7 +52,8 @@ export interface ReplayDerivationInput {
 export interface BoardDerivationInput {
   readonly gameId: string;
   readonly places?: ResolvedPlaces;
-  readonly turn: number;
+  /** `bigint`, for the reason {@link ReplayDerivationInput} carries. */
+  readonly turn: bigint;
 }
 
 /** `events_from_autosaves(runs_root, game_id, places, *, cache_root, complete)`. */
