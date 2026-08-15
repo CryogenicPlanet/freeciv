@@ -929,7 +929,7 @@ export type TrioSide = 'python' | 'tsFs' | 'tsPg';
 /** A value keyed by trio side.  The three-way analogue of {@link ByImpl}. */
 export type BySide<A> = Readonly<Record<TrioSide, A>>;
 
-const bySide = <A>(python: A, tsFs: A, tsPg: A): BySide<A> => ({ python, tsFs, tsPg });
+const bySide = <A>(python: A, tsFs: A, tsPg: A) => ({ python, tsFs, tsPg });
 
 /** The three sides, in a fixed order, for a rig that iterates rather than names. */
 export const TRIO_SIDES: ReadonlyArray<TrioSide> = ['python', 'tsFs', 'tsPg'];
@@ -990,6 +990,10 @@ export type TrioResult =
       readonly cleanup: () => void;
     };
 
+interface TrioState {
+  report: TrioStopReport | null;
+}
+
 const makeTrio = (
   spec: ResolvedBootSpec,
   python: BootedGateway,
@@ -997,7 +1001,7 @@ const makeTrio = (
   tsPg: BootedGateway,
   cleanup: () => void,
 ): GatewayTrio => {
-  const state: { report: TrioStopReport | null } = { report: null };
+  const state: TrioState = { report: null };
   const all = [python, tsFs, tsPg] as const;
 
   const stop = async (): Promise<TrioStopReport> => {
@@ -1154,4 +1158,3 @@ export const trioArgvParity = (trio: GatewayTrio): TrioArgvParity => {
     pgSharedDivergent: paired.flatMap(({ name, same }) => (same ? [] : [name])),
   };
 };
-

@@ -3,8 +3,8 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { CliConfig, CommandDescriptor, HelpDoc } from '@effect/cli';
 import { type FileSystem } from '@effect/platform';
 import { NodeFileSystem, NodePath, NodeTerminal } from '@effect/platform-node';
-import { Gateway } from '@arena/wire';
-import { Effect, Either, Layer, Option, Redacted } from 'effect';
+import { decodeGameId, Gateway } from '@arena/wire';
+import { Effect, Either, Layer, Option, Predicate, Redacted, Schema } from 'effect';
 import { mkdir, mkdtemp, realpath, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -44,6 +44,7 @@ import {
 } from '../../src/gateway/cli.ts';
 import type { GatewayCliArgs } from '../../src/gateway/cli.ts';
 import type { PostgresBackendInput } from '../../src/gateway/config.ts';
+import { terminalArchiveView } from '../../src/gateway/archive.ts';
 import {
   GATEWAY_DB_APPLICATION_NAME,
   GATEWAY_MAX_DB_CONNECTIONS,
@@ -1349,9 +1350,9 @@ describe('main.ts — which layers the backend selects', () => {
       ).pipe(Effect.orDie),
     );
     expect(services[0].runsRoot).toBe(config.runsRoot);
-    expect([services[1].replay, services[1].board, services[1].events].map((f) => typeof f)).toEqual(
-      ['function', 'function', 'function'],
-    );
+    expect(
+      [services[1].replay, services[1].board, services[1].events].every(Predicate.isFunction),
+    ).toBe(true);
   });
 
   test('--backend postgres builds @arena/db’s layers, and an unusable URL is exit 2', async () => {
@@ -1427,12 +1428,18 @@ describe('main.ts — which layers the backend selects', () => {
       }));
     `;
     const child = Bun.spawnSync(['bun', '-e', probe], { cwd: join(REPO_ROOT, 'arena/harness') });
-    const report = JSON.parse(child.stdout.toString().trim()) as {
-      total: number;
-      db: number;
-      sqlPg: number;
-      driver: number;
-    };
+    const ModuleGraphReport = Schema.parseJson(
+      Schema.Struct({
+        total: Schema.Number,
+        db: Schema.Number,
+        sqlPg: Schema.Number,
+        driver: Schema.Number,
+      }),
+    );
+    const report = Either.getOrThrowWith(
+      Schema.decodeUnknownEither(ModuleGraphReport)(child.stdout.toString().trim()),
+      (error) => new Error(String(error)),
+    );
     expect(child.exitCode).toBe(0);
     // A real graph was walked, and none of it was the database.
     expect(report.total).toBeGreaterThan(100);
@@ -1458,22 +1465,33 @@ describe('main.ts — which layers the backend selects', () => {
  * `lstat` on a tree no gateway writes, so a lock around any of them would be a
  * queue in front of reads that cannot conflict.
  */
-const overlapProbe = (): {
+interface OverlapProbe {
   readonly repository: RunsRepositoryApi;
   readonly peak: () => number;
-} => {
+}
+
+const archiveOf = (gameId: string): TerminalArchive => {
+  const decoded = Either.getOrThrowWith(decodeGameId(gameId), (error) =>
+    new Error(String(error)),
+  );
+  const view = Either.getOrThrowWith(
+    terminalArchiveView(
+      decoded,
+      { state: 'completed' },
+      { manifest: { game_id: decoded } },
+      Option.none(),
+    ),
+    (error) => new Error(error),
+  );
+  return { ...view, runRoot: `/runs/${gameId}` };
+};
+
+const overlapProbe = (): OverlapProbe => {
   const state = { inside: 0, peak: 0 };
   const enter = (): void => {
     state.inside += 1;
     state.peak = Math.max(state.peak, state.inside);
   };
-  // The decorator reads exactly one field of a `TerminalArchive` — `gameId`,
-  // for the log line — so the stub carries it and is cast
-  // rather than built: a full archive here would be twelve fields of
-  // projection output that nothing under test looks at, and building one from
-  // a fixture would make this a filesystem test.
-  const archiveOf = (gameId: string): TerminalArchive =>
-    ({ gameId, runRoot: `/runs/${gameId}` }) as unknown as TerminalArchive;
   const guarded = <A>(value: A): Effect.Effect<A> =>
     Effect.acquireUseRelease(
       Effect.sync(enter),
@@ -1483,20 +1501,18 @@ const overlapProbe = (): {
           state.inside -= 1;
         }),
     );
-  return {
-    repository: {
-      runsRoot: '/runs',
-      readManifest: () => Effect.succeed({}),
-      decodeManifest: () => Effect.die('unused'),
-      terminalArchive: (gameId: string) => guarded(archiveOf(gameId)),
-      lastReplayTurn: () => Effect.succeedNone,
-      diskGamesIndex: () => Effect.die('unused'),
-      diskRowsWithInterrupted: () => Effect.die('unused'),
-      frameFile: (archive: TerminalArchive) => guarded(`/runs/${archive.gameId}/frame.png`),
-      videoFile: (archive: TerminalArchive) => guarded(`/runs/${archive.gameId}/game.mp4`),
-    } as unknown as RunsRepositoryApi,
-    peak: () => state.peak,
-  };
+  const repository = {
+    runsRoot: '/runs',
+    readManifest: () => Effect.succeed({}),
+    decodeManifest: () => Effect.die('unused'),
+    terminalArchive: (gameId: string) => guarded(archiveOf(gameId)),
+    lastReplayTurn: () => Effect.succeedNone,
+    diskGamesIndex: () => Effect.die('unused'),
+    diskRowsWithInterrupted: () => Effect.die('unused'),
+    frameFile: (archive: TerminalArchive) => guarded(`/runs/${archive.gameId}/frame.png`),
+    videoFile: (archive: TerminalArchive) => guarded(`/runs/${archive.gameId}/game.mp4`),
+  } satisfies RunsRepositoryApi;
+  return { repository, peak: () => state.peak };
 };
 
 describe('the pg repository decorator adds a log line and no lock', () => {
@@ -1519,12 +1535,13 @@ describe('the pg repository decorator adds a log line and no lock', () => {
 
   test('the frame and video reads are not queued behind the archive read', async () => {
     const probe = overlapProbe();
-    const archive = { gameId: 'game_shared' } as unknown as TerminalArchive;
+    const gameId = 'game_parity_terminal_valid_01';
+    const archive = archiveOf(gameId);
     const guarded = withFailureLog(probe.repository);
     await Effect.runPromise(
       Effect.all(
         [
-          guarded.terminalArchive('game_shared'),
+          guarded.terminalArchive(gameId),
           guarded.frameFile(archive, Option.none()),
           guarded.videoFile(archive),
         ],

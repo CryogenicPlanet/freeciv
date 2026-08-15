@@ -234,8 +234,11 @@ export const GATEWAY_DB_APPLICATION_NAME = 'arena-replay-gateway';
  * - **Filesystem gateways never reach it.**  It is installed by
  *   {@link postgresArchiveServices} and by nothing else.
  */
-export const describeRepositoryFailure = (operation: string, gameId: string, error: unknown): string =>
-  `pg-backend: ${operation} ${gameId} failed: ${describeStartupError(error)}`;
+export const describeRepositoryFailure = <Failure>(
+  operation: string,
+  gameId: string,
+  error: Failure,
+): string => `pg-backend: ${operation} ${gameId} failed: ${describeStartupError(error)}`;
 
 /**
  * The failure's `cause`, when it has one.
@@ -248,8 +251,10 @@ export const describeRepositoryFailure = (operation: string, gameId: string, err
  * second kind is a defect report; the first is an answer, and the parity
  * corpus contains a fixture that produces it on every run.
  */
-const failureCause = (error: unknown): unknown =>
-  typeof error === 'object' && error !== null && 'cause' in error ? error.cause : undefined;
+const failureCause = <Failure>(error: Failure): Option.Option<string> =>
+  Predicate.isRecord(error) && 'cause' in error
+    ? Option.map(Option.fromNullable(error.cause), describeStartupError)
+    : Option.none();
 
 /**
  * The failure's own text, plus whatever its `cause` can say for itself.
@@ -261,8 +266,12 @@ const failureCause = (error: unknown): unknown =>
  * relayed.  Rendering it with the same {@link describeStartupError} the exit-2
  * site uses keeps the scalar-only, no-stack, no-URL discipline in one function.
  */
-const failureLine = (operation: string, gameId: string, error: unknown, cause: unknown): string =>
-  `${describeRepositoryFailure(operation, gameId, error)} (${describeStartupError(cause)})`;
+const failureLine = <Failure>(
+  operation: string,
+  gameId: string,
+  error: Failure,
+  cause: string,
+): string => `${describeRepositoryFailure(operation, gameId, error)} (${cause})`;
 
 /**
  * {@link failureLine}, attached to one repository read — and to nothing that
@@ -280,7 +289,7 @@ const logged = <A, E, R>(
   effect: Effect.Effect<A, E, R>,
 ): Effect.Effect<A, E, R> =>
   Effect.tapError(effect, (error) =>
-    Option.match(Option.fromNullable(failureCause(error)), {
+    Option.match(failureCause(error), {
       onNone: () => Effect.void,
       onSome: (cause) => Console.error(failureLine(operation, gameId, error, cause)),
     }),

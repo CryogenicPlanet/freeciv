@@ -67,6 +67,7 @@ import { fileURLToPath } from "node:url"
 
 import {
   CANON_UTF8,
+  type CanonRecord,
   type CanonValue,
   canonicalText,
   decodeJsonValueFromString,
@@ -80,7 +81,10 @@ import {
 
 import { MAX_PROXY_JSON_BYTES } from "../../harness/src/gateway/constants.ts"
 import { untrustedField } from "../../harness/src/gateway/public.ts"
-import { parsePythonJson } from "../../harness/src/gateway/python-json.ts"
+import {
+  parsePythonJson,
+  parsePythonJsonObject
+} from "../../harness/src/gateway/python-json.ts"
 import {
   type BinaryArtifact,
   isArchiveBytes,
@@ -215,9 +219,15 @@ interface StoredDocument {
   /** The **fstat** size that the gate saw; `0` when the open failed. */
   readonly byteSize: number
   readonly document: Option.Option<JsonObject>
+  readonly integerPointers: ReadonlyArray<string>
 }
 
-const ABSENT: StoredDocument = { status: "absent", byteSize: 0, document: Option.none() }
+const ABSENT: StoredDocument = {
+  status: "absent",
+  byteSize: 0,
+  document: Option.none(),
+  integerPointers: []
+}
 
 /**
  * The two document gates, exactly as `services/runs.ts#readArchiveJson` applies
@@ -229,25 +239,45 @@ const ABSENT: StoredDocument = { status: "absent", byteSize: 0, document: Option
  * *declared* divergence from the fs backend and is pinned in
  * `hunt-pg-divergence.test.ts`, not hidden here.
  */
+const pointerToken = (key: string): string => key.replaceAll("~", "~0").replaceAll("/", "~1")
+
+const integerPointers = (value: CanonValue, path: string): ReadonlyArray<string> =>
+  typeof value === "bigint"
+    ? [path === "" ? "/" : path]
+    : Array.isArray(value)
+    ? value.flatMap((entry, index) => integerPointers(entry, `${path}/${String(index)}`))
+    : typeof value === "object" && value !== null
+    ? Object.entries(value).flatMap(([key, entry]) =>
+      integerPointers(entry, `${path}/${pointerToken(key)}`)
+    )
+    : []
+
 const readDocument = (path: string): StoredDocument =>
   Option.match(attempt(() => openSync(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)), {
     onNone: () => ABSENT,
     onSome: (fd) => {
       const info = attempt(() => fstatSync(fd))
-      const document = Option.flatMap(info, (stat) =>
+      const text = Option.flatMap(info, (stat) =>
         !stat.isFile() || stat.size <= 0 || stat.size > MAX_PROXY_JSON_BYTES
-          ? Option.none<JsonObject>()
-          : Option.flatMap(
-            Option.flatMap(attempt(() => readAt(fd, 0, stat.size)), decodeUtf8),
-            (text) =>
-              Option.filter(Option.flatMap(parseJson(text), asJsonObject), (value) =>
-                storable(value))
-          ))
+          ? Option.none<string>()
+          : Option.flatMap(attempt(() => readAt(fd, 0, stat.size)), decodeUtf8)
+      )
+      const document = Option.flatMap(text, (source) =>
+        Option.filter(Option.flatMap(parseJson(source), asJsonObject), storable)
+      )
+      const pointers = Option.match(
+        Option.flatMap(text, (source) => Option.getRight(parsePythonJsonObject(source))),
+        {
+          onNone: (): ReadonlyArray<string> => [],
+          onSome: (value) => integerPointers(value, "")
+        }
+      )
       Option.getOrElse(attempt(() => closeSync(fd)), () => undefined)
       return {
         status: Option.isSome(document) ? "ok" : "unusable",
         byteSize: Option.match(info, { onNone: () => 0, onSome: (stat) => stat.size }),
-        document
+        document,
+        integerPointers: pointers
       }
     }
   })
@@ -491,10 +521,19 @@ const storeRun = (
   const stored = Option.map(manifest.document, partitionManifest)
   const fits = Option.exists(turn, (value) =>
     value >= BigInt(INT32_MIN) && value <= BigInt(INT32_MAX))
-  const derived: JsonObject = Option.match(turn, {
+  const overflow = Option.match(turn, {
     onNone: (): JsonObject => ({}),
     onSome: (value): JsonObject => fits ? {} : { last_replay_turn: value.toString() }
   })
+  const derived: JsonObject = {
+    ...overflow,
+    ...(manifest.integerPointers.length > 0
+      ? { manifest_integer_pointers: [...manifest.integerPointers] }
+      : {}),
+    ...(report.integerPointers.length > 0
+      ? { report_integer_pointers: [...report.integerPointers] }
+      : {})
+  }
   return Effect.orDie(db.insert(games).values({
     gameId,
     state: Option.match(stored, { onNone: () => "invalid" as const, onSome: (row) => row.state }),
@@ -639,7 +678,7 @@ const readBytes = (artifact: BinaryArtifact): ReadonlyArray<number> =>
 const frameIndex = (name: string): Option.Option<FrameIndex> =>
   Option.getRight(Gateway.decodeArchivePngName(name))
 
-/** A `bigint` anywhere in a reconstructed document is R4, the int/float trap. */
+/** Whether a reconstructed document preserved at least one Python integer. */
 const hasBigInt = (value: unknown): boolean =>
   typeof value === "bigint" ||
   (Array.isArray(value)
@@ -652,14 +691,17 @@ const hasBigInt = (value: unknown): boolean =>
  * The document on disk, as the *filesystem backend* sees it — the §0 oracle's
  * right side.
  *
- * `decodeJsonValueFromString` rather than a bare `JSON.parse`: it is literally
- * what `readManifest` runs (`Schema.JsonNumber`, so every number is a JS
- * `number`), and a reconstruction that matched `JSON.parse` but not the reader
- * would be matching the wrong oracle.
+ * `parsePythonJsonObject` rather than `JSON.parse`: the filesystem repository
+ * preserves Python integer tokens as bigint, so the oracle must preserve the
+ * same integer/float distinction.
  */
-const documentOnDisk = (runsRoot: string, gameId: string, file: string): JsonObject | null =>
+const documentOnDisk = (
+  runsRoot: string,
+  gameId: string,
+  file: string
+): CanonRecord | null =>
   Option.getOrNull(
-    Option.flatMap(parseJson(readFileSync(join(runsRoot, gameId, file), "utf8")), asJsonObject)
+    Option.getRight(parsePythonJsonObject(readFileSync(join(runsRoot, gameId, file), "utf8")))
   )
 
 /**
@@ -727,7 +769,7 @@ describe("reconstruction is deep-equal to the document on disk", () => {
           expect(Option.getOrNull(rebuilt)).toEqual(
             documentOnDisk(f.scratch.runsRoot, gameId, MANIFEST_FILE)
           )
-          expect(hasBigInt(Option.getOrNull(rebuilt))).toBe(false)
+          expect(hasBigInt(Option.getOrNull(rebuilt))).toBe(true)
         })
       )
   )

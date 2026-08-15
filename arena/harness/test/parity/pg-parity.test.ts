@@ -102,6 +102,7 @@ import {
   UNROUTABLE_UPSTREAM_URL,
   unwrapTrio,
 } from './boot.ts';
+import { pipedStreamText } from './json-boundary.ts';
 import { REQUEST_CASES, VALID_GAME_ID } from './fixtures/request-cases.ts';
 import { PARITY_RUNS_ROOT, PARITY_SCENARIOS, type ParityScenario } from './fixtures/scenarios.ts';
 import { compareBodies, describeBodyVerdict } from './normalizers.ts';
@@ -114,7 +115,13 @@ import {
   waiverExpectsNoResponse,
   waiversIn,
 } from './waivers.ts';
-import { bodyLatin1, isWireResponse, type WireOutcome, wireRequest } from './wire-client.ts';
+import {
+  bodyLatin1,
+  isWireResponse,
+  type WireOutcome,
+  type WireRequest,
+  wireRequest,
+} from './wire-client.ts';
 
 const DARWIN = PARITY_PLATFORM_SUPPORTED;
 
@@ -261,12 +268,14 @@ const RUNNABLE = DARWIN && POSTGRES_VERDICT._tag === 'Usable';
  * registered **before** `createdb` runs, so a create that fails halfway still
  * leaves a droppable record.
  */
-const databases = ((): {
+interface DatabaseRegistry {
   readonly create: (label: string) => string;
   readonly drop: (name: string) => PsqlResult;
   readonly dropAll: () => ReadonlyArray<string>;
   readonly created: () => ReadonlyArray<string>;
-} => {
+}
+
+const databases = ((): DatabaseRegistry => {
   const created: string[] = [];
   const dropped = new Set<string>();
   return {
@@ -312,15 +321,6 @@ const databases = ((): {
 
 /** `@arena/db`'s writer.  The gateway never writes; this is the only ingester. */
 const INGEST_CLI: string = join(REPO_ROOT, 'arena/db/src/ingest-cli.ts');
-
-/**
- * `Bun.Subprocess`'s streams are typed as a union over every `stdio` option;
- * `'pipe'` — the one asked for below — is the `ReadableStream` arm, and
- * `instanceof` is how that is established rather than asserted.  `boot.ts` has
- * the same three lines for the same reason.
- */
-const streamText = (stream: unknown): Promise<string> =>
-  stream instanceof ReadableStream ? new Response(stream).text() : Promise.resolve('');
 
 /** What one sweep reported, as a value a test can assert on. */
 interface IngestOutcome {
@@ -369,7 +369,10 @@ const ingestFixtures = async (database: string): Promise<IngestOutcome> => {
     ],
     { cwd: REPO_ROOT, stdout: 'pipe', stderr: 'pipe' },
   );
-  const [stdout, stderr] = await Promise.all([streamText(child.stdout), streamText(child.stderr)]);
+  const [stdout, stderr] = await Promise.all([
+    pipedStreamText(child.stdout),
+    pipedStreamText(child.stderr),
+  ]);
   await child.exited;
   return { database, exitCode: child.exitCode, stdout, stderr };
 };
@@ -579,12 +582,17 @@ const routeLegNamesInDiffTest = (source: string): ReadonlyArray<string> => {
 };
 
 /** The two tables' route-leg names, for the assertion that they agree. */
-const ROUTE_LEG_DRIFT: { readonly mine: ReadonlyArray<string>; readonly theirs: ReadonlyArray<string> } = {
+interface RouteLegDrift {
+  readonly mine: ReadonlyArray<string>;
+  readonly theirs: ReadonlyArray<string>;
+}
+
+const ROUTE_LEG_DRIFT = {
   mine: ROUTE_LEGS.map((leg) => leg.name).toSorted(),
   theirs: routeLegNamesInDiffTest(
     existsSync(DIFF_TEST_SOURCE) ? readFileSync(DIFF_TEST_SOURCE, 'utf8') : '',
   ),
-};
+} satisfies RouteLegDrift;
 
 // ---------------------------------------------------------------------------
 // Scenarios
@@ -700,15 +708,22 @@ const mapPool = async <A, B>(
     .map(([, value]) => value);
 };
 
-const runLeg = (origin: string, leg: MatrixLeg): Promise<WireOutcome> =>
-  wireRequest(origin, {
+const runLeg = (origin: string, leg: MatrixLeg): Promise<WireOutcome> => {
+  const base: WireRequest = {
     method: leg.method,
     target: leg.target,
-    ...(leg.headers === undefined ? {} : { headers: leg.headers }),
-    ...(leg.body === undefined ? {} : { body: leg.body }),
-    ...(leg.rawRequestLine === undefined ? {} : { rawRequestLine: leg.rawRequestLine }),
     timeoutMs: LEG_TIMEOUT_MS,
-  });
+  };
+  const withHeaders: WireRequest =
+    leg.headers === undefined ? base : { ...base, headers: leg.headers };
+  const withBody: WireRequest =
+    leg.body === undefined ? withHeaders : { ...withHeaders, body: leg.body };
+  const request: WireRequest =
+    leg.rawRequestLine === undefined
+      ? withBody
+      : { ...withBody, rawRequestLine: leg.rawRequestLine };
+  return wireRequest(origin, request);
+};
 
 /** All three sides of one leg, concurrently — they are three processes. */
 const runAll = async (
@@ -1082,26 +1097,19 @@ const SCENARIO_NAMES: ReadonlyArray<string> = [
   ...STUB_MODES.map(stubScenarioName),
 ];
 
-/**
- * The scenarios in which the archive is read from **storage** rather than
- * relayed from the upstream — and therefore the only ones in which any gateway
- * has a reason to run a derivation at all.
- *
- * Read off `waivers.ts` rather than restated: `binary-disk-fallback-chunked`
- * is scoped to exactly this set, for exactly this reason ("the five scenarios
- * in which the archive is read from disk"), and deriving it means a scenario
- * added to that entry cannot silently fall out of this assertion.
- *
- * Measured, and it is the sharp form of the claim: a derivation cache is
- * filled in these five and empty in the four where the stub answers, because a
- * relayed `replay.json` never reaches the derivation service at all.  Asserting
- * "filled" everywhere — the first version of this rig did — is wrong in four
- * scenarios; asserting nothing would let the derivation legs agree for the
- * worst possible reason, an archive so empty that every side says
- * `available: false`.
- */
-const DISK_FALLBACK_SCENARIOS: ReadonlyArray<string> =
-  MATRIX_WAIVERS.find((waiver) => waiver.id === 'binary-disk-fallback-chunked')?.scenarios ?? [];
+/** Stub personalities whose archive responses fall back to local storage. */
+const DISK_FALLBACK_MODES = [
+  'not-found-404',
+  'method-405',
+  'portless',
+  'hang',
+] as const satisfies ReadonlyArray<StubMode>;
+
+/** Scenarios in which derivation must fill all three private caches. */
+const DISK_FALLBACK_SCENARIOS: ReadonlyArray<string> = [
+  UPSTREAM_DOWN.name,
+  ...DISK_FALLBACK_MODES.map(stubScenarioName),
+];
 
 /**
  * The one edit that makes a pg gateway answer differently from an fs one.
@@ -1262,8 +1270,7 @@ test('the 3-way pg matrix is not silently skipped', () => {
     const what =
       `${String(SCENARIO_NAMES.length)} upstream scenarios x ${String(MATRIX_LEGS.length)} legs x ` +
       '3 pairwise comparisons (python/ts-fs/ts-pg), plus the pg provenance falsification';
-    // oxlint-disable-next-line effecttsgo/global-console -- a skipped oracle has
-    // to reach a terminal; there is no Logger in a bun:test process.
+    // oxlint-disable-next-line effecttsgo/global-console -- skipped oracle must reach the terminal
     console.warn(
       DARWIN
         ? `\n!! THE 3-WAY PG MATRIX DID NOT RUN: ${POSTGRES_VERDICT.why}\n!! ${what} contributed ZERO assertions.\n!! Set ARENA_REQUIRE_PARITY=1 to make this a failure instead of a warning.\n`
@@ -1282,7 +1289,7 @@ test('the 3-way pg matrix is not silently skipped', () => {
 
 describe.if(RUNNABLE)('the 3-way pg matrix', () => {
   test('the transcribed route table still names exactly diff.test.ts\'s legs', () => {
-    expect(ROUTE_LEG_DRIFT.mine).toEqual(ROUTE_LEG_DRIFT.theirs);
+    expect([...ROUTE_LEG_DRIFT.mine]).toEqual([...ROUTE_LEG_DRIFT.theirs]);
   });
 
   SCENARIO_NAMES.forEach((scenario) => {

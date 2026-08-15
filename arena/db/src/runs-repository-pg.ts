@@ -67,15 +67,14 @@
  * `untrustedFieldOr(manifest, 'state', 'status')` case, the single site where a
  * *present* `null` beats `status` and an *absent* key does not.
  *
- * ## No `bigint` in a reconstructed document
+ * ## Integer/float spelling survives jsonb
  *
- * `readManifest` answers a `JsonObject`, and the fs backend produces it with
- * `JSON.parse` under `Schema.JsonNumber`: **every number is a JS `number`.**
- * `Gateway.decodeManifest` depends on it (`WireInt = BigIntFromNumber` decodes
- * *from* a number), the declared return type has no `bigint` member, and the
- * deep-equality oracle would fail on one. The only `bigint` in this module is
- * {@link RunsRepositoryApi.lastReplayTurn}'s answer, whose value came from
- * `parsePythonJson` and whose `int`-ness is what refuses `{"turn": 2.0}`.
+ * The filesystem repository parses Python integer tokens as `bigint` and float
+ * tokens as `number`. jsonb cannot retain that distinction for integral values,
+ * so ingest records each integer's JSON pointer in `extras.derived` and stores
+ * unsafe integers as decimal strings. Reconstruction consumes those markers
+ * before returning a `CanonRecord`; `decodeManifest` then applies the same
+ * `canonToJson` conversion as the filesystem backend.
  *
  * ## The four SQL temptations, still refused
  *
@@ -113,11 +112,13 @@ import * as Effect from "effect/Effect"
 import * as Either from "effect/Either"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as Predicate from "effect/Predicate"
 import { closeSync, fstatSync, openSync, readSync, realpathSync } from "node:fs"
 import { join } from "node:path"
 
 import {
-  decodeJsonValueFromString,
+  type CanonRecord,
+  type CanonValue,
   Gateway,
   isGameId,
   isTerminalRunState,
@@ -147,6 +148,11 @@ import {
 import type { Canonical, Untrusted } from "../../harness/src/gateway/public.ts"
 import { untrustedField } from "../../harness/src/gateway/public.ts"
 import {
+  isCanonRecord,
+  parsePythonJson
+} from "../../harness/src/gateway/python-json.ts"
+import {
+  canonToJson,
   type DiskGamesIndexOptions,
   makeRunsRepository,
   O_CLOEXEC,
@@ -249,6 +255,9 @@ const EXTRAS_DERIVED = "derived"
 
 /** `extras.derived.last_replay_turn` — the decimal string of an int32 overflow. */
 const DERIVED_LAST_REPLAY_TURN = "last_replay_turn"
+const DERIVED_MANIFEST_INTEGERS = "manifest_integer_pointers"
+const DERIVED_REPORT_INTEGERS = "report_integer_pointers"
+const DECIMAL_RE = /^-?[0-9]+$/
 
 /** `games.state`'s sentinel for "not one of the seven spellings" (§1.2). */
 const INVALID_STATE = "invalid"
@@ -327,6 +336,76 @@ const stateEntries = (row: GameDocumentRow, demoted: JsonObject): Entries =>
 const configEntries = (config: unknown): Entries =>
   config === null || config === undefined || !isJsonValue(config) ? [] : [["config", config]]
 
+const pointerToken = (key: string): string => key.replaceAll("~", "~0").replaceAll("/", "~1")
+
+const integerPointerSet = (
+  row: GameDocumentRow,
+  key: string
+): Option.Option<ReadonlySet<string>> =>
+  Option.flatMap(extrasSection(row.extras, EXTRAS_DERIVED), (derived) => {
+    const value = derived[key]
+    if (value === undefined) {
+      return Option.some(new Set<string>())
+    }
+    return isJsonArray(value) && value.every(Predicate.isString)
+      ? Option.some(new Set(value))
+      : Option.none()
+  })
+
+const restoreCanonValue = (
+  value: JsonValue,
+  path: string,
+  integers: ReadonlySet<string>,
+  seen: Set<string>
+): Option.Option<CanonValue> => {
+  const pointer = path === "" ? "/" : path
+  if (integers.has(pointer)) {
+    const restored = Predicate.isNumber(value) && Number.isSafeInteger(value)
+      ? Option.some(BigInt(value))
+      : Predicate.isString(value) && DECIMAL_RE.test(value)
+      ? Option.some(BigInt(value))
+      : Option.none<bigint>()
+    return Option.map(restored, (integer) => {
+      seen.add(pointer)
+      return integer
+    })
+  }
+  if (Array.isArray(value)) {
+    return Option.map(
+      Option.all(value.map((entry, index) =>
+        restoreCanonValue(entry, `${path}/${String(index)}`, integers, seen)
+      )),
+      (entries): CanonValue => entries
+    )
+  }
+  if (isJsonValue(value) && value !== null && Predicate.isRecord(value)) {
+    return Option.map(
+      Option.all(Object.entries(value).map(([key, entry]) =>
+        Option.map(
+          restoreCanonValue(entry, `${path}/${pointerToken(key)}`, integers, seen),
+          (restored) => [key, restored] as const
+        )
+      )),
+      (entries): CanonValue => Object.fromEntries(entries)
+    )
+  }
+  return Option.some(value)
+}
+
+const restoreDocument = (
+  row: GameDocumentRow,
+  key: string,
+  document: JsonObject
+): Option.Option<CanonRecord> =>
+  Option.flatMap(integerPointerSet(row, key), (integers) => {
+    const seen = new Set<string>()
+    return Option.flatMap(restoreCanonValue(document, "", integers, seen), (restored) =>
+      seen.size === integers.size && isCanonRecord(restored)
+        ? Option.some(restored)
+        : Option.none()
+    )
+  })
+
 /**
  * `manifest.json`, put back together (§1.2).
  *
@@ -338,8 +417,8 @@ const configEntries = (config: unknown): Entries =>
  * `Option.none` is an unreadable envelope, never an absent document — the
  * document's own absence is `manifest_status`.
  */
-export const reconstructManifest = (row: GameDocumentRow): Option.Option<JsonObject> =>
-  Option.map(extrasSection(row.extras, EXTRAS_MANIFEST), (demoted) => {
+export const reconstructManifest = (row: GameDocumentRow): Option.Option<CanonRecord> =>
+  Option.flatMap(extrasSection(row.extras, EXTRAS_MANIFEST), (demoted) => {
     const columns: Entries = [
       ...stateEntries(row, demoted),
       ...columnEntry("schema_version", row.schemaVersion),
@@ -350,10 +429,11 @@ export const reconstructManifest = (row: GameDocumentRow): Option.Option<JsonObj
       ...columnEntry("benchmark_valid", row.benchmarkValid),
       ...configEntries(row.config)
     ]
-    return Object.fromEntries([
+    const document: JsonObject = Object.fromEntries([
       ...columns.filter(([key]) => !Object.hasOwn(demoted, key)),
       ...Object.entries(demoted)
     ])
+    return restoreDocument(row, DERIVED_MANIFEST_INTEGERS, document)
   })
 
 /**
@@ -365,13 +445,13 @@ export const reconstructManifest = (row: GameDocumentRow): Option.Option<JsonObj
  * `latency_ms` accumulator sibling. So the document is carried whole in
  * `extras.report` and this is the entire reconstruction.
  */
-export const reconstructReport = (row: GameDocumentRow): Option.Option<JsonObject> =>
-  Option.flatMap(
-    asJsonObject(row.extras),
-    (envelope) =>
-      Object.hasOwn(envelope, EXTRAS_REPORT)
-        ? asJsonObject(envelope[EXTRAS_REPORT])
-        : Option.none()
+export const reconstructReport = (row: GameDocumentRow): Option.Option<CanonRecord> =>
+  Option.flatMap(asJsonObject(row.extras), (envelope) =>
+    Object.hasOwn(envelope, EXTRAS_REPORT)
+      ? Option.flatMap(asJsonObject(envelope[EXTRAS_REPORT]), (document) =>
+        restoreDocument(row, DERIVED_REPORT_INTEGERS, document)
+      )
+      : Option.none()
   )
 
 /**
@@ -384,8 +464,6 @@ export const reconstructReport = (row: GameDocumentRow): Option.Option<JsonObjec
  * is allowed to carry one. The answer is a `bigint` either way, because that is
  * what `asInterrupted` compares against `current_turn`.
  */
-const DECIMAL_RE = /^-?[0-9]+$/
-
 export const reconstructLastReplayTurn = (row: GameDocumentRow): Option.Option<bigint> => {
   const derived = Option.flatMap(
     extrasSection(row.extras, EXTRAS_DERIVED),
@@ -463,9 +541,9 @@ const UTF8 = new TextDecoder("utf-8", { fatal: true })
 const decodeUtf8 = (bytes: Uint8Array): Option.Option<string> =>
   Option.getRight(Either.try(() => UTF8.decode(bytes)))
 
-/** `json.loads`, narrowed to what `JSON.parse` accepts. */
-const parseJson = (text: string): Option.Option<JsonValue> =>
-  Option.getRight(decodeJsonValueFromString(text))
+/** `json.loads`, preserving CPython's integer/float distinction. */
+const parseJson = (text: string): Option.Option<CanonValue> =>
+  Option.getRight(parsePythonJson(text))
 
 /**
  * `_archive_victory`'s file read (`:684`), from the run directory on disk.
@@ -548,13 +626,13 @@ const GAME_COLUMNS = {
  */
 const documentJson = (
   status: "ok" | "unusable" | "absent",
-  document: Option.Option<JsonObject>,
+  document: Option.Option<CanonRecord>,
   label: Gateway.ArchiveJsonLabel
-): Either.Either<JsonObject, RunsError> =>
+): Either.Either<CanonRecord, RunsError> =>
   status === "absent"
     ? Either.left(new NotFound({ problem: ARCHIVE_JSON_PROBLEMS[label].missing }))
     : Either.fromOption(
-      status === "ok" ? document : Option.none<JsonObject>(),
+      status === "ok" ? document : Option.none<CanonRecord>(),
       () => new ArchiveUnavailable({ problem: ARCHIVE_JSON_PROBLEMS[label].unusable })
     )
 
@@ -598,7 +676,7 @@ export const makeRunsRepositoryPg = (db: Database, runsRoot: string): RunsReposi
   const manifestOf = (
     gameId: string,
     row: Option.Option<GameDocumentRow>
-  ): Either.Either<JsonObject, RunsError> =>
+  ): Either.Either<CanonRecord, RunsError> =>
     !isGameId(gameId) || Option.isNone(row)
       ? Either.left(gone)
       : Either.flatMap(
@@ -607,7 +685,7 @@ export const makeRunsRepositoryPg = (db: Database, runsRoot: string): RunsReposi
           untrustedField(manifest, "game_id") === gameId ? Either.right(manifest) : Either.left(gone)
       )
 
-  const readManifest = (gameId: string): Effect.Effect<JsonObject, RunsError> =>
+  const readManifest = (gameId: string): Effect.Effect<CanonRecord, RunsError> =>
     isGameId(gameId)
       ? Effect.flatMap(
         Effect.mapError(loadGame(gameId), unreachable("manifestUnavailable")),
@@ -756,7 +834,9 @@ export const makeRunsRepositoryPg = (db: Database, runsRoot: string): RunsReposi
     runsRoot: root,
     readManifest,
     decodeManifest: (gameId): Effect.Effect<Gateway.Manifest, RunsError | WireDecodeError> =>
-      Effect.flatMap(readManifest(gameId), (manifest) => Gateway.decodeManifest(manifest)),
+      Effect.flatMap(readManifest(gameId), (manifest) =>
+        Gateway.decodeManifest(canonToJson(manifest))
+      ),
     terminalArchive,
     lastReplayTurn,
     diskGamesIndex: (indexOptions) => Effect.map(diskGameRows(indexOptions), gamesIndex),

@@ -226,7 +226,7 @@ const asJsonObject = (value: CanonValue): Option.Option<CanonRecord> =>
   isCanonRecord(value) ? Option.some(value) : Option.none();
 
 /** A Python-aware document converted only for a strict wire-schema decode. */
-const canonToJson = (value: CanonValue): JsonValue => {
+export const canonToJson = (value: CanonValue): JsonValue => {
   if (Predicate.isBigInt(value)) return Number(value);
   if (Array.isArray(value)) return value.map(canonToJson);
   if (isCanonRecord(value)) {
@@ -303,7 +303,7 @@ export const archiveBytes = (bytes: Uint8Array): ArchiveBytes => ({ _tag: 'Bytes
 
 /** Which arm of {@link BinaryArtifact} this is. */
 export const isArchiveBytes = (artifact: BinaryArtifact): artifact is ArchiveBytes =>
-  typeof artifact !== 'string';
+  !Predicate.isString(artifact);
 
 /** Options for {@link RunsRepositoryApi.diskGamesIndex}. */
 export interface DiskGamesIndexOptions {

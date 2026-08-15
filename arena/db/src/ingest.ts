@@ -102,9 +102,9 @@
 
 import {
   CANON_ASCII,
+  type CanonRecord,
   type CanonValue,
   canonicalText,
-  decodeJsonValueFromString,
   findLoneSurrogate,
   Gateway,
   isGameId,
@@ -148,7 +148,10 @@ import { fileURLToPath } from "node:url"
 
 import { MAX_PROXY_JSON_BYTES } from "../../harness/src/gateway/constants.ts"
 import { derivationPlaces } from "../../harness/src/gateway/http/routes/replay.ts"
-import { parsePythonJson } from "../../harness/src/gateway/python-json.ts"
+import {
+  parsePythonJson,
+  parsePythonJsonObject
+} from "../../harness/src/gateway/python-json.ts"
 import {
   type DerivationError,
   type DerivationRunner,
@@ -705,14 +708,7 @@ const UTF8 = new TextDecoder("utf-8", { fatal: true })
 const decodeUtf8 = (bytes: Uint8Array): Option.Option<string> =>
   Option.getRight(Either.try(() => UTF8.decode(bytes)))
 
-const asJsonObject = (value: JsonValue): Option.Option<JsonObject> =>
-  isJsonObject(value) ? Option.some(value) : Option.none()
 
-const parseJsonObject = (bytes: Uint8Array): Option.Option<JsonObject> =>
-  Option.flatMap(
-    Option.flatMap(decodeUtf8(bytes), (text) => Option.getRight(decodeJsonValueFromString(text))),
-    asJsonObject
-  )
 
 /**
  * Can Postgres hold this string faithfully?
@@ -751,6 +747,48 @@ const unstorableAt = (value: JsonValue, path: string): Option.Option<string> => 
 
 /** RFC 6901 token escaping, so a pointer stays readable and unambiguous. */
 const pointerToken = (key: string): string => key.replaceAll("~", "~0").replaceAll("/", "~1")
+
+/** Every JSON pointer at which the source document spelled a Python integer. */
+const integerPointers = (value: CanonValue, path: string): ReadonlyArray<string> =>
+  typeof value === "bigint"
+    ? [path === "" ? "/" : path]
+    : Array.isArray(value)
+    ? value.flatMap((entry, index) => integerPointers(entry, `${path}/${String(index)}`))
+    : typeof value === "object" && value !== null
+    ? Object.entries(value).flatMap(([key, entry]) =>
+      integerPointers(entry, `${path}/${pointerToken(key)}`)
+    )
+    : []
+
+/** A canonical document encoded for jsonb, with integer paths carried separately. */
+const storedJson = (value: CanonValue): JsonValue => {
+  if (typeof value === "bigint") {
+    return Number.isSafeInteger(Number(value)) ? Number(value) : String(value)
+  }
+  if (Array.isArray(value)) {
+    return value.map(storedJson)
+  }
+  if (typeof value === "object" && value !== null) {
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, storedJson(entry)]))
+  }
+  return value
+}
+
+interface StoredDocumentObject {
+  readonly value: JsonObject
+  readonly integerPointers: ReadonlyArray<string>
+}
+
+const storedDocumentObject = (bytes: Uint8Array): Option.Option<StoredDocumentObject> =>
+  Option.flatMap(
+    Option.flatMap(decodeUtf8(bytes), (text) => Option.getRight(parsePythonJsonObject(text))),
+    (record: CanonRecord) => {
+      const value = storedJson(record)
+      return isJsonObject(value)
+        ? Option.some({ value, integerPointers: integerPointers(record, "") })
+        : Option.none()
+    }
+  )
 
 /** Every JSON pointer at which `value` carries a negative zero. */
 const negativeZeroPointers = (value: JsonValue, path: string): ReadonlyArray<string> =>
@@ -908,6 +946,8 @@ export interface ReadDocument {
   readonly digest: Uint8Array
   /** The parsed object, present exactly when `status === 'ok'`. */
   readonly value: Option.Option<JsonObject>
+  /** JSON pointers whose source tokens were Python integers rather than floats. */
+  readonly integerPointers: ReadonlyArray<string>
   /** Where the document held something Postgres cannot store, if it did. */
   readonly unstorable: Option.Option<string>
 }
@@ -934,19 +974,26 @@ const readDocument = (runRoot: string, file: string): ReadDocument => {
       byteSize: 0,
       digest: ABSENT_DIGEST,
       value: Option.none(),
+      integerPointers: [],
       unstorable: Option.none()
     }),
     onSome: (found) => {
-      const gated = found.regular && found.size > 0 && found.size <= MAX_DOCUMENT_BYTES
-        ? parseJsonObject(found.bytes)
-        : Option.none<JsonObject>()
-      const unstorable = Option.flatMap(gated, (value) => unstorableAt(value, ""))
+      const parsed = found.regular && found.size > 0 && found.size <= MAX_DOCUMENT_BYTES
+        ? storedDocumentObject(found.bytes)
+        : Option.none<StoredDocumentObject>()
+      const unstorable = Option.flatMap(parsed, ({ value }) => unstorableAt(value, ""))
       return {
         file,
-        status: Option.isNone(gated) || Option.isSome(unstorable) ? "unusable" : "ok",
+        status: Option.isNone(parsed) || Option.isSome(unstorable) ? "unusable" : "ok",
         byteSize: found.size,
         digest: sha256(found.bytes),
-        value: Option.isSome(unstorable) ? Option.none() : gated,
+        value: Option.isSome(unstorable) ? Option.none() : Option.map(parsed, ({ value }) => value),
+        integerPointers: Option.isSome(unstorable)
+          ? []
+          : Option.match(parsed, {
+            onNone: (): ReadonlyArray<string> => [],
+            onSome: ({ integerPointers: pointers }) => pointers
+          }),
         unstorable
       }
     }
@@ -1210,10 +1257,9 @@ const readReplay = (
 /**
  * `games.extras` — our own envelope, with exactly three reserved keys.
  *
- * `manifest` and `report` are **verbatim JSON**: no tagging, no rewriting, so
- * reconstruction is a merge rather than a decode. `derived` is the only place a
- * tagged encoding (a bigint as a decimal string) is legal, and nothing
- * reconstructs from it.
+ * `manifest` and `report` keep their JSON shape. Python integers are stored as
+ * safe JSON numbers (or decimal strings when unsafe), while `derived` records
+ * their JSON pointers so reconstruction can restore bigint/float spelling.
  */
 export interface ExtrasEnvelope {
   /** Demoted and un-columned manifest keys, verbatim. Present iff `manifest_status = 'ok'`. */
@@ -1494,7 +1540,7 @@ export const encodeFields = (fields: ReadonlyArray<string>): string =>
  * changes, so an upgrade re-reads every run instead of trusting a hash that
  * was taken over different questions.
  */
-const HASH_HEADER = "arena-ingest v2\n"
+const HASH_HEADER = "arena-ingest v3\n"
 
 interface HashEntry {
   readonly category: string
@@ -1549,28 +1595,34 @@ export interface RunData {
  * through `parsePythonJson`, and `lastReplayTurn` must answer the same `bigint`
  * the fs backend answers.
  *
- * `manifest_negative_zero` / `report_negative_zero` record the pointers at
- * which a `-0` was seen and flattened. `String(-0) === "0"` in the parameter
- * binding and `JSON.stringify(-0) === "0"` in extras, so v2 cannot carry one;
- * this makes the loss legible instead of silent.
+ * `manifest_integer_pointers` / `report_integer_pointers` preserve CPython's
+ * integer-vs-float distinction through jsonb. `manifest_negative_zero` /
+ * `report_negative_zero` record pointers at which a `-0` was flattened;
+ * Postgres cannot carry that sign, so the loss remains explicit.
  */
 const derivedFacts = (
-  manifest: Option.Option<JsonObject>,
-  report: Option.Option<JsonObject>,
+  manifest: ReadDocument,
+  report: ReadDocument,
   lastReplayTurn: Option.Option<bigint>,
   storedLastReplayTurn: number | null
 ): JsonObject => {
-  const manifestZeros = Option.match(manifest, {
+  const manifestZeros = Option.match(manifest.value, {
     onNone: (): ReadonlyArray<string> => [],
     onSome: (value) => negativeZeroPointers(value, "")
   })
-  const reportZeros = Option.match(report, {
+  const reportZeros = Option.match(report.value, {
     onNone: (): ReadonlyArray<string> => [],
     onSome: (value) => negativeZeroPointers(value, "")
   })
   return {
     ...(storedLastReplayTurn === null && Option.isSome(lastReplayTurn)
       ? { last_replay_turn: String(lastReplayTurn.value) }
+      : {}),
+    ...(manifest.integerPointers.length > 0
+      ? { manifest_integer_pointers: [...manifest.integerPointers] }
+      : {}),
+    ...(report.integerPointers.length > 0
+      ? { report_integer_pointers: [...report.integerPointers] }
       : {}),
     ...(manifestZeros.length > 0 ? { manifest_negative_zero: [...manifestZeros] } : {}),
     ...(reportZeros.length > 0 ? { report_negative_zero: [...reportZeros] } : {})
@@ -1611,12 +1663,7 @@ export const collectRun = (
         ? Option.some(Number(turn))
         : Option.none())
   )
-  const derived = derivedFacts(
-    manifest.value,
-    report.value,
-    replay.lastReplayTurn,
-    storedLastReplayTurn
-  )
+  const derived = derivedFacts(manifest, report, replay.lastReplayTurn, storedLastReplayTurn)
 
   return {
     gameId,

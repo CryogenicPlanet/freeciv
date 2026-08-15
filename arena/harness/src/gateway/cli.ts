@@ -246,4 +246,3 @@ export const formatStartupError = (error: GatewayConfigError): string => `error:
 
 /** The exit code `main` uses for a rejected configuration (`:2207`). */
 export const GATEWAY_CLI_ERROR_EXIT_CODE = 2 as const;
-

@@ -792,7 +792,9 @@ describe("values a typed column cannot hold cost one column, never the sweep", (
       // *disappears* — a missing game rather than a demoted field.
       expect(report.runs[0]?.outcome).toBe("inserted")
       expect(row?.currentTurn).toBe(null)
-      expect(extrasManifestOf(row ?? { extras: null })["current_turn"]).toBe(1e20)
+      expect(extrasManifestOf(row ?? { extras: null })["current_turn"]).toBe(
+        "99999999999999999999"
+      )
     })))
 
   it("D1: a last_replay_turn past int32 is answered from extras, not from the column", () =>
@@ -867,15 +869,15 @@ describe("values a typed column cannot hold cost one column, never the sweep", (
       )
       expect(rows[0]?.inputTokens).toBe(null)
       expect(rows[0]?.outputTokens).toBe(12)
-      // The *document* is a `JsonObject` by then — `decodeJsonValueFromString`
-      // is `JSON.parse`, so the envelope carries the double the fs backend also
-      // sees (2^53, one below the digits on disk). The guard is about the
-      // column: `Number.isSafeInteger(2^53)` is false, so it is not written at
-      // all rather than written as a number that is not the one recorded.
-      const stats = asObject(
-        asObject(asObject((yield* rowOf(gid(1)))?.extras)["report"])["seat_stats"]
+      // Unsafe Python integers use a decimal-string carrier plus a pointer in
+      // extras. The typed projection stays null, while reconstruction can
+      // restore the exact bigint instead of laundering it through Number.
+      const row = yield* rowOf(gid(1))
+      const stats = asObject(asObject(asObject(row?.extras)["report"])["seat_stats"])
+      expect(asObject(stats["place-1"])["input_tokens"]).toBe("9007199254740993")
+      expect(asObject(asObject(row?.extras)["derived"])["report_integer_pointers"]).toContain(
+        "/seat_stats/place-1/input_tokens"
       )
-      expect(asObject(stats["place-1"])["input_tokens"]).toBe(Number("9007199254740992"))
     })))
 
   it("D13: a non-integer is demoted rather than rounded", () =>

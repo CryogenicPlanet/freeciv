@@ -45,9 +45,18 @@ import { createHash } from "node:crypto"
 import { mkdirSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 
-import { CANON_UTF8, type CanonValue, canonicalText, Gateway, type JsonObject } from "@arena/wire"
+import {
+  CANON_UTF8,
+  type CanonRecord,
+  type CanonValue,
+  canonicalText,
+  Gateway,
+  isJsonObject,
+  type JsonObject
+} from "@arena/wire"
 
 import type { Canonical } from "../../harness/src/gateway/public.ts"
+import { parsePythonJsonObject } from "../../harness/src/gateway/python-json.ts"
 import {
   makeRunsRepository,
   type RunsError,
@@ -215,7 +224,7 @@ const CASES: ReadonlyArray<HuntCase> = [
       extras: extrasOf({
         game_id: "hunt_current_turn_overflows_05",
         state: "running",
-        current_turn: 1e20
+        current_turn: "99999999999999999999"
       })
     }
   },
@@ -479,6 +488,46 @@ const makeScratch = (): Scratch => {
   return { base, runsRoot }
 }
 
+const pointerToken = (key: string): string => key.replaceAll("~", "~0").replaceAll("/", "~1")
+
+const integerPointers = (value: CanonValue, path: string): ReadonlyArray<string> =>
+  typeof value === "bigint"
+    ? [path === "" ? "/" : path]
+    : Array.isArray(value)
+    ? value.flatMap((entry, index) => integerPointers(entry, `${path}/${String(index)}`))
+    : typeof value === "object" && value !== null
+    ? Object.entries(value).flatMap(([key, entry]) =>
+      integerPointers(entry, `${path}/${pointerToken(key)}`)
+    )
+    : []
+
+const pointersIn = (text: string | undefined): ReadonlyArray<string> =>
+  text === undefined
+    ? []
+    : Option.match(Option.getRight(parsePythonJsonObject(text)), {
+      onNone: (): ReadonlyArray<string> => [],
+      onSome: (value) => integerPointers(value, "")
+    })
+
+const extrasFor = (hunt: HuntCase): JsonObject | null => {
+  const envelope = isJsonObject(hunt.row.extras) ? hunt.row.extras : {}
+  const existingDerived = isJsonObject(envelope["derived"]) ? envelope["derived"] : {}
+  const manifestPointers = hunt.row.manifestStatus === "unusable" ? [] : pointersIn(hunt.manifest)
+  const reportPointers = hunt.row.reportStatus === "ok" ? pointersIn(hunt.report) : []
+  const derived: JsonObject = {
+    ...existingDerived,
+    ...(manifestPointers.length > 0
+      ? { manifest_integer_pointers: [...manifestPointers] }
+      : {}),
+    ...(reportPointers.length > 0
+      ? { report_integer_pointers: [...reportPointers] }
+      : {})
+  }
+  return Object.keys(envelope).length === 0 && Object.keys(derived).length === 0
+    ? null
+    : { ...envelope, derived }
+}
+
 const insertCase = (db: Database, hunt: HuntCase): Effect.Effect<unknown, never> =>
   Effect.orDie(db.insert(games).values({
     gameId: hunt.id,
@@ -494,7 +543,7 @@ const insertCase = (db: Database, hunt: HuntCase): Effect.Effect<unknown, never>
     manifestStatus: hunt.row.manifestStatus ?? "ok",
     reportStatus: hunt.row.reportStatus ?? "absent",
     contentHash: new Uint8Array(createHash("sha256").update(hunt.id).digest()),
-    extras: hunt.row.extras ?? null
+    extras: extrasFor(hunt)
   }))
 
 const testLayer = Layer.mergeAll(
@@ -590,9 +639,10 @@ describe("documents that survive the round trip", () => {
           const fs = yield* settle(f.fs.readManifest(hunt.id))
           const pg = yield* settle(f.pg.readManifest(hunt.id))
           expect(pg).toEqual(fs)
-          // …and the reconstruction is deep-equal to the bytes on disk, which is
-          // the §0 predicate: same keys, same scalars, no `bigint` anywhere.
-          expect(Either.getOrNull(pg)).toEqual(JSON.parse(hunt.manifest))
+          // …and the reconstruction is deep-equal to the canonical document on disk.
+          expect(Either.getOrNull(pg)).toEqual(
+            Either.getOrNull(parsePythonJsonObject(hunt.manifest))
+          )
         })
       )
   )
@@ -750,7 +800,7 @@ const ROUND_TRIP: ReadonlyArray<readonly [string, JsonObject]> = [
 ]
 
 /** One manifest, through the real partition and back. */
-const roundTrip = (manifest: JsonObject): JsonObject | null => {
+const roundTrip = (manifest: JsonObject): CanonRecord | null => {
   const fields = gameFields(manifest)
   const row: GameDocumentRow = {
     gameId: "g",

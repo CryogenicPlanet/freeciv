@@ -812,7 +812,10 @@ describe("agent_stats and the report envelope", () => {
       yield* sweep(FIXTURES)
       const row = yield* gameRow(db, INTERRUPTED)
       expect("report" in extrasOf(row)).toBe(false)
-      expect(Object.keys(extrasOf(row))).toEqual(["manifest"])
+      expect(Object.keys(extrasOf(row))).toEqual(["derived", "manifest"])
+      expect(Object.keys(asObject(extrasOf(row)["derived"]))).toContain(
+        "manifest_integer_pointers"
+      )
     })))
 
   it("stores no agent_stats for a seat_stats that is not a map of objects", () => {
